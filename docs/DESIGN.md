@@ -1,0 +1,95 @@
+# Validator protocol and trust model
+
+## Scope
+
+This repository implements the validator portion of the subnet and includes a
+small demo miner as a protocol reference. The validator treats the challenge
+source and every miner as untrusted remote systems. It accepts no remote grading
+claim: it executes committed candidate code against the revealed evaluation
+cases in its own sandbox and derives rewards locally.
+
+## Challenge lifecycle
+
+1. The validator signs a retry-safe lease request to the configured HTTPS
+   problem service.
+2. The service returns a public task, a challenge ID, a deadline, and
+   response-commit thresholds. Hidden evaluation cases are absent.
+3. The validator dispatches a signed `TaskRequest` to every serving miner
+   (subset sampling is available by configuration for very large pools).
+4. It retains each exact signed response body and authentication headers.
+5. It commits that immutable response set to the problem service.
+6. A valid commit token unlocks the hidden cases for that challenge.
+7. The validator executes every committed candidate locally and computes its
+   pass/fail result.
+8. Verified outcomes update the validator's recent score window and eventually its chain
+   weights. Aggregate feedback to the service is advisory only.
+
+Lease and commit operations are idempotent. Challenge ownership, expiry,
+registered UID/hotkey pairs, response signatures, request IDs, uniqueness, and
+minimum response counts are checked before reveal.
+
+## Security boundaries
+
+- Problem-service requests are signed and bound to the validator hotkey. HTTPS
+  authenticates responses in production; plain HTTP is an explicit local-test
+  escape hatch.
+- Miner requests and responses are signed for their intended recipient.
+- Hidden cases are unavailable until miner responses have been committed.
+- Candidate code runs without network access and with time, memory, process,
+  and output limits when Docker execution is selected.
+- Pass/fail comparison occurs in the trusted parent process rather than inside
+  candidate code.
+- Invalid, missing, oversized, unauthenticated, or timed-out responses receive
+  zero verified reward and cannot crash an entire round.
+- Score state is keyed by hotkey so UID reassignment does not inherit another
+  participant's history.
+
+## Reward and weights
+
+Correctness is determined by the complete hidden suite. Correct submissions are
+then weighted by observed response speed and leave-one-out difficulty. Failed
+submissions always receive zero.
+
+TODO(V2): Revisit duplication-resistant scoring only with a robust signal.
+Simple AST fingerprints encourage irrelevant structural changes in submitted
+solutions, so V1 deliberately excludes them from scoring and difficulty
+classification.
+
+The resulting per-UID payments update a recent-history score containing at
+most six observations from the preceding 16 hours. A minimum denominator of
+four prevents a few early responses from receiving a full score. Entries
+expire only when a completed challenge records the next observation, so a
+planned pause or exhausted problem batch does not erase every validator score.
+Validators periodically normalize those scores and submit weights through
+Bittensor, but only after the configured minimum number of completed
+observations is present in the authoritative score histories.
+
+The launch validator reserves 80% of the vector for the dynamically resolved
+subnet-owner UID. With NETUID 5's chain mode set to `Burn`, that owner-directed
+miner incentive is destroyed rather than paid to the owner; positive-scoring
+miners divide the remaining 20%. A valid completed history with no positive
+miner score directs the entire vector to burn. The owner is removed from the
+scored-miner allocation, and each positive miner receives a small floor that
+survives Bittensor's uint16 weight conversion.
+
+Owner hotkey and chain mode are read as one cached pair and refreshed hourly.
+A transient read uses the last-known-good pair. A missing first mapping prevents
+submission; an inconsistent formerly valid mapping or a non-`Burn` chain mode
+falls back without a reserved burn share and emits a prominent error. When the
+owner mapping remains valid in a non-`Burn` mode, the owner is removed from that
+fallback vector. Weight submission waits for inclusion in a worker thread, but
+not finalization, so the synchronous SDK call does not block the event loop.
+
+Rounds with an elevated sandbox-error rate run an independent known-good
+sandbox probe before scores are changed. A failed probe discards the grading
+event; a successful probe treats those errors as candidate failures. This keeps
+a broken local executor from manufacturing an all-zero miner history without
+giving candidate code the authority to declare the sandbox unhealthy.
+
+## Availability behavior
+
+The validator fails closed when no problem-service URL is configured. An
+exhausted or unavailable service produces no challenge and therefore no grading
+event. On a completed challenge, previously observed non-serving miners may
+receive a zero according to validator configuration; paced or empty rounds do
+not change scores. Remote systems cannot directly set or report scores.

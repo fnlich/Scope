@@ -1,0 +1,244 @@
+"""GLM demo miner protocol and provider-client coverage."""
+
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+
+import rlvr.protocol as protocol_module
+from rlvr.neurons.demo_miner import (
+    DemoMiner,
+    DemoMinerSettings,
+    GLM52Client,
+    build_demo_miner_app,
+    build_model_messages,
+    extract_python,
+)
+from rlvr.neurons.live import LiveSolverClient
+from rlvr.protocol import TaskRequest
+from rlvr.types import Problem, TestCase as Case
+
+fastapi = pytest.importorskip("fastapi")
+
+
+@pytest.fixture(autouse=True)
+def force_chain_free_signatures(monkeypatch):
+    """Keep protocol tests hermetic when a chain-signing package is installed."""
+
+    monkeypatch.setattr(protocol_module, "_HAVE_CRYPTO", False)
+    monkeypatch.setattr(protocol_module, "_Keypair", None)
+
+
+class WalletLike:
+    class Hotkey:
+        def __init__(self, address: str):
+            self.ss58_address = address
+
+    def __init__(self, address: str):
+        self.hotkey = self.Hotkey(address)
+
+
+class FakeMetagraph:
+    def __init__(self, validator: str, *, permit: bool = True):
+        self.hotkeys = [validator]
+        self.S = [100.0]
+        self.validator_permit = [permit]
+
+
+class FakeGLM:
+    def __init__(
+        self, content: str = "```python\ndef add(a, b):\n    return a + b\n```"
+    ):
+        self.content = content
+        self.messages = None
+
+    async def complete(self, messages, *, timeout_s):
+        self.messages = messages
+        return self.content
+
+    async def aclose(self):
+        return None
+
+
+class FailingGLM(FakeGLM):
+    async def complete(self, messages, *, timeout_s):
+        request = httpx.Request("POST", "https://provider.example/v4")
+        response = httpx.Response(429, request=request)
+        raise httpx.HTTPStatusError(
+            "quota unavailable",
+            request=request,
+            response=response,
+        )
+
+
+def demo_settings(**updates) -> DemoMinerSettings:
+    return DemoMinerSettings(
+        _env_file=None,
+        glm_api_key="test-key",
+        miner_require_validator_permit=True,
+        **updates,
+    )
+
+
+def test_extract_python_prefers_python_fence():
+    reply = "Text\n```json\n{}\n```\n```python\ndef f():\n    return 1\n```"
+    assert extract_python(reply) == "def f():\n    return 1"
+    assert extract_python("def f():\n    return 1") == "def f():\n    return 1"
+
+
+def test_model_prompt_contains_only_public_task_data():
+    request = TaskRequest(
+        problem_id="request-id",
+        statement="Add two integers.",
+        entrypoint="add",
+        public_examples=[Case(args=[20, 22], expected=42)],
+    )
+    messages = build_model_messages(request)
+    rendered = json.dumps(messages)
+
+    assert "Add two integers." in rendered
+    assert "add" in rendered
+    assert "42" in rendered
+    assert "hidden" not in rendered.lower()
+
+
+async def test_glm_client_uses_configured_chat_completion_contract():
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers["authorization"]
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "```python\ndef f(): return 1\n```"}}
+                ]
+            },
+        )
+
+    settings = demo_settings(
+        glm_base_url="https://provider.example/v4",
+        glm_model="glm-5.2",
+        glm_reasoning_effort="max",
+    )
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = GLM52Client(settings, http=http)
+    content = await client.complete(
+        [{"role": "user", "content": "Implement f."}],
+        timeout_s=30.0,
+    )
+    await http.aclose()
+
+    assert content.startswith("```python")
+    assert captured["url"] == "https://provider.example/v4/chat/completions"
+    assert captured["authorization"] == "Bearer test-key"
+    assert captured["body"]["model"] == "glm-5.2"
+    assert captured["body"]["thinking"] == {"type": "enabled"}
+    assert captured["body"]["reasoning_effort"] == "max"
+
+
+async def test_glm_client_requires_https():
+    settings = demo_settings(glm_base_url="http://provider.example/v4")
+    client = GLM52Client(settings)
+    try:
+        with pytest.raises(RuntimeError, match="HTTPS"):
+            _ = client.completion_url
+    finally:
+        await client.aclose()
+
+
+def setup_roundtrip(*, permit: bool = True, request_limit: int = 1_000_000):
+    validator_address = "validator-test-address"
+    miner_address = "miner-test-address"
+    settings = demo_settings(miner_max_request_bytes=request_limit)
+    fake_glm = FakeGLM()
+    miner = DemoMiner(
+        settings,
+        fake_glm,  # type: ignore[arg-type]
+        wallet=WalletLike(miner_address),
+        metagraph=FakeMetagraph(validator_address, permit=permit),
+    )
+    app = build_demo_miner_app(miner)
+    http = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://miner",
+    )
+
+    from rlvr.config import Settings
+
+    validator_settings = Settings(_env_file=None)
+    client = LiveSolverClient(
+        uid=0,
+        hotkey=miner_address,
+        url="http://miner",
+        wallet=WalletLike(validator_address),
+        settings=validator_settings,
+        http=http,
+    )
+    problem = Problem(
+        problem_id="canonical-problem-id",
+        statement="Add two integers.",
+        entrypoint="add",
+        tests=[],
+        public_examples=[Case(args=[1, 2], expected=3)],
+    )
+    return http, client, problem, fake_glm
+
+
+async def test_signed_validator_to_demo_miner_roundtrip():
+    http, client, problem, fake_glm = setup_roundtrip()
+    try:
+        solution = await client.solve(problem, problem.statement)
+    finally:
+        await http.aclose()
+
+    assert solution.code == "def add(a, b):\n    return a + b"
+    assert fake_glm.messages[1]["content"].startswith("Add two integers.")
+
+
+async def test_provider_http_failure_returns_signed_zero_code(capsys):
+    validator_address = "validator-test-address"
+    miner_address = "miner-test-address"
+    miner = DemoMiner(
+        demo_settings(),
+        FailingGLM(),  # type: ignore[arg-type]
+        wallet=WalletLike(miner_address),
+        metagraph=FakeMetagraph(validator_address),
+    )
+    request = TaskRequest(
+        problem_id="request-id",
+        statement="Implement f.",
+        entrypoint="f",
+    )
+
+    payload = await miner.solve(request, timeout_s=30.0)
+
+    assert payload.code == ""
+    assert payload.raw_response == "<model request failed>"
+    assert "HTTP 429" in capsys.readouterr().out
+
+
+async def test_demo_miner_rejects_unpermitted_validator():
+    http, client, problem, _fake_glm = setup_roundtrip(permit=False)
+    try:
+        solution = await client.solve(problem, problem.statement)
+    finally:
+        await http.aclose()
+
+    assert solution.code == ""
+    assert "HTTP 403" in solution.raw_response
+
+
+async def test_demo_miner_rejects_oversized_request():
+    http, client, problem, _fake_glm = setup_roundtrip(request_limit=16)
+    try:
+        solution = await client.solve(problem, problem.statement)
+    finally:
+        await http.aclose()
+
+    assert solution.code == ""
+    assert "HTTP 413" in solution.raw_response
