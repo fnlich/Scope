@@ -14,8 +14,9 @@ cases in its own sandbox and derives rewards locally.
    problem service.
 2. The service returns a public task, a challenge ID, a deadline, and
    response-commit thresholds. Hidden evaluation cases are absent.
-3. The validator dispatches a signed `TaskRequest` to every serving miner
-   (subset sampling is available by configuration for very large pools).
+3. The validator rotation-deals each signed `TaskRequest` to half of the serving
+   miners. A challenge's commit quorum can raise that sample, and operators may
+   configure a fixed count.
 4. It retains each exact signed response body and authentication headers.
 5. It commits that immutable response set to the problem service.
 6. A valid commit token unlocks the hidden cases for that challenge.
@@ -27,6 +28,15 @@ cases in its own sandbox and derives rewards locally.
 Lease and commit operations are idempotent. Challenge ownership, expiry,
 registered UID/hotkey pairs, response signatures, request IDs, uniqueness, and
 minimum response counts are checked before reveal.
+A rejected lease consumes no problem. A server `Retry-After` defers only future
+leases on a monotonic clock; the validator continues its event loop and weight
+schedule during that delay. Ordinary failed miner responses remain part of the
+committed response set so contact count, returned responses, and signed
+responses stay auditable.
+
+A rejected commit reports the service's stated reason and is not retried. An
+accepted commit is never repeated with another response set. A successful
+receipt whose count differs from the sent set is treated as a protocol error.
 
 ## Security boundaries
 
@@ -55,19 +65,27 @@ Simple AST fingerprints encourage irrelevant structural changes in submitted
 solutions, so V1 deliberately excludes them from scoring and difficulty
 classification.
 
-The resulting per-UID payments update a recent-history score containing at
-most six observations from the preceding 16 hours. A minimum denominator of
-four prevents a few early responses from receiving a full score. Entries
-expire only when a completed challenge records the next observation, so a
-planned pause or exhausted problem batch does not erase every validator score.
+The resulting per-UID payments update a rolling score containing the latest
+200 completed-problem observations for that registration. Until 200 problems
+have been attempted, every available observation is retained. A minimum
+denominator of four prevents a few early responses from receiving a full score,
+and weight submission begins after four completed observations. A UID's history
+is cleared when its registered hotkey changes, so a new registration never
+inherits the previous miner's results.
 Validators periodically normalize those scores and submit weights through
 Bittensor, but only after the configured minimum number of completed
 observations is present in the authoritative score histories.
+The SN5 example/default cadence is 75 blocks (about 15 minutes) for challenge
+attempts and 180 blocks for weights. The problem service uses `Retry-After` to
+enforce per-validator pacing and shared global-slot contention. The effective weight
+cadence is `max(configured interval, chain rate limit + 20)`; 180 is safely
+above the known 100-block limit and allows roughly two attempts per 360-block
+tempo.
 
-The launch validator reserves 80% of the vector for the dynamically resolved
+The launch validator reserves 60% of the vector for the dynamically resolved
 subnet-owner UID. With NETUID 5's chain mode set to `Burn`, that owner-directed
 miner incentive is destroyed rather than paid to the owner; positive-scoring
-miners divide the remaining 20%. A valid completed history with no positive
+miners divide the remaining 40%. A valid completed history with no positive
 miner score directs the entire vector to burn. The owner is removed from the
 scored-miner allocation, and each positive miner receives a small floor that
 survives Bittensor's uint16 weight conversion.

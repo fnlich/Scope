@@ -71,13 +71,11 @@ class Settings(BaseSettings):
     payment_speed_floor: float = Field(default=0.95, ge=0.0, le=1.0)
 
     # --- Dispatch (subset sampling over the miner pool) ---
-    # Miners sampled per problem-turn. 0 (or >= pool size) dispatches to
-    # EVERYONE — the V1 default: problems are the scarce resource (each is
-    # burned on lease and cost real tokens to mint), while dispatch and local
-    # verification are cheap, so full-pool measurement maximizes per-miner
-    # samples and pass-rate fidelity per problem consumed. Set to ~32 to
-    # subset-sample instead (rotation-dealt, ±1 problem per epoch per miner).
-    dispatch_subset_k: int = Field(default=0, ge=0)
+    # By default each problem is rotation-dealt to half of the serving pool.
+    # An explicit 0 preserves the legacy full-pool behavior; a positive value
+    # is a fixed-count override. Challenge quorum may raise the chosen value.
+    dispatch_subset_k: int | None = Field(default=None, ge=0)
+    dispatch_subset_fraction: float = Field(default=0.5, gt=0.0, le=1.0)
 
     # --- Private problem-source client ---
     problem_server_url: str = ""
@@ -95,6 +93,10 @@ class Settings(BaseSettings):
     # needs one in-flight request per serving miner or slow solvers serialize
     # into deadline-length waves.
     validator_dispatch_concurrency: int = Field(default=256, ge=1, le=1024)
+    # Requests waiting for one of these short-lived send-start slots remain
+    # unsigned. The slot is released after the request body reaches the HTTP
+    # transport, so miner solve time does not serialize the fan-out.
+    validator_send_concurrency: int = Field(default=32, ge=1, le=1024)
     # Concurrent sandbox verifications (each spawns per-test subprocesses or
     # Docker containers). Bounded separately from the HTTP fan-out so a
     # full-pool dispatch cannot thrash the executor.
@@ -102,11 +104,10 @@ class Settings(BaseSettings):
     validator_score_state_file: str = "data/validator_scores.json"
 
     # --- Scoring (bounded recent history -> weights) ---
-    # Entries older than 16 hours leave the window when the next completed
-    # challenge arrives. This is shorter than NETUID 5's nominal 20-hour
-    # immunity period without forcing a volatile tiny-observation-only score.
+    # Retained for compatibility with existing configuration and score-state
+    # files. Scoring is count-bounded by SCORE_WINDOW_MAX_SAMPLES, not by age.
     score_window_seconds: float = Field(default=57_600.0, gt=0.0, le=604_800.0)
-    score_window_max_samples: int = Field(default=6, ge=1, le=1024)
+    score_window_max_samples: int = Field(default=200, ge=1, le=1024)
     # Thin-evidence floor: first/second/third successes -> 1/4, 1/2, 3/4.
     score_window_min_samples: int = Field(default=4, ge=1, le=1024)
     # Do not submit a normalized on-chain vector from a thinner history. This
@@ -129,8 +130,8 @@ class Settings(BaseSettings):
     # Validator request cadence (blocks). The private problem source owns the
     # actual burn rate and may pace a round with HTTP 429; a denied lease
     # consumes no problem. Lower this only for a quick on-chain smoke test.
-    round_interval_blocks: int = Field(default=88, ge=0)
-    weights_interval_blocks: int = Field(default=100, ge=0)
+    round_interval_blocks: int = Field(default=75, ge=0)
+    weights_interval_blocks: int = Field(default=180, ge=0)
 
     @model_validator(mode="after")
     def validate_ranges(self) -> "Settings":

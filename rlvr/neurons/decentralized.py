@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -27,19 +28,27 @@ from ..problemserver.api import (
     PublicChallenge,
     derive_request_id,
 )
-from ..problemserver.client import ProblemServerClient, require_secure_problem_url
+from ..problemserver.client import (
+    LeaseCategory,
+    ProblemServerClient,
+    next_lease_not_before,
+    require_secure_problem_url,
+)
 from ..protocol import SignedSolution
 from ..scoring.eval_engine import EvalEngine
 from ..scoring.verifier import Verifier
 from ..types import ChallengeResult, Problem, SolutionResponse, TestCase
-from .live import LiveSolverClient, _solver_clients
+from .live import LiveSolverClient, SendGate, _solver_clients
 from .validator import ValidatorNeuron
 
 _MINER_RESPONSE_GRACE_S = 10.0
-OWNER_BURN_SHARE = 0.80
+OWNER_BURN_SHARE = 0.60
 _OWNER_BURN_CACHE_TTL_S = 3_600.0
 _SANDBOX_ERROR_PROBE_THRESHOLD = 0.25
 _U16_MAX = 65_535
+_WEIGHTS_RATE_LIMIT_MARGIN = 20
+_MAX_WEIGHT_DETAIL_CHARS = 200
+_MAX_WEIGHT_FIELD_CHARS = 80
 
 
 @dataclass
@@ -57,6 +66,7 @@ class _CapturedSolver:
     uid: int
     hotkey: str
     solution: SolutionResponse
+    responded: bool = False
 
     async def solve(self, problem: Problem, prompt: str) -> SolutionResponse:
         return self.solution
@@ -72,6 +82,142 @@ def _weight_result_status(result: object) -> tuple[bool, str]:
         message = str(result[1]) if len(result) > 1 else ""
         return ok, message
     return bool(result), ""
+
+
+def _weight_failure_detail(result: object) -> str:
+    """Return bounded single-line SDK ``error``/``data`` without raising."""
+
+    def render_field(name: str) -> str:
+        try:
+            value = getattr(result, name)
+        except Exception:  # noqa: BLE001 - diagnostics must never break weights
+            return ""
+        try:
+            if value is None or value is False:
+                return ""
+            if isinstance(value, str):
+                rendered = value
+            else:
+                if hasattr(value, "__len__") and len(value) == 0:
+                    return ""
+                if isinstance(value, (int, float)) and value == 0:
+                    return ""
+                rendered = repr(value)
+        except Exception:  # noqa: BLE001 - hostile SDK values are non-fatal
+            return ""
+        rendered = " ".join(rendered.split())
+        rendered = "".join(ch for ch in rendered if ch.isprintable())
+        if not rendered:
+            return ""
+        if len(rendered) > _MAX_WEIGHT_FIELD_CHARS:
+            rendered = rendered[: _MAX_WEIGHT_FIELD_CHARS - 3] + "..."
+        return f"{name}={rendered}"
+
+    parts = [part for name in ("error", "data") if (part := render_field(name))]
+    return " ".join(parts)[:_MAX_WEIGHT_DETAIL_CHARS]
+
+
+def _weights_rate_limited(
+    blocks_elapsed: Optional[int], chain_limit: Optional[int]
+) -> bool:
+    """Mirror the chain's strict admission boundary for diagnostics."""
+    return bool(
+        blocks_elapsed is not None
+        and blocks_elapsed >= 0
+        and chain_limit is not None
+        and chain_limit > 0
+        and blocks_elapsed < chain_limit
+    )
+
+
+def _weight_failure_report(result: object, validator: ValidatorNeuron) -> str:
+    """Explain a failed, otherwise silent weight submission without raising."""
+    try:
+        ok, message = _weight_result_status(result)
+    except Exception:  # noqa: BLE001 - diagnostics must not mask submission
+        ok, message = False, ""
+    if ok or message:
+        return ""
+
+    detail = _weight_failure_detail(result)
+    if detail:
+        return detail
+
+    try:
+        current = int(validator.subtensor.get_current_block())
+    except Exception:  # noqa: BLE001 - retain the context that is available
+        current = None
+    try:
+        uid = validator.uid
+        if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
+            raise ValueError("invalid validator uid")
+        last_update = int(validator.metagraph.last_update[uid])
+    except Exception:  # noqa: BLE001 - optional diagnostic context
+        last_update = None
+    elapsed = (
+        current - int(last_update)
+        if current is not None and last_update is not None
+        else None
+    )
+    chain_limit = getattr(validator, "chain_weights_rate_limit", None)
+    effective = getattr(validator, "weights_interval_blocks", None)
+    report = (
+        f"current_block={current if current is not None else 'unknown'} "
+        f"last_update_block={last_update if last_update is not None else 'unknown'} "
+        f"blocks_elapsed={elapsed if elapsed is not None else 'unknown'} "
+        f"chain_limit={chain_limit if chain_limit is not None else 'unknown'} "
+        f"effective_interval={effective if effective is not None else 'unknown'}"
+    )
+    if elapsed is not None and chain_limit is not None:
+        report += f" rate_limited={_weights_rate_limited(elapsed, chain_limit)}"
+    return report
+
+
+def _read_weights_rate_limit(
+    validator: ValidatorNeuron, netuid: int
+) -> Optional[int]:
+    """Read a trustworthy positive chain limit, or fall back with a warning."""
+    try:
+        reader = getattr(validator.subtensor, "weights_rate_limit")
+        value = reader(netuid)
+    except Exception as error:  # noqa: BLE001 - startup must retain safe fallback
+        print(
+            "[validator] WARN: could not read chain weights rate limit; "
+            f"using configured interval ({error})"
+        )
+        return None
+    if type(value) is not int or value <= 0:
+        print(
+            "[validator] WARN: chain returned an invalid weights rate limit; "
+            "using configured interval"
+        )
+        return None
+    return value
+
+
+def effective_weights_interval(
+    configured: int, chain_limit: Optional[int]
+) -> int:
+    """Apply the chain-derived rate-limit floor plus its fixed safety margin."""
+    configured_interval = int(configured)
+    if type(chain_limit) is not int or chain_limit <= 0:
+        return configured_interval
+    return max(
+        configured_interval,
+        chain_limit + _WEIGHTS_RATE_LIMIT_MARGIN,
+    )
+
+
+def _apply_weights_rate_limit(
+    validator: ValidatorNeuron, settings: Settings
+) -> None:
+    """Install the startup chain-derived cadence and retain its source value."""
+    chain_limit = _read_weights_rate_limit(validator, settings.netuid)
+    validator.chain_weights_rate_limit = chain_limit
+    validator.weights_interval_blocks = effective_weights_interval(
+        settings.weights_interval_blocks,
+        chain_limit,
+    )
 
 
 def _validator_http_limits(settings: Settings) -> httpx.Limits:
@@ -190,7 +336,7 @@ def _without_owner(weights: np.ndarray, owner_position: int) -> np.ndarray:
 def _build_owner_burn_weights(
     weights: np.ndarray, owner_position: int
 ) -> np.ndarray:
-    """Reserve 80% for burn while preserving every positive miner on chain."""
+    """Reserve 60% for burn while preserving every positive miner on chain."""
     base = np.asarray(weights, dtype=np.float64)
     if (
         base.ndim != 1
@@ -318,6 +464,7 @@ def _submit_local_weights(
         max_attempts=1,
     )
     ok, message = _weight_result_status(result)
+    failure_detail = _weight_failure_report(result, validator)
     top = max(range(len(weights)), key=lambda idx: weights[idx])
     burn_detail = ""
     if burn_active and owner_position is not None:
@@ -338,6 +485,7 @@ def _submit_local_weights(
         f"response_type={type(result).__name__}{response_detail} "
         f"ok={ok} msg={message!r} "
         f"(top uid={uids[top]} w={float(weights[top]):.4f}){burn_detail}"
+        f"{f' failure_detail={failure_detail}' if failure_detail else ''}"
     )
     return ok
 
@@ -482,8 +630,7 @@ def _load_scores(engine: EvalEngine, path: str) -> None:
                 )
 
             # A configured cap change intentionally keeps only the latest
-            # observations. Time expiry happens on the next grading record,
-            # never on load/read, so batch exhaustion cannot zero all weights.
+            # completed-problem observations.
             histories = {
                 uid: values[-engine.max_samples :]
                 for uid, values in histories.items()
@@ -585,11 +732,30 @@ async def _dispatch_committed(
             uid=solver.uid,
             hotkey=solver.hotkey,
             solution=artifact.to_solution(public.problem_id),
+            responded=artifact.responded,
         )
         return submission, captured
 
     pairs = await asyncio.gather(*(one(solver) for solver in solvers))
     return [pair[0] for pair in pairs], [pair[1] for pair in pairs]
+
+
+def _dispatch_subset_size(
+    pool_size: int,
+    required: int,
+    fixed_k: Optional[int],
+    fraction: float,
+) -> int:
+    """Choose a bounded sample, raising the default to commit quorum."""
+    if pool_size <= 0:
+        return 0
+    if fixed_k == 0:
+        requested = pool_size
+    elif fixed_k is not None:
+        requested = fixed_k
+    else:
+        requested = math.ceil(pool_size * fraction)
+    return min(pool_size, max(1, required, requested))
 
 
 async def _evaluate_one(
@@ -599,6 +765,8 @@ async def _evaluate_one(
     solvers: list[LiveSolverClient],
     settings: Settings,
     quorum_hint: Optional[dict[str, int]] = None,
+    pacing: Optional[dict[str, object]] = None,
+    now: Optional[float] = None,
 ) -> Optional[ChallengeResult]:
     # A lease BURNS the problem server-side (durable FIFO cursor), so refuse to
     # lease when the last-seen quorum requirement already rules this round out.
@@ -613,9 +781,20 @@ async def _evaluate_one(
                 "skipping lease to avoid burning a problem"
             )
             return None
-    public = await client.lease()
+    outcome = await client.lease()
+    public = outcome.challenge
     if public is None:
-        print("[validator] WARN: no public challenge available")
+        if outcome.category is LeaseCategory.PACED and pacing is not None:
+            pacing["paced"] = True
+            if outcome.retry_after_s is not None:
+                pacing["not_before"] = next_lease_not_before(
+                    outcome.retry_after_s,
+                    now=now,
+                )
+        # An exhausted pool, a paced lease, a rejected validator and an
+        # unreachable server all used to print the same line; each is a
+        # different operator action, so each says so.
+        print(f"[validator] WARN: no public challenge ({outcome.describe()})")
         return None
     required = max(
         public.commit_min_responses, public.commit_min_signed_responses
@@ -628,9 +807,12 @@ async def _evaluate_one(
             f"responses but only {len(solvers)} miners are serving"
         )
         return None
-    subset_k = settings.dispatch_subset_k
-    if subset_k > 0:
-        subset_k = max(subset_k, required)
+    subset_k = _dispatch_subset_size(
+        len(solvers),
+        required,
+        settings.dispatch_subset_k,
+        settings.dispatch_subset_fraction,
+    )
     subset = cast(
         list[LiveSolverClient],
         rotation.sample(solvers, subset_k),
@@ -641,20 +823,39 @@ async def _evaluate_one(
     submissions, captured = await _dispatch_committed(
         public, subset, settings.validator_dispatch_concurrency
     )
+    responded = sum(
+        bool(
+            getattr(
+                solution,
+                "responded",
+                not getattr(submission, "error", ""),
+            )
+        )
+        for submission, solution in zip(submissions, captured, strict=True)
+    )
+    signed = sum(
+        bool(getattr(submission, "response_headers", {}))
+        for submission in submissions
+    )
+    print(
+        "[validator] miner response counts "
+        f"contacted={len(subset)} responses={responded} signed={signed}"
+    )
     receipt = await client.commit(public.challenge_id, submissions)
-    if (
-        receipt is None
-        or not receipt.accepted
-        or not receipt.commit_token
-        or receipt.num_submissions != len(submissions)
-    ):
-        if receipt is None:
-            detail = "server unavailable"
-        elif receipt.num_submissions != len(submissions):
-            detail = "server receipt submission-count mismatch"
-        else:
-            detail = receipt.detail
-        print(f"[validator] WARN: response commit rejected ({detail})")
+    if receipt is not None and not receipt.accepted:
+        print(f"[validator] WARN: response commit rejected ({receipt.detail})")
+        return None
+    if receipt is None:
+        print("[validator] WARN: response commit failed (server unavailable)")
+        return None
+    if not receipt.commit_token:
+        print("[validator] WARN: accepted response commit omitted its token")
+        return None
+    if receipt.num_submissions != len(submissions):
+        print(
+            "[validator] WARN: accepted response commit protocol error "
+            f"(receipt count {receipt.num_submissions}, sent {len(submissions)})"
+        )
         return None
 
     reveal = await client.reveal(public.challenge_id, receipt.commit_token)
@@ -708,6 +909,40 @@ async def _evaluate_one(
         )
     )
     return result
+
+
+async def _run_challenge_round(
+    validator: ValidatorNeuron,
+    client: ProblemServerClient,
+    orchestrator: Orchestrator,
+    rotation: RotationSampler,
+    solvers: list[LiveSolverClient],
+    settings: Settings,
+    *,
+    quorum_hint: Optional[dict[str, int]] = None,
+    now: Optional[float] = None,
+) -> int:
+    """Evaluate configured challenges, stopping immediately on lease pacing."""
+    completed = 0
+    for _ in range(settings.validator_challenges_per_round):
+        pacing: dict[str, object] = {}
+        result = await _evaluate_one(
+            client,
+            orchestrator,
+            rotation,
+            solvers,
+            settings,
+            quorum_hint=quorum_hint,
+            pacing=pacing,
+            now=now,
+        )
+        completed += int(result is not None)
+        if pacing.get("paced"):
+            not_before = pacing.get("not_before")
+            if isinstance(not_before, (int, float)):
+                validator.defer_rounds_until(float(not_before))
+            break
+    return completed
 
 
 def _sandbox_error_rate(result: ChallengeResult) -> float:
@@ -765,6 +1000,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
     )
     validator = ValidatorNeuron(settings)
     validator.setup_bittensor()
+    _apply_weights_rate_limit(validator, settings)
     engine = EvalEngine(
         len(validator.metagraph.hotkeys),
         settings.score_window_seconds,
@@ -793,25 +1029,46 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         # Last-seen challenge quorum requirement; survives across rounds so an
         # under-quorum pool stops burning leases after the first observation.
         quorum_hint: dict[str, int] = {}
+        dispatch_policy_logged = False
+        send_gate = SendGate(settings.validator_send_concurrency)
 
         async def round_callback(v: ValidatorNeuron) -> dict[int, float]:
+            nonlocal dispatch_policy_logged
             await asyncio.to_thread(v.metagraph.sync, subtensor=v.subtensor)
             engine.resize(len(v.metagraph.hotkeys))
             engine.sync({uid: hk for uid, hk in enumerate(v.metagraph.hotkeys)})
-            live_solvers = _solver_clients(v, v.wallet, settings, http)
+            live_solvers = _solver_clients(v, v.wallet, settings, http, gate=send_gate)
             if not live_solvers:
                 return {}
-            completed = 0
-            for _ in range(settings.validator_challenges_per_round):
-                result = await _evaluate_one(
-                    client,
-                    orchestrator,
-                    rotation,
-                    live_solvers,
-                    settings,
-                    quorum_hint=quorum_hint,
+            if not dispatch_policy_logged:
+                base_sample = _dispatch_subset_size(
+                    len(live_solvers),
+                    required=0,
+                    fixed_k=settings.dispatch_subset_k,
+                    fraction=settings.dispatch_subset_fraction,
                 )
-                completed += int(result is not None)
+                if settings.dispatch_subset_k is None:
+                    rule = f"fraction={settings.dispatch_subset_fraction:g}"
+                elif settings.dispatch_subset_k == 0:
+                    rule = "explicit full pool"
+                else:
+                    rule = f"fixed={settings.dispatch_subset_k}"
+                print(
+                    "[validator] dispatch policy "
+                    f"sample={base_sample}/{len(live_solvers)} ({rule}); "
+                    "challenge quorum may raise the sample"
+                )
+                dispatch_policy_logged = True
+
+            completed = await _run_challenge_round(
+                v,
+                client,
+                orchestrator,
+                rotation,
+                live_solvers,
+                settings,
+                quorum_hint=quorum_hint,
+            )
             _save_scores(engine, settings.validator_score_state_file)
             print(f"[validator] locally evaluated {completed} challenges")
             return {uid: float(score) for uid, score in enumerate(engine.scores)}

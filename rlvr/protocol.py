@@ -117,6 +117,8 @@ class SignedSolution(BaseModel):
     response_headers: dict[str, str] = Field(default_factory=dict)
     error: str = ""
     latency_ms: float = 0.0
+    responded: bool = False
+    signed_age_s: Optional[float] = None
 
     def to_solution(self, canonical_problem_id: str) -> SolutionResponse:
         if self.error or not self.response_body:

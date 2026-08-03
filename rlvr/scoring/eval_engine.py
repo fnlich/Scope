@@ -1,8 +1,7 @@
-"""Time- and count-bounded score histories -> L1-normalized weights.
+"""Count-bounded score histories -> L1-normalized weights.
 
 Design choices:
-  - Each uid retains at most ``max_samples`` payments from the latest
-    ``window_seconds`` when a new observation arrives.
+  - Each uid retains its latest ``max_samples`` completed-problem payments.
   - Scores divide by at least ``min_samples``, preventing one lucky first answer
     from immediately receiving a full score while allowing a fuller window to
     reduce the impact of one transient miss.
@@ -101,12 +100,6 @@ class EvalEngine:
         if not np.isfinite(value) or value < 0.0:
             value = 0.0
         history = self.histories.setdefault(uid, [])
-        cutoff = observed_at - self.window_seconds
-        history[:] = [
-            (timestamp, prior)
-            for timestamp, prior in history
-            if timestamp > cutoff
-        ]
         history.append((observed_at, value))
         if len(history) > self.max_samples:
             del history[: len(history) - self.max_samples]
@@ -260,9 +253,8 @@ class EvalEngine:
 
         nan/inf scores -> 0; negative scores -> 0 (weights are a distribution).
         An all-zero (or empty) score vector yields an all-zero weight vector.
-        Reading weights does not expire history: expiration happens only when
-        another completed challenge is recorded, so a pause in problem supply
-        cannot make every validator submit an all-zero vector.
+        Reading weights does not mutate history. Only completed challenges add
+        observations, and only the count cap removes the oldest observation.
 
         ``n`` (optional) aligns the returned vector to a metagraph size so its
         length matches what ``set_weights`` expects: a larger ``n`` is zero-padded,

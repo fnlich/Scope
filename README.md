@@ -1,18 +1,19 @@
 # RLVR subnet
 
 This repository contains the validator for RLVR on Bittensor Finney, NETUID 5.
-Validators lease a public coding challenge, send it to every serving miner,
+Validators lease a public coding challenge, rotation-deal it to half of the
+serving miners,
 commit the signed responses, reveal the hidden tests, grade every response in a
 local Docker sandbox, and submit the resulting weights on chain.
 
 ## Launch emission policy
 
-This launch release hard-codes `OWNER_BURN_SHARE` at 80%. After the completed-
+This launch release hard-codes `OWNER_BURN_SHARE` at 60%. After the completed-
 observation gate opens, the validator dynamically resolves the subnet owner's
-currently registered hotkey to its metagraph UID and reserves 80% of the
+currently registered hotkey to its metagraph UID and reserves 60% of the
 submitted weight vector for that UID. Finney NETUID 5 is currently configured
 for `Burn`, so the runtime destroys that owner-directed miner incentive; it
-does not credit the owner. Positive-scoring miners split the remaining 20% in
+does not credit the owner. Positive-scoring miners split the remaining 40% in
 proportion to score. If every miner has zero score after valid completed
 observations, the validator directs 100% of the vector to burn.
 
@@ -24,8 +25,8 @@ weights and logs an error.
 
 Runtime 440 separately applies `MinerBurned` before network-wide emission shares
 are renormalized. At this launch setting and NETUID 5's present scale, that
-reduces NETUID 5's share of network emission by close to 80% and reallocates the
-difference to other subnets. Changing the published 80% constant requires a
+reduces NETUID 5's share of network emission by close to 60% and reallocates the
+difference to other subnets. Changing the published 60% constant requires a
 visible validator release; it is not an environment override.
 
 ## Run a validator
@@ -39,11 +40,17 @@ Requirements:
 
 The launch configuration can run up to 16 one-CPU, 256 MiB grading containers
 at once. A 16-vCPU, 16-GiB host is recommended; hosts with fewer CPU cores will
-grade the full miner pool more slowly but will not send to fewer miners.
+grade each sampled half more slowly but will not reduce the sample size.
 Use a stable broadband connection: the production server rejects a commit
 whose request body takes more than 120 seconds to upload.
 The validator records its first four completed challenges before submitting an
 on-chain weight vector; paced or unavailable rounds do not advance that gate.
+The SN5 defaults are 75 blocks (about 15 minutes) between challenge attempts and
+180 blocks between weight attempts. The problem service remains authoritative:
+when an attempt is too early or the shared global lease slot is busy, its
+`Retry-After` response defers leasing without blocking weight scheduling. At
+startup the validator reads the chain weight rate limit and raises the effective
+weight interval to at least that limit plus 20 blocks.
 
 After cloning this repository, run the bootstrap with the names of your
 existing Bittensor wallet and hotkey from the repository root:
@@ -60,7 +67,7 @@ problem server and local clock. It does not create, read, or modify wallet keys.
 
 If you omit the wallet arguments, edit only `WALLET_NAME` and `WALLET_HOTKEY`
 in `.env`, then run `./start_validator.sh`. The production URL, Finney network,
-NETUID 5, full-pool dispatch, and sandbox image are already configured.
+NETUID 5, half-pool rotation, and sandbox image are already configured.
 
 Run the tests with:
 
@@ -77,7 +84,7 @@ private problem server
         |
         | public challenge
         v
-validator ---- signed request ----> every serving miner
+validator ---- signed request ----> rotating half of serving miners
         |<--- signed responses -----|
         |
         | commit exact response set
@@ -92,6 +99,10 @@ verified rewards -> recent score window -> on-chain weights
 The commit-before-reveal sequence prevents hidden evaluation cases from being
 included in miner requests. The server never grades miner code or controls
 validator weights. Each validator evaluates the signed responses locally.
+A rejected lease consumes no problem. Once a challenge is leased, ordinary
+failed miner calls—including timeouts and invalid responses—remain in the exact
+committed submission list with their recorded error; they are not silently
+dropped before reveal.
 
 ## Demo miner and development
 

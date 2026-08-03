@@ -65,12 +65,16 @@ class RotationSampler:
         picked: list[int] = []
         while len(picked) < k:
             if not self._queue:
-                fresh = [u for u in by_uid if u not in picked]
+                fresh = list(by_uid)
                 self._rng.shuffle(fresh)
                 self._queue = fresh
             uid = self._queue.pop(0)
-            if uid not in picked:
-                picked.append(uid)
+            if uid in picked:
+                # Preserve this epoch slot for the next problem rather than
+                # deleting it at a boundary crossed mid-sample.
+                self._queue.append(uid)
+                continue
+            picked.append(uid)
         return [by_uid[u] for u in picked]
 
 
