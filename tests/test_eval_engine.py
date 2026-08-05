@@ -28,8 +28,8 @@ from rlvr.neurons.decentralized import (
 from rlvr.scoring.eval_engine import EvalEngine
 
 
-def test_launch_owner_burn_share_is_sixty_percent():
-    assert OWNER_BURN_SHARE == pytest.approx(0.60)
+def test_launch_owner_burn_share_is_forty_percent():
+    assert OWNER_BURN_SHARE == pytest.approx(0.40)
 
 
 # --------------------------------------------------------------------------- #

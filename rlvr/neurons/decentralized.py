@@ -42,7 +42,7 @@ from .live import LiveSolverClient, SendGate, _solver_clients
 from .validator import ValidatorNeuron
 
 _MINER_RESPONSE_GRACE_S = 10.0
-OWNER_BURN_SHARE = 0.60
+OWNER_BURN_SHARE = 0.40
 _OWNER_BURN_CACHE_TTL_S = 3_600.0
 _SANDBOX_ERROR_PROBE_THRESHOLD = 0.25
 _U16_MAX = 65_535
@@ -336,7 +336,7 @@ def _without_owner(weights: np.ndarray, owner_position: int) -> np.ndarray:
 def _build_owner_burn_weights(
     weights: np.ndarray, owner_position: int
 ) -> np.ndarray:
-    """Reserve 60% for burn while preserving every positive miner on chain."""
+    """Reserve 40% for burn while preserving every positive miner on chain."""
     base = np.asarray(weights, dtype=np.float64)
     if (
         base.ndim != 1

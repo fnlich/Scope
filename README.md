@@ -8,12 +8,12 @@ local Docker sandbox, and submit the resulting weights on chain.
 
 ## Launch emission policy
 
-This launch release hard-codes `OWNER_BURN_SHARE` at 60%. After the completed-
+This launch release hard-codes `OWNER_BURN_SHARE` at 40%. After the completed-
 observation gate opens, the validator dynamically resolves the subnet owner's
-currently registered hotkey to its metagraph UID and reserves 60% of the
+currently registered hotkey to its metagraph UID and reserves 40% of the
 submitted weight vector for that UID. Finney NETUID 5 is currently configured
 for `Burn`, so the runtime destroys that owner-directed miner incentive; it
-does not credit the owner. Positive-scoring miners split the remaining 40% in
+does not credit the owner. Positive-scoring miners split the remaining 60% in
 proportion to score. If every miner has zero score after valid completed
 observations, the validator directs 100% of the vector to burn.
 
@@ -25,8 +25,8 @@ weights and logs an error.
 
 Runtime 440 separately applies `MinerBurned` before network-wide emission shares
 are renormalized. At this launch setting and NETUID 5's present scale, that
-reduces NETUID 5's share of network emission by close to 60% and reallocates the
-difference to other subnets. Changing the published 60% constant requires a
+reduces NETUID 5's share of network emission by close to 40% and reallocates the
+difference to other subnets. Changing the published 40% constant requires a
 visible validator release; it is not an environment override.
 
 ## Run a validator

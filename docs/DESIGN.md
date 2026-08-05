@@ -82,10 +82,10 @@ cadence is `max(configured interval, chain rate limit + 20)`; 180 is safely
 above the known 100-block limit and allows roughly two attempts per 360-block
 tempo.
 
-The launch validator reserves 60% of the vector for the dynamically resolved
+The launch validator reserves 40% of the vector for the dynamically resolved
 subnet-owner UID. With NETUID 5's chain mode set to `Burn`, that owner-directed
 miner incentive is destroyed rather than paid to the owner; positive-scoring
-miners divide the remaining 40%. A valid completed history with no positive
+miners divide the remaining 60%. A valid completed history with no positive
 miner score directs the entire vector to burn. The owner is removed from the
 scored-miner allocation, and each positive miner receives a small floor that
 survives Bittensor's uint16 weight conversion.
