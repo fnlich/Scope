@@ -101,36 +101,58 @@ fi
 
 "${python_bin}" - <<'PY'
 import email.utils
-import json
 import os
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 
 base = os.environ["PROBLEM_SERVER_URL"].rstrip("/")
 parsed = urllib.parse.urlparse(base)
 if os.environ.get("SUBTENSOR_NETWORK") == "finney" and parsed.scheme != "https":
     raise SystemExit("[preflight] ERROR: Finney problem server must use HTTPS")
-url = f"{base}/v1/health?preflight={int(time.time())}"
+url = f"{base}/v1/challenges/lease"
+request = urllib.request.Request(
+    url,
+    data=b"{}",
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+
+
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+opener = urllib.request.build_opener(NoRedirects)
 try:
-    with urllib.request.urlopen(url, timeout=20) as response:
-        payload = json.load(response)
+    with opener.open(request, timeout=20) as response:
+        status = response.status
         date_header = response.headers.get("Date", "")
+except urllib.error.HTTPError as error:
+    status = error.code
+    date_header = error.headers.get("Date", "")
 except Exception as error:
     raise SystemExit(
-        f"[preflight] ERROR: problem server health check failed: {error}; "
+        f"[preflight] ERROR: problem server reachability check failed: {error}; "
         "check network access and NTP"
     )
-if payload.get("status") != "ok":
-    raise SystemExit(f"[preflight] ERROR: problem server is not healthy: {payload!r}")
+if status != 401:
+    raise SystemExit(
+        f"[preflight] ERROR: unsigned lease probe returned HTTP {status}; expected 401"
+    )
 if not date_header:
     raise SystemExit("[preflight] ERROR: server omitted Date; cannot verify clock")
-server_time = email.utils.parsedate_to_datetime(date_header).timestamp()
+try:
+    server_time = email.utils.parsedate_to_datetime(date_header).timestamp()
+except (TypeError, ValueError, OverflowError):
+    raise SystemExit("[preflight] ERROR: server returned an invalid Date header")
 skew = abs(time.time() - server_time)
 if skew > 5:
     raise SystemExit(
         f"[preflight] ERROR: system clock differs from server by {skew:.1f}s; "
         "enable NTP before starting"
     )
-print("[preflight] problem server healthy; clock synchronized")
+print("[preflight] problem server reachable; unsigned lease rejected; clock synchronized")
 PY
