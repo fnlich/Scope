@@ -10,7 +10,7 @@ become an addressable function. A closure defined inside
 `_run_decentralized_validator_async` cannot be exercised without standing up the
 whole live runner, and an untestable break is how this regresses later.
 
-Deliberately EXCLUDED: cadence defaults (75/180), and any change to how
+Deliberately EXCLUDED: cadence defaults (150/180), and any change to how
 non-paced causes drive the loop.
 
 """

@@ -10,7 +10,7 @@ from __future__ import annotations
 from rlvr.config import Settings
 from rlvr.neurons.validator import ValidatorNeuron
 
-SN5_ROUND_INTERVAL_BLOCKS = 75
+SN5_ROUND_INTERVAL_BLOCKS = 150
 
 
 def test_the_default_round_interval_is_the_sn5_value():

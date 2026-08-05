@@ -130,7 +130,7 @@ class Settings(BaseSettings):
     # Validator request cadence (blocks). The private problem source owns the
     # actual burn rate and may pace a round with HTTP 429; a denied lease
     # consumes no problem. Lower this only for a quick on-chain smoke test.
-    round_interval_blocks: int = Field(default=75, ge=0)
+    round_interval_blocks: int = Field(default=150, ge=0)
     weights_interval_blocks: int = Field(default=180, ge=0)
 
     @model_validator(mode="after")

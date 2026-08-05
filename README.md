@@ -45,7 +45,7 @@ Use a stable broadband connection: the production server rejects a commit
 whose request body takes more than 120 seconds to upload.
 The validator records its first four completed challenges before submitting an
 on-chain weight vector; paced or unavailable rounds do not advance that gate.
-The SN5 defaults are 75 blocks (about 15 minutes) between challenge attempts and
+The SN5 defaults are 150 blocks (about 30 minutes) between challenge attempts and
 180 blocks between weight attempts. The problem service remains authoritative:
 when an attempt is too early or the shared global lease slot is busy, its
 `Retry-After` response defers leasing without blocking weight scheduling. At
