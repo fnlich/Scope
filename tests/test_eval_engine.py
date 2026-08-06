@@ -28,6 +28,10 @@ from rlvr.neurons.decentralized import (
 from rlvr.scoring.eval_engine import EvalEngine
 
 
+def test_launch_owner_burn_share_is_forty_percent():
+    assert OWNER_BURN_SHARE == pytest.approx(0.40)
+
+
 # --------------------------------------------------------------------------- #
 # Constructor contract (extended, not broken)
 # --------------------------------------------------------------------------- #
@@ -134,7 +138,9 @@ def test_weight_submission_waits_for_configured_completed_observations():
     assert len(subtensor.calls) == 1
     assert subtensor.calls[0]["netuid"] == 5
     assert subtensor.calls[0]["uids"] == [77, 251]
-    assert subtensor.calls[0]["weights"] == pytest.approx([0.2, 0.8])
+    assert subtensor.calls[0]["weights"] == pytest.approx(
+        [1.0 - OWNER_BURN_SHARE, OWNER_BURN_SHARE]
+    )
     assert subtensor.calls[0]["wait_for_inclusion"] is True
     assert subtensor.calls[0]["wait_for_finalization"] is False
     assert subtensor.calls[0]["wait_for_revealed_execution"] is False
@@ -308,7 +314,9 @@ def test_owner_burn_cache_uses_last_known_good_pair_on_rpc_failure():
         validator, engine, settings, owner_burn_state=state
     ) is True
     assert len(subtensor.calls) == 2
-    assert subtensor.calls[-1]["weights"] == pytest.approx([0.2, 0.8])
+    assert subtensor.calls[-1]["weights"] == pytest.approx(
+        [1.0 - OWNER_BURN_SHARE, OWNER_BURN_SHARE]
+    )
 
 
 def test_changed_owner_missing_from_metagraph_falls_back_to_ordinary_weights(
@@ -363,7 +371,7 @@ def test_weight_gate_survives_score_state_restart(tmp_path):
     assert _weight_observation_count(restored) == 4
 
 
-def test_weight_gate_closes_only_when_a_new_record_expires_old_evidence():
+def test_weight_gate_stays_open_when_old_observations_age():
     now = [0.0]
     engine = EvalEngine(
         num_uids=1,
@@ -380,7 +388,7 @@ def test_weight_gate_closes_only_when_a_new_record_expires_old_evidence():
     assert _weight_observation_count(engine) == 4
 
     engine.update({0: 1.0}, dispatched={0})
-    assert _weight_observation_count(engine) == 1
+    assert _weight_observation_count(engine) == 5
 
 
 # --------------------------------------------------------------------------- #

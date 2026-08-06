@@ -268,10 +268,11 @@ def test_settings_fail_closed_to_docker_and_validate_difficulty_band():
     assert settings.executor == "docker"
     assert settings.docker_memory == "256m"
     assert settings.validator_dispatch_concurrency == 256
+    assert settings.validator_send_concurrency == 32
     assert settings.validator_verify_concurrency == 16
     assert settings.problem_server_request_timeout_s == 60
     assert settings.score_window_seconds == 57_600
-    assert settings.score_window_max_samples == 6
+    assert settings.score_window_max_samples == 200
     assert settings.score_window_min_samples == 4
     assert settings.validator_min_weight_observations == 4
     with pytest.raises(ValueError, match="BAND_LOW"):

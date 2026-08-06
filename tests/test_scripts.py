@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import http.server
 import importlib.util
+import os
 import shutil
 import subprocess
+import threading
 import types
 from pathlib import Path
 
@@ -73,6 +76,67 @@ def test_setup_pulls_the_configured_immutable_sandbox_image():
     assert "@sha256:" in preflight
     assert "run_timed 20 docker info" in preflight
     assert "run_timed 45 docker run" in preflight
+
+
+def test_preflight_probes_the_protected_lease_route_without_consuming_a_problem():
+    preflight = (SCRIPTS / "preflight_validator.sh").read_text()
+    assert 'f"{base}/v1/challenges/lease"' in preflight
+    assert 'data=b"{}"' in preflight
+    assert 'method="POST"' in preflight
+    assert "status != 401" in preflight
+    assert 'headers.get("Date", "")' in preflight
+    assert "/v1/health" not in preflight
+
+
+@pytest.mark.parametrize(
+    "status, valid_date, succeeds",
+    [(401, True, True), (200, True, False), (302, True, False), (401, False, False)],
+)
+def test_preflight_requires_an_unsigned_lease_rejection(
+    status, valid_date, succeeds
+):
+    received = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            received["path"] = self.path
+            received["body"] = self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(status)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+        def date_time_string(self, timestamp=None):
+            if valid_date:
+                return super().date_time_string(timestamp)
+            return "not-a-date"
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        env = {
+            **os.environ,
+            "EXECUTOR": "local",
+            "PROBLEM_SERVER_URL": f"http://127.0.0.1:{server.server_port}",
+            "SUBTENSOR_NETWORK": "test",
+        }
+        result = subprocess.run(
+            ["bash", str(SCRIPTS / "preflight_validator.sh")],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert (result.returncode == 0) is succeeds
+    assert received == {"path": "/v1/challenges/lease", "body": b"{}"}
 
 
 def test_register_script_is_runbook_only():

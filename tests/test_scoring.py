@@ -362,7 +362,7 @@ def test_eval_engine_rolling_window_update():
     assert e.scores[0] == pytest.approx(1.0)
 
 
-def test_hybrid_window_bounds_startup_and_forgets_old_hiccup():
+def test_count_window_bounds_startup_without_expiring_old_results():
     now = [0.0]
     e = EvalEngine(
         num_uids=1,
@@ -382,10 +382,10 @@ def test_hybrid_window_bounds_startup_and_forgets_old_hiccup():
     now[0] = 100.5
     e.update({0: 1.0}, dispatched={0})
     assert e.scores[0] == pytest.approx(3 / 4)
-    assert [reward for _, reward in e.histories[0]] == [1.0, 1.0, 1.0]
+    assert [reward for _, reward in e.histories[0]] == [0.0, 1.0, 1.0, 1.0]
 
 
-def test_time_expiry_happens_on_record_not_weight_read():
+def test_observations_do_not_expire_by_age():
     now = [0.0]
     e = EvalEngine(
         num_uids=1,
@@ -402,8 +402,8 @@ def test_time_expiry_happens_on_record_not_weight_read():
     assert len(e.histories[0]) == 1
 
     e.update({0: 1.0}, dispatched={0})
-    assert e.scores[0] == pytest.approx(1 / 4)
-    assert e.histories[0] == [(200.0, 1.0)]
+    assert e.scores[0] == pytest.approx(2 / 4)
+    assert e.histories[0] == [(0.0, 1.0), (200.0, 1.0)]
 
 
 def test_hybrid_window_keeps_only_six_latest_observations():
@@ -431,7 +431,7 @@ def test_eval_engine_only_responders_updated():
     e = EvalEngine(num_uids=3, window_seconds=100, max_samples=1, min_samples=1)
     e.update({1: 0.8})
     assert e.scores[0] == 0.0
-    assert e.scores[1] == pytest.approx(0.8)  # window_seconds=100, max_samples=1, min_samples=1 -> replace
+    assert e.scores[1] == pytest.approx(0.8)  # one observation fills this window
     assert e.scores[2] == 0.0
 
 

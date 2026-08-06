@@ -13,6 +13,7 @@ from rlvr.neurons.decentralized import (
     _weight_result_status,
 )
 from rlvr.problemserver.api import PublicChallenge
+from rlvr.problemserver.client import LeaseCategory, LeaseOutcome
 from rlvr.types import (
     ChallengeResult,
     DifficultyBand,
@@ -157,11 +158,15 @@ async def test_broken_sandbox_probe_prevents_score_update_and_feedback(monkeypat
         feedback_called = False
 
         async def lease(self):
-            return PublicChallenge(
-                challenge_id="challenge",
-                problem_id="problem",
-                statement="Return the input.",
-                entrypoint="solve",
+            return LeaseOutcome(
+                category=LeaseCategory.LEASED,
+                status=200,
+                challenge=PublicChallenge(
+                    challenge_id="challenge",
+                    problem_id="problem",
+                    statement="Return the input.",
+                    entrypoint="solve",
+                ),
             )
 
         async def commit(self, challenge_id, submissions):

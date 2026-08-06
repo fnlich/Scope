@@ -13,6 +13,8 @@ Callbacks:
 from __future__ import annotations
 
 import asyncio
+import math
+import time
 from typing import Awaitable, Callable, Optional
 
 from ..config import Settings
@@ -22,6 +24,8 @@ from .base import BaseNeuron
 # Type of the injected orchestrator round callback.
 RoundCallback = Callable[["ValidatorNeuron"], Awaitable[dict[int, float]]]
 WeightSetter = Callable[["ValidatorNeuron"], None]
+_CURRENT_BLOCK_MAX_ATTEMPTS = 3
+_CURRENT_BLOCK_RETRY_DELAY_S = 1.0
 
 
 class ValidatorNeuron(BaseNeuron):
@@ -46,6 +50,8 @@ class ValidatorNeuron(BaseNeuron):
         # How often (in blocks) to run a round / set weights when live.
         self.round_interval_blocks: int = self.settings.round_interval_blocks
         self.weights_interval_blocks: int = self.settings.weights_interval_blocks
+        self.chain_weights_rate_limit: Optional[int] = None
+        self._rounds_deferred_until: Optional[float] = None
 
         self._should_exit = False
 
@@ -64,6 +70,25 @@ class ValidatorNeuron(BaseNeuron):
     ) -> None:
         """Inject the validator-local weight computation/submission function."""
         self._weight_setter = setter
+
+    @property
+    def rounds_deferred_until(self) -> Optional[float]:
+        """Current monotonic lease deadline, if server pacing is active."""
+        return self._rounds_deferred_until
+
+    def defer_rounds_until(self, monotonic_deadline: float) -> None:
+        """Extend server-directed round pacing without touching block gates."""
+        try:
+            deadline = float(monotonic_deadline)
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError("lease deferral deadline must be finite") from error
+        if not math.isfinite(deadline):
+            raise ValueError("lease deferral deadline must be finite")
+        if (
+            self._rounds_deferred_until is None
+            or deadline > self._rounds_deferred_until
+        ):
+            self._rounds_deferred_until = deadline
 
     # ------------------------------------------------------------------ #
     # Round driver
@@ -98,6 +123,20 @@ class ValidatorNeuron(BaseNeuron):
         """Signal the run loop to exit after the current iteration."""
         self._should_exit = True
 
+    async def _current_block_with_recovery(self) -> Optional[int]:
+        """Bound transient current-block RPC failures without ending the loop."""
+        for attempt in range(1, _CURRENT_BLOCK_MAX_ATTEMPTS + 1):
+            try:
+                return int(self.current_block())
+            except Exception as exc:  # noqa: BLE001 - chain RPCs vary by SDK
+                print(
+                    "[validator] WARN: current-block RPC failed "
+                    f"(attempt {attempt}/{_CURRENT_BLOCK_MAX_ATTEMPTS}: {exc})"
+                )
+                if attempt < _CURRENT_BLOCK_MAX_ATTEMPTS:
+                    await asyncio.sleep(_CURRENT_BLOCK_RETRY_DELAY_S)
+        return None
+
     async def run(self, max_rounds: Optional[int] = None) -> None:
         """Block-interval run loop (live).
 
@@ -115,8 +154,25 @@ class ValidatorNeuron(BaseNeuron):
         rounds_done = 0
         weights_gate = BaseNeuron(self.settings)  # separate interval bookkeeping
         while not self._should_exit:
-            block = self.current_block()
-            if self.should_run(block, self.round_interval_blocks):
+            block = await self._current_block_with_recovery()
+            if block is None:
+                await asyncio.sleep(1.0)
+                continue
+            now = time.monotonic()
+            deadline = self._rounds_deferred_until
+            deferred = deadline is not None and now < deadline
+            retry_due = deadline is not None and not deferred
+            if not deferred and (
+                retry_due
+                or self.should_run(block, self.round_interval_blocks)
+            ):
+                if retry_due:
+                    # Clear before the callback so a repeated pacing response
+                    # can install a new deadline without being wiped afterward.
+                    self._rounds_deferred_until = None
+                    # The retry trigger short-circuits should_run(), so anchor
+                    # the ordinary cadence explicitly at the retry block.
+                    self._last_run_block = block
                 await self.run_round()
                 rounds_done += 1
                 if max_rounds is not None and rounds_done >= max_rounds:
