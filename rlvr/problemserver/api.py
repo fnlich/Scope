@@ -98,6 +98,14 @@ class ChallengeRevealResponse(_WireModel):
     tests: list[TestCase] = Field(default_factory=list, max_length=1000)
 
 
+class FeedbackVerdict(_WireModel):
+    """One authenticated miner response graded by the validator."""
+
+    uid: int = Field(ge=0)
+    hotkey: str = Field(min_length=1, max_length=256)
+    passed: bool
+
+
 class ChallengeFeedback(_WireModel):
     """Validator-reported curriculum signal; never used as authoritative grading."""
 
@@ -106,3 +114,8 @@ class ChallengeFeedback(_WireModel):
     band: DifficultyBand
     num_responses: int = Field(ge=0)
     dup_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+    verdicts: list[FeedbackVerdict] = Field(
+        default_factory=list,
+        max_length=1024,
+        exclude_if=lambda value: not value,
+    )

@@ -24,6 +24,7 @@ from ..execution import get_executor
 from ..orchestrator import Orchestrator, RotationSampler
 from ..problemserver.api import (
     ChallengeFeedback,
+    FeedbackVerdict,
     MinerSubmission,
     PublicChallenge,
     derive_request_id,
@@ -899,6 +900,28 @@ async def _evaluate_one(
         result,
         active_uids={solver.uid for solver in solvers},
     )
+    outcomes_by_registration = {
+        (outcome.uid, outcome.hotkey): outcome for outcome in result.outcomes
+    }
+    verdicts = []
+    for submission, captured_solver in zip(submissions, captured, strict=True):
+        # A verdict means an authenticated response was actually graded. HTTP
+        # errors, timeouts, and invalid signatures remain committed attempts
+        # for response-rate accounting, but are not mislabeled as wrong answers.
+        if submission.error or not submission.response_headers:
+            continue
+        graded = outcomes_by_registration.get(
+            (captured_solver.uid, captured_solver.hotkey)
+        )
+        if graded is None:
+            continue
+        verdicts.append(
+            FeedbackVerdict(
+                uid=graded.uid,
+                hotkey=graded.hotkey,
+                passed=graded.verification.all_passed,
+            )
+        )
     await client.feedback(
         ChallengeFeedback(
             challenge_id=public.challenge_id,
@@ -906,6 +929,7 @@ async def _evaluate_one(
             band=result.band,
             num_responses=result.num_responses,
             dup_ratio=result.dup_ratio,
+            verdicts=verdicts,
         )
     )
     return result
