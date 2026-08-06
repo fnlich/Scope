@@ -75,7 +75,7 @@ inherits the previous miner's results.
 Validators periodically normalize those scores and submit weights through
 Bittensor, but only after the configured minimum number of completed
 observations is present in the authoritative score histories.
-The SN5 example/default cadence is 150 blocks (about 30 minutes) for challenge
+The SN5 example/default cadence is 75 blocks (about 15 minutes) for challenge
 attempts and 180 blocks for weights. The problem service uses `Retry-After` to
 enforce per-validator pacing and shared global-slot contention. The effective weight
 cadence is `max(configured interval, chain rate limit + 20)`; 180 is safely
