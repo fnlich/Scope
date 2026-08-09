@@ -1,15 +1,14 @@
 """Convert verified correctness outcomes into chain payments.
 
-Each observation is binary correctness with a small response-speed tiebreaker.
-A fully correct response starts at 1.0; every other result is zero. Among
-correct responses, validator-
-   measured latency, the fastest response receives a 1.0 multiplier. Each
-   additional ``speed_half_life_ms`` halves the above-floor share, flattening
-   out at a configurable floor. Defaults make speed a very light, continuous
+Only responses that pass the complete hidden test suite receive a nonzero
+payment. Among those responses, the fastest validator-measured latency receives
+a 1.0 multiplier. Each additional ``speed_half_life_ms`` halves the above-floor
+share, flattening out at a configurable floor. Defaults make speed a very light,
+continuous
    tiebreaker (three-minute half-life, floor 0.95), never the dominant term.
-   Correctness remains a hard gate: a fast failing answer receives nothing. If
-   a non-networked harness supplies no valid latency, speed weighting is skipped
-   so offline evaluation stays meaningful.
+Correctness is a hard gate: a fast failing answer receives nothing. If a
+non-networked harness supplies no valid latency, speed weighting is skipped so
+offline evaluation stays meaningful.
 
 TODO(V2): Revisit duplication-resistant scoring only with a signal that cannot
 be cheaply gamed. Simple AST fingerprints encourage irrelevant structural

@@ -488,7 +488,7 @@ def test_eval_engine_negative_scores_clamped_in_weights():
 
 
 # --------------------------------------------------------------------------- #
-# compute_payments: binary correctness + response-speed tiebreaker
+# compute_payments: complete-suite correctness gate + speed tiebreaker
 # --------------------------------------------------------------------------- #
 from rlvr.scoring.payment import compute_payments  # noqa: E402
 
@@ -562,7 +562,7 @@ def test_payment_is_flat_without_a_difficulty_setting():
     assert pay[1] == 0.0
 
 
-def test_payment_partial_credit_does_not_change_binary_scoring():
+def test_payment_requires_all_tests_even_with_partial_credit_reward():
     outs = [
         _outcome(0, False, reward=0.5, code="def f(x):\n    return x\n"),
         _outcome(1, False, reward=0.0),

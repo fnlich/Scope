@@ -51,8 +51,7 @@ class Settings(BaseSettings):
     )
     docker_cpus: float = Field(default=1.0, gt=0.0, le=256.0)
     docker_pids_limit: int = Field(default=128, ge=16, le=4096)
-    # Alters exported dataset reward labels only. Chain payment remains binary:
-    # every hidden test must pass, regardless of this setting.
+    # Controls reward labels written to exported datasets, not validator weights.
     reward_partial_credit: bool = False
 
     validator_challenges_per_round: int = Field(default=1, gt=0, le=10_000)

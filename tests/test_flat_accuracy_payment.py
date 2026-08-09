@@ -1,15 +1,9 @@
-"""Flat accuracy payment: correctness pays full, latency breaks ties, peers
-are irrelevant.
+"""Payment based on all-pass correctness and a small latency adjustment.
 
 The scoring rule: a fully correct response pays its latency multiplier in
 [speed_floor, 1.0]; anything else pays zero; a miner's score is the mean of its
-latest observations. Peer pass-rates no longer scale anyone's payment — the
-leave-one-out difficulty weighting is removed, not merely floored.
-
-What deliberately survives: the latency tiebreaker exactly as configured
-(fastest correct response 1.0, each half-life of additional delay halves the
-share above the floor), zero for every failure mode, the rolling window, the
-startup divisor, registration reset and non-serving decay.
+latest observations. Peer pass-rates do not scale payment. The latency
+multiplier uses the configured floor and half-life.
 """
 
 from __future__ import annotations
@@ -41,7 +35,7 @@ def outcome(uid: int, *, passed: bool, latency_ms: float = 1_000.0) -> MinerOutc
 
 
 # --------------------------------------------------------------------------- #
-# Peer independence: the change itself
+# Peer independence
 # --------------------------------------------------------------------------- #
 def test_peer_pass_rate_does_not_change_a_correct_miners_payment():
     """The same correct response pays the same whether peers passed or failed."""
@@ -58,8 +52,8 @@ def test_peer_pass_rate_does_not_change_a_correct_miners_payment():
     )
 
 
-def test_a_universally_solved_problem_still_pays_in_the_latency_band():
-    """The 0.25 easy-problem discount is gone: equal-latency passes pay 1.0."""
+def test_a_universally_solved_problem_pays_in_the_latency_band():
+    """Equal-latency passes receive the same full payment."""
     payments = compute_payments(
         [outcome(1, passed=True), outcome(2, passed=True), outcome(3, passed=True)]
     )
@@ -83,7 +77,7 @@ def test_every_correct_payment_lies_in_the_configured_latency_band():
 
 
 # --------------------------------------------------------------------------- #
-# The latency tiebreaker survives, at exactly its configured strength
+# Latency adjustment
 # --------------------------------------------------------------------------- #
 def test_the_fastest_correct_response_pays_exactly_one():
     payments = compute_payments(
@@ -99,9 +93,7 @@ def test_the_fastest_correct_response_pays_exactly_one():
 def test_one_half_life_of_delay_halves_the_share_above_the_floor():
     """180s behind the fastest: 0.95 + 0.5 * 0.05 = 0.975 exactly.
 
-    Under the removed difficulty weighting this value was scaled by the
-    pass-rate factor; now the tiebreaker is the ONLY modifier of a correct
-    payment and its arithmetic is directly visible.
+    This verifies the configured latency adjustment directly.
     """
     payments = compute_payments(
         [
@@ -130,8 +122,8 @@ def test_every_failure_mode_pays_zero():
     assert payments[3] > 0.0
 
 
-def test_a_lone_correct_responder_still_pays_full():
-    """Behavior preserved from before: a pool of one pays 1.0."""
+def test_a_lone_correct_responder_pays_full():
+    """A pool containing one correct response pays 1.0."""
     assert compute_payments([outcome(1, passed=True)])[1] == 1.0
 
 
@@ -148,10 +140,10 @@ def test_weights_follow_averaged_accuracy():
 
 
 # --------------------------------------------------------------------------- #
-# Config surface: the difficulty knob is gone, stale envs stay harmless
+# Configuration compatibility
 # --------------------------------------------------------------------------- #
-def test_the_difficulty_floor_setting_no_longer_exists():
-    """An inert knob invites the belief it does something. Removed, not kept."""
+def test_difficulty_floor_is_not_an_active_setting():
+    """The obsolete difficulty setting is not exposed in active configuration."""
     assert not hasattr(Settings(_env_file=None), "payment_difficulty_floor")
 
 
@@ -162,7 +154,6 @@ def test_a_stale_difficulty_floor_env_entry_is_ignored_not_fatal():
     assert settings.solve_deadline_s > 0  # loaded fine; entry ignored
 
 
-def test_compute_payments_no_longer_accepts_a_difficulty_floor():
-    """The parameter goes with the feature; a silent no-op kwarg would let a
-    caller believe difficulty weighting still exists."""
+def test_compute_payments_has_no_difficulty_floor_parameter():
+    """The payment API does not expose the obsolete difficulty setting."""
     assert "difficulty_floor" not in inspect.signature(compute_payments).parameters

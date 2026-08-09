@@ -3,7 +3,7 @@
 - `verifier.Verifier`   -> runs a solution against hidden tests, filters flaky
                            cases, and emits correctness plus compile errors.
 - `difficulty`          -> pool pass-rate and band classification.
-- `payment`             -> binary correctness with a small speed tiebreaker.
+- `payment`             -> complete-suite correctness gate and speed tiebreaker.
 - `eval_engine.EvalEngine` -> bounded score history -> L1-normalized, nan-safe weights
                            (adapted from the BitMind EvalEngine pattern).
 """
