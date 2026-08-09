@@ -488,7 +488,7 @@ def test_eval_engine_negative_scores_clamped_in_weights():
 
 
 # --------------------------------------------------------------------------- #
-# compute_payments: difficulty + response-speed weighted payment
+# compute_payments: complete-suite correctness gate + speed tiebreaker
 # --------------------------------------------------------------------------- #
 from rlvr.scoring.payment import compute_payments  # noqa: E402
 
@@ -516,33 +516,30 @@ def _outcome(
 
 
 def test_payment_sole_solver_earns_full():
-    # 1 pass among 4: LOO pool pass-rate for the winner is 0 -> full pay.
     outs = [_outcome(0, True, code="def f(x):\n    return x\n")] + [
         _outcome(i, False, code=f"def f(x):\n    return {i}\n") for i in (1, 2, 3)
     ]
-    pay = compute_payments(outs, difficulty_floor=0.25)
+    pay = compute_payments(outs)
     assert pay[0] == pytest.approx(1.0)
     assert pay[1] == pay[2] == pay[3] == 0.0
 
 
-def test_payment_all_pass_pays_floor():
-    # Everyone passes (distinct code): LOO p = 1 -> everyone earns the floor.
+def test_payment_all_pass_pays_full_at_equal_latency():
     outs = [_outcome(i, True, code=f"def f(x):\n    return x + {i} - {i}\n") for i in range(4)]
-    pay = compute_payments(outs, difficulty_floor=0.25)
-    assert all(pay[i] == pytest.approx(0.25) for i in range(4))
+    pay = compute_payments(outs)
+    assert all(pay[i] == pytest.approx(1.0) for i in range(4))
 
 
-def test_payment_scales_with_rarity():
-    # 2 of 4 pass with distinct code: LOO p = 1/3 -> 0.25 + 0.75 * (2/3) = 0.75.
+def test_payment_does_not_scale_with_rarity():
     outs = [
         _outcome(0, True, code="def f(x):\n    return x\n"),
         _outcome(1, True, code="def f(y):\n    return y + 0\n"),  # structurally distinct
         _outcome(2, False),
         _outcome(3, False),
     ]
-    pay = compute_payments(outs, difficulty_floor=0.25)
-    assert pay[0] == pytest.approx(0.75)
-    assert pay[1] == pytest.approx(0.75)
+    pay = compute_payments(outs)
+    assert pay[0] == pytest.approx(1.0)
+    assert pay[1] == pytest.approx(1.0)
 
 
 def test_payment_identical_solutions_are_scored_independently_in_v1():
@@ -552,29 +549,26 @@ def test_payment_identical_solutions_are_scored_independently_in_v1():
         _outcome(2, True, code="def f(x):\n    return 0 + x\n"),
         _outcome(3, False),
     ]
-    pay = compute_payments(outs, difficulty_floor=0.25)
-    # LOO p for each passer = 2/3 -> weight 0.5 for every passing response.
-    assert pay[0] == pytest.approx(0.5)
-    assert pay[1] == pytest.approx(0.5)
-    assert pay[2] == pytest.approx(0.5)
+    pay = compute_payments(outs)
+    assert pay[0] == pytest.approx(1.0)
+    assert pay[1] == pytest.approx(1.0)
+    assert pay[2] == pytest.approx(1.0)
 
 
-def test_payment_floor_one_restores_flat_pay():
+def test_payment_is_flat_without_a_difficulty_setting():
     outs = [_outcome(0, True), _outcome(1, False)]
-    pay = compute_payments(outs, difficulty_floor=1.0)
+    pay = compute_payments(outs)
     assert pay[0] == pytest.approx(1.0)
     assert pay[1] == 0.0
 
 
-def test_payment_partial_credit_base_respected():
-    # Under reward_partial_credit a fractional reward scales the payment base.
+def test_payment_requires_all_tests_even_with_partial_credit_reward():
     outs = [
         _outcome(0, False, reward=0.5, code="def f(x):\n    return x\n"),
         _outcome(1, False, reward=0.0),
     ]
-    pay = compute_payments(outs, difficulty_floor=0.25)
-    # no full passes anywhere -> LOO p = 0 -> weight 1 -> pay = base.
-    assert pay[0] == pytest.approx(0.5)
+    pay = compute_payments(outs)
+    assert pay[0] == 0.0
     assert pay[1] == 0.0
 
 
@@ -592,7 +586,6 @@ def test_payment_speed_halves_for_each_relative_latency_half_life():
     ]
     pay = compute_payments(
         outs,
-        difficulty_floor=1.0,
         speed_half_life_ms=250.0,
         speed_floor=0.0,
     )
@@ -606,10 +599,7 @@ def test_default_payment_speed_is_a_light_tiebreaker():
         _outcome(0, True, code="def f(x):\n    return x\n", latency_ms=100.0),
         _outcome(1, True, code="def f(x):\n    return x + 0\n", latency_ms=180_100.0),
     ]
-    pay = compute_payments(
-        outs,
-        difficulty_floor=1.0,
-    )
+    pay = compute_payments(outs)
     assert pay[0] == pytest.approx(1.0)
     assert pay[1] == pytest.approx(0.975)
 
@@ -623,7 +613,6 @@ def test_payment_speed_is_correctness_gated_and_respects_floor():
     ]
     pay = compute_payments(
         outs,
-        difficulty_floor=1.0,
         speed_half_life_ms=250.0,
         speed_floor=0.001,
     )
@@ -640,7 +629,6 @@ def test_payment_speed_skips_weighting_when_no_valid_latency_exists():
     ]
     pay = compute_payments(
         outs,
-        difficulty_floor=1.0,
         speed_half_life_ms=250.0,
         speed_floor=0.001,
     )
