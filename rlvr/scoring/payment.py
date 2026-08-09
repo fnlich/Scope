@@ -4,8 +4,8 @@ Only responses that pass the complete hidden test suite receive a nonzero
 payment. Among those responses, the fastest validator-measured latency receives
 a 1.0 multiplier. Each additional ``speed_half_life_ms`` halves the above-floor
 share, flattening out at a configurable floor. Defaults make speed a very light,
-continuous
-   tiebreaker (three-minute half-life, floor 0.95), never the dominant term.
+continuous tiebreaker (three-minute half-life, floor 0.95), never the dominant
+term.
 Correctness is a hard gate: a fast failing answer receives nothing. If a
 non-networked harness supplies no valid latency, speed weighting is skipped so
 offline evaluation stays meaningful.

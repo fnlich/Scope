@@ -108,7 +108,7 @@ def test_one_half_life_of_delay_halves_the_share_above_the_floor():
 # --------------------------------------------------------------------------- #
 # Zeros and controls
 # --------------------------------------------------------------------------- #
-def test_every_failure_mode_pays_zero():
+def test_failed_outcomes_pay_zero():
     payments = compute_payments(
         [
             outcome(1, passed=False),                       # wrong answer
@@ -127,8 +127,8 @@ def test_a_lone_correct_responder_pays_full():
     assert compute_payments([outcome(1, passed=True)])[1] == 1.0
 
 
-def test_weights_follow_averaged_accuracy():
-    """Two miners at 100% and 50% accuracy weigh 2:1 after normalization."""
+def test_eval_engine_normalizes_averaged_observations():
+    """Averages of 1.0 and 0.5 produce weights in a 2:1 ratio."""
     e = EvalEngine(num_uids=4, window_seconds=57_600.0, max_samples=200, min_samples=4)
     for i in range(4):
         e.update({0: 1.0}, observed_at=1_000.0 + i, dispatched={0})
@@ -147,9 +147,10 @@ def test_difficulty_floor_is_not_an_active_setting():
     assert not hasattr(Settings(_env_file=None), "payment_difficulty_floor")
 
 
-def test_a_stale_difficulty_floor_env_entry_is_ignored_not_fatal():
+def test_a_stale_difficulty_floor_env_entry_is_ignored_not_fatal(monkeypatch):
     """Operators with PAYMENT_DIFFICULTY_FLOOR in .env must not break."""
-    settings = Settings(_env_file=None, PAYMENT_DIFFICULTY_FLOOR="0.25")
+    monkeypatch.setenv("PAYMENT_DIFFICULTY_FLOOR", "0.25")
+    settings = Settings(_env_file=None)
 
     assert settings.solve_deadline_s > 0  # loaded fine; entry ignored
 
