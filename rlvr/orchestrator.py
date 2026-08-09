@@ -199,7 +199,6 @@ class Orchestrator:
         """Apply verified outcomes to local scores and persist the audit record."""
         payments = compute_payments(
             cr.outcomes,
-            difficulty_floor=self.settings.payment_difficulty_floor,
             speed_half_life_ms=self.settings.payment_speed_half_life_ms,
             speed_floor=self.settings.payment_speed_floor,
         )

@@ -51,17 +51,14 @@ class Settings(BaseSettings):
     )
     docker_cpus: float = Field(default=1.0, gt=0.0, le=256.0)
     docker_pids_limit: int = Field(default=128, ge=16, le=4096)
-    reward_partial_credit: bool = False  # default near-binary: all-pass=1 else 0
+    # Alters exported dataset reward labels only. Chain payment remains binary:
+    # every hidden test must pass, regardless of this setting.
+    reward_partial_credit: bool = False
 
     validator_challenges_per_round: int = Field(default=1, gt=0, le=10_000)
 
     # --- Payment (chain emissions), decoupled from the training reward ---
-    # pay_i = reward_i * (floor + (1-floor)*(1 - p_loo)): a pass nobody else
-    # achieved pays full, a pass everyone achieved pays `floor`. 1.0 = flat pay
-    # (old behavior). The floor keeps answering easy problems rational, so
-    # measured pass-rates keep reflecting difficulty rather than effort.
-    payment_difficulty_floor: float = Field(default=0.25, ge=0.0, le=1.0)
-    # Correct responses are additionally weighted by validator-measured
+    # Correct responses are weighted by validator-measured
     # round-trip latency relative to the fastest correct response in the same
     # dispatch. Every three minutes of additional latency halves the 5% share
     # above the 0.95 floor. This makes speed a slight, continuous tiebreaker:

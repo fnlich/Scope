@@ -56,9 +56,12 @@ receipt whose count differs from the sent set is treated as a protocol error.
 
 ## Reward and weights
 
-Correctness is determined by the complete hidden suite. Correct submissions are
-then weighted by observed response speed and leave-one-out difficulty. Failed
-submissions always receive zero.
+Correctness is determined by the complete hidden suite. A fully correct
+submission receives a score between 0.95 and 1.0 using observed response speed
+as a small tiebreaker. Wrong, partial, invalid, missing, or timed-out responses
+receive zero. Peer pass-rates do not change an individual miner's score.
+Optional partial-credit rewards affect exported dataset labels only; on-chain
+scoring remains binary and requires the complete hidden suite to pass.
 
 TODO(V2): Revisit duplication-resistant scoring only with a robust signal.
 Simple AST fingerprints encourage irrelevant structural changes in submitted
