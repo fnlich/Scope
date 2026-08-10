@@ -28,6 +28,7 @@ from rlvr.problemserver.client import (
     LeaseCategory,
     LeaseOutcome,
 )
+from rlvr.policy import ValidatorPolicy
 
 NOW = 5_000.0
 
@@ -146,7 +147,7 @@ async def test_pacing_stops_the_multi_challenge_loop_immediately():
 
     completed = await _run_challenge_round(
         v, client, None, rotation(), solvers(),
-        settings(validator_challenges_per_round=5), now=NOW,
+        settings(), now=NOW, policy=ValidatorPolicy(challenges_per_round=5),
     )
 
     assert client.leases == 1, f"leased {client.leases} times while paced"
@@ -160,7 +161,7 @@ async def test_pacing_without_a_directive_stops_the_loop_without_deferring():
 
     await _run_challenge_round(
         v, client, None, rotation(), solvers(),
-        settings(validator_challenges_per_round=5), now=NOW,
+        settings(), now=NOW, policy=ValidatorPolicy(challenges_per_round=5),
     )
 
     assert client.leases == 1
@@ -174,7 +175,7 @@ async def test_a_non_paced_failure_does_not_shorten_the_round():
 
     await _run_challenge_round(
         v, client, None, rotation(), solvers(),
-        settings(validator_challenges_per_round=5), now=NOW,
+        settings(), now=NOW, policy=ValidatorPolicy(challenges_per_round=5),
     )
 
     assert client.leases == 5
@@ -216,7 +217,7 @@ async def test_a_real_429_over_http_reaches_the_validator_as_a_deadline():
     try:
         completed = await _run_challenge_round(
             v, client, None, rotation(), solvers(),
-            settings(validator_challenges_per_round=5), now=NOW,
+            settings(), now=NOW, policy=ValidatorPolicy(challenges_per_round=5),
         )
     finally:
         await client._http.aclose()

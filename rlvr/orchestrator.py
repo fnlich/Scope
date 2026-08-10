@@ -13,6 +13,7 @@ from typing import Iterable, Optional, Protocol, Sequence, runtime_checkable
 
 from .config import Settings
 from .dataset.writer import RolloutWriter
+from .policy import RELEASE_POLICY, ValidatorPolicy
 from .scoring.difficulty import classify_band, pass_rate
 from .scoring.eval_engine import EvalEngine
 from .scoring.payment import compute_payments
@@ -85,11 +86,13 @@ class Orchestrator:
         eval_engine: EvalEngine,
         writer: RolloutWriter,
         settings: Settings,
+        policy: ValidatorPolicy = RELEASE_POLICY,
     ):
         self.verifier = verifier
         self.eval_engine = eval_engine
         self.writer = writer
         self.settings = settings
+        self.policy = policy
 
     async def _attempt_one(
         self, solver: SolverClient, problem: Problem, prompt: str, sem: asyncio.Semaphore
@@ -199,8 +202,8 @@ class Orchestrator:
         """Apply verified outcomes to local scores and persist the audit record."""
         payments = compute_payments(
             cr.outcomes,
-            speed_half_life_ms=self.settings.payment_speed_half_life_ms,
-            speed_floor=self.settings.payment_speed_floor,
+            speed_half_life_ms=self.policy.payment_speed_half_life_ms,
+            speed_floor=self.policy.payment_speed_floor,
         )
         dispatched = {o.uid for o in cr.outcomes}
         active = None if active_uids is None else {int(uid) for uid in active_uids}

@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from rlvr.config import get_settings
+from rlvr.policy import ValidatorPolicy
 from rlvr.scoring.difficulty import (
     classify_band,
     pass_rate,
@@ -120,7 +121,6 @@ def test_verify_some_fail_reward_zero_near_binary():
 def test_verify_partial_credit_when_enabled():
     s = get_settings()
     s.reward_partial_credit = True
-    s.determinism_runs = 1
     run = [(True, None), (True, None), (False, "AssertionError")]
     ex = FakeExecutor([run])
     v = Verifier(ex, s)
@@ -147,7 +147,6 @@ def test_verify_compile_error_all_tests_errored():
 
 def test_verify_runtime_error_on_one_test_is_not_compile_error():
     s = get_settings()
-    s.determinism_runs = 1
     # some tests pass -> NOT a compile error even though one errored
     run = [(True, None), (False, "ZeroDivisionError"), (True, None)]
     ex = FakeExecutor([run])
@@ -163,7 +162,6 @@ def test_verify_wrong_values_every_test_is_not_compile_error():
     test has value_ok=True everywhere, so it is scored as failing tests — NOT
     masked as a compile/define failure."""
     s = get_settings()
-    s.determinism_runs = 1
     # every test fails by VALUE comparison (no error, value_ok True) -> ran fine,
     # just wrong answers. The executor's signal says the entrypoint is callable.
     run = [(False, None), (False, None), (False, None)]
@@ -178,7 +176,6 @@ def test_verify_wrong_values_every_test_is_not_compile_error():
 
 def test_verify_undefined_entrypoint_is_compile_error():
     s = get_settings()
-    s.determinism_runs = 2
     err = "entrypoint 'f' is not defined by the candidate"
     run = [(False, err), (False, err), (False, err)]
     ex = FakeExecutor([run])  # repeated for both determinism runs
@@ -193,7 +190,6 @@ def test_verify_undefined_entrypoint_is_compile_error():
 
 def test_verify_runtime_crash_on_every_test_is_not_compile_error():
     settings = get_settings()
-    settings.determinism_runs = 1
     run = [(False, "ValueError: bad input")] * 3
     out = Verifier(FakeExecutor([run]), settings).verify(
         make_problem(3), make_solution()
@@ -208,13 +204,12 @@ def test_verify_flaky_test_counts_as_failure_not_dropped():
     be silently excluded. A miner who makes one hidden test nondeterministic while
     passing the rest must NOT score 1.0."""
     s = get_settings()
-    s.determinism_runs = 2
     s.reward_partial_credit = False
     # test index 2 flips: passes in run0, fails in run1 -> flaky.
     run0 = [(True, None), (True, None), (True, None)]
     run1 = [(True, None), (True, None), (False, "Flaky")]
     ex = FakeExecutor([run0, run1])
-    v = Verifier(ex, s)
+    v = Verifier(ex, s, policy=ValidatorPolicy(verification_runs=2))
     out = v.verify(make_problem(3), make_solution())
     assert out.flagged_flaky is True
     # the flaky test is counted as failed, NOT excluded -> not all passed.
@@ -227,13 +222,12 @@ def test_verify_flaky_exploit_partial_credit_does_not_drop_test():
     """Even under partial credit, a flaky test counts against the fraction; it is
     never dropped to shrink the denominator."""
     s = get_settings()
-    s.determinism_runs = 2
     s.reward_partial_credit = True
     # idx2 flips -> flaky; the other two pass deterministically.
     run0 = [(True, None), (True, None), (True, None)]
     run1 = [(True, None), (True, None), (False, "Flaky")]
     ex = FakeExecutor([run0, run1])
-    v = Verifier(ex, s)
+    v = Verifier(ex, s, policy=ValidatorPolicy(verification_runs=2))
     out = v.verify(make_problem(3), make_solution())
     assert out.flagged_flaky is True
     assert out.num_passed == 2
@@ -244,13 +238,12 @@ def test_verify_flaky_exploit_partial_credit_does_not_drop_test():
 
 def test_verify_flaky_with_remaining_failure_zero_reward():
     s = get_settings()
-    s.determinism_runs = 2
     s.reward_partial_credit = False
     # idx2 flaky (counts as fail); idx1 stably fails -> not all passed.
     run0 = [(True, None), (False, "err"), (True, None)]
     run1 = [(True, None), (False, "err"), (False, "flip")]
     ex = FakeExecutor([run0, run1])
-    v = Verifier(ex, s)
+    v = Verifier(ex, s, policy=ValidatorPolicy(verification_runs=2))
     out = v.verify(make_problem(3), make_solution())
     assert out.flagged_flaky is True
     # idx0 passes deterministically; idx1 stably fails; idx2 flaky (fails).
@@ -263,11 +256,10 @@ def test_verify_correct_solution_still_scores_one():
     """A genuinely-correct solution (passes every test in EVERY run) still scores
     1.0 and is not flagged flaky."""
     s = get_settings()
-    s.determinism_runs = 3
     s.reward_partial_credit = False
     runs = [passes(3), passes(3), passes(3)]
     ex = FakeExecutor(runs)
-    v = Verifier(ex, s)
+    v = Verifier(ex, s, policy=ValidatorPolicy(verification_runs=3))
     out = v.verify(make_problem(3), make_solution())
     assert out.flagged_flaky is False
     assert out.num_passed == 3

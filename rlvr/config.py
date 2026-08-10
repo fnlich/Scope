@@ -7,8 +7,13 @@ belong here. The optional demo miner keeps its model-provider settings in
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .policy import RELEASE_POLICY, RELEASE_POLICY_ENV_KEYS
 
 
 class Settings(BaseSettings):
@@ -39,7 +44,6 @@ class Settings(BaseSettings):
         description="'subprocess' | 'docker'",
     )
     per_test_timeout_s: float = Field(default=5.0, gt=0.0, le=300.0)
-    determinism_runs: int = Field(default=2, ge=1, le=10)
     docker_image: str = Field(
         default="python:3.12-slim",
         min_length=1,
@@ -53,25 +57,6 @@ class Settings(BaseSettings):
     docker_pids_limit: int = Field(default=128, ge=16, le=4096)
     # Controls reward labels written to exported datasets, not validator weights.
     reward_partial_credit: bool = False
-
-    validator_challenges_per_round: int = Field(default=1, gt=0, le=10_000)
-
-    # --- Payment (chain emissions), decoupled from the training reward ---
-    # Correct responses are weighted by validator-measured
-    # round-trip latency relative to the fastest correct response in the same
-    # dispatch. Every three minutes of additional latency halves the 5% share
-    # above the 0.95 floor. This makes speed a slight, continuous tiebreaker:
-    # relative penalties are about 0.55% at 30s, 1.03% at 60s, and 3.43% at
-    # five minutes, while correctness remains the dominant term.
-    payment_speed_half_life_ms: float = Field(default=180_000.0, gt=0.0)
-    payment_speed_floor: float = Field(default=0.95, ge=0.0, le=1.0)
-
-    # --- Dispatch (subset sampling over the miner pool) ---
-    # By default each problem is rotation-dealt to half of the serving pool.
-    # An explicit 0 preserves the legacy full-pool behavior; a positive value
-    # is a fixed-count override. Challenge quorum may raise the chosen value.
-    dispatch_subset_k: int | None = Field(default=None, ge=0)
-    dispatch_subset_fraction: float = Field(default=0.5, gt=0.0, le=1.0)
 
     # --- Private problem-source client ---
     problem_server_url: str = ""
@@ -99,20 +84,6 @@ class Settings(BaseSettings):
     validator_verify_concurrency: int = Field(default=16, ge=1, le=256)
     validator_score_state_file: str = "data/validator_scores.json"
 
-    # --- Scoring (bounded recent history -> weights) ---
-    # Retained for compatibility with existing configuration and score-state
-    # files. Scoring is count-bounded by SCORE_WINDOW_MAX_SAMPLES, not by age.
-    score_window_seconds: float = Field(default=57_600.0, gt=0.0, le=604_800.0)
-    score_window_max_samples: int = Field(default=200, ge=1, le=1024)
-    # Thin-evidence floor: first/second/third successes -> 1/4, 1/2, 3/4.
-    score_window_min_samples: int = Field(default=4, ge=1, le=1024)
-    # Do not submit a normalized on-chain vector from a thinner history. This
-    # is a validator-startup gate; completed challenges still score and persist.
-    validator_min_weight_observations: int = Field(default=4, ge=1, le=1024)
-    # Record zeros for dispatched/non-serving miners on completed challenges so
-    # a disconnected miner stops draining emissions. Disable to freeze on silence.
-    score_decay_nonresponders: bool = True
-
     # --- Dataset export ---
     dataset_dir: str = "data/rollouts"
 
@@ -123,31 +94,65 @@ class Settings(BaseSettings):
     wallet_name: str = "default"
     wallet_hotkey: str = "default"
 
-    # Validator request cadence (blocks). The private problem source owns the
-    # actual burn rate and may pace a round with HTTP 429; a denied lease
-    # consumes no problem. Lower this only for a quick on-chain smoke test.
-    round_interval_blocks: int = Field(default=75, ge=0)
-    weights_interval_blocks: int = Field(default=180, ge=0)
-
     @model_validator(mode="after")
     def validate_ranges(self) -> "Settings":
         if self.band_low > self.band_high:
             raise ValueError("BAND_LOW must be <= BAND_HIGH")
-        if self.score_window_min_samples > self.score_window_max_samples:
-            raise ValueError(
-                "SCORE_WINDOW_MIN_SAMPLES must be <= SCORE_WINDOW_MAX_SAMPLES"
-            )
-        if (
-            self.validator_min_weight_observations
-            > self.score_window_max_samples
-        ):
-            raise ValueError(
-                "VALIDATOR_MIN_WEIGHT_OBSERVATIONS must be <= "
-                "SCORE_WINDOW_MAX_SAMPLES"
-            )
         return self
 
 
 def get_settings() -> Settings:
     """Load settings from environment / .env."""
     return Settings()
+
+
+def ignored_release_policy_keys(env_file: str = ".env") -> list[str]:
+    """Return obsolete policy overrides present in the environment or env file.
+
+    Values are never read or logged. The keys are reported so an upgraded
+    operator can remove stale entries without startup depending on that edit.
+    """
+    found = {key for key in RELEASE_POLICY_ENV_KEYS if key in os.environ}
+    try:
+        for raw_line in Path(env_file).read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key = line.split("=", 1)[0].strip()
+            if key.startswith("export "):
+                key = key.removeprefix("export ").strip()
+            if key in RELEASE_POLICY_ENV_KEYS:
+                found.add(key)
+    except (OSError, UnicodeError):
+        pass
+    return sorted(found)
+
+
+def release_policy_summary() -> str:
+    """Safe, non-secret summary of consensus-relevant validator policy."""
+    return RELEASE_POLICY.summary()
+
+
+_SAFE_EFFECTIVE_SETTINGS = {
+    "docker_cpus": "DOCKER_CPUS",
+    "docker_memory": "DOCKER_MEMORY",
+    "docker_pids_limit": "DOCKER_PIDS_LIMIT",
+    "executor": "EXECUTOR",
+    "miner_max_response_bytes": "MINER_MAX_RESPONSE_BYTES",
+    "problem_max_response_bytes": "PROBLEM_MAX_RESPONSE_BYTES",
+    "problem_server_request_timeout_s": "PROBLEM_SERVER_REQUEST_TIMEOUT_S",
+    "validator_dispatch_concurrency": "VALIDATOR_DISPATCH_CONCURRENCY",
+    "validator_send_concurrency": "VALIDATOR_SEND_CONCURRENCY",
+    "validator_verify_concurrency": "VALIDATOR_VERIFY_CONCURRENCY",
+}
+
+
+def nondefault_settings_summary(settings: Settings) -> str:
+    """Return an allowlisted summary of non-default machine settings."""
+    changed = []
+    for field_name, label in _SAFE_EFFECTIVE_SETTINGS.items():
+        default = Settings.model_fields[field_name].default
+        value = getattr(settings, field_name)
+        if value != default:
+            changed.append(f"{label}={value}")
+    return " ".join(changed)

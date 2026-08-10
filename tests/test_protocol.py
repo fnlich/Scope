@@ -14,6 +14,7 @@ import pytest
 
 import rlvr.protocol as protocol_module
 from rlvr.config import Settings, get_settings
+from rlvr.policy import RELEASE_POLICY
 from rlvr.problemserver.api import PublicChallenge
 from rlvr.protocol import (
     NonceCache,
@@ -271,26 +272,13 @@ def test_settings_fail_closed_to_docker_and_validate_difficulty_band():
     assert settings.validator_send_concurrency == 32
     assert settings.validator_verify_concurrency == 16
     assert settings.problem_server_request_timeout_s == 60
-    assert settings.score_window_seconds == 57_600
-    assert settings.score_window_max_samples == 200
-    assert settings.score_window_min_samples == 4
-    assert settings.validator_min_weight_observations == 4
+    assert RELEASE_POLICY.score_window_max_samples == 200
+    assert RELEASE_POLICY.score_window_min_samples == 4
+    assert RELEASE_POLICY.min_weight_observations == 4
     with pytest.raises(ValueError, match="BAND_LOW"):
         Settings(_env_file=None, band_low=0.8, band_high=0.2)
     with pytest.raises(ValueError):
         Settings(_env_file=None, docker_image="--privileged")
-    with pytest.raises(ValueError, match="SCORE_WINDOW_MIN_SAMPLES"):
-        Settings(
-            _env_file=None,
-            score_window_min_samples=7,
-            score_window_max_samples=6,
-        )
-    with pytest.raises(ValueError, match="VALIDATOR_MIN_WEIGHT_OBSERVATIONS"):
-        Settings(
-            _env_file=None,
-            validator_min_weight_observations=7,
-            score_window_max_samples=6,
-        )
 
 
 def test_base_neuron_setup_raises_clearly_when_bittensor_missing(monkeypatch):

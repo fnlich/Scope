@@ -49,6 +49,9 @@ receipt whose count differs from the sent set is treated as a protocol error.
   and output limits when Docker execution is selected.
 - Pass/fail comparison occurs in the trusted parent process rather than inside
   candidate code.
+- The Docker grader starts one container per submitted program. Source is
+  compiled once, and each hidden case runs in a fresh child process with its
+  own deadline. The current release uses one verification pass.
 - Invalid, missing, oversized, unauthenticated, or timed-out responses receive
   zero verified reward and cannot crash an entire round.
 - Score state is keyed by hotkey so UID reassignment does not inherit another
@@ -76,12 +79,12 @@ and weight submission begins after four completed observations. A UID's history
 is cleared when its registered hotkey changes, so a new registration never
 inherits the previous miner's results.
 Validators periodically normalize those scores and submit weights through
-Bittensor, but only after the configured minimum number of completed
+Bittensor, but only after the release-policy minimum number of completed
 observations is present in the authoritative score histories.
-The SN5 example/default cadence is 75 blocks (about 15 minutes) for challenge
+The SN5 release cadence is 75 blocks (about 15 minutes) for challenge
 attempts and 180 blocks for weights. The problem service uses `Retry-After` to
 enforce per-validator pacing and shared global-slot contention. The effective weight
-cadence is `max(configured interval, chain rate limit + 20)`; 180 is safely
+cadence is `max(release interval, chain rate limit + 20)`; 180 is safely
 above the known 100-block limit and allows roughly two attempts per 360-block
 tempo.
 

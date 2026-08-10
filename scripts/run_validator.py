@@ -13,13 +13,29 @@ Prerequisites (see scripts/register_testnet.sh):
     . .venv/bin/activate && PYTHONPATH=. python scripts/run_validator.py
 """
 
-from rlvr.config import get_settings
+from rlvr.config import (
+    get_settings,
+    ignored_release_policy_keys,
+    nondefault_settings_summary,
+    release_policy_summary,
+)
 
 
 def main() -> None:
     settings = get_settings()
     if not settings.problem_server_url:
         raise SystemExit("set PROBLEM_SERVER_URL for the V1 problem source")
+
+    ignored = ignored_release_policy_keys()
+    if ignored:
+        print(
+            "[validator] WARN: ignored release-policy overrides: "
+            + ", ".join(ignored)
+        )
+    print(f"[validator] release policy {release_policy_summary()}")
+    nondefault = nondefault_settings_summary(settings)
+    if nondefault:
+        print(f"[validator] non-default machine settings {nondefault}")
 
     from rlvr.neurons.decentralized import run_decentralized_validator
 

@@ -29,6 +29,7 @@ from rlvr.neurons.decentralized import (
     _weight_observation_count,
 )
 from rlvr.scoring.eval_engine import EvalEngine
+from rlvr.policy import LEGACY_SCORE_WINDOW_SECONDS, RELEASE_POLICY
 
 DEFAULTS = Settings(_env_file=None)
 TARGET_SAMPLES = 200
@@ -46,15 +47,15 @@ def _advancing_clock(start: float = 0.0, step: float = 1.0):
     return clock
 
 
-def _engine(settings: Settings = DEFAULTS, num_uids: int = 1, clock=None):
+def _engine(num_uids: int = 1, clock=None, max_samples: int = TARGET_SAMPLES):
     """Build an engine exactly the way the validator entrypoint does."""
     extra = {} if clock is None else {"clock": clock}
     return EvalEngine(
         num_uids,
-        settings.score_window_seconds,
-        settings.score_window_max_samples,
-        settings.score_window_min_samples,
-        decay=settings.score_decay_nonresponders,
+        LEGACY_SCORE_WINDOW_SECONDS,
+        max_samples,
+        RELEASE_POLICY.score_window_min_samples,
+        decay=RELEASE_POLICY.decay_nonresponders,
         **extra,
     )
 
@@ -114,7 +115,7 @@ def test_ancient_observations_survive_a_much_later_record():
     _observe(engine, STARTUP_GATE, reward=1.0)
 
     # Far beyond the retired 16-hour bound.
-    now[0] = DEFAULTS.score_window_seconds * 1000.0
+    now[0] = LEGACY_SCORE_WINDOW_SECONDS * 1000.0
     _observe(engine, 1, reward=1.0)
 
     assert len(engine.histories[0]) == STARTUP_GATE + 1
@@ -128,7 +129,7 @@ def test_weight_gate_stays_open_across_a_long_supply_pause():
     _observe(engine, STARTUP_GATE, reward=1.0)
     assert _weight_observation_count(engine) == STARTUP_GATE
 
-    now[0] = DEFAULTS.score_window_seconds * 10.0
+    now[0] = LEGACY_SCORE_WINDOW_SECONDS * 10.0
     _observe(engine, 1, reward=1.0)
 
     assert _weight_observation_count(engine) == STARTUP_GATE + 1
@@ -139,7 +140,7 @@ def test_a_stale_miss_is_not_forgiven_by_the_passage_of_time():
     engine = _engine(clock=lambda: now[0])
     _observe(engine, 1, reward=0.0)
 
-    now[0] = DEFAULTS.score_window_seconds * 100.0
+    now[0] = LEGACY_SCORE_WINDOW_SECONDS * 100.0
     _observe(engine, 3, reward=1.0)
 
     # 0 + 1 + 1 + 1 over four observations; the old zero still counts.
@@ -223,12 +224,12 @@ def test_persisted_history_is_still_reset_by_a_hotkey_change_after_reload(tmp_pa
 # Defaults
 # --------------------------------------------------------------------------- #
 def test_default_score_window_cap_is_two_hundred():
-    assert DEFAULTS.score_window_max_samples == TARGET_SAMPLES
+    assert RELEASE_POLICY.score_window_max_samples == TARGET_SAMPLES
 
 
 def test_default_startup_gates_stay_at_four():
-    assert DEFAULTS.score_window_min_samples == STARTUP_GATE
-    assert DEFAULTS.validator_min_weight_observations == STARTUP_GATE
+    assert RELEASE_POLICY.score_window_min_samples == STARTUP_GATE
+    assert RELEASE_POLICY.min_weight_observations == STARTUP_GATE
 
 
 def test_default_engine_accumulates_two_hundred_observations():
@@ -238,9 +239,8 @@ def test_default_engine_accumulates_two_hundred_observations():
     assert len(engine.histories[0]) == TARGET_SAMPLES
 
 
-def test_operator_override_of_the_cap_is_still_honored():
-    settings = Settings(_env_file=None, score_window_max_samples=50)
-    engine = _engine(settings, clock=_advancing_clock())
+def test_internal_engine_supports_a_smaller_test_cap():
+    engine = _engine(max_samples=50, clock=_advancing_clock())
     _observe(engine, 60, reward=1.0)
 
     assert len(engine.histories[0]) == 50
@@ -296,7 +296,7 @@ def test_loaded_six_entry_state_keeps_growing_under_the_new_cap(tmp_path):
 def test_loaded_ancient_entries_are_not_expired_by_the_next_record(tmp_path):
     path = tmp_path / "scores-ancient.json"
     path.write_text(_six_entry_state([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
-    engine = _engine(num_uids=0, clock=lambda: DEFAULTS.score_window_seconds * 1000.0)
+    engine = _engine(num_uids=0, clock=lambda: LEGACY_SCORE_WINDOW_SECONDS * 1000.0)
     _load_scores(engine, str(path))
 
     _observe(engine, 1, reward=1.0)
@@ -331,11 +331,7 @@ def test_reducing_the_cap_keeps_only_the_latest_observations(tmp_path):
     _observe(source, 1, reward=1.0)
     _save_scores(source, str(path))
 
-    smaller = _engine(
-        Settings(_env_file=None, score_window_max_samples=10),
-        num_uids=0,
-        clock=_advancing_clock(),
-    )
+    smaller = _engine(num_uids=0, clock=_advancing_clock(), max_samples=10)
     _load_scores(smaller, str(path))
 
     assert len(smaller.histories[0]) == 10

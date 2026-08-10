@@ -17,6 +17,7 @@ from rlvr.neurons.decentralized import (
     effective_weights_interval,
 )
 from rlvr.neurons.validator import ValidatorNeuron
+from rlvr.policy import RELEASE_POLICY
 
 SN5_WEIGHTS_INTERVAL_BLOCKS = 180
 # The on-chain per-validator floor this default is chosen to clear.
@@ -26,9 +27,7 @@ TEMPO_BLOCKS = 360
 
 
 def test_the_default_weight_interval_is_the_sn5_value():
-    assert Settings(_env_file=None).weights_interval_blocks == (
-        SN5_WEIGHTS_INTERVAL_BLOCKS
-    )
+    assert RELEASE_POLICY.weights_interval_blocks == SN5_WEIGHTS_INTERVAL_BLOCKS
 
 
 def test_the_validator_adopts_the_configured_weight_interval():
@@ -37,15 +36,15 @@ def test_the_validator_adopts_the_configured_weight_interval():
     assert v.weights_interval_blocks == SN5_WEIGHTS_INTERVAL_BLOCKS
 
 
-def test_an_operator_can_still_override_the_weight_cadence(monkeypatch):
+def test_operator_environment_cannot_override_the_weight_cadence(monkeypatch):
     monkeypatch.setenv("WEIGHTS_INTERVAL_BLOCKS", "240")
 
-    assert Settings(_env_file=None).weights_interval_blocks == 240
+    assert ValidatorNeuron(Settings(_env_file=None)).weights_interval_blocks == 180
 
 
 def test_the_round_cadence_is_not_disturbed_by_the_weight_default():
     """The weight default must not alter the independent round interval."""
-    assert Settings(_env_file=None).round_interval_blocks == 75
+    assert RELEASE_POLICY.round_interval_blocks == 75
 
 
 # --------------------------------------------------------------------------- #
