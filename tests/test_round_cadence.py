@@ -9,14 +9,13 @@ from __future__ import annotations
 
 from rlvr.config import Settings
 from rlvr.neurons.validator import ValidatorNeuron
+from rlvr.policy import RELEASE_POLICY
 
 SN5_ROUND_INTERVAL_BLOCKS = 75
 
 
 def test_the_default_round_interval_is_the_sn5_value():
-    assert Settings(_env_file=None).round_interval_blocks == (
-        SN5_ROUND_INTERVAL_BLOCKS
-    )
+    assert RELEASE_POLICY.round_interval_blocks == SN5_ROUND_INTERVAL_BLOCKS
 
 
 def test_the_validator_adopts_the_configured_round_interval():
@@ -26,15 +25,13 @@ def test_the_validator_adopts_the_configured_round_interval():
     assert v.round_interval_blocks == SN5_ROUND_INTERVAL_BLOCKS
 
 
-def test_an_operator_can_still_override_the_cadence(monkeypatch):
-    """A default is a default, not a policy an operator cannot escape."""
+def test_operator_environment_cannot_override_the_cadence(monkeypatch):
     monkeypatch.setenv("ROUND_INTERVAL_BLOCKS", "200")
 
-    assert Settings(_env_file=None).round_interval_blocks == 200
+    assert ValidatorNeuron(Settings(_env_file=None)).round_interval_blocks == 75
 
 
-def test_the_cadence_still_accepts_a_fast_smoke_test_value(monkeypatch):
-    """config.py documents lowering this for an on-chain smoke test."""
+def test_another_environment_value_cannot_override_the_cadence(monkeypatch):
     monkeypatch.setenv("ROUND_INTERVAL_BLOCKS", "1")
 
-    assert Settings(_env_file=None).round_interval_blocks == 1
+    assert ValidatorNeuron(Settings(_env_file=None)).round_interval_blocks == 75

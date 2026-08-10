@@ -18,6 +18,7 @@ import time
 from typing import Awaitable, Callable, Optional
 
 from ..config import Settings
+from ..policy import RELEASE_POLICY, ValidatorPolicy
 from ..types import NeuronType
 from .base import BaseNeuron
 
@@ -42,14 +43,16 @@ class ValidatorNeuron(BaseNeuron):
         settings: Optional[Settings] = None,
         round_callback: Optional[RoundCallback] = None,
         weight_setter: Optional[WeightSetter] = None,
+        policy: ValidatorPolicy = RELEASE_POLICY,
     ):
         super().__init__(settings)
+        self.policy = policy
         self._round_callback: Optional[RoundCallback] = round_callback
         self._weight_setter: Optional[WeightSetter] = weight_setter
 
         # How often (in blocks) to run a round / set weights when live.
-        self.round_interval_blocks: int = self.settings.round_interval_blocks
-        self.weights_interval_blocks: int = self.settings.weights_interval_blocks
+        self.round_interval_blocks: int = policy.round_interval_blocks
+        self.weights_interval_blocks: int = policy.weights_interval_blocks
         self.chain_weights_rate_limit: Optional[int] = None
         self._rounds_deferred_until: Optional[float] = None
 

@@ -22,6 +22,11 @@ from ..config import Settings, get_settings
 from ..dataset.writer import RolloutWriter
 from ..execution import get_executor
 from ..orchestrator import Orchestrator, RotationSampler
+from ..policy import (
+    LEGACY_SCORE_WINDOW_SECONDS,
+    RELEASE_POLICY,
+    ValidatorPolicy,
+)
 from ..problemserver.api import (
     ChallengeFeedback,
     FeedbackVerdict,
@@ -43,7 +48,7 @@ from .live import LiveSolverClient, SendGate, _solver_clients
 from .validator import ValidatorNeuron
 
 _MINER_RESPONSE_GRACE_S = 10.0
-OWNER_BURN_SHARE = 0.40
+OWNER_BURN_SHARE = RELEASE_POLICY.owner_burn_share
 _OWNER_BURN_CACHE_TTL_S = 3_600.0
 _SANDBOX_ERROR_PROBE_THRESHOLD = 0.25
 _U16_MAX = 65_535
@@ -210,13 +215,15 @@ def effective_weights_interval(
 
 
 def _apply_weights_rate_limit(
-    validator: ValidatorNeuron, settings: Settings
+    validator: ValidatorNeuron,
+    settings: Settings,
+    policy: ValidatorPolicy = RELEASE_POLICY,
 ) -> None:
     """Install the startup chain-derived cadence and retain its source value."""
     chain_limit = _read_weights_rate_limit(validator, settings.netuid)
     validator.chain_weights_rate_limit = chain_limit
     validator.weights_interval_blocks = effective_weights_interval(
-        settings.weights_interval_blocks,
+        policy.weights_interval_blocks,
         chain_limit,
     )
 
@@ -397,10 +404,11 @@ def _submit_local_weights(
     *,
     log_response_repr: bool = False,
     owner_burn_state: Optional[_OwnerBurnState] = None,
+    policy: ValidatorPolicy = RELEASE_POLICY,
 ) -> Optional[bool]:
     """Submit normalized local weights only after enough completed evidence."""
     observations = _weight_observation_count(engine)
-    required = settings.validator_min_weight_observations
+    required = policy.min_weight_observations
     if observations < required:
         print(
             "[validator] local weight evidence "
@@ -744,18 +752,12 @@ async def _dispatch_committed(
 def _dispatch_subset_size(
     pool_size: int,
     required: int,
-    fixed_k: Optional[int],
     fraction: float,
 ) -> int:
     """Choose a bounded sample, raising the default to commit quorum."""
     if pool_size <= 0:
         return 0
-    if fixed_k == 0:
-        requested = pool_size
-    elif fixed_k is not None:
-        requested = fixed_k
-    else:
-        requested = math.ceil(pool_size * fraction)
+    requested = math.ceil(pool_size * fraction)
     return min(pool_size, max(1, required, requested))
 
 
@@ -768,6 +770,7 @@ async def _evaluate_one(
     quorum_hint: Optional[dict[str, int]] = None,
     pacing: Optional[dict[str, object]] = None,
     now: Optional[float] = None,
+    policy: ValidatorPolicy = RELEASE_POLICY,
 ) -> Optional[ChallengeResult]:
     # A lease BURNS the problem server-side (durable FIFO cursor), so refuse to
     # lease when the last-seen quorum requirement already rules this round out.
@@ -811,8 +814,7 @@ async def _evaluate_one(
     subset_k = _dispatch_subset_size(
         len(solvers),
         required,
-        settings.dispatch_subset_k,
-        settings.dispatch_subset_fraction,
+        policy.dispatch_fraction,
     )
     subset = cast(
         list[LiveSolverClient],
@@ -945,10 +947,11 @@ async def _run_challenge_round(
     *,
     quorum_hint: Optional[dict[str, int]] = None,
     now: Optional[float] = None,
+    policy: ValidatorPolicy = RELEASE_POLICY,
 ) -> int:
     """Evaluate configured challenges, stopping immediately on lease pacing."""
     completed = 0
-    for _ in range(settings.validator_challenges_per_round):
+    for _ in range(policy.challenges_per_round):
         pacing: dict[str, object] = {}
         result = await _evaluate_one(
             client,
@@ -959,6 +962,7 @@ async def _run_challenge_round(
             quorum_hint=quorum_hint,
             pacing=pacing,
             now=now,
+            policy=policy,
         )
         completed += int(result is not None)
         if pacing.get("paced"):
@@ -1022,21 +1026,22 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         settings.problem_server_url,
         settings.problem_server_allow_insecure_http,
     )
-    validator = ValidatorNeuron(settings)
+    policy = RELEASE_POLICY
+    validator = ValidatorNeuron(settings, policy=policy)
     validator.setup_bittensor()
-    _apply_weights_rate_limit(validator, settings)
+    _apply_weights_rate_limit(validator, settings, policy)
     engine = EvalEngine(
         len(validator.metagraph.hotkeys),
-        settings.score_window_seconds,
-        settings.score_window_max_samples,
-        settings.score_window_min_samples,
-        decay=settings.score_decay_nonresponders,
+        LEGACY_SCORE_WINDOW_SECONDS,
+        policy.score_window_max_samples,
+        policy.score_window_min_samples,
+        decay=policy.decay_nonresponders,
     )
     _load_scores(engine, settings.validator_score_state_file)
-    verifier = Verifier(get_executor(settings), settings)
+    verifier = Verifier(get_executor(settings), settings, policy=policy)
     writer = RolloutWriter(settings.dataset_dir)
     # This path only evaluates challenges returned by the private service.
-    orchestrator = Orchestrator(verifier, engine, writer, settings)
+    orchestrator = Orchestrator(verifier, engine, writer, settings, policy=policy)
     rotation = RotationSampler()
     owner_burn_state = _OwnerBurnState()
 
@@ -1068,15 +1073,9 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                 base_sample = _dispatch_subset_size(
                     len(live_solvers),
                     required=0,
-                    fixed_k=settings.dispatch_subset_k,
-                    fraction=settings.dispatch_subset_fraction,
+                    fraction=policy.dispatch_fraction,
                 )
-                if settings.dispatch_subset_k is None:
-                    rule = f"fraction={settings.dispatch_subset_fraction:g}"
-                elif settings.dispatch_subset_k == 0:
-                    rule = "explicit full pool"
-                else:
-                    rule = f"fixed={settings.dispatch_subset_k}"
+                rule = f"release fraction={policy.dispatch_fraction:g}"
                 print(
                     "[validator] dispatch policy "
                     f"sample={base_sample}/{len(live_solvers)} ({rule}); "
@@ -1092,6 +1091,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                 live_solvers,
                 settings,
                 quorum_hint=quorum_hint,
+                policy=policy,
             )
             _save_scores(engine, settings.validator_score_state_file)
             print(f"[validator] locally evaluated {completed} challenges")

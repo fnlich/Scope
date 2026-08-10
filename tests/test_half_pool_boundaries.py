@@ -7,8 +7,8 @@ helper's shape:
   * sizing at the pool edges (1/2/3/255/256) and the empty pool;
   * the challenge commit quorum raising the half, capped by the serving pool,
     while the pre-lease viability gate keeps reading the SERVING count;
-  * the explicit fixed-count operator override, and full-pool remaining
-    expressible through the legacy ``DISPATCH_SUBSET_K=0`` override;
+  * release-controlled half-pool sizing that legacy environment values cannot
+    override;
   * multi-round fairness: full coverage every two rounds, +/-1 load per epoch;
   * the no-decay boundary. Half the pool is silent every round BY DESIGN, so
     an unsampled SERVING miner must be frozen, while a dispatched-but-silent
@@ -37,6 +37,7 @@ from rlvr.neurons.decentralized import (
     _weight_observation_count,
 )
 from rlvr.orchestrator import Orchestrator, RotationSampler
+from rlvr.policy import LEGACY_SCORE_WINDOW_SECONDS, RELEASE_POLICY
 from rlvr.problemserver.api import MinerSubmission, PublicChallenge
 from rlvr.problemserver.client import LeaseCategory, LeaseOutcome
 from rlvr.scoring.eval_engine import EvalEngine
@@ -57,11 +58,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def _size(
     pool: int,
     required: int = 1,
-    fixed_k: int | None = None,
     fraction: float = 0.5,
 ) -> int:
-    """Size one dispatch. ``fixed_k=None`` is the shipped dynamic default."""
-    return _dispatch_subset_size(pool, required, fixed_k, fraction)
+    return _dispatch_subset_size(pool, required, fraction)
 
 
 # --------------------------------------------------------------------------- #
@@ -93,9 +92,9 @@ def test_an_empty_serving_pool_targets_nobody():
 
 def test_shipped_default_configuration_selects_the_dynamic_half():
     """An unset fixed-count override selects the fractional default."""
-    assert DEFAULTS.dispatch_subset_k is None
-    assert _size(256, fixed_k=DEFAULTS.dispatch_subset_k) == 128
-    assert _size(256, fixed_k=DEFAULTS.dispatch_subset_k) != 256
+    assert RELEASE_POLICY.dispatch_fraction == 0.5
+    assert _size(256) == 128
+    assert _size(256) != 256
 
 
 # --------------------------------------------------------------------------- #
@@ -119,37 +118,7 @@ def test_quorum_never_widens_the_dispatch_beyond_the_serving_pool():
 
 
 # --------------------------------------------------------------------------- #
-# 3. Fixed-count operator override
-# --------------------------------------------------------------------------- #
-def test_fixed_count_override_replaces_the_dynamic_half():
-    assert _size(256, fixed_k=32) == 32
-    assert _size(256, fixed_k=1) == 1
-    assert _size(3, fixed_k=2) == 2
-
-
-def test_fixed_count_override_is_capped_at_the_pool_and_raised_to_quorum():
-    """The override sets the target, not the invariants around it."""
-    assert _size(10, fixed_k=32) == 10
-    assert _size(10, fixed_k=2, required=6) == 6
-    assert _size(10, fixed_k=2, required=3) == 3
-
-
-def test_full_pool_dispatch_remains_expressible():
-    """Explicit zero preserves the legacy full-pool behavior."""
-    assert _size(256, fixed_k=0) == 256
-    assert _size(256, fixed_k=256) == 256
-    assert _size(256, fixed_k=1000) == 256
-    assert _size(256, fraction=1.0) == 256
-    assert _size(255, fraction=1.0) == 255
-
-
-def test_a_fixed_count_of_zero_is_the_legacy_full_pool_override():
-    for pool in (1, 2, 3, 255, 256):
-        assert _size(pool, fixed_k=0) == pool
-
-
-# --------------------------------------------------------------------------- #
-# 4. Wiring: the round actually dispatches to the half
+# 3. Wiring: the round actually dispatches to the half
 # --------------------------------------------------------------------------- #
 class _RecordingRotation:
     """Records the size _evaluate_one asks for and deals the first k solvers."""
@@ -293,7 +262,7 @@ async def test_round_raises_the_dispatch_to_the_challenge_quorum(monkeypatch, ca
     assert result is not None
 
 
-async def test_round_honors_a_fixed_count_override(monkeypatch, capsys):
+async def test_round_ignores_a_retired_fixed_count_setting(monkeypatch, capsys):
     _install_dispatch(monkeypatch)
     rotation = _RecordingRotation()
 
@@ -305,8 +274,8 @@ async def test_round_honors_a_fixed_count_override(monkeypatch, capsys):
         _settings(dispatch_subset_k=3),
     )
 
-    assert rotation.requested == [3]
-    assert "contacted=3" in capsys.readouterr().out
+    assert rotation.requested == [4]
+    assert "contacted=4" in capsys.readouterr().out
 
 
 async def test_prelease_viability_still_reads_the_full_serving_count(monkeypatch):
@@ -450,9 +419,9 @@ def _outcome(uid: int, reward: float) -> MinerOutcome:
 def _engine(num_uids: int, decay: bool = True) -> EvalEngine:
     return EvalEngine(
         num_uids,
-        DEFAULTS.score_window_seconds,
-        DEFAULTS.score_window_max_samples,
-        DEFAULTS.score_window_min_samples,
+        LEGACY_SCORE_WINDOW_SECONDS,
+        RELEASE_POLICY.score_window_max_samples,
+        RELEASE_POLICY.score_window_min_samples,
         decay=decay,
         clock=lambda: 1000.0,
     )
@@ -564,13 +533,10 @@ def test_one_new_registration_does_not_close_an_established_weight_gate():
 # --------------------------------------------------------------------------- #
 # 7. Operator-facing defaults
 # --------------------------------------------------------------------------- #
-def test_env_example_documents_the_half_pool_default():
-    """.env.example is the file operators copy. It must not keep promising
-    full-pool dispatch after the default changed."""
+def test_env_example_does_not_pin_release_policy():
     text = (REPO_ROOT / ".env.example").read_text()
 
-    assert "DISPATCH_SUBSET_FRACTION=0.5" in text
-    assert "# DISPATCH_SUBSET_K=0" in text
+    assert "DISPATCH_SUBSET_FRACTION=" not in text
+    assert "DISPATCH_SUBSET_K=" not in text
     assert "FULL pool" not in text
     assert "All serving miners receive every problem" not in text
-    assert "half" in text.lower()

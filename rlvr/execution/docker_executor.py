@@ -10,7 +10,8 @@ isolation suitable for untrusted code:
   - ``--pids-limit``          : fork-bomb resistance.
   - dropped Linux capabilities, no-new-privileges, and an unprivileged uid.
   - stdout/stderr are continuously drained but retained only up to hard caps.
-  - One container PER TEST, killed at the per-test timeout.
+  - One container per submitted program; each test runs in a fresh child
+    process with its own timeout.
 
 Security posture MIRRORS SubprocessExecutor (see that module + _runner.py):
   - The container is NEVER given the expected answer; the parent (this class)
@@ -45,15 +46,15 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..types import ExecutionResult, TestCase
-from . import _runner
+from . import _batch_runner
 from .compare import values_equal
 from .executor import Executor
 from .framing import extract_framed as _extract_framed
 
-_RUNNER_SRC = Path(_runner.__file__).read_text(encoding="utf-8")
+_RUNNER_SRC = Path(_batch_runner.__file__).read_text(encoding="utf-8")
 _DOCKER_WATCHDOG_SLACK_S = 10.0
 _CONTAINER_CLEANUP_TIMEOUT_S = 10.0
-_MAX_STDOUT_BYTES = 256 * 1024
+_MAX_STDOUT_BYTES = _batch_runner._MAX_BATCH_BYTES + 64 * 1024
 _MAX_STDERR_BYTES = 64 * 1024
 
 
@@ -103,31 +104,29 @@ class DockerExecutor(Executor):
     ) -> list[ExecutionResult]:
         if not tests:
             return []
-        return [
-            self._run_one(idx, t, code, entrypoint, timeout_s)
-            for idx, t in enumerate(tests)
-        ]
+        return self._run_batch(code, entrypoint, tests, timeout_s)
 
     # ------------------------------------------------------------------ #
-    def _run_one(
+    def _run_batch(
         self,
-        idx: int,
-        test: TestCase,
         code: str,
         entrypoint: str,
+        tests: list[TestCase],
         timeout_s: float,
-    ) -> ExecutionResult:
+    ) -> list[ExecutionResult]:
         nonce = secrets.token_hex(16)
         container_name = f"rlvr-sbx-{secrets.token_hex(12)}"
         timeout_s = max(0.001, float(timeout_s))
-        # NOTE: expected is intentionally NOT sent into the container. The parent
-        # compares the returned value below; the runner emits only the value.
+        # Expected answers are intentionally omitted. The host compares returned
+        # values only after the container exits.
         payload = json.dumps(
             {
                 "code": code,
                 "entrypoint": entrypoint,
-                "args": test.args,
-                "kwargs": test.kwargs,
+                "tests": [
+                    {"args": test.args, "kwargs": test.kwargs} for test in tests
+                ],
+                "timeout_s": timeout_s,
                 "nonce": nonce,
             }
         )
@@ -148,6 +147,8 @@ class DockerExecutor(Executor):
             "import io;sys.stdin=io.StringIO(payload);"
             "g['main']()"
         )
+        timeout_slack_s = min(60.0, 5.0 + 0.025 * len(tests))
+        total_timeout_s = timeout_s * len(tests) + timeout_slack_s
         cmd = [
             self._docker,
             "run",
@@ -178,7 +179,7 @@ class DockerExecutor(Executor):
             "timeout",
             "--signal=TERM",
             "--kill-after=0.25",
-            f"{timeout_s:.6f}",
+            f"{total_timeout_s:.6f}",
             "python",
             "-I",
             "-S",
@@ -194,7 +195,7 @@ class DockerExecutor(Executor):
             proc, watchdog_timed_out, launch_error = self._run_bounded(
                 cmd,
                 stdin_blob.encode("utf-8"),
-                timeout_s + _DOCKER_WATCHDOG_SLACK_S,
+                total_timeout_s + _DOCKER_WATCHDOG_SLACK_S,
             )
             # GNU timeout normally exits 124. If candidate code ignores TERM,
             # --kill-after escalates to KILL and Docker reports 137—the same
@@ -211,39 +212,77 @@ class DockerExecutor(Executor):
 
         runtime_ms = (time.monotonic() - t0) * 1000.0
         if cleanup_error is not None:
-            return ExecutionResult(
-                test_index=idx,
-                passed=False,
-                actual_repr=None,
-                error=cleanup_error,
-                error_kind="sandbox_error",
-                timed_out=False,
-                runtime_ms=runtime_ms,
-            )
+            return self._batch_failure(tests, cleanup_error, runtime_ms)
         if watchdog_timed_out or (
             proc is not None
             and (proc.returncode == 124 or (proc.returncode == 137 and not oom_killed))
         ):
-            return ExecutionResult(
-                test_index=idx,
-                passed=False,
-                actual_repr=None,
-                error=f"container timed out after {timeout_s:.3f}s",
-                error_kind="timeout",
+            return self._batch_failure(
+                tests,
+                f"container timed out after {total_timeout_s:.3f}s",
+                runtime_ms,
                 timed_out=True,
-                runtime_ms=runtime_ms,
             )
         if launch_error is not None or proc is None:
-            return ExecutionResult(
-                test_index=idx,
+            return self._batch_failure(
+                tests,
+                launch_error or "docker launch failed without a result",
+                runtime_ms,
+            )
+        return self._parse_batch(tests, nonce, proc, runtime_ms)
+
+    @staticmethod
+    def _batch_failure(
+        tests: list[TestCase],
+        error: str,
+        runtime_ms: float,
+        *,
+        timed_out: bool = False,
+    ) -> list[ExecutionResult]:
+        return [
+            ExecutionResult(
+                test_index=index,
                 passed=False,
                 actual_repr=None,
-                error=launch_error or "docker launch failed without a result",
-                error_kind="sandbox_error",
-                timed_out=False,
+                error=error,
+                error_kind="timeout" if timed_out else "sandbox_error",
+                timed_out=timed_out,
                 runtime_ms=runtime_ms,
             )
-        return self._parse(idx, test, nonce, proc, runtime_ms)
+            for index, _ in enumerate(tests)
+        ]
+
+    @classmethod
+    def _parse_batch(
+        cls,
+        tests: list[TestCase],
+        nonce: str,
+        proc: subprocess.CompletedProcess[str],
+        runtime_ms: float,
+    ) -> list[ExecutionResult]:
+        payload = _extract_framed(proc.stdout or "", nonce)
+        if not isinstance(payload, dict) or payload.get("status") != "batch":
+            stderr = (proc.stderr or "").strip()
+            if proc.returncode == 137:
+                detail = "container killed (likely OOM / memory limit)"
+            else:
+                detail = stderr[-500:] if stderr else f"no output (rc={proc.returncode})"
+            return cls._batch_failure(
+                tests,
+                f"container produced no verdict: {detail}",
+                runtime_ms,
+            )
+        statuses = payload.get("results")
+        if not isinstance(statuses, list) or len(statuses) != len(tests):
+            return cls._batch_failure(
+                tests,
+                "container returned an invalid result count",
+                runtime_ms,
+            )
+        return [
+            cls._parse_status(index, test, status, runtime_ms)
+            for index, (test, status) in enumerate(zip(tests, statuses, strict=True))
+        ]
 
     @staticmethod
     def _run_bounded(
@@ -345,6 +384,8 @@ class DockerExecutor(Executor):
         stderr_thread.join(timeout=2.0)
         stdout_text = bytes(stdout).decode("utf-8", errors="replace")
         stderr_text = bytes(stderr).decode("utf-8", errors="replace")
+        if truncated["stdout"]:
+            stderr_text = "<stdout truncated; tail retained>\n" + stderr_text
         if truncated["stderr"]:
             stderr_text = "<stderr truncated; tail follows>\n" + stderr_text
         completed = subprocess.CompletedProcess(
@@ -390,8 +431,9 @@ class DockerExecutor(Executor):
         detail = (proc.stderr or proc.stdout or "unknown error").strip()[-500:]
         return f"docker cleanup failed for {container_name}: {detail}"
 
-    @staticmethod
+    @classmethod
     def _parse(
+        cls,
         idx: int,
         test: TestCase,
         nonce: str,
@@ -417,6 +459,25 @@ class DockerExecutor(Executor):
                 runtime_ms=runtime_ms,
             )
 
+        return cls._parse_status(idx, test, status, runtime_ms)
+
+    @staticmethod
+    def _parse_status(
+        idx: int,
+        test: TestCase,
+        status: object,
+        runtime_ms: float,
+    ) -> ExecutionResult:
+        if not isinstance(status, dict):
+            return ExecutionResult(
+                test_index=idx,
+                passed=False,
+                value_ok=False,
+                error="container returned an invalid test result",
+                error_kind="sandbox_error",
+                timed_out=False,
+                runtime_ms=runtime_ms,
+            )
         kind = status.get("status")
         if kind == "ok":
             value = status.get("value")
@@ -445,6 +506,16 @@ class DockerExecutor(Executor):
                 error=status.get("error", "unserializable return value"),
                 error_kind="unserializable",
                 timed_out=False,
+                runtime_ms=runtime_ms,
+            )
+        if kind == "timeout":
+            return ExecutionResult(
+                test_index=idx,
+                passed=False,
+                value_ok=False,
+                error=status.get("error", "test timed out"),
+                error_kind="timeout",
+                timed_out=True,
                 runtime_ms=runtime_ms,
             )
         # error / compile_error

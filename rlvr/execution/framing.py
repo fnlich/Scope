@@ -20,11 +20,19 @@ def _valid_status(obj: Any) -> bool:
         return set(obj) == {"status", "value"}
     if kind in {"error", "compile_error"}:
         return set(obj) == {"status", "error"} and isinstance(obj["error"], str)
+    if kind == "timeout":
+        return set(obj) == {"status", "error"} and isinstance(obj["error"], str)
     if kind == "unserializable":
         return (
             set(obj) == {"status", "error", "actual_repr"}
             and isinstance(obj["error"], str)
             and isinstance(obj["actual_repr"], str)
+        )
+    if kind == "batch":
+        return (
+            set(obj) == {"status", "results"}
+            and isinstance(obj["results"], list)
+            and all(_valid_status(item) for item in obj["results"])
         )
     return False
 

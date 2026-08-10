@@ -1,7 +1,8 @@
 """Verifier: turn a solution + hidden tests into a Verification verdict.
 
 Pipeline per solution:
-  1. Run the candidate against ALL hidden tests `determinism_runs` times.
+  1. Run the candidate against all hidden tests for the release-policy number
+     of verification passes (one in the current release).
   2. Detect a COMPILE failure from the executor's typed error signal. Syntax,
      import, and missing-entrypoint failures are surfaced as `compile_error`
      (reward 0); a callable that raises on some or all inputs remains a normal
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ..policy import RELEASE_POLICY, ValidatorPolicy
 from ..types import (
     ExecutionResult,
     Problem,
@@ -31,16 +33,22 @@ if TYPE_CHECKING:  # avoid a hard runtime dep on the execution module
 
 
 class Verifier:
-    def __init__(self, executor: "Executor", settings):
+    def __init__(
+        self,
+        executor: "Executor",
+        settings,
+        policy: ValidatorPolicy = RELEASE_POLICY,
+    ):
         self.executor = executor
         self.settings = settings
+        self.policy = policy
 
     # ------------------------------------------------------------------ #
     def verify(self, problem: Problem, solution: SolutionResponse) -> Verification:
         tests = problem.tests
         num_tests = len(tests)
         timeout_s = float(self.settings.per_test_timeout_s)
-        runs = max(1, int(self.settings.determinism_runs))
+        runs = self.policy.verification_runs
 
         # 1. Execute the candidate `runs` times over the full hidden suite.
         all_runs: list[list[ExecutionResult]] = []

@@ -114,7 +114,7 @@ class Verification(BaseModel):
     reward: float  # near-binary: 1.0 if all_passed else 0.0 (unless partial-credit)
     compile_error: Optional[str] = None  # syntax/import failure -> reward 0
     results: list[ExecutionResult] = Field(default_factory=list)
-    flagged_flaky: bool = False  # nondeterministic across determinism_runs
+    flagged_flaky: bool = False  # verdict changed across verification passes
 
 
 # --------------------------------------------------------------------------- #

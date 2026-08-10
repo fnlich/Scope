@@ -25,6 +25,7 @@ from rlvr.neurons.decentralized import (
     _submit_local_weights,
     _weight_observation_count,
 )
+from rlvr.policy import ValidatorPolicy
 from rlvr.scoring.eval_engine import EvalEngine
 
 
@@ -154,11 +155,8 @@ def test_six_observation_override_blocks_five_problem_rehearsal():
         max_samples=6,
         min_samples=4,
     )
-    settings = Settings(
-        _env_file=None,
-        netuid=5,
-        validator_min_weight_observations=6,
-    )
+    settings = Settings(_env_file=None, netuid=5)
+    policy = ValidatorPolicy(min_weight_observations=6)
     subtensor = _FakeSubtensor()
     validator = SimpleNamespace(
         metagraph=SimpleNamespace(hotkeys=["miner", "owner"], uids=[0, 251]),
@@ -168,12 +166,12 @@ def test_six_observation_override_blocks_five_problem_rehearsal():
 
     for _ in range(5):
         engine.update({0: 1.0, 1: 0.0}, dispatched={0, 1})
-    assert _submit_local_weights(validator, engine, settings) is None
+    assert _submit_local_weights(validator, engine, settings, policy=policy) is None
     assert subtensor.calls == []
     assert subtensor.owner_calls == subtensor.mode_calls == 0
 
     engine.update({0: 1.0, 1: 0.0}, dispatched={0, 1})
-    assert _submit_local_weights(validator, engine, settings) is True
+    assert _submit_local_weights(validator, engine, settings, policy=policy) is True
     assert len(subtensor.calls) == 1
 
 

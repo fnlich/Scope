@@ -69,6 +69,12 @@ If you omit the wallet arguments, edit only `WALLET_NAME` and `WALLET_HOTKEY`
 in `.env`, then run `./start_validator.sh`. The production URL, Finney network,
 NETUID 5, half-pool rotation, and sandbox image are already configured.
 
+Validator dispatch, scoring, payment, and cadence are release policy rather
+than operator settings. Pulling a release and restarting adopts that policy;
+legacy policy entries in an existing `.env` are ignored and named in a startup
+warning. Machine-specific resource limits and operator identity remain normal
+environment settings.
+
 Run the tests with:
 
 ```bash
@@ -76,6 +82,10 @@ Run the tests with:
 pip install -e '.[chain,dev]'
 pytest -q
 ```
+
+Validator hosts can measure local sandbox throughput with
+[`scripts/benchmark_grading.py`](scripts/benchmark_grading.py); see
+[`docs/GRADING_BENCHMARK.md`](docs/GRADING_BENCHMARK.md).
 
 ## Protocol
 
