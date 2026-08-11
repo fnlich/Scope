@@ -156,3 +156,123 @@ def test_docs_describe_the_validator_and_demo_miner_boundary():
         "rewards",
     ):
         assert keyword in readme
+
+
+# --------------------------------------------------------------------------- #
+# Stage-2 Rust activation package (docs/RUST_CHALLENGES.md): reproducible
+# sandbox image, honest digest handling, staged preflight, benchmark matrix.
+# --------------------------------------------------------------------------- #
+RUST_DOCKERFILE = REPO_ROOT / "docker" / "rust-sandbox" / "Dockerfile"
+RUST_BUILD_SCRIPT = SCRIPTS / "build_rust_sandbox.sh"
+
+
+def test_rust_sandbox_dockerfile_is_digest_pinned_and_minimal():
+    """The canonical image recipe: digest-pinned official Rust base, the
+    Python 3 supervisor runtime, nothing else. The toolchain version is
+    asserted AT BUILD TIME against the release policy's pin, so an image
+    built from a drifted base fails the build instead of skewing verdicts."""
+    from rlvr.policy import RELEASE_POLICY
+
+    assert RUST_DOCKERFILE.exists()
+    text = RUST_DOCKERFILE.read_text(encoding="utf-8")
+
+    from_lines = [l for l in text.splitlines() if l.startswith("FROM ")]
+    assert from_lines, "Dockerfile has no FROM line"
+    assert all("@sha256:" in line for line in from_lines), (
+        "base image must be digest-pinned, not tag-floating"
+    )
+    assert "python3" in text
+    assert "--no-install-recommends" in text
+    assert "rm -rf /var/lib/apt/lists" in text
+    # Build-time toolchain assertion, version-locked to policy.
+    assert RELEASE_POLICY.rustc_version in text
+    assert "rustc --version" in text
+
+
+def test_build_script_never_invents_a_digest():
+    """The ONLY digest that may enter RELEASE_POLICY is a registry
+    RepoDigest read back after a real push. The build script therefore
+    contains no digest literal of its own, reads the pinned toolchain
+    version from policy, self-checks the built image, and prints the
+    published digest with the policy line to update."""
+    assert RUST_BUILD_SCRIPT.exists()
+    result = subprocess.run(
+        ["bash", "-n", str(RUST_BUILD_SCRIPT)], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+
+    text = RUST_BUILD_SCRIPT.read_text(encoding="utf-8")
+    assert "@sha256:" not in text, "digests are read from the registry, never typed"
+    assert "RepoDigests" in text
+    assert "RELEASE_POLICY" in text
+    assert "rustc --version" in text
+    assert "--push" in text
+    assert "policy" in text
+
+
+def test_preflight_validates_rust_image_without_blocking_python_operation():
+    """Staged semantics: the rust section reports readiness truthfully but
+    NEVER fails a python-only validator by default; --require-rust exists
+    for operators who expect the custom image to be live. The checks name
+    the policy pin and the real toolchain probe."""
+    preflight = (SCRIPTS / "preflight_validator.sh").read_text(encoding="utf-8")
+
+    assert "RELEASE_POLICY.rust_image" in preflight
+    assert "rustc --version" in preflight
+    assert "--require-rust" in preflight
+    assert "python-only" in preflight.lower()
+
+
+def test_benchmark_covers_the_rust_matrix():
+    """The deployment benchmark grows a language axis plus the knobs the
+    canonical matrix needs: source-size padding for the compile axis and
+    the adversarial cases, all synthetic."""
+    result = subprocess.run(
+        [os.fspath(REPO_ROOT / ".venv" / "bin" / "python"),
+         str(SCRIPTS / "benchmark_grading.py"), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--language" in result.stdout
+    assert "rust" in result.stdout
+    assert "--source-pad-bytes" in result.stdout
+    assert "--adversarial" in result.stdout
+    # BENCHMARK-ONLY image override: the validator's executor is policy-pinned
+    # (and must stay so), which means a locally built, not-yet-published image
+    # is unbenchmarkable without a dev-tool override. The flag lets benchmark
+    # data exist BEFORE the registry push decision, is echoed in the output
+    # configuration block, and touches nothing in validator runtime.
+    assert "--image" in result.stdout
+
+
+def test_env_example_carries_no_rust_knobs():
+    """Everything rust is release policy; nothing rust is operator env.
+    Green today and must stay green — this is the B3 boundary expressed at
+    the operator-facing file."""
+    text = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "RUST" not in text.upper()
+
+
+def test_rust_sandbox_image_provides_the_full_supervisor_stdlib():
+    """MEASURED on the benchmark host: python3-minimal lacks shutil under
+    `python3 -I -S`, so the supervisor's tempfile import dies before the
+    first case runs. The image must install the FULL python3 stdlib, and —
+    the durable half of the pin — the build must PROVE the supervisor's
+    import surface under the exact isolated flags the container uses, so
+    any future Debian stdlib split fails the build, not the fleet."""
+    text = RUST_DOCKERFILE.read_text(encoding="utf-8")
+
+    assert "python3-minimal" not in text
+    assert "python3 -I -S" in text
+    assert "tempfile" in text, (
+        "build must import-check the supervisor's stdlib surface"
+    )
+
+
+def test_preflight_checks_rust_memory_requirement():
+    preflight = (SCRIPTS / "preflight_validator.sh").read_text(encoding="utf-8")
+
+    assert "MemTotal" in preflight
+    assert "VALIDATOR_VERIFY_CONCURRENCY" in preflight

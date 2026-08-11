@@ -8,6 +8,7 @@ the miner requests whose signed responses unlock the reveal.
 from __future__ import annotations
 
 import hashlib
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -31,6 +32,7 @@ class PublicChallenge(_WireModel):
 
     challenge_id: str = Field(min_length=1, max_length=128)
     problem_id: str = Field(min_length=1, max_length=256)
+    language: Literal["python", "rust"]
     statement: str = Field(min_length=1, max_length=500_000)
     entrypoint: str = Field(
         min_length=1,
@@ -49,6 +51,7 @@ class PublicChallenge(_WireModel):
         """Materialize the validator-local problem after the test reveal."""
         return Problem(
             problem_id=self.problem_id,
+            language=self.language,
             statement=self.statement,
             entrypoint=self.entrypoint,
             tests=tests,
@@ -95,6 +98,7 @@ class ChallengeRevealRequest(_WireModel):
 
 class ChallengeRevealResponse(_WireModel):
     challenge_id: str = Field(min_length=1, max_length=128)
+    language: Literal["python", "rust"]
     tests: list[TestCase] = Field(default_factory=list, max_length=1000)
 
 

@@ -37,6 +37,7 @@ class _Client:
             challenge=PublicChallenge(
                 challenge_id="challenge-1",
                 problem_id="problem-1",
+                language="python",
                 statement="Return a + b.",
                 entrypoint="add",
                 commit_min_responses=1,
@@ -57,7 +58,9 @@ class _Client:
 
     async def reveal(self, challenge_id, commit_token):
         return SimpleNamespace(
-            challenge_id=challenge_id, tests=[TestCase(args=[1, 2], expected=3)]
+            challenge_id=challenge_id,
+            language="python",
+            tests=[TestCase(args=[1, 2], expected=3)],
         )
 
     async def feedback(self, feedback):

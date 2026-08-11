@@ -71,6 +71,7 @@ class FakeExecutor:
 def make_problem(n_tests=3) -> Problem:
     return Problem(
         problem_id="p1",
+        language="python",
         statement="add",
         entrypoint="f",
         tests=[Case(args=[i], expected=i) for i in range(n_tests)],

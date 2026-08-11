@@ -24,16 +24,23 @@ from ..protocol import (
     verify_signature,
 )
 
-SYSTEM_PROMPT = (
+PYTHON_SYSTEM_PROMPT = (
     "Implement the requested Python function exactly as specified. Return one "
     "complete, self-contained Python code block defining the required entrypoint. "
     "Use only the Python standard library. Do not include explanations, tests, "
     "example calls, or input/output handling."
 )
+RUST_SYSTEM_PROMPT = (
+    "Write one complete, self-contained Rust program with fn main(). Read the "
+    "input from standard input and write only the requested answer to standard "
+    "output. Use only the Rust standard library. Do not include explanations, "
+    "tests, or Cargo files."
+)
 
 _PYTHON_FENCE_RE = re.compile(
     r"```(?:python|py)\s*\n(.*?)```", re.IGNORECASE | re.DOTALL
 )
+_RUST_FENCE_RE = re.compile(r"```rust\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 _ANY_FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
 
 
@@ -80,18 +87,33 @@ def extract_python(text: str) -> str:
     return (match.group(1) if match else text).strip()
 
 
+def extract_rust(text: str) -> str:
+    """Extract the first Rust fence, then any fence, or use the whole reply."""
+
+    match = _RUST_FENCE_RE.search(text) or _ANY_FENCE_RE.search(text)
+    return (match.group(1) if match else text).strip()
+
+
 def build_model_messages(request: TaskRequest) -> list[dict[str, str]]:
     """Render a task using only fields in the request wire model."""
 
     prompt = request.statement.strip()
-    prompt += f"\n\nRequired function name: {request.entrypoint}"
+    if request.language == "python":
+        prompt += f"\n\nRequired function name: {request.entrypoint}"
     if request.public_examples:
         examples = [case.model_dump(mode="json") for case in request.public_examples]
         prompt += "\n\nPublic examples:\n" + json.dumps(
             examples, ensure_ascii=False, indent=2
         )
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": (
+                RUST_SYSTEM_PROMPT
+                if request.language == "rust"
+                else PYTHON_SYSTEM_PROMPT
+            ),
+        },
         {"role": "user", "content": prompt},
     ]
 
@@ -261,7 +283,11 @@ class DemoMiner:
             )
         return SolutionPayload(
             problem_id=request.problem_id,
-            code=extract_python(raw),
+            code=(
+                extract_rust(raw)
+                if request.language == "rust"
+                else extract_python(raw)
+            ),
             raw_response=raw,
         )
 

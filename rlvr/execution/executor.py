@@ -51,13 +51,21 @@ class Executor(ABC):
         raise NotImplementedError
 
 
-def get_executor(settings) -> Executor:
+def get_executor(settings, language: str) -> Executor:
     """Construct the configured executor.
 
     ``settings.executor == 'subprocess'`` -> SubprocessExecutor (dev only).
     ``settings.executor == 'docker'``     -> DockerExecutor (default).
     """
+    if language not in {"python", "rust"}:
+        raise ValueError(f"Unknown challenge language {language!r}.")
     kind = getattr(settings, "executor", "docker")
+    if language == "rust":
+        if kind != "docker":
+            raise RuntimeError("Rust challenge execution requires the Docker executor")
+        from .rust_docker_executor import RustDockerExecutor
+
+        return RustDockerExecutor(settings)
     if kind == "subprocess":
         from .subprocess_executor import SubprocessExecutor
 

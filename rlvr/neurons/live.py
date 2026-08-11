@@ -100,6 +100,7 @@ class LiveSolverClient:
         """Return exact miner-signed bytes for commit-before-test-reveal."""
         req = TaskRequest(
             problem_id=request_id,
+            language=problem.language,
             statement=problem.statement,
             entrypoint=problem.entrypoint,
             public_examples=problem.public_examples,

@@ -94,6 +94,7 @@ def setup_transport(
     )
     problem = Problem(
         problem_id="p1",
+        language="python",
         statement="Return a + b.",
         entrypoint="add",
         tests=[Case(args=[20, 22], expected=42)],
@@ -141,6 +142,7 @@ async def test_dispatch_total_deadline_stops_drip_fed_http_response(
     public = PublicChallenge(
         challenge_id="drip-challenge",
         problem_id=problem.problem_id,
+        language=problem.language,
         statement=problem.statement,
         entrypoint=problem.entrypoint,
         public_examples=problem.public_examples,

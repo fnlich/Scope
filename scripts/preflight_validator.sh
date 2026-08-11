@@ -8,12 +8,17 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 pull_image=false
-if [[ "${1:-}" == "--pull" ]]; then
-  pull_image=true
+require_rust=false
+while (( $# )); do
+  case "$1" in
+    --pull) pull_image=true ;;
+    --require-rust) require_rust=true ;;
+    *) echo "[preflight] ERROR: usage: $0 [--pull] [--require-rust]" >&2; exit 2 ;;
+  esac
   shift
-fi
+done
 if (( $# != 0 )); then
-  echo "[preflight] ERROR: usage: $0 [--pull]" >&2
+  echo "[preflight] ERROR: usage: $0 [--pull] [--require-rust]" >&2
   exit 2
 fi
 
@@ -156,3 +161,62 @@ if skew > 5:
     )
 print("[preflight] problem server reachable; unsigned lease rejected; clock synchronized")
 PY
+
+rust_image="$("${python_bin}" - <<'PY'
+from rlvr.policy import RELEASE_POLICY
+print(RELEASE_POLICY.rust_image)
+PY
+)"
+if [[ "${EXECUTOR}" == "docker" ]]; then
+  rust_capacity="$("${python_bin}" - <<'PY'
+from rlvr.config import get_settings
+from rlvr.neurons.decentralized import _host_memory_bytes, _rust_verify_concurrency
+
+settings = get_settings()
+print(
+    _host_memory_bytes(),
+    settings.validator_verify_concurrency,
+    _rust_verify_concurrency(settings),
+)
+PY
+)"
+  read -r host_memory_bytes VALIDATOR_VERIFY_CONCURRENCY effective_rust_slots \
+    <<<"${rust_capacity}"
+  echo "[preflight] rust memory MemTotal=${host_memory_bytes} configured_slots=${VALIDATOR_VERIFY_CONCURRENCY} effective_slots=${effective_rust_slots}"
+  rust_required_memory=$((14 * 1024 * 1024 * 1024))
+  if (( host_memory_bytes < rust_required_memory )); then
+    if [[ "${require_rust}" == true ]]; then
+      echo "[preflight] ERROR: Rust grading requires a nominal 16 GiB host." >&2
+      exit 1
+    fi
+    echo "[preflight] WARN: Rust grading requires a nominal 16 GiB host." >&2
+  fi
+fi
+rust_ready=false
+if [[ "${EXECUTOR}" == "docker" ]]; then
+  if [[ "${pull_image}" == true ]]; then
+    run_timed 600 docker pull "${rust_image}" >/dev/null 2>&1 || true
+  fi
+  if run_timed 20 docker image inspect "${rust_image}" >/dev/null 2>&1 \
+    && run_timed 20 docker run --rm --pull=never --network=none --read-only \
+      --cap-drop=ALL --security-opt=no-new-privileges \
+      "${rust_image}" sh -ec 'rustc --version; command -v python3; command -v timeout' \
+      >/dev/null 2>&1 \
+    && run_timed 120 "${python_bin}" - <<'PY'
+from rlvr.config import get_settings
+from rlvr.neurons.decentralized import _rust_ready
+raise SystemExit(0 if _rust_ready(get_settings()) else 1)
+PY
+  then
+    rust_ready=true
+  fi
+fi
+
+if [[ "${rust_ready}" == true ]]; then
+  echo "[preflight] rust ready; validator will advertise rust support"
+elif [[ "${require_rust}" == true ]]; then
+  echo "[preflight] ERROR: rust sandbox is not ready: ${rust_image}" >&2
+  exit 1
+else
+  echo "[preflight] rust not ready; continuing in python-only mode"
+fi

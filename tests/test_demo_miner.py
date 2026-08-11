@@ -91,6 +91,7 @@ def test_extract_python_prefers_python_fence():
 def test_model_prompt_contains_only_public_task_data():
     request = TaskRequest(
         problem_id="request-id",
+        language="python",
         statement="Add two integers.",
         entrypoint="add",
         public_examples=[Case(args=[20, 22], expected=42)],
@@ -181,6 +182,7 @@ def setup_roundtrip(*, permit: bool = True, request_limit: int = 1_000_000):
     )
     problem = Problem(
         problem_id="canonical-problem-id",
+        language="python",
         statement="Add two integers.",
         entrypoint="add",
         tests=[],
@@ -211,6 +213,7 @@ async def test_provider_http_failure_returns_signed_zero_code(capsys):
     )
     request = TaskRequest(
         problem_id="request-id",
+        language="python",
         statement="Implement f.",
         entrypoint="f",
     )
@@ -242,3 +245,50 @@ async def test_demo_miner_rejects_oversized_request():
 
     assert solution.code == ""
     assert "HTTP 413" in solution.raw_response
+
+
+# --------------------------------------------------------------------------- #
+# Rust prompting and extraction (docs/RUST_CHALLENGES.md)
+# --------------------------------------------------------------------------- #
+def test_rust_task_prompts_for_a_complete_program():
+    from rlvr.neurons.demo_miner import RUST_SYSTEM_PROMPT
+
+    request = TaskRequest(
+        problem_id="p",
+        statement="Sum the integers on stdin.",
+        entrypoint="main",
+        language="rust",
+    )
+
+    messages = build_model_messages(request)
+
+    assert messages[0]["content"] == RUST_SYSTEM_PROMPT
+    assert "Rust" in RUST_SYSTEM_PROMPT
+    assert "standard input" in RUST_SYSTEM_PROMPT
+    # Program mode has no entrypoint concept for the model to target.
+    assert "Required function name" not in messages[1]["content"]
+
+
+def test_python_prompt_is_unchanged_when_language_is_omitted():
+    from rlvr.neurons.demo_miner import PYTHON_SYSTEM_PROMPT
+
+    request = TaskRequest(
+        problem_id="p",
+        statement="Return a + b.",
+        entrypoint="add",
+        language="python",
+    )
+
+    messages = build_model_messages(request)
+
+    assert messages[0]["content"] == PYTHON_SYSTEM_PROMPT
+    assert "Required function name: add" in messages[1]["content"]
+
+
+def test_rust_fence_is_preferred_over_other_fences():
+    from rlvr.neurons.demo_miner import extract_rust
+
+    both = "```python\nx = 1\n```\n\n```rust\nfn main() {}\n```"
+    assert extract_rust(both) == "fn main() {}"
+    assert extract_rust("```\nfn main() {}\n```") == "fn main() {}"
+    assert extract_python("```python\nx = 1\n```") == "x = 1"

@@ -81,28 +81,17 @@ inherits the previous miner's results.
 Validators periodically normalize those scores and submit weights through
 Bittensor, but only after the release-policy minimum number of completed
 observations is present in the authoritative score histories.
-The SN5 release cadence is 75 blocks (about 15 minutes) for challenge
+The SN5 release cadence is 38 blocks (about 7.5 minutes) for challenge
 attempts and 180 blocks for weights. The problem service uses `Retry-After` to
 enforce per-validator pacing and shared global-slot contention. The effective weight
 cadence is `max(release interval, chain rate limit + 20)`; 180 is safely
 above the known 100-block limit and allows roughly two attempts per 360-block
 tempo.
 
-The launch validator reserves 40% of the vector for the dynamically resolved
-subnet-owner UID. With NETUID 5's chain mode set to `Burn`, that owner-directed
-miner incentive is destroyed rather than paid to the owner; positive-scoring
-miners divide the remaining 60%. A valid completed history with no positive
-miner score directs the entire vector to burn. The owner is removed from the
-scored-miner allocation, and each positive miner receives a small floor that
-survives Bittensor's uint16 weight conversion.
-
-Owner hotkey and chain mode are read as one cached pair and refreshed hourly.
-A transient read uses the last-known-good pair. A missing first mapping prevents
-submission; an inconsistent formerly valid mapping or a non-`Burn` chain mode
-falls back without a reserved burn share and emits a prominent error. When the
-owner mapping remains valid in a non-`Burn` mode, the owner is removed from that
-fallback vector. Weight submission waits for inclusion in a worker thread, but
-not finalization, so the synchronous SDK call does not block the event loop.
+The release owner burn share is 0%. Validators submit the normalized miner
+score vector without an owner reservation and skip an all-zero vector. Weight
+submission waits for inclusion in a worker thread, but not finalization, so the
+synchronous SDK call does not block the event loop.
 
 Rounds with an elevated sandbox-error rate run an independent known-good
 sandbox probe before scores are changed. A failed probe discards the grading

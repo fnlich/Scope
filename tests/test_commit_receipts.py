@@ -22,6 +22,7 @@ class Client:
             challenge=PublicChallenge(
                 challenge_id="challenge",
                 problem_id="problem",
+                language="python",
                 statement="Return the input.",
                 entrypoint="solve",
             ),
