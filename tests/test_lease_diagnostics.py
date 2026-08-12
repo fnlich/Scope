@@ -24,6 +24,7 @@ httpx = pytest.importorskip("httpx")
 _CHALLENGE = {
     "challenge_id": "challenge-1",
     "problem_id": "problem-1",
+    "language": "python",
     "statement": "Return a + b.",
     "entrypoint": "add",
 }

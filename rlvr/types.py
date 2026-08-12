@@ -7,7 +7,7 @@ scoring, and chain logic. Keep I/O JSON-serializable.
 from __future__ import annotations
 
 import enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -52,6 +52,7 @@ class Problem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     problem_id: str
+    language: Literal["python", "rust"]
     statement: str  # natural-language task shown to the solver
     entrypoint: str  # function name the solver must implement
     tests: list[TestCase]  # hidden tests, never shipped to solvers

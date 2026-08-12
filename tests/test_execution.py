@@ -129,14 +129,14 @@ def test_values_equal_structural():
 # factory
 # --------------------------------------------------------------------------- #
 def test_get_executor_subprocess():
-    inst = get_executor(_Settings("subprocess"))
+    inst = get_executor(_Settings("subprocess"), language="python")
     assert isinstance(inst, SubprocessExecutor)
     assert isinstance(inst, Executor)
 
 
 def test_get_executor_unknown_raises():
     with pytest.raises(ValueError):
-        get_executor(_Settings("bogus"))
+        get_executor(_Settings("bogus"), language="python")
 
 
 # --------------------------------------------------------------------------- #

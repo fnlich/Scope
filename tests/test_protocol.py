@@ -171,6 +171,7 @@ def test_sign_accepts_wallet_like_object():
 def test_task_request_defaults_and_examples():
     req = TaskRequest(
         problem_id="p1",
+        language="python",
         statement="Add two numbers.",
         entrypoint="add",
         public_examples=[Case(args=[1, 2], expected=3)],

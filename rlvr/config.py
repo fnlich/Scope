@@ -67,7 +67,6 @@ class Settings(BaseSettings):
     # separate from the larger cap for problem-server challenge/reveal
     # responses so full-pool commits remain predictably bounded.
     miner_max_response_bytes: int = Field(default=128_000, gt=0, le=1_000_000)
-    problem_max_response_bytes: int = Field(default=512_000, gt=0, le=10_000_000)
     problem_server_request_timeout_s: float = Field(default=60.0, gt=0.0)
     problem_server_metagraph_sync_s: float = Field(default=60.0, gt=0.0)
     # HTTP fan-out width when querying miners. I/O-bound: full-pool dispatch
@@ -139,7 +138,6 @@ _SAFE_EFFECTIVE_SETTINGS = {
     "docker_pids_limit": "DOCKER_PIDS_LIMIT",
     "executor": "EXECUTOR",
     "miner_max_response_bytes": "MINER_MAX_RESPONSE_BYTES",
-    "problem_max_response_bytes": "PROBLEM_MAX_RESPONSE_BYTES",
     "problem_server_request_timeout_s": "PROBLEM_SERVER_REQUEST_TIMEOUT_S",
     "validator_dispatch_concurrency": "VALIDATOR_DISPATCH_CONCURRENCY",
     "validator_send_concurrency": "VALIDATOR_SEND_CONCURRENCY",

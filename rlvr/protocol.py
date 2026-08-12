@@ -39,7 +39,7 @@ import hmac
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Mapping, Optional
+from typing import Any, Literal, Mapping, Optional
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -87,6 +87,7 @@ class TaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     problem_id: str = Field(min_length=1, max_length=256)
+    language: Literal["python", "rust"]
     statement: str = Field(min_length=1, max_length=500_000)
     entrypoint: str = Field(
         min_length=1,

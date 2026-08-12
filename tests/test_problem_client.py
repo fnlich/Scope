@@ -24,6 +24,7 @@ httpx = pytest.importorskip("httpx")
 _CHALLENGE = {
     "challenge_id": "challenge-1",
     "problem_id": "problem-1",
+    "language": "python",
     "statement": "Return a + b.",
     "entrypoint": "add",
 }
@@ -421,7 +422,10 @@ async def test_legacy_callers_stay_failure_shaped_when_a_response_precedes_trans
             "commit",
             b'{"accepted":true,"commit_token":"token","num_submissions":0}',
         ),
-        ("reveal", b'{"challenge_id":"challenge-1","tests":[]}'),
+        (
+            "reveal",
+            b'{"challenge_id":"challenge-1","language":"python","tests":[]}',
+        ),
         ("feedback", b'{"accepted":true}'),
     ],
 )
@@ -438,3 +442,77 @@ async def test_legacy_callers_retry_an_oversized_retryable_error(
 
     assert handler.attempts["n"] == 2
     assert result is not LEGACY_FAILURE[method]
+
+
+# --------------------------------------------------------------------------- #
+# Canonical V2 lease request: no capability negotiation.
+# --------------------------------------------------------------------------- #
+def _capturing_client(captured: dict, max_response_bytes: int = 2 * 1024 * 1024):
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        body = captured.get("response_body") or json.dumps(
+            {**_CHALLENGE, "language": "python"}
+        ).encode()
+        return httpx.Response(200, content=body)
+
+    return ProblemServerClient(
+        url="https://problems.invalid",
+        wallet="validator-hotkey",
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        retries=1,
+        max_response_bytes=max_response_bytes,
+    )
+
+
+def test_client_has_no_capability_parameter():
+    """The server's canonical V2 removed capability negotiation; a client
+    still accepting the parameter would tempt a call site into serializing
+    a field the server rejects wholesale."""
+    with pytest.raises(TypeError):
+        ProblemServerClient(
+            url="https://problems.invalid",
+            wallet="validator-hotkey",
+            http=None,
+            supported_languages=["python"],
+        )
+
+
+async def test_lease_body_is_exactly_request_id():
+    captured: dict = {}
+    client = _capturing_client(captured)
+
+    await client.lease()
+
+    assert set(captured["body"]) == {"request_id"}
+
+
+async def test_large_python_lease_is_accepted_under_the_single_v2_cap():
+    """V1 held python responses to 512,000 bytes to protect deployed old
+    validators; the cutover retires those readers, and the server's V2
+    contract states one >=2 MiB read limit for BOTH languages on BOTH
+    wires. A ~560 KB python lease — max-length statement plus example
+    bulk, every FIELD within its unchanged V1 limit — must now lease,
+    not report MALFORMED. (The statement field limit itself stays at
+    500,000: see test_rust_wire_compat's field-limit pin.)"""
+    captured: dict = {}
+    big_statement = "x" * 500_000
+    examples = [
+        {"args": ["y" * 2000], "kwargs": {}, "expected": "z"} for _ in range(30)
+    ]
+    body = json.dumps(
+        {
+            **_CHALLENGE,
+            "language": "python",
+            "statement": big_statement,
+            "public_examples": examples,
+        }
+    ).encode()
+    assert len(body) > 512_000, "fixture must exceed the retired V1 cap"
+    captured["response_body"] = body
+    client = _capturing_client(captured)
+
+    outcome = await client.lease()
+
+    assert outcome.category is LeaseCategory.LEASED
+    assert outcome.challenge is not None
+    assert outcome.challenge.statement == big_statement

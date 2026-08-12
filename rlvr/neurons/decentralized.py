@@ -11,6 +11,7 @@ import asyncio
 import json
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, cast
@@ -48,23 +49,10 @@ from .live import LiveSolverClient, SendGate, _solver_clients
 from .validator import ValidatorNeuron
 
 _MINER_RESPONSE_GRACE_S = 10.0
-OWNER_BURN_SHARE = RELEASE_POLICY.owner_burn_share
-_OWNER_BURN_CACHE_TTL_S = 3_600.0
 _SANDBOX_ERROR_PROBE_THRESHOLD = 0.25
-_U16_MAX = 65_535
 _WEIGHTS_RATE_LIMIT_MARGIN = 20
 _MAX_WEIGHT_DETAIL_CHARS = 200
 _MAX_WEIGHT_FIELD_CHARS = 80
-
-
-@dataclass
-class _OwnerBurnState:
-    """Last atomically resolved owner-hotkey and recycle/burn mode pair."""
-
-    owner_hotkey: Optional[str] = None
-    mode: Optional[str] = None
-    checked_at: float = 0.0
-    last_valid_hotkey: Optional[str] = None
 
 
 @dataclass
@@ -244,166 +232,12 @@ def _weight_observation_count(engine: EvalEngine) -> int:
     return max((len(history) for history in engine.histories.values()), default=0)
 
 
-def _chain_mode_name(value: object) -> str:
-    """Normalize the decoded RecycleOrBurn storage value without guessing."""
-    raw = getattr(value, "value", value)
-    if isinstance(raw, dict) and len(raw) == 1:
-        raw = next(iter(raw))
-    name = getattr(raw, "name", None)
-    if isinstance(name, str) and name:
-        raw = name
-    text = str(raw).strip()
-    if "::" in text:
-        text = text.rsplit("::", 1)[-1]
-    return text.strip(" <>'\"")
-
-
-def _refresh_owner_burn_state(
-    validator: ValidatorNeuron,
-    state: _OwnerBurnState,
-    settings: Settings,
-    *,
-    force: bool = False,
-    now: Optional[float] = None,
-) -> bool:
-    """Refresh owner and mode together, retaining a last-known-good pair."""
-    current = time.monotonic() if now is None else float(now)
-    has_pair = bool(state.owner_hotkey and state.mode)
-    if (
-        not force
-        and has_pair
-        and current - state.checked_at < _OWNER_BURN_CACHE_TTL_S
-    ):
-        return True
-    try:
-        block = int(validator.subtensor.get_current_block())
-        owner_hotkey = str(
-            validator.subtensor.get_subnet_owner_hotkey(
-                settings.netuid, block=block
-            )
-            or ""
-        ).strip()
-        mode = _chain_mode_name(
-            validator.subtensor.query_subtensor(
-                "RecycleOrBurn", params=[settings.netuid], block=block
-            )
-        )
-        if not owner_hotkey or not mode:
-            raise ValueError("chain returned an empty owner hotkey or mode")
-    except Exception as exc:  # noqa: BLE001 - stale safe cache is intentional
-        if has_pair:
-            print(
-                "[validator] WARN: owner/burn-mode refresh failed; "
-                f"using last-known-good chain values ({exc})"
-            )
-            return True
-        print(
-            "[validator] ERROR: owner/burn-mode resolution failed; "
-            f"refusing weight submission ({exc})"
-        )
-        return False
-
-    # Replace only after both reads have succeeded, so a transient RPC failure
-    # can never combine a new owner with a stale mode (or the reverse).
-    state.owner_hotkey = owner_hotkey
-    state.mode = mode
-    state.checked_at = current
-    return True
-
-
-def _owner_position(
-    validator: ValidatorNeuron, owner_hotkey: str
-) -> tuple[Optional[int], str]:
-    """Locate an owner by hotkey; metagraph UIDs need not equal list positions."""
-    hotkeys = [str(hotkey) for hotkey in validator.metagraph.hotkeys]
-    raw_uids = list(validator.metagraph.uids)
-    if len(hotkeys) != len(raw_uids):
-        return None, "metagraph hotkey/UID lengths differ"
-    try:
-        uids = [int(uid) for uid in raw_uids]
-    except (TypeError, ValueError):
-        return None, "metagraph contains a non-integer UID"
-    if len(set(uids)) != len(uids):
-        return None, "metagraph contains duplicate UIDs"
-    positions = [idx for idx, hotkey in enumerate(hotkeys) if hotkey == owner_hotkey]
-    if len(positions) != 1:
-        return None, f"owner hotkey matched {len(positions)} metagraph entries"
-    return positions[0], ""
-
-
-def _without_owner(weights: np.ndarray, owner_position: int) -> np.ndarray:
-    """Remove an owner from an ordinary miner vector and renormalize."""
-    adjusted = np.asarray(weights, dtype=np.float64).copy()
-    adjusted[owner_position] = 0.0
-    total = float(adjusted.sum())
-    if total > 0.0:
-        adjusted /= total
-    return adjusted
-
-
-def _build_owner_burn_weights(
-    weights: np.ndarray, owner_position: int
-) -> np.ndarray:
-    """Reserve 40% for burn while preserving every positive miner on chain."""
-    base = np.asarray(weights, dtype=np.float64)
-    if (
-        base.ndim != 1
-        or owner_position < 0
-        or owner_position >= base.size
-        or not np.all(np.isfinite(base))
-        or np.any(base < 0.0)
-    ):
-        raise ValueError("weights and owner position must form a valid vector")
-
-    miners = base.copy()
-    miners[owner_position] = 0.0
-    positive = miners > 0.0
-    total = float(miners.sum())
-    output = np.zeros_like(miners)
-    if total <= 0.0:
-        output[owner_position] = 1.0
-        return output
-
-    # Bittensor 10.5 max-normalizes before uint16 conversion. A floor just
-    # above owner_share / 65535 guarantees each positive miner survives as at
-    # least one quantum while zero-score miners remain zero.
-    min_share = float(
-        np.nextafter(OWNER_BURN_SHARE / _U16_MAX, np.inf)
-    )
-    positive_count = int(np.count_nonzero(positive))
-    remaining = (1.0 - OWNER_BURN_SHARE) - positive_count * min_share
-    if remaining < 0.0:
-        raise ValueError("too many positive miners for the uint16 preservation floor")
-    output[positive] = min_share + remaining * (miners[positive] / total)
-    output[owner_position] = OWNER_BURN_SHARE
-    output[owner_position] += 1.0 - float(output.sum())
-    effective = _effective_u16_share(output, owner_position)
-    if abs(effective - OWNER_BURN_SHARE) > 0.01:
-        raise ValueError("uint16 conversion moved the effective burn unexpectedly")
-    return output
-
-
-def _effective_u16_share(weights: np.ndarray, position: int) -> float:
-    """Predict one UID's effective share after Bittensor 10.5 conversion."""
-    vector = np.asarray(weights, dtype=np.float64)
-    maximum = float(vector.max())
-    if maximum <= 0.0:
-        return 0.0
-    quantized = np.asarray(
-        [round(float(weight / maximum) * _U16_MAX) for weight in vector],
-        dtype=np.float64,
-    )
-    total = float(quantized.sum())
-    return float(quantized[position] / total) if total > 0.0 else 0.0
-
-
 def _submit_local_weights(
     validator: ValidatorNeuron,
     engine: EvalEngine,
     settings: Settings,
     *,
     log_response_repr: bool = False,
-    owner_burn_state: Optional[_OwnerBurnState] = None,
     policy: ValidatorPolicy = RELEASE_POLICY,
 ) -> Optional[bool]:
     """Submit normalized local weights only after enough completed evidence."""
@@ -416,47 +250,7 @@ def _submit_local_weights(
         )
         return None
 
-    state = owner_burn_state or _OwnerBurnState()
-    if not _refresh_owner_burn_state(validator, state, settings):
-        return None
-
-    owner_hotkey = state.owner_hotkey or ""
-    owner_position, owner_error = _owner_position(validator, owner_hotkey)
-    if owner_position is None:
-        # A cached owner missing from a freshly synced metagraph may have
-        # changed. Refresh immediately rather than waiting for the hourly TTL.
-        if not _refresh_owner_burn_state(
-            validator, state, settings, force=True
-        ):
-            return None
-        owner_hotkey = state.owner_hotkey or ""
-        owner_position, owner_error = _owner_position(validator, owner_hotkey)
-    if owner_position is None:
-        if state.last_valid_hotkey is None:
-            print(
-                "[validator] ERROR: registered owner is not uniquely present in "
-                f"the current metagraph; refusing weight submission ({owner_error})"
-            )
-            return None
-        print(
-            "[validator] ERROR: registered owner mapping became inconsistent; "
-            f"submitting an ordinary vector without a burn reservation ({owner_error})"
-        )
-        weights = engine.get_weights(n=len(validator.metagraph.hotkeys))
-        burn_active = False
-    else:
-        state.last_valid_hotkey = owner_hotkey
-        base = engine.get_weights(n=len(validator.metagraph.hotkeys))
-        if (state.mode or "").casefold() == "burn":
-            weights = _build_owner_burn_weights(base, owner_position)
-            burn_active = True
-        else:
-            print(
-                "[validator] ERROR: chain RecycleOrBurn mode is "
-                f"{state.mode!r}, not 'Burn'; submitting miner-only weights"
-            )
-            weights = _without_owner(base, owner_position)
-            burn_active = False
+    weights = engine.get_weights(n=len(validator.metagraph.hotkeys))
 
     if float(sum(weights)) <= 0.0:
         print("[validator] local miner weights are all-zero; skipping")
@@ -475,14 +269,6 @@ def _submit_local_weights(
     ok, message = _weight_result_status(result)
     failure_detail = _weight_failure_report(result, validator)
     top = max(range(len(weights)), key=lambda idx: weights[idx])
-    burn_detail = ""
-    if burn_active and owner_position is not None:
-        effective_burn = _effective_u16_share(weights, owner_position)
-        burn_detail = (
-            f" burn_mode=Burn owner_uid={uids[owner_position]} "
-            f"configured_burn={OWNER_BURN_SHARE:.2%} "
-            f"effective_u16_burn={effective_burn:.2%}"
-        )
     response_detail = ""
     if log_response_repr:
         response_repr = repr(result)
@@ -493,7 +279,7 @@ def _submit_local_weights(
         "[validator] set local weights "
         f"response_type={type(result).__name__}{response_detail} "
         f"ok={ok} msg={message!r} "
-        f"(top uid={uids[top]} w={float(weights[top]):.4f}){burn_detail}"
+        f"(top uid={uids[top]} w={float(weights[top]):.4f})"
         f"{f' failure_detail={failure_detail}' if failure_detail else ''}"
     )
     return ok
@@ -761,6 +547,70 @@ def _dispatch_subset_size(
     return min(pool_size, max(1, required, requested))
 
 
+_RUST_READINESS_LOCK = threading.Lock()
+_RUST_READINESS: Optional[bool] = None
+
+
+def _host_memory_bytes() -> int:
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _rust_verify_concurrency(settings: Settings) -> int:
+    units = {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
+    memory = RELEASE_POLICY.rust_memory.strip().lower()
+    multiplier = units.get(memory[-1], 1)
+    amount = memory[:-1] if memory[-1] in units else memory
+    container_bytes = max(1, int(float(amount) * multiplier))
+    available = max(0, _host_memory_bytes() - 2 * 1024**3)
+    memory_slots = max(1, available // container_bytes)
+    return min(max(1, settings.validator_verify_concurrency), memory_slots)
+
+
+def _rust_ready(settings: Settings) -> bool:
+    """Run one real, process-cached canary against the pinned Rust image."""
+
+    global _RUST_READINESS
+    if settings.executor != "docker":
+        return False
+    with _RUST_READINESS_LOCK:
+        if _RUST_READINESS is not None:
+            return _RUST_READINESS
+        try:
+            from ..execution.executor import get_executor
+
+            executor = get_executor(settings, language="rust")
+            canary = executor.run_tests(
+                'fn main() { println!("ready"); }',
+                "main",
+                [TestCase(args=[""], kwargs={}, expected="ready\n")],
+                timeout_s=2.0,
+            )
+            _RUST_READINESS = (
+                len(canary) == 1
+                and canary[0].passed
+                and canary[0].error is None
+            )
+        except Exception as error:  # noqa: BLE001 - readiness fails closed
+            print(
+                "[validator] WARN: Rust sandbox readiness failed for "
+                f"{RELEASE_POLICY.rust_image} ({type(error).__name__}: {error})"
+            )
+            _RUST_READINESS = False
+        if not _RUST_READINESS:
+            print(
+                "[validator] WARN: Rust sandbox is not ready for "
+                f"{RELEASE_POLICY.rust_image}; Rust dispatch is disabled"
+            )
+        return _RUST_READINESS
+
+
 async def _evaluate_one(
     client: ProblemServerClient,
     orchestrator: Orchestrator,
@@ -800,6 +650,18 @@ async def _evaluate_one(
         # different operator action, so each says so.
         print(f"[validator] WARN: no public challenge ({outcome.describe()})")
         return None
+    if public.language == "rust":
+        from ..problemserver.rust_validation import validate_rust_tests
+
+        try:
+            if settings.executor != "docker" or not _rust_ready(settings):
+                raise ValueError("Rust sandbox is not ready")
+            if public.entrypoint != "main":
+                raise ValueError("Rust entrypoint must be main")
+            validate_rust_tests(public.public_examples, require_nonempty=False)
+        except ValueError as error:
+            print(f"[validator] WARN: invalid Rust challenge; abandoning ({error})")
+            return None
     required = max(
         public.commit_min_responses, public.commit_min_signed_responses
     )
@@ -868,14 +730,26 @@ async def _evaluate_one(
     if not reveal.tests:
         print("[validator] WARN: challenge revealed no tests; refusing to score")
         return None
+    if reveal.language != public.language:
+        print("[validator] WARN: lease/reveal language mismatch; abandoning")
+        return None
+    if public.language == "rust":
+        try:
+            validate_rust_tests(reveal.tests)
+        except ValueError as error:
+            print(f"[validator] WARN: invalid Rust reveal; abandoning ({error})")
+            return None
 
     problem = public.to_problem(reveal.tests)
+    verify_concurrency = settings.validator_verify_concurrency
+    if public.language == "rust":
+        verify_concurrency = _rust_verify_concurrency(settings)
     result = await orchestrator.evaluate(
         problem,
         captured,
         # Verification concurrency, NOT the HTTP fan-out width: each permit
         # holds a sandbox (subprocess/Docker) verification slot.
-        asyncio.Semaphore(max(1, settings.validator_verify_concurrency)),
+        asyncio.Semaphore(max(1, verify_concurrency)),
     )
     sandbox_error_rate = _sandbox_error_rate(result)
     if sandbox_error_rate > 0.0:
@@ -885,9 +759,13 @@ async def _evaluate_one(
         )
     if sandbox_error_rate >= _SANDBOX_ERROR_PROBE_THRESHOLD:
         sandbox_healthy = await asyncio.to_thread(
-            _sandbox_healthcheck, orchestrator
+            _sandbox_healthcheck, orchestrator, public.language
         )
         if not sandbox_healthy:
+            if public.language == "rust":
+                global _RUST_READINESS
+                with _RUST_READINESS_LOCK:
+                    _RUST_READINESS = False
             print(
                 "[validator] ERROR: independent sandbox health probe failed; "
                 "discarding challenge without updating scores"
@@ -988,23 +866,29 @@ def _sandbox_error_rate(result: ChallengeResult) -> float:
     return suspected / len(result.outcomes)
 
 
-def _sandbox_healthcheck(orchestrator: Orchestrator) -> bool:
+def _sandbox_healthcheck(orchestrator: Orchestrator, language: str) -> bool:
     """Verify trusted code through the full verifier and sandbox path."""
     try:
+        if language == "rust":
+            entrypoint = "main"
+            tests = [TestCase(args=[""], expected="7\n")]
+            code = 'fn main() { println!("7"); }'
+        else:
+            entrypoint = "__rlvr_sandbox_healthcheck__"
+            tests = [TestCase(args=[7], expected=7)]
+            code = "def __rlvr_sandbox_healthcheck__(value):\n    return value\n"
         problem = Problem(
             problem_id="__rlvr_sandbox_healthcheck__",
-            statement="Return the input value.",
-            entrypoint="__rlvr_sandbox_healthcheck__",
-            tests=[TestCase(args=[7], expected=7)],
+            language=language,
+            statement="Sandbox health check.",
+            entrypoint=entrypoint,
+            tests=tests,
         )
         verification = orchestrator.verifier.verify(
             problem,
             SolutionResponse(
                 problem_id=problem.problem_id,
-                code=(
-                    "def __rlvr_sandbox_healthcheck__(value):\n"
-                    "    return value\n"
-                ),
+                code=code,
             ),
         )
     except Exception as exc:  # noqa: BLE001 - a failed probe is the signal
@@ -1038,12 +922,13 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
         decay=policy.decay_nonresponders,
     )
     _load_scores(engine, settings.validator_score_state_file)
-    verifier = Verifier(get_executor(settings), settings, policy=policy)
+    verifier = Verifier(
+        get_executor(settings, language="python"), settings, policy=policy
+    )
     writer = RolloutWriter(settings.dataset_dir)
     # This path only evaluates challenges returned by the private service.
     orchestrator = Orchestrator(verifier, engine, writer, settings, policy=policy)
     rotation = RotationSampler()
-    owner_burn_state = _OwnerBurnState()
 
     async with httpx.AsyncClient(limits=_validator_http_limits(settings)) as http:
         client = ProblemServerClient(
@@ -1052,7 +937,7 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
             http,
             allow_insecure_http=settings.problem_server_allow_insecure_http,
             timeout_s=settings.problem_server_request_timeout_s,
-            max_response_bytes=settings.problem_max_response_bytes,
+            max_response_bytes=policy.problem_response_read_bytes,
         )
 
         # Last-seen challenge quorum requirement; survives across rounds so an
@@ -1106,7 +991,6 @@ async def _run_decentralized_validator_async(settings: Settings) -> None:
                 engine,
                 settings,
                 log_response_repr=not weight_response_logged,
-                owner_burn_state=owner_burn_state,
             )
             if result is not None:
                 weight_response_logged = True

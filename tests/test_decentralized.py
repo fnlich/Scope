@@ -121,7 +121,7 @@ def test_sandbox_healthcheck_requires_a_clean_known_good_result():
         {"verifier": verifier},
     )()
 
-    assert _sandbox_healthcheck(orchestrator) is True
+    assert _sandbox_healthcheck(orchestrator, "python") is True
     assert verifier.calls[0][0].entrypoint == "__rlvr_sandbox_healthcheck__"
     assert verifier.calls[0][1].code.endswith("    return value\n")
 
@@ -140,7 +140,7 @@ def test_sandbox_healthcheck_requires_a_clean_known_good_result():
             )
         ],
     )
-    assert _sandbox_healthcheck(orchestrator) is False
+    assert _sandbox_healthcheck(orchestrator, "python") is False
 
 
 async def test_broken_sandbox_probe_prevents_score_update_and_feedback(monkeypatch):
@@ -164,6 +164,7 @@ async def test_broken_sandbox_probe_prevents_score_update_and_feedback(monkeypat
                 challenge=PublicChallenge(
                     challenge_id="challenge",
                     problem_id="problem",
+                    language="python",
                     statement="Return the input.",
                     entrypoint="solve",
                 ),
@@ -180,6 +181,7 @@ async def test_broken_sandbox_probe_prevents_score_update_and_feedback(monkeypat
         async def reveal(self, challenge_id, commit_token):
             return SimpleNamespace(
                 challenge_id=challenge_id,
+                language="python",
                 tests=[Case(args=[7], expected=7)],
             )
 
@@ -202,7 +204,7 @@ async def test_broken_sandbox_probe_prevents_score_update_and_feedback(monkeypat
     monkeypatch.setattr(
         decentralized,
         "_sandbox_healthcheck",
-        lambda orchestrator: False,
+        lambda orchestrator, language: False,
     )
     client = Client()
     orchestrator = Orchestrator()
@@ -246,6 +248,7 @@ async def test_dispatch_has_a_total_deadline_and_cancels_stalling_miner(
     public = PublicChallenge(
         challenge_id="challenge",
         problem_id="problem",
+        language="python",
         statement="Return the input.",
         entrypoint="solve",
         deadline_s=0.02,

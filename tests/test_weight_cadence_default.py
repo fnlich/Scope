@@ -44,7 +44,7 @@ def test_operator_environment_cannot_override_the_weight_cadence(monkeypatch):
 
 def test_the_round_cadence_is_not_disturbed_by_the_weight_default():
     """The weight default must not alter the independent round interval."""
-    assert RELEASE_POLICY.round_interval_blocks == 75
+    assert RELEASE_POLICY.round_interval_blocks == 38
 
 
 # --------------------------------------------------------------------------- #

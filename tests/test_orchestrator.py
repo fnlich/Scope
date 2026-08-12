@@ -17,6 +17,7 @@ from rlvr.types import TestCase as Case
 def make_problem(pid: str = "p1", n_tests: int = 3) -> Problem:
     return Problem(
         problem_id=pid,
+        language="python",
         statement="implement f",
         entrypoint="f",
         tests=[Case(args=[i], expected=i) for i in range(n_tests)],

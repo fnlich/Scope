@@ -2,7 +2,7 @@
 
 Exported surface:
     Executor              - the backend-agnostic ABC.
-    get_executor(settings)- factory selecting subprocess/docker per Settings.
+    get_executor(settings, language) - language-aware backend factory.
     SubprocessExecutor    - explicit development backend; one subprocess/test.
     DockerExecutor        - production default; container with --network=none.
     values_equal          - structural, float-tolerant comparison helper.

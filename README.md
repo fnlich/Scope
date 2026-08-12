@@ -8,26 +8,10 @@ local Docker sandbox, and submit the resulting weights on chain.
 
 ## Launch emission policy
 
-This launch release hard-codes `OWNER_BURN_SHARE` at 40%. After the completed-
-observation gate opens, the validator dynamically resolves the subnet owner's
-currently registered hotkey to its metagraph UID and reserves 40% of the
-submitted weight vector for that UID. Finney NETUID 5 is currently configured
-for `Burn`, so the runtime destroys that owner-directed miner incentive; it
-does not credit the owner. Positive-scoring miners split the remaining 60% in
-proportion to score. If every miner has zero score after valid completed
-observations, the validator directs 100% of the vector to burn.
-
-The owner UID is never hard-coded. The validator refuses its first submission
-if it cannot safely resolve the owner, and falls back to the ordinary score
-vector without a reserved burn share if a previously valid mapping becomes
-inconsistent. If the chain mode is no longer `Burn`, it submits miner-only
-weights and logs an error.
-
-Runtime 440 separately applies `MinerBurned` before network-wide emission shares
-are renormalized. At this launch setting and NETUID 5's present scale, that
-reduces NETUID 5's share of network emission by close to 40% and reallocates the
-difference to other subnets. Changing the published 40% constant requires a
-visible validator release; it is not an environment override.
+This release hard-codes the owner burn share at 0%. Validators submit the
+ordinary normalized miner score vector without reserving weight for the subnet
+owner. An all-zero vector is not submitted. Changing this value requires a
+validator release; it is not an environment override.
 
 ## Run a validator
 
@@ -45,8 +29,8 @@ Use a stable broadband connection: the production server rejects a commit
 whose request body takes more than 120 seconds to upload.
 The validator records its first four completed challenges before submitting an
 on-chain weight vector; paced or unavailable rounds do not advance that gate.
-The SN5 defaults are 75 blocks (about 15 minutes) between challenge attempts and
-180 blocks between weight attempts. The problem service remains authoritative:
+The SN5 defaults are 38 blocks (about 7.5 minutes) between challenge attempts
+and 180 blocks between weight attempts. The problem service remains authoritative:
 when an attempt is too early or the shared global lease slot is busy, its
 `Retry-After` response defers leasing without blocking weight scheduling. At
 startup the validator reads the chain weight rate limit and raises the effective

@@ -16,10 +16,6 @@ import pytest
 
 from rlvr.config import Settings
 from rlvr.neurons.decentralized import (
-    OWNER_BURN_SHARE,
-    _OwnerBurnState,
-    _build_owner_burn_weights,
-    _effective_u16_share,
     _load_scores,
     _save_scores,
     _submit_local_weights,
@@ -27,10 +23,6 @@ from rlvr.neurons.decentralized import (
 )
 from rlvr.policy import ValidatorPolicy
 from rlvr.scoring.eval_engine import EvalEngine
-
-
-def test_launch_owner_burn_share_is_forty_percent():
-    assert OWNER_BURN_SHARE == pytest.approx(0.40)
 
 
 # --------------------------------------------------------------------------- #
@@ -66,42 +58,12 @@ def test_constructor_still_validates():
 
 
 class _FakeSubtensor:
-    def __init__(self, owner_hotkey="owner", mode="Burn"):
+    def __init__(self):
         self.calls: list[dict] = []
-        self.owner_hotkey = owner_hotkey
-        self.mode = mode
-        self.owner_calls = 0
-        self.mode_calls = 0
-        self.fail_queries = False
-        self.block_calls = 0
 
     def set_weights(self, **kwargs):
         self.calls.append(kwargs)
         return True, "accepted"
-
-    def get_current_block(self):
-        self.block_calls += 1
-        if self.fail_queries:
-            raise RuntimeError("temporary chain read failure")
-        return 123
-
-    def get_subnet_owner_hotkey(self, netuid, block=None):
-        self.owner_calls += 1
-        if self.fail_queries:
-            raise RuntimeError("temporary chain read failure")
-        assert netuid == 5
-        assert block == 123
-        return self.owner_hotkey
-
-    def query_subtensor(self, name, params, block=None):
-        self.mode_calls += 1
-        if self.fail_queries:
-            raise RuntimeError("temporary chain read failure")
-        assert name == "RecycleOrBurn"
-        assert params == [5]
-        assert block == 123
-        return SimpleNamespace(value=self.mode)
-
 
 def test_weight_submission_waits_for_configured_completed_observations():
     engine = EvalEngine(
@@ -131,7 +93,6 @@ def test_weight_submission_waits_for_configured_completed_observations():
     assert _weight_observation_count(engine) == 3
     assert _submit_local_weights(validator, engine, settings) is None
     assert subtensor.calls == []
-    assert subtensor.owner_calls == subtensor.mode_calls == 0
 
     engine.update({0: 1.0, 1: 0.0}, dispatched={0, 1})
     assert _weight_observation_count(engine) == 4
@@ -139,9 +100,7 @@ def test_weight_submission_waits_for_configured_completed_observations():
     assert len(subtensor.calls) == 1
     assert subtensor.calls[0]["netuid"] == 5
     assert subtensor.calls[0]["uids"] == [77, 251]
-    assert subtensor.calls[0]["weights"] == pytest.approx(
-        [1.0 - OWNER_BURN_SHARE, OWNER_BURN_SHARE]
-    )
+    assert subtensor.calls[0]["weights"] == pytest.approx([1.0, 0.0])
     assert subtensor.calls[0]["wait_for_inclusion"] is True
     assert subtensor.calls[0]["wait_for_finalization"] is False
     assert subtensor.calls[0]["wait_for_revealed_execution"] is False
@@ -168,181 +127,10 @@ def test_six_observation_override_blocks_five_problem_rehearsal():
         engine.update({0: 1.0, 1: 0.0}, dispatched={0, 1})
     assert _submit_local_weights(validator, engine, settings, policy=policy) is None
     assert subtensor.calls == []
-    assert subtensor.owner_calls == subtensor.mode_calls == 0
 
     engine.update({0: 1.0, 1: 0.0}, dispatched={0, 1})
     assert _submit_local_weights(validator, engine, settings, policy=policy) is True
     assert len(subtensor.calls) == 1
-
-
-def test_owner_burn_excludes_owner_score_and_preserves_miner_proportions():
-    output = _build_owner_burn_weights(
-        np.array([1.0, 100.0, 3.0], dtype=np.float64),
-        owner_position=1,
-    )
-
-    assert output.sum() == pytest.approx(1.0)
-    assert output[1] == pytest.approx(OWNER_BURN_SHARE)
-    assert output[[0, 2]].sum() == pytest.approx(1.0 - OWNER_BURN_SHARE)
-    assert output[2] / output[0] == pytest.approx(3.0, rel=2e-4)
-
-
-def test_owner_burn_keeps_every_positive_miner_above_one_sdk_quantum():
-    base = np.ones(256, dtype=np.float64)
-    owner_position = 251
-
-    output = _build_owner_burn_weights(base, owner_position)
-    converted = [
-        int(round(float(weight / output.max()) * 65_535))
-        for weight in output
-    ]
-
-    assert output[owner_position] == pytest.approx(OWNER_BURN_SHARE)
-    assert _effective_u16_share(output, owner_position) == pytest.approx(
-        OWNER_BURN_SHARE, abs=0.002
-    )
-    assert converted[owner_position] == 65_535
-    assert all(
-        quantum >= 1
-        for idx, quantum in enumerate(converted)
-        if idx != owner_position
-    )
-
-
-def test_owner_burn_cold_start_burns_everything():
-    output = _build_owner_burn_weights(np.zeros(3), owner_position=2)
-
-    assert output.tolist() == [0.0, 0.0, 1.0]
-
-
-def test_all_zero_completed_history_submits_full_burn():
-    engine = EvalEngine(2, window_seconds=100, max_samples=4, min_samples=4)
-    for _ in range(4):
-        engine.update({0: 0.0, 1: 0.0}, dispatched={0, 1})
-    subtensor = _FakeSubtensor()
-    validator = SimpleNamespace(
-        metagraph=SimpleNamespace(hotkeys=["miner", "owner"], uids=[77, 251]),
-        subtensor=subtensor,
-        wallet=object(),
-    )
-
-    assert _submit_local_weights(
-        validator, engine, Settings(_env_file=None, netuid=5)
-    ) is True
-    assert subtensor.calls[0]["weights"] == [0.0, 1.0]
-
-
-def test_missing_owner_refuses_first_weight_submission(capsys):
-    engine = EvalEngine(2, window_seconds=100, max_samples=4, min_samples=4)
-    for _ in range(4):
-        engine.update({0: 1.0, 1: 0.0}, dispatched={0, 1})
-    subtensor = _FakeSubtensor(owner_hotkey="not-in-metagraph")
-    validator = SimpleNamespace(
-        metagraph=SimpleNamespace(hotkeys=["miner", "other"], uids=[77, 88]),
-        subtensor=subtensor,
-        wallet=object(),
-    )
-
-    assert _submit_local_weights(
-        validator, engine, Settings(_env_file=None, netuid=5)
-    ) is None
-    assert subtensor.calls == []
-    assert subtensor.owner_calls == subtensor.mode_calls == 2
-    assert "refusing weight submission" in capsys.readouterr().out
-
-
-def test_duplicate_owner_hotkey_refuses_first_weight_submission(capsys):
-    engine = EvalEngine(3, window_seconds=100, max_samples=4, min_samples=4)
-    for _ in range(4):
-        engine.update({0: 1.0, 1: 0.0, 2: 0.0}, dispatched={0, 1, 2})
-    subtensor = _FakeSubtensor()
-    validator = SimpleNamespace(
-        metagraph=SimpleNamespace(
-            hotkeys=["miner", "owner", "owner"],
-            uids=[77, 251, 252],
-        ),
-        subtensor=subtensor,
-        wallet=object(),
-    )
-
-    assert _submit_local_weights(
-        validator, engine, Settings(_env_file=None, netuid=5)
-    ) is None
-    assert subtensor.calls == []
-    assert "matched 2 metagraph entries" in capsys.readouterr().out
-
-
-def test_non_burn_mode_submits_miner_only_vector(capsys):
-    engine = EvalEngine(2, window_seconds=100, max_samples=4, min_samples=4)
-    for _ in range(4):
-        engine.update({0: 1.0, 1: 1.0}, dispatched={0, 1})
-    subtensor = _FakeSubtensor(mode="Recycle")
-    validator = SimpleNamespace(
-        metagraph=SimpleNamespace(hotkeys=["miner", "owner"], uids=[77, 251]),
-        subtensor=subtensor,
-        wallet=object(),
-    )
-
-    assert _submit_local_weights(
-        validator, engine, Settings(_env_file=None, netuid=5)
-    ) is True
-    assert subtensor.calls[0]["weights"] == pytest.approx([1.0, 0.0])
-    assert "not 'Burn'" in capsys.readouterr().out
-
-
-def test_owner_burn_cache_uses_last_known_good_pair_on_rpc_failure():
-    engine = EvalEngine(2, window_seconds=100, max_samples=4, min_samples=4)
-    for _ in range(4):
-        engine.update({0: 1.0, 1: 0.0}, dispatched={0, 1})
-    subtensor = _FakeSubtensor()
-    validator = SimpleNamespace(
-        metagraph=SimpleNamespace(hotkeys=["miner", "owner"], uids=[77, 251]),
-        subtensor=subtensor,
-        wallet=object(),
-    )
-    state = _OwnerBurnState()
-    settings = Settings(_env_file=None, netuid=5)
-
-    assert _submit_local_weights(
-        validator, engine, settings, owner_burn_state=state
-    ) is True
-    state.checked_at = 0.0
-    subtensor.fail_queries = True
-    assert _submit_local_weights(
-        validator, engine, settings, owner_burn_state=state
-    ) is True
-    assert len(subtensor.calls) == 2
-    assert subtensor.calls[-1]["weights"] == pytest.approx(
-        [1.0 - OWNER_BURN_SHARE, OWNER_BURN_SHARE]
-    )
-
-
-def test_changed_owner_missing_from_metagraph_falls_back_to_ordinary_weights(
-    capsys,
-):
-    engine = EvalEngine(2, window_seconds=100, max_samples=4, min_samples=4)
-    for _ in range(4):
-        engine.update({0: 1.0, 1: 0.0}, dispatched={0, 1})
-    subtensor = _FakeSubtensor()
-    validator = SimpleNamespace(
-        metagraph=SimpleNamespace(hotkeys=["miner", "owner"], uids=[77, 251]),
-        subtensor=subtensor,
-        wallet=object(),
-    )
-    state = _OwnerBurnState()
-    settings = Settings(_env_file=None, netuid=5)
-    assert _submit_local_weights(
-        validator, engine, settings, owner_burn_state=state
-    ) is True
-
-    subtensor.owner_hotkey = "new-owner-not-yet-synced"
-    state.checked_at = 0.0
-    assert _submit_local_weights(
-        validator, engine, settings, owner_burn_state=state
-    ) is True
-
-    assert subtensor.calls[-1]["weights"] == pytest.approx([1.0, 0.0])
-    assert "ordinary vector without a burn reservation" in capsys.readouterr().out
 
 
 def test_weight_gate_survives_score_state_restart(tmp_path):

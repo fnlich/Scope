@@ -30,6 +30,7 @@ from rlvr.types import (
 def make_problem(problem_id: str = "p1") -> Problem:
     return Problem(
         problem_id=problem_id,
+        language="python",
         statement=(
             "Return the sum of two integers a and b.\n"
             "Implement a function `add`. For example, add(1, 2) == 3."

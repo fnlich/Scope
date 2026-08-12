@@ -42,6 +42,7 @@ class Verifier:
         self.executor = executor
         self.settings = settings
         self.policy = policy
+        self._language_executors = {"python": executor}
 
     # ------------------------------------------------------------------ #
     def verify(self, problem: Problem, solution: SolutionResponse) -> Verification:
@@ -50,10 +51,17 @@ class Verifier:
         timeout_s = float(self.settings.per_test_timeout_s)
         runs = self.policy.verification_runs
 
+        executor = self._language_executors.get(problem.language)
+        if executor is None:
+            from ..execution.executor import get_executor
+
+            executor = get_executor(self.settings, language=problem.language)
+            self._language_executors[problem.language] = executor
+
         # 1. Execute the candidate `runs` times over the full hidden suite.
         all_runs: list[list[ExecutionResult]] = []
         for _ in range(runs):
-            results = self.executor.run_tests(
+            results = executor.run_tests(
                 solution.code, problem.entrypoint, tests, timeout_s
             )
             all_runs.append(list(results))

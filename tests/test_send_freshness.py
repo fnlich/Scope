@@ -36,7 +36,11 @@ from rlvr.neurons.live import LiveSolverClient, SendGate
 from rlvr.types import Problem
 
 BODY_PROBLEM = Problem(
-    problem_id="p1", statement="Return a + b.", entrypoint="add", tests=[]
+    problem_id="p1",
+    language="python",
+    statement="Return a + b.",
+    entrypoint="add",
+    tests=[],
 )
 
 

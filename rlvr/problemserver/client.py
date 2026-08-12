@@ -228,7 +228,7 @@ class ProblemServerClient:
         allow_insecure_http: bool = False,
         timeout_s: float = 60.0,
         retries: int = 3,
-        max_response_bytes: int = 512_000,
+        max_response_bytes: int = 2 * 1024 * 1024,
     ):
         require_secure_problem_url(url, allow_insecure_http)
         self._url = url.rstrip("/")
@@ -497,10 +497,11 @@ class ProblemServerClient:
         if response is None or response.status_code != 200:
             return None
         try:
-            return ChallengeRevealResponse.model_validate_json(response.content)
+            reveal = ChallengeRevealResponse.model_validate_json(response.content)
         except Exception as e:  # noqa: BLE001
             print(f"[validator] WARN: invalid test reveal: {e}")
             return None
+        return reveal
 
     async def feedback(self, feedback: ChallengeFeedback) -> bool:
         body = feedback.model_dump_json().encode()
