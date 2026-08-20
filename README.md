@@ -67,6 +67,9 @@ pip install -e '.[chain,dev]'
 pytest -q
 ```
 
+Miner developers can check solution formatting and basic behavior against five
+examples in [`examples/sample_challenges`](examples/sample_challenges/README.md).
+
 Validator hosts can measure local sandbox throughput with
 [`scripts/benchmark_grading.py`](scripts/benchmark_grading.py); see
 [`docs/GRADING_BENCHMARK.md`](docs/GRADING_BENCHMARK.md).
