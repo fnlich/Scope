@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
-"""Run the miner on-chain with Claude, Gemini, and/or ChatGPT as the solver.
+"""Run the miner on-chain with Claude and/or ChatGPT as the solver.
 
-    MINER_BACKENDS=claude                  python examples/custom_miner/run_miner.py
-    MINER_BACKENDS=claude,gemini           python examples/custom_miner/run_miner.py
-    MINER_BACKENDS=claude,chatgpt          python examples/custom_miner/run_miner.py
+    MINER_BACKENDS=claude           python examples/custom_miner/run_miner.py
+    MINER_BACKENDS=claude,chatgpt   python examples/custom_miner/run_miner.py
 
-Each backend answers into the same self-verify-and-repair loop, and with more
-than one they form a fallback chain: the first provider whose answer reproduces
-every public example wins, and the rest are never called for that task. Ordering
-is therefore a cost decision — put the provider you would rather pay for first.
+Both backends drive a browser you are already logged in to, over CDP:
+
+    claude    a logged-in Chrome on CLAUDE_PORTS
+    chatgpt   a logged-in Chrome on CHATGPT_PORTS
+
+No API key is read anywhere. Each backend answers into the same
+self-verify-and-repair loop, and with more than one they form a fallback chain:
+the first provider whose answer reproduces every public example wins, and the
+rest are never called for that task.
+
+Run two, if you can. A browser miner has no API path to fall back to, so a
+second logged-in provider is the only thing standing between one expired login
+and a run of zeros.
 
 This is the provider-agnostic entrypoint. ``run_chatgpt_miner.py`` remains as
-the browser-only launcher; it is equivalent to ``MINER_BACKENDS=chatgpt`` here.
+the ChatGPT-only launcher; it is equivalent to ``MINER_BACKENDS=chatgpt`` here.
 
-Credentials, by backend:
-
-    claude      a logged-in Chrome on CLAUDE_PORTS   (no API key)
-    chatgpt     a logged-in Chrome on CHATGPT_PORTS  (no API key)
-    claude-api  ANTHROPIC_API_KEY, or an `ant auth login` profile
-    gemini      GEMINI_API_KEY or GOOGLE_API_KEY; GEMINI_MODEL
-
-Before a browser backend serves a registered hotkey, verify its selectors once:
+Before either backend serves a registered hotkey, verify its selectors once:
 
     cd examples/custom_miner && python -m solvers.doctor claude --probe
 

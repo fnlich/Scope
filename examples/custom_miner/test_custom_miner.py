@@ -354,7 +354,7 @@ def test_an_unknown_backend_name_is_rejected_by_name():
 
     with pytest.raises(SystemExit, match="unknown backend"):
         build_backend("llama")
-    assert {"claude", "claude-api", "gemini", "chatgpt"} == set(KNOWN_BACKENDS)
+    assert {"claude", "chatgpt"} == set(KNOWN_BACKENDS)
 
 
 def test_a_single_backend_builds_a_plain_verifying_solver(monkeypatch):
@@ -363,7 +363,7 @@ def test_a_single_backend_builds_a_plain_verifying_solver(monkeypatch):
 
     monkeypatch.setattr(multi, "build_backend", lambda name: _Backend([RIGHT]))
     assert isinstance(multi.build_solver(["claude"]), VerifyingSolver)
-    assert isinstance(multi.build_solver(["claude", "gemini"]), multi.FallbackSolver)
+    assert isinstance(multi.build_solver(["claude", "chatgpt"]), multi.FallbackSolver)
 
 
 # --------------------------------------------------------------------------- #
@@ -460,24 +460,27 @@ def _tab(page, site) -> _Tab:
     return _Tab(_SoloPool(site), page, None, "probe", composer="#composer")
 
 
-def test_the_claude_backend_drives_the_browser_and_never_reads_an_api_key():
-    """`MINER_BACKENDS=claude` must mean the browser. The API path is still
-    available, but only under its own name."""
+def test_no_backend_anywhere_reads_an_api_key():
+    """Every backend drives a browser. Nothing in the package reads a key, and
+    nothing imports a provider SDK — a regression would be invisible otherwise,
+    because a key-reading backend works fine right up until it bills someone."""
     import inspect
+    from pathlib import Path
 
     from solvers import claude_cdp
-    from solvers.multi import build_backend
-
-    from solvers.multi import KNOWN_BACKENDS
+    from solvers.multi import KNOWN_BACKENDS, build_backend
 
     backend = build_backend("claude")
     assert isinstance(backend, claude_cdp.ClaudeBrowserPool)
     assert backend.site.name == "claude" and "claude.ai" in backend.site.url
-    # No credential lookup anywhere in the module, and no SDK import.
-    assert "import anthropic" not in inspect.getsource(claude_cdp)
-    assert "ANTHROPIC" not in inspect.getsource(claude_cdp.claude_site)
-    # The API path is still reachable, but only under its own name.
-    assert "claude-api" in KNOWN_BACKENDS
+    assert set(KNOWN_BACKENDS) == {"claude", "chatgpt"}
+
+    banned = ("API_KEY", "import anthropic", "from anthropic", "google.genai")
+    package = Path(inspect.getfile(claude_cdp)).parent
+    for module in sorted(package.glob("*.py")):
+        body = module.read_text()
+        for needle in banned:
+            assert needle not in body, f"{module.name} references {needle!r}"
 
 
 def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():

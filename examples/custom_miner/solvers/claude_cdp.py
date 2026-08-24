@@ -4,14 +4,16 @@ Same shape as the ChatGPT backend and the same machinery underneath
 (``cdp_pool.py``): attach to a Chrome you already logged in to, hold one tab per
 concurrent solve, start every task in a fresh conversation, and feed the reply
 into the self-verify-and-repair loop in ``verify.py``. Your existing Claude
-subscription is the quota; nothing here reads ``ANTHROPIC_API_KEY``.
+subscription is the quota; no API key is read anywhere.
 
     chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-claude-1
     # log in to https://claude.ai in it, then:
     CLAUDE_PORTS=9222 MINER_BACKENDS=claude python examples/custom_miner/run_miner.py
 
-``solvers/claude_api.py`` is still here and still works, as backend name
-``claude-api``, for anyone who would rather spend an API key than a browser.
+There is deliberately no API-key path in this package. The consequence is that
+a browser backend has no supported fallback to switch to, which is exactly why
+the doctor tool below is not optional and why running ``claude,chatgpt`` as a
+chain is worth the second browser.
 
 ## Read this before you trust the selectors below
 

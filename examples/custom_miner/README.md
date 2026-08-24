@@ -84,37 +84,38 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 - **Never raise.** On any failure return empty `code` — a zero is survivable, a
   crash loop is not. `custom_miner.py` already wraps your solver this way.
 
-## Backends: Claude, ChatGPT, Gemini
+## Backends: Claude and ChatGPT, both from the browser
 
-Four backends ship, all behind the same `open()` → `send()`/`close()` protocol,
-all feeding the same self-verify-and-repair loop. Pick with `MINER_BACKENDS`:
+Two backends ship, behind the same `open()` → `send()`/`close()` protocol, both
+feeding the same self-verify-and-repair loop. Pick with `MINER_BACKENDS`:
 
 ```bash
-MINER_BACKENDS=claude                  python examples/custom_miner/run_miner.py
-MINER_BACKENDS=claude,chatgpt          python examples/custom_miner/run_miner.py
-MINER_BACKENDS=claude,chatgpt,gemini   python examples/custom_miner/run_miner.py
+MINER_BACKENDS=claude           python examples/custom_miner/run_miner.py
+MINER_BACKENDS=claude,chatgpt   python examples/custom_miner/run_miner.py
 ```
 
 | Backend | Credentials | Quota you spend |
 |---|---|---|
 | `claude` | a logged-in Chrome on `CLAUDE_PORTS` | your Claude subscription |
 | `chatgpt` | a logged-in Chrome on `CHATGPT_PORTS` | your ChatGPT subscription |
-| `claude-api` | `ANTHROPIC_API_KEY`, or an `ant auth login` profile | tokens, per task |
-| `gemini` | `GEMINI_API_KEY` or `GOOGLE_API_KEY`; set `GEMINI_MODEL` | tokens, per task |
 
-`claude` and `chatgpt` drive a browser you are already logged in to and read no
-API key at all. `claude-api` is the same model over the API for anyone who would
-rather pay per token than keep a browser alive; see the risk list below for why
-you might.
+Both attach to a browser you are already logged in to. **No API key is read
+anywhere in this package** — there is no API path at all, which is a deliberate
+choice with a real cost attached: see the risks below, and run two providers if
+you can.
 
 `run_chatgpt_miner.py` still exists and is equivalent to `MINER_BACKENDS=chatgpt`.
 
-### More than one backend is a fallback chain
+### More than one backend is a fallback chain — and your only redundancy
 
-With several names, providers run **in order and stop at the first answer that
-reproduces every public example**. That ordering is a cost decision, not a
-quality one: a verified answer ends the chain, so later providers cost nothing
-on tasks the first one solves. Put the provider you would rather pay for first.
+With both names, providers run **in order and stop at the first answer that
+reproduces every public example**. Ordering is a cost decision, not a quality
+one: a verified answer ends the chain, so the second provider costs nothing on
+tasks the first one solves. Put the account you would rather spend first.
+
+It is also the only redundancy a browser miner has. With no API backend to fall
+back to, a second logged-in provider is what stands between one expired login
+and a run of zeros — and the two do not share a DOM, a login, or a rate limit.
 
 This is worth doing because of how the subnet pays. The latency tiebreaker spans
 about 3.5%; being wrong costs 100%. A second opinion is therefore worth far more
@@ -129,10 +130,8 @@ little time remains for another provider to be useful.
 | Variable | Default | Meaning |
 |---|---|---|
 | `MINER_BACKENDS` | `claude` | Comma-separated backends, in preference order |
-| `CLAUDE_PORTS` | `9222` | CDP ports for the `claude` browser backend |
-| `CLAUDE_MODEL` | `claude-opus-5` | `claude-api` only |
-| `CLAUDE_EFFORT` | `high` | `claude-api` only; `low` … `max` |
-| `GEMINI_MODEL` | — | Set one your key can actually reach |
+| `CLAUDE_PORTS` | `9222` | CDP ports, one per Claude account |
+| `CLAUDE_TABS_PER_BROWSER` | `2` | Conversation slots per browser |
 | `SOLVER_MAX_ATTEMPTS` | `3` | Repair rounds per provider |
 
 These are read from the process environment **and** from `.env` — `run_miner.py`
@@ -269,15 +268,20 @@ browser-backed miner fails quietly, and silence looks identical to success.
   paid service is very likely against the provider's terms — OpenAI's prohibit
   automated extraction of Output, and Anthropic's usage policies and Claude.ai
   terms similarly do not contemplate scripted access to the web app in place of
-  the API. The realistic downside is account termination. This applies to
-  `claude` and `chatgpt` equally; `claude-api` and `gemini` are the supported
-  way to do the same thing.
-- **Fragility.** Chrome updates, DOM changes, expired logins, rate limits and
-  CAPTCHAs all break browser automation. A miner that does not answer scores
-  zero into a 200-observation window (~2.1 days), so one bad night costs most
-  of your score. This is what the doctor and the `.env` selector overrides are
-  for, and why the API backends exist alongside: switching is one variable,
-  `MINER_BACKENDS=claude-api`, with nothing else to change.
+  the API. The realistic downside is account termination, and it applies to
+  `claude` and `chatgpt` equally. The supported way to do this is each
+  provider's API; this package does not offer that path.
+- **Fragility, with nothing to fall back to.** Chrome updates, DOM changes,
+  expired logins, rate limits and CAPTCHAs all break browser automation. A miner
+  that does not answer scores zero into a 200-observation window (~2.1 days), so
+  one bad night costs most of your score — and there is no `MINER_BACKENDS=...-api`
+  to switch to when it happens. Three things stand in for that: run both
+  providers so they are not down together, run the doctor before you serve, and
+  watch `/solver-status`, because a provider that has started failing looks
+  exactly like one that is merely quiet.
+- **The `Backend` protocol is three methods.** If you do want an API path,
+  `open()` returning something with `send(text, timeout_s)` and `close()` is the
+  whole interface; `verify.py` and the fallback chain take it unchanged.
 - **Rust.** `SOLVER_VERIFY_EXECUTOR=docker` is required to verify Rust answers;
   without it Rust candidates are returned unverified.
 

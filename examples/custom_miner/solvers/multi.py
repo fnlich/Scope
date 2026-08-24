@@ -9,11 +9,15 @@ Ordering is a cost decision, not a quality one — put the provider you would
 rather pay for first. A verified answer ends the chain immediately, so later
 providers cost nothing on tasks the first one solves.
 
-    MINER_BACKENDS=claude,gemini,chatgpt   # in preference order
-    MINER_BACKENDS=claude                  # just one
+    MINER_BACKENDS=claude,chatgpt   # in preference order
+    MINER_BACKENDS=claude           # just one
 
-``claude`` and ``chatgpt`` drive a logged-in browser over CDP; ``claude-api``
-and ``gemini`` call an API with a key.
+Both backends drive a browser you are already logged in to, over CDP. No API
+key is read anywhere in this package.
+
+Running both is also the only redundancy a browser miner has. There is no API
+path to fall back to, so when one provider's DOM changes or its login expires,
+the other is what stops the score going to zero — see the fallback chain below.
 
 Every backend implements the same protocol, so adding another is one class.
 """
@@ -26,12 +30,10 @@ from typing import Any, Optional
 
 from .verify import Answer, VerifyingSolver
 
-# `claude` and `chatgpt` drive a logged-in browser over CDP and need no API key;
-# `claude-api` and `gemini` call an API. Browser backends are imported lazily
-# because they pull in Playwright, which an API-only deployment will not have.
-_BROWSER_BACKENDS = {"claude", "chatgpt"}
-_API_BACKENDS = {"claude-api", "gemini"}
-KNOWN_BACKENDS = sorted(_BROWSER_BACKENDS | _API_BACKENDS)
+# Both backends drive a logged-in browser over CDP; neither reads an API key.
+# Imported lazily inside build_backend so that importing this module does not
+# require Playwright.
+KNOWN_BACKENDS = ["chatgpt", "claude"]
 
 
 def _pool_kwargs(prefix: str) -> dict[str, Any]:
@@ -59,14 +61,6 @@ def build_backend(name: str):
 
         kwargs = _pool_kwargs("CLAUDE")
         return ClaudeBrowserPool(kwargs.pop("ports"), **kwargs)
-    if key == "claude-api":
-        from .claude_api import ClaudeBackend
-
-        return ClaudeBackend()
-    if key == "gemini":
-        from .gemini_api import GeminiBackend
-
-        return GeminiBackend()
     if key == "chatgpt":
         from .chatgpt_cdp import ChatGPTPool
 
@@ -190,7 +184,7 @@ async def warm_up(solver, min_capacity: int = 1) -> None:
     for backend in backends(solver):
         start = getattr(backend, "start", None)
         if start is None:
-            continue  # API backends have nothing to warm up
+            continue  # a backend with nothing to warm up
         await start()
         tabs = backend.stats().get("tabs", 0)
         if tabs < min_capacity:
