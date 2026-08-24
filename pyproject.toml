@@ -8,12 +8,14 @@ version = "0.1.0"
 description = "Bittensor subnet for farming RLVR (verifiable-reward) data on code tasks"
 license = { file = "LICENSE" }
 authors = [{ name = "subnet-5-hone contributors" }]
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10"
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
     "pydantic>=2.12,<3",

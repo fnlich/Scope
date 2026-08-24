@@ -17,3 +17,4 @@ venv/
 *.log
 /cache/
 /data/
+/build
