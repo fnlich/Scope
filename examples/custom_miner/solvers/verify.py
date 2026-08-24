@@ -79,6 +79,11 @@ class Answer:
 
     code: str
     raw_response: str = ""
+    # Whether this answer reproduced every public example. A chain of providers
+    # needs this to know when to stop trying; the miner itself ignores it.
+    verified: bool = False
+    passed: int = 0
+    total: int = 0
 
 
 @dataclass
@@ -219,7 +224,7 @@ class VerifyingSolver:
         if key in self._cache:
             self._counts["cache_hits"] += 1
             code, raw = self._cache[key]
-            return Answer(code=code, raw_response=raw)
+            return Answer(code=code, raw_response=raw, verified=True)
 
         best = Candidate(code="", raw="")
         conversation = None
@@ -271,7 +276,10 @@ class VerifyingSolver:
             f"examples={best.passed}/{best.total} verified={best.verified} "
             f"{elapsed:.1f}s/{budget:.0f}s"
         )
-        return Answer(code=best.code, raw_response=best.raw)
+        return Answer(
+            code=best.code, raw_response=best.raw,
+            verified=best.verified, passed=best.passed, total=best.total,
+        )
 
     # ---------------------------------------------------------------------- #
     def _grade(self, reply: str, task) -> Candidate:

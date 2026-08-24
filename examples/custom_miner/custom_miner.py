@@ -41,13 +41,27 @@ Correctness rules your solver must honor (the scoring is accuracy-or-nothing):
 
 from __future__ import annotations
 
-import asyncio
-import json
-import os
-from dataclasses import dataclass
-from typing import Any, Optional, Protocol
+import sys
+from pathlib import Path
 
-import httpx
+# preflight.py is this file's sibling; keep them together if you copy this out.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from preflight import require_linux  # noqa: E402
+
+# Checked HERE, above the imports below, and not inside run_custom_miner(): on
+# Windows `pip install '.[chain]'` has already failed, so `import rlvr` would
+# raise ModuleNotFoundError before any guard in a function could speak. The
+# whole point is to say why instead.
+require_linux("The custom miner")
+
+import asyncio  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
+from typing import Any, Optional, Protocol  # noqa: E402
+
+import httpx  # noqa: E402
 
 from rlvr.neurons.demo_miner import (
     DemoMiner,
