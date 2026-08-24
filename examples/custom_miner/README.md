@@ -373,6 +373,31 @@ browser-backed miner fails quietly, and silence looks identical to success.
 - **Rust.** `SOLVER_VERIFY_EXECUTOR=docker` is required to verify Rust answers;
   without it Rust candidates are returned unverified.
 
+## Testing your setup
+
+Four layers, cheapest first, each isolating a different failure:
+
+```bash
+pytest examples/custom_miner        # 1. code only — no browser, no chain
+python -m solvers.doctor claude --probe   # 2. profile, login and selectors
+python scripts/try_solver.py        # 3. a real solve, end to end, no wallet
+                                    # 4. testnet, then finney
+```
+
+`scripts/try_solver.py` is the one to reach for when something is wrong. It
+builds the solver exactly as the miner does, hands it one task with public
+examples, and reports whether the answer reproduced them — while importing
+neither bittensor nor `custom_miner`, so it runs before you have a wallet and a
+failure there can only be the solver. Its three outcomes are distinct on
+purpose: verified (setup is good), code-but-wrong (plumbing works, model
+missed), and nothing-came-back (login, selector, or deadline — it names all
+three in likelihood order).
+
+```bash
+python scripts/try_solver.py --statement "Return n factorial." \
+    --entrypoint fact --example '{"args": [5], "expected": 120}'
+```
+
 ## Tests
 
 ```bash
