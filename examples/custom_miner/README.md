@@ -7,6 +7,10 @@ response signing, and the byte/concurrency limits — and replaces **only** the
 part that produces an answer, so your own solver plugs in without you
 re-implementing the wire protocol.
 
+> **Linux only.** Every entrypoint here refuses to start on anything else, and
+> says why. See [Linux only, and why](#linux-only-and-why) — on Windows, WSL2 is
+> the intended path and counts as Linux.
+
 ## What the validator actually requires
 
 A validator sends a signed `POST /solve` and accepts the reply only if it is
@@ -59,6 +63,10 @@ run_custom_miner(MySolver())
 ## Run
 
 ```bash
+# Debian/Ubuntu — Python 3.12 and the build tools the chain wheels expect
+sudo apt-get update && sudo apt-get install -y \
+    python3.12 python3.12-venv build-essential pkg-config libssl-dev
+
 python3.12 -m venv .venv && . .venv/bin/activate
 pip install -e '.[chain,miner]'
 cp .env.example .env        # set NETUID, SUBTENSOR_NETWORK, WALLET_NAME,
@@ -68,6 +76,29 @@ python examples/custom_miner/custom_miner.py
 
 Register the hotkey first (see `scripts/register_testnet.sh`), open the axon
 port to the internet, and confirm `curl http://127.0.0.1:$AXON_PORT/health`.
+
+### Linux only, and why
+
+`custom_miner.py`, `run_miner.py`, `run_chatgpt_miner.py` and the doctor all
+call `require_linux()` before doing anything, so a wrong platform costs one
+clear line instead of a build failure three layers down.
+
+**Windows cannot run this at all.** `bittensor-wallet` and `bittensor-drand`
+publish manylinux and macOS wheels only — no Windows wheel of any version — so
+`pip install '.[chain]'` falls back to compiling them through a Rust toolchain,
+and that is where a Windows install dies. Nothing here can route around it: the
+miner has to sign with the hotkey, and the hotkey lives in `bittensor-wallet`.
+**Use WSL2**; `sys.platform` there is `linux` and everything below applies
+unchanged. Install into the WSL filesystem, not `/mnt/c`, or file I/O will
+crawl.
+
+**macOS** can install the chain dependencies but is refused here anyway. A
+miner is a long-lived server that has to answer inside a deadline around the
+clock, and the shape of that — systemd, Chrome under Xvfb, a firewall in front
+of the axon port — is Linux shaped. Half-working on a laptop is worse than a
+clear no.
+
+Tested against x86-64 glibc 2.28+ (Ubuntu 22.04/24.04, Debian 12, Rocky 9).
 
 ## Rules your solver must honor
 
@@ -149,16 +180,49 @@ failing looks exactly like success until the score drops.
 key is involved; the quota is whatever your Claude plan gives you.
 
 ```bash
-pip install playwright     # not in any extra — the API backends do not need it
-                           # and no `playwright install` is needed either: these
-                           # attach to a Chrome you start yourself
+# Debian/Ubuntu. No `playwright install` is needed — the backends attach over
+# CDP to a Chrome you start yourself, so there is no bundled browser to fetch.
+sudo apt-get install -y chromium xvfb        # or google-chrome-stable
+pip install playwright                       # in no extra; the package only
 
-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-claude-1
-# log in to https://claude.ai in that window, then verify the selectors:
-cd examples/custom_miner && python -m solvers.doctor claude --probe
-# then:
-CLAUDE_PORTS=9222 MINER_BACKENDS=claude python examples/custom_miner/run_miner.py
+cd examples/custom_miner
+./scripts/start_browser.sh --port 9222 --profile ~/.chrome-claude-1 \
+                          --url https://claude.ai/new
+# log in once in that browser (see below for a headless host), then:
+python -m solvers.doctor claude --probe
+CLAUDE_PORTS=9222 MINER_BACKENDS=claude python run_miner.py
 ```
+
+`scripts/start_browser.sh` is the Linux specifics in one place: it finds
+`google-chrome-stable`, `chromium`, `chromium-browser` or `$CHROME_BIN`, adds
+`--no-sandbox` only when you are root, keeps CDP on loopback, refuses to
+double-launch a profile that is already running, and waits for the port before
+telling you it is up.
+
+**Logging in on a headless host.** There is no display, so the script runs
+Chrome under `xvfb-run` — a real headful Chrome with a virtual screen, not
+headless mode, because these sites treat headless as a bot and a CAPTCHA on a
+miner is a silent run of zeros. To reach that invisible window, forward the CDP
+port and drive it from your own machine:
+
+```bash
+ssh -N -L 9222:127.0.0.1:9222 you@your-miner     # from your laptop
+# then open http://127.0.0.1:9222 and pick the tab; log in there
+```
+
+**Keep the CDP port on loopback.** Anyone who can reach it has full control of
+the browser *and* its logged-in sessions, on a box that is already exposing a
+public axon port. Never pass `--remote-debugging-address`; use the SSH tunnel.
+
+**Chrome's log is noisy on a server.** `Failed to connect to the bus`,
+`org.freedesktop.UPower`, and similar D-Bus errors are normal on a headless box
+with no desktop session and do not mean the browser is broken. What matters is
+the `DevTools listening on ws://127.0.0.1:9222/...` line and the script's
+`CDP is up.`
+
+**Keeping it alive.** Run the browser and the miner as two systemd services
+with `Restart=always`. Give the browser the same `--user-data-dir` every time,
+so a crash comes back already logged in rather than at a login page.
 
 As with ChatGPT, the account is the rate-limit unit: one browser per Claude
 account, `CLAUDE_TABS_PER_BROWSER` conversation slots inside each, and at least
@@ -238,12 +302,12 @@ Accounts are the rate-limit unit, so N accounts give N× throughput (the same
 insight as `run_parallel.py`):
 
 ```bash
-pip install playwright   # see the note under "Running Claude from the browser"
-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-1
-chrome --remote-debugging-port=9223 --user-data-dir=/tmp/chrome-2
-# log in to https://chatgpt.com in each, then check it:
+# Same setup as Claude above; one profile and one port per account.
+./scripts/start_browser.sh --port 9222 --profile ~/.chrome-gpt-1 --url https://chatgpt.com
+./scripts/start_browser.sh --port 9223 --profile ~/.chrome-gpt-2 --url https://chatgpt.com
+# log in to each, then check it:
 python -m solvers.doctor chatgpt --probe
-CHATGPT_PORTS=9222,9223 python examples/custom_miner/run_chatgpt_miner.py
+CHATGPT_PORTS=9222,9223 python run_chatgpt_miner.py
 ```
 
 Keep the tab count at or above `MINER_MAX_CONCURRENT_REQUESTS`, or extra tasks
@@ -297,6 +361,10 @@ reply, that the verify loop repairs a wrong answer, that a solve never outruns
 its budget and never returns nothing when it has something, that a browser tab
 which dies is retired rather than recycled into the pool (for both browser
 backends — they share one pool), and that a reply echoing the prompt is refused.
+
+They also pin the platform guard: every entrypoint refuses a non-Linux host
+*before* the project imports that would otherwise fail first with a
+`ModuleNotFoundError` explaining nothing.
 
 What they cannot test is the selectors themselves, because there is no browser
 in CI. That is what `python -m solvers.doctor <backend> --probe` is for, and it

@@ -460,6 +460,69 @@ def _tab(page, site) -> _Tab:
     return _Tab(_SoloPool(site), page, None, "probe", composer="#composer")
 
 
+# --------------------------------------------------------------------------- #
+# Linux only.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "platform,name", [("win32", "Windows"), ("cygwin", "Windows"), ("darwin", "macOS")]
+)
+def test_a_non_linux_host_is_refused_with_the_reason(monkeypatch, platform, name):
+    """A Windows install dies compiling bittensor-wallet through Rust, three
+    layers below anything this repo wrote. One clear line beats that."""
+    import preflight
+
+    monkeypatch.setattr(preflight.sys, "platform", platform)
+    with pytest.raises(SystemExit) as raised:
+        preflight.require_linux("The custom miner")
+    message = str(raised.value)
+    assert name in message and "bittensor-wallet" in message
+    assert "WSL2" in message, "Windows users need to be told where to go"
+
+
+def test_wsl2_and_any_linux_pass(monkeypatch):
+    """WSL2 is real Linux to Python and to Chrome; it must not be refused.
+
+    monkeypatch, not assignment: `preflight.sys` IS the stdlib sys module, so a
+    bare assignment would change sys.platform for the whole test session.
+    """
+    import preflight
+
+    for platform in ("linux", "linux2"):
+        monkeypatch.setattr(preflight.sys, "platform", platform)
+        preflight.require_linux()  # must not raise
+
+
+def test_every_entrypoint_checks_the_platform_before_importing_anything_heavy():
+    """A guard only one launcher calls is a guard nobody has — and one that runs
+    after `import rlvr` never speaks at all, because on a Windows box that
+    import is what already failed."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent
+    for name in ("custom_miner.py", "run_miner.py", "run_chatgpt_miner.py"):
+        body = (root / name).read_text()
+        assert "require_linux(" in body, name
+        guard = body.index('require_linux("')
+        for heavy in ("import httpx", "from rlvr", "from custom_miner"):
+            if heavy in body:
+                assert guard < body.index(heavy), f"{name}: guard runs after {heavy}"
+    assert "require_linux(" in (root / "solvers" / "doctor.py").read_text()
+
+
+def test_the_browser_launcher_is_linux_only_and_keeps_cdp_on_loopback():
+    """The CDP port is full control of a logged-in browser, on a box that is
+    already exposing a public axon port."""
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parent / "scripts" / "start_browser.sh").read_text()
+    assert 'uname -s' in script and 'Linux' in script
+    assert "--remote-debugging-address" not in script.replace(
+        "# Never add --remote-debugging-address", ""
+    ), "must never bind CDP off loopback"
+    assert "--no-sandbox" in script  # needed when running as root
+    assert "xvfb-run" in script      # headless hosts have no display
+
+
 def test_no_backend_anywhere_reads_an_api_key():
     """Every backend drives a browser. Nothing in the package reads a key, and
     nothing imports a provider SDK — a regression would be invisible otherwise,

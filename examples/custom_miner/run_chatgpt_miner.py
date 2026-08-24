@@ -29,13 +29,22 @@ Environment (miner settings come from .env as usual):
 
 from __future__ import annotations
 
-import asyncio
-import os
 import sys
 from pathlib import Path
-from typing import Any
 
+# preflight.py is a sibling of this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from preflight import require_linux  # noqa: E402
+
+# First, before anything else can fail: on a non-Linux box the project imports
+# below raise ModuleNotFoundError from somewhere inside bittensor, which
+# explains nothing about why. This says why.
+require_linux("The custom miner")
+
+import asyncio  # noqa: E402
+import os  # noqa: E402
+from typing import Any  # noqa: E402
 
 from custom_miner import CustomMiner  # noqa: E402
 from rlvr.neurons.demo_miner import DemoMinerSettings, build_demo_miner_app  # noqa: E402

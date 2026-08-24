@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import os
 import sys
+from pathlib import Path
 
 from .cdp_pool import Site, import_playwright, usable_busy_selectors, wait_for_any
 from .config import find_env_file, load_env_file
@@ -197,6 +198,11 @@ def main(argv: list[str] | None = None) -> int:
         "--probe", action="store_true", help="also send a real prompt and read it back"
     )
     args = parser.parse_args(argv)
+    # preflight.py sits beside custom_miner.py, one level above this package.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from preflight import require_linux
+
+    require_linux("The browser-backend doctor")
     found = find_env_file()
     if load_env_file(found):
         print(f"[doctor] loaded {found}")
