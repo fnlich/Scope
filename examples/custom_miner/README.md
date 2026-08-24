@@ -84,6 +84,76 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 - **Never raise.** On any failure return empty `code` — a zero is survivable, a
   crash loop is not. `custom_miner.py` already wraps your solver this way.
 
+## Included backend: ChatGPT over CDP + self-verification
+
+`run_chatgpt_miner.py` wires up a ready-made solver built from
+[fnlich/Automation](https://github.com/fnlich/Automation)'s CDP driver:
+
+```
+POST /solve -> fresh ChatGPT conversation -> self-grade against the public
+examples with the validator's own executor -> repair on failure -> signed reply
+```
+
+### Why the self-verification matters
+
+Scoring is accuracy-or-nothing, and models routinely produce *nearly* right
+answers. But every task ships real `public_examples`, and the comparators the
+validator will judge you with live in this repository
+(`rlvr/execution/compare.py`, `rlvr/execution/rust_judge.py`). So the miner
+grades its own candidate with the validator's executor before answering, and on
+failure hands the model the concrete evidence:
+
+```
+Your solution is WRONG. I ran `sum_of_digits` against the examples and got:
+  - sum_of_digits(*[12345], **{}) returned 14, expected 15
+  - sum_of_digits(*[999], **{}) returned 18, expected 27
+```
+
+That turns a one-shot paste into a repair loop that converges. Passing the
+public examples is not proof of passing the hidden suite, but it eliminates the
+large class of answers that are simply wrong on the stated contract.
+
+### Setup — one browser per ChatGPT account
+
+Accounts are the rate-limit unit, so N accounts give N× throughput (the same
+insight as `run_parallel.py`):
+
+```bash
+chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-1
+chrome --remote-debugging-port=9223 --user-data-dir=/tmp/chrome-2
+# log in to https://chatgpt.com in each, then:
+CHATGPT_PORTS=9222,9223 python examples/custom_miner/run_chatgpt_miner.py
+```
+
+Keep the tab count at or above `MINER_MAX_CONCURRENT_REQUESTS`, or extra tasks
+queue and burn their deadline. The launcher warns when it is short.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CHATGPT_PORTS` | `9222` | Comma-separated CDP ports (one per account) |
+| `CHATGPT_TABS_PER_BROWSER` | `2` | Conversation slots per browser |
+| `SOLVER_MAX_ATTEMPTS` | `3` | Initial answer + repair rounds |
+| `SOLVER_SAFETY_MARGIN_S` | `15` | Headroom kept before the cutoff |
+| `SOLVER_MAX_BUDGET_S` | `240` | Hard cap on one solve |
+| `SOLVER_VERIFY_EXECUTOR` | `subprocess` | `docker` also verifies Rust |
+
+`GET /solver-status` reports pool health and solve counts. Watch it — a
+browser-backed miner fails quietly, and silence looks identical to success.
+
+### Know the risks before running this for money
+
+- **Terms of service.** Driving ChatGPT's web UI programmatically to power a
+  paid service is very likely against OpenAI's terms, which prohibit automated
+  extraction of Output. The realistic downside is account termination.
+- **Fragility.** Chrome updates, DOM changes, expired logins, rate limits and
+  CAPTCHAs all break browser automation. A miner that does not answer scores
+  zero into a 200-observation window (~2.1 days), so one bad night costs most
+  of your score. The backend is deliberately swappable for exactly this reason:
+  moving to an API backend means implementing `open()` returning something with
+  `send()`/`close()`, and touching nothing else.
+- **Rust.** `SOLVER_VERIFY_EXECUTOR=docker` is required to verify Rust answers;
+  without it Rust candidates are returned unverified.
+
 ## Two caveats worth knowing
 
 - **Trust the request's `deadline_s` cautiously.** The validator advertises one
