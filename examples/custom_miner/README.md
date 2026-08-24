@@ -84,6 +84,54 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 - **Never raise.** On any failure return empty `code` — a zero is survivable, a
   crash loop is not. `custom_miner.py` already wraps your solver this way.
 
+## Backends: Claude, Gemini, ChatGPT
+
+Three backends ship, all behind the same `open()` → `send()`/`close()` protocol,
+all feeding the same self-verify-and-repair loop. Pick with `MINER_BACKENDS`:
+
+```bash
+MINER_BACKENDS=claude                  python examples/custom_miner/run_miner.py
+MINER_BACKENDS=claude,gemini           python examples/custom_miner/run_miner.py
+MINER_BACKENDS=claude,gemini,chatgpt   python examples/custom_miner/run_miner.py
+```
+
+| Backend | Credentials | Needs a browser |
+|---|---|---|
+| `claude` | `ANTHROPIC_API_KEY`, or an `ant auth login` profile | no |
+| `gemini` | `GEMINI_API_KEY` or `GOOGLE_API_KEY`; set `GEMINI_MODEL` | no |
+| `chatgpt` | a logged-in Chrome on `CHATGPT_PORTS` | yes |
+
+`run_chatgpt_miner.py` still exists and is equivalent to `MINER_BACKENDS=chatgpt`.
+
+### More than one backend is a fallback chain
+
+With several names, providers run **in order and stop at the first answer that
+reproduces every public example**. That ordering is a cost decision, not a
+quality one: a verified answer ends the chain, so later providers cost nothing
+on tasks the first one solves. Put the provider you would rather pay for first.
+
+This is worth doing because of how the subnet pays. The latency tiebreaker spans
+about 3.5%; being wrong costs 100%. A second opinion is therefore worth far more
+than a faster first one. If no provider verifies, the best partial answer across
+all of them is still returned — never nothing when some provider produced
+runnable code.
+
+Budget is split across the remaining providers rather than handed to the first,
+so a slow leader cannot starve the rest, and the chain stops early when too
+little time remains for another provider to be useful.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MINER_BACKENDS` | `claude` | Comma-separated backends, in preference order |
+| `CLAUDE_MODEL` | `claude-opus-5` | |
+| `CLAUDE_EFFORT` | `high` | `low` … `max` |
+| `GEMINI_MODEL` | `gemini-3-pro` | Set one your key can actually reach |
+| `SOLVER_MAX_ATTEMPTS` | `3` | Repair rounds per provider |
+
+`GET /solver-status` reports the chain, which provider verified each task, and
+per-provider turn and error counts — watch it, because a provider that starts
+failing looks exactly like success until the score drops.
+
 ## Included backend: ChatGPT over CDP + self-verification
 
 `run_chatgpt_miner.py` wires up a ready-made solver built from

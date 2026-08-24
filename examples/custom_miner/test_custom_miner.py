@@ -286,3 +286,69 @@ def test_starting_twice_connects_only_once():
 
     asyncio.run(go())
     assert calls == [1], "start() must connect once no matter how often it is called"
+
+
+# --------------------------------------------------------------------------- #
+# Multi-provider chain
+# --------------------------------------------------------------------------- #
+def test_answer_reports_whether_it_verified():
+    verified = asyncio.run(_solver([RIGHT]).solve_task(DIGITS, timeout_s=120))
+    assert verified.verified and verified.passed == verified.total > 0
+    unverified = asyncio.run(_solver([WRONG]).solve_task(DIGITS, timeout_s=120))
+    assert not unverified.verified
+
+
+def test_the_chain_stops_at_the_first_verified_provider():
+    """A verified answer must end the chain — later providers cost real money."""
+    from solvers.multi import FallbackSolver
+
+    second = _solver([RIGHT])
+    chain = FallbackSolver(
+        [("first", _solver([RIGHT])), ("second", second)], safety_margin_s=0
+    )
+    answer = asyncio.run(chain.solve_task(DIGITS, timeout_s=120))
+    assert answer.verified
+    stats = chain.stats()
+    assert stats["verified_by"]["first"] == 1
+    assert stats["attempts"]["second"] == 0, "second provider must not be called"
+
+
+def test_the_chain_falls_through_to_a_provider_that_can_solve_it():
+    from solvers.multi import FallbackSolver
+
+    chain = FallbackSolver(
+        [("weak", _solver([WRONG, WRONG, WRONG])), ("strong", _solver([RIGHT]))],
+        safety_margin_s=0,
+    )
+    answer = asyncio.run(chain.solve_task(DIGITS, timeout_s=120))
+    assert answer.verified and "while n > 0" in answer.code
+    assert chain.stats()["verified_by"]["strong"] == 1
+
+
+def test_when_nothing_verifies_the_best_partial_answer_is_returned():
+    """Never return nothing when some provider produced runnable code."""
+    from solvers.multi import FallbackSolver
+
+    chain = FallbackSolver(
+        [("a", _solver(["no code here"])), ("b", _solver([WRONG]))], safety_margin_s=0
+    )
+    answer = asyncio.run(chain.solve_task(DIGITS, timeout_s=120))
+    assert not answer.verified
+    assert answer.code.strip(), "the runnable-but-wrong answer beats an empty one"
+
+
+def test_an_unknown_backend_name_is_rejected_by_name():
+    from solvers.multi import KNOWN_BACKENDS, build_backend
+
+    with pytest.raises(SystemExit, match="unknown backend"):
+        build_backend("llama")
+    assert {"claude", "gemini", "chatgpt"} == set(KNOWN_BACKENDS)
+
+
+def test_a_single_backend_builds_a_plain_verifying_solver(monkeypatch):
+    """One name must not pay the chain's budget-splitting overhead."""
+    import solvers.multi as multi
+
+    monkeypatch.setattr(multi, "build_backend", lambda name: _Backend([RIGHT]))
+    assert isinstance(multi.build_solver(["claude"]), VerifyingSolver)
+    assert isinstance(multi.build_solver(["claude", "gemini"]), multi.FallbackSolver)
