@@ -1,14 +1,20 @@
-"""Claude backend for the custom miner, via the official Anthropic SDK.
+"""Claude via the Anthropic API — backend name ``claude-api``.
 
-Implements the same ``Backend``/``Conversation`` protocol as the ChatGPT-CDP
-backend in this package, so the self-verify-and-repair loop in ``verify.py``
-drives it unchanged: one conversation per task, and each repair turn appends to
-that conversation so the model sees its own previous attempt beside the failure
+``claude`` is the browser backend (``claude_cdp.py``), which spends a Claude
+subscription instead of an API key. This module is the other option, for
+someone who would rather pay per token and be rid of the browser entirely:
+
+    MINER_BACKENDS=claude-api      # instead of, or after, `claude`
+
+It implements the same ``Backend``/``Conversation`` protocol as the browser
+backends, so the self-verify-and-repair loop in ``verify.py`` drives it
+unchanged: one conversation per task, and each repair turn appends to that
+conversation so the model sees its own previous attempt beside the failure
 report.
 
-Unlike the browser backend, this needs no Chrome, no display and no persistent
-profile — which removes most of the hosting difficulty and all of the
-terms-of-service exposure that comes with driving a consumer web UI.
+What it buys over the browser: no Chrome, no display, no persistent profile, no
+DOM to break, and none of the terms-of-service exposure that comes with driving
+a consumer web UI. What it costs: a bill per solved task.
 
     ANTHROPIC_API_KEY=sk-ant-...    # or an `ant auth login` profile
     CLAUDE_MODEL=claude-opus-5      # optional
@@ -80,7 +86,7 @@ class _ClaudeConversation:
 class ClaudeBackend:
     """Anthropic-backed solver backend."""
 
-    name = "claude"
+    name = "claude-api"
 
     def __init__(
         self,

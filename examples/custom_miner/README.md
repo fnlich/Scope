@@ -84,22 +84,28 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 - **Never raise.** On any failure return empty `code` — a zero is survivable, a
   crash loop is not. `custom_miner.py` already wraps your solver this way.
 
-## Backends: Claude, Gemini, ChatGPT
+## Backends: Claude, ChatGPT, Gemini
 
-Three backends ship, all behind the same `open()` → `send()`/`close()` protocol,
+Four backends ship, all behind the same `open()` → `send()`/`close()` protocol,
 all feeding the same self-verify-and-repair loop. Pick with `MINER_BACKENDS`:
 
 ```bash
 MINER_BACKENDS=claude                  python examples/custom_miner/run_miner.py
-MINER_BACKENDS=claude,gemini           python examples/custom_miner/run_miner.py
-MINER_BACKENDS=claude,gemini,chatgpt   python examples/custom_miner/run_miner.py
+MINER_BACKENDS=claude,chatgpt          python examples/custom_miner/run_miner.py
+MINER_BACKENDS=claude,chatgpt,gemini   python examples/custom_miner/run_miner.py
 ```
 
-| Backend | Credentials | Needs a browser |
+| Backend | Credentials | Quota you spend |
 |---|---|---|
-| `claude` | `ANTHROPIC_API_KEY`, or an `ant auth login` profile | no |
-| `gemini` | `GEMINI_API_KEY` or `GOOGLE_API_KEY`; set `GEMINI_MODEL` | no |
-| `chatgpt` | a logged-in Chrome on `CHATGPT_PORTS` | yes |
+| `claude` | a logged-in Chrome on `CLAUDE_PORTS` | your Claude subscription |
+| `chatgpt` | a logged-in Chrome on `CHATGPT_PORTS` | your ChatGPT subscription |
+| `claude-api` | `ANTHROPIC_API_KEY`, or an `ant auth login` profile | tokens, per task |
+| `gemini` | `GEMINI_API_KEY` or `GOOGLE_API_KEY`; set `GEMINI_MODEL` | tokens, per task |
+
+`claude` and `chatgpt` drive a browser you are already logged in to and read no
+API key at all. `claude-api` is the same model over the API for anyone who would
+rather pay per token than keep a browser alive; see the risk list below for why
+you might.
 
 `run_chatgpt_miner.py` still exists and is equivalent to `MINER_BACKENDS=chatgpt`.
 
@@ -123,14 +129,80 @@ little time remains for another provider to be useful.
 | Variable | Default | Meaning |
 |---|---|---|
 | `MINER_BACKENDS` | `claude` | Comma-separated backends, in preference order |
-| `CLAUDE_MODEL` | `claude-opus-5` | |
-| `CLAUDE_EFFORT` | `high` | `low` … `max` |
-| `GEMINI_MODEL` | `gemini-3-pro` | Set one your key can actually reach |
+| `CLAUDE_PORTS` | `9222` | CDP ports for the `claude` browser backend |
+| `CLAUDE_MODEL` | `claude-opus-5` | `claude-api` only |
+| `CLAUDE_EFFORT` | `high` | `claude-api` only; `low` … `max` |
+| `GEMINI_MODEL` | — | Set one your key can actually reach |
 | `SOLVER_MAX_ATTEMPTS` | `3` | Repair rounds per provider |
+
+These are read from the process environment **and** from `.env` — `run_miner.py`
+loads that file into the environment itself, because the miner's own settings go
+through pydantic-settings, which reads `.env` directly and leaves `os.environ`
+untouched. A shell variable still wins over the file.
 
 `GET /solver-status` reports the chain, which provider verified each task, and
 per-provider turn and error counts — watch it, because a provider that starts
 failing looks exactly like success until the score drops.
+
+## Running Claude from the browser
+
+`claude` attaches to a Chrome you have already logged in to, over CDP. No API
+key is involved; the quota is whatever your Claude plan gives you.
+
+```bash
+pip install playwright     # not in any extra — the API backends do not need it
+                           # and no `playwright install` is needed either: these
+                           # attach to a Chrome you start yourself
+
+chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-claude-1
+# log in to https://claude.ai in that window, then verify the selectors:
+cd examples/custom_miner && python -m solvers.doctor claude --probe
+# then:
+CLAUDE_PORTS=9222 MINER_BACKENDS=claude python examples/custom_miner/run_miner.py
+```
+
+As with ChatGPT, the account is the rate-limit unit: one browser per Claude
+account, `CLAUDE_TABS_PER_BROWSER` conversation slots inside each, and at least
+`MINER_MAX_CONCURRENT_REQUESTS` tabs in total or extra tasks queue and burn
+their deadline. The launcher warns when it is short.
+
+### Run the doctor before you point a hotkey at it
+
+claude.ai's markup is not a published interface, so the selectors shipped here
+are candidate lists, not verified facts — and a browser miner fails *silently*:
+a DOM change looks exactly like an idle miner, and by the time the score drops
+the zeros are already inside the 200-observation window (~2.1 days).
+
+```
+$ python -m solvers.doctor claude --probe
+```
+
+reports which candidate your page actually has for each role, flags the three
+mistakes that matter, and then drives the real read path with a trivial prompt
+so you see exactly what the miner would see. Every role is overridable in
+`.env`, with `|` between candidates (`,` is already CSS's own "either"):
+
+```dotenv
+CLAUDE_COMPOSER='div[contenteditable="true"].ProseMirror'
+CLAUDE_ASSISTANT='div[data-is-streaming]'
+CLAUDE_SEND_BUTTON='button[aria-label="Send message"]'
+CLAUDE_STOP_BUTTON='button[aria-label="Stop response"]'
+```
+
+Three hazards are handled in code rather than left to the selectors:
+
+- **An assistant selector that also matches your own message** would make the
+  miner hand its own prompt back as the answer — no error, no empty reply, just
+  a permanent zero. Any reply that starts with the prompt just sent is refused,
+  and the log names the doctor.
+- **Artifacts.** Long code can land in the side panel, outside the message the
+  reader scrapes, so every prompt asks for an inline code block
+  (`CLAUDE_NUDGE` overrides the wording).
+- **A "still generating" selector that is always true** would make every answer
+  look unfinished and burn the whole budget. Each candidate is checked against
+  a freshly-loaded idle page at startup, and any that matches is dropped.
+
+The same doctor works for ChatGPT: `python -m solvers.doctor chatgpt`.
 
 ## Included backend: ChatGPT over CDP + self-verification
 
@@ -167,9 +239,11 @@ Accounts are the rate-limit unit, so N accounts give N× throughput (the same
 insight as `run_parallel.py`):
 
 ```bash
+pip install playwright   # see the note under "Running Claude from the browser"
 chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-1
 chrome --remote-debugging-port=9223 --user-data-dir=/tmp/chrome-2
-# log in to https://chatgpt.com in each, then:
+# log in to https://chatgpt.com in each, then check it:
+python -m solvers.doctor chatgpt --probe
 CHATGPT_PORTS=9222,9223 python examples/custom_miner/run_chatgpt_miner.py
 ```
 
@@ -180,6 +254,7 @@ queue and burn their deadline. The launcher warns when it is short.
 |---|---|---|
 | `CHATGPT_PORTS` | `9222` | Comma-separated CDP ports (one per account) |
 | `CHATGPT_TABS_PER_BROWSER` | `2` | Conversation slots per browser |
+| `CHATGPT_HOST` | `127.0.0.1` | CDP host (`CLAUDE_HOST` for Claude) |
 | `SOLVER_MAX_ATTEMPTS` | `3` | Initial answer + repair rounds |
 | `SOLVER_SAFETY_MARGIN_S` | `15` | Headroom kept before the cutoff |
 | `SOLVER_MAX_BUDGET_S` | `240` | Hard cap on one solve |
@@ -188,17 +263,21 @@ queue and burn their deadline. The launcher warns when it is short.
 `GET /solver-status` reports pool health and solve counts. Watch it — a
 browser-backed miner fails quietly, and silence looks identical to success.
 
-### Know the risks before running this for money
+### Know the risks before running either browser backend for money
 
-- **Terms of service.** Driving ChatGPT's web UI programmatically to power a
-  paid service is very likely against OpenAI's terms, which prohibit automated
-  extraction of Output. The realistic downside is account termination.
+- **Terms of service.** Driving a consumer chat UI programmatically to power a
+  paid service is very likely against the provider's terms — OpenAI's prohibit
+  automated extraction of Output, and Anthropic's usage policies and Claude.ai
+  terms similarly do not contemplate scripted access to the web app in place of
+  the API. The realistic downside is account termination. This applies to
+  `claude` and `chatgpt` equally; `claude-api` and `gemini` are the supported
+  way to do the same thing.
 - **Fragility.** Chrome updates, DOM changes, expired logins, rate limits and
   CAPTCHAs all break browser automation. A miner that does not answer scores
   zero into a 200-observation window (~2.1 days), so one bad night costs most
-  of your score. The backend is deliberately swappable for exactly this reason:
-  moving to an API backend means implementing `open()` returning something with
-  `send()`/`close()`, and touching nothing else.
+  of your score. This is what the doctor and the `.env` selector overrides are
+  for, and why the API backends exist alongside: switching is one variable,
+  `MINER_BACKENDS=claude-api`, with nothing else to change.
 - **Rust.** `SOLVER_VERIFY_EXECUTOR=docker` is required to verify Rust answers;
   without it Rust candidates are returned unverified.
 
@@ -211,8 +290,13 @@ pytest examples/custom_miner
 Kept out of `tests/` (the validator's own suite) so the default `pytest -q` is
 unaffected. They lock in the four validator acceptance checks on a real signed
 reply, that the verify loop repairs a wrong answer, that a solve never outruns
-its budget and never returns nothing when it has something, and that a browser
-tab which dies is retired rather than recycled into the pool.
+its budget and never returns nothing when it has something, that a browser tab
+which dies is retired rather than recycled into the pool (for both browser
+backends — they share one pool), and that a reply echoing the prompt is refused.
+
+What they cannot test is the selectors themselves, because there is no browser
+in CI. That is what `python -m solvers.doctor <backend> --probe` is for, and it
+is not optional before a browser backend serves a registered hotkey.
 
 ## Two caveats worth knowing
 

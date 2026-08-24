@@ -12,6 +12,9 @@ providers cost nothing on tasks the first one solves.
     MINER_BACKENDS=claude,gemini,chatgpt   # in preference order
     MINER_BACKENDS=claude                  # just one
 
+``claude`` and ``chatgpt`` drive a logged-in browser over CDP; ``claude-api``
+and ``gemini`` call an API with a key.
+
 Every backend implements the same protocol, so adding another is one class.
 """
 
@@ -23,16 +26,40 @@ from typing import Any, Optional
 
 from .verify import Answer, VerifyingSolver
 
-# Backends that need no browser. `chatgpt` is imported lazily below because it
-# pulls in Playwright, which most deployments of the API backends will not have.
-_API_BACKENDS = {"claude", "gemini"}
-KNOWN_BACKENDS = sorted(_API_BACKENDS | {"chatgpt"})
+# `claude` and `chatgpt` drive a logged-in browser over CDP and need no API key;
+# `claude-api` and `gemini` call an API. Browser backends are imported lazily
+# because they pull in Playwright, which an API-only deployment will not have.
+_BROWSER_BACKENDS = {"claude", "chatgpt"}
+_API_BACKENDS = {"claude-api", "gemini"}
+KNOWN_BACKENDS = sorted(_BROWSER_BACKENDS | _API_BACKENDS)
+
+
+def _pool_kwargs(prefix: str) -> dict[str, Any]:
+    """CDP settings for a browser backend: one browser per account."""
+    raw = os.environ.get(f"{prefix}_PORTS", "9222").replace(",", " ").split()
+    ports = []
+    for chunk in raw:
+        try:
+            ports.append(int(chunk))
+        except ValueError:
+            raise SystemExit(f"{prefix}_PORTS: {chunk!r} is not a port number")
+    return dict(
+        ports=ports or [9222],
+        host=os.environ.get(f"{prefix}_HOST", "127.0.0.1"),
+        tabs_per_browser=int(os.environ.get(f"{prefix}_TABS_PER_BROWSER", "2")),
+    )
 
 
 def build_backend(name: str):
     """Construct one backend by name."""
     key = name.strip().lower()
     if key == "claude":
+        # The browser, not an API key: your Claude subscription is the quota.
+        from .claude_cdp import ClaudeBrowserPool
+
+        kwargs = _pool_kwargs("CLAUDE")
+        return ClaudeBrowserPool(kwargs.pop("ports"), **kwargs)
+    if key == "claude-api":
         from .claude_api import ClaudeBackend
 
         return ClaudeBackend()
@@ -43,14 +70,8 @@ def build_backend(name: str):
     if key == "chatgpt":
         from .chatgpt_cdp import ChatGPTPool
 
-        ports = [
-            int(p) for p in os.environ.get("CHATGPT_PORTS", "9222").replace(",", " ").split()
-        ]
-        return ChatGPTPool(
-            ports,
-            host=os.environ.get("CHATGPT_HOST", "127.0.0.1"),
-            tabs_per_browser=int(os.environ.get("CHATGPT_TABS_PER_BROWSER", "2")),
-        )
+        kwargs = _pool_kwargs("CHATGPT")
+        return ChatGPTPool(kwargs.pop("ports"), **kwargs)
     raise SystemExit(f"unknown backend {name!r}; expected one of {KNOWN_BACKENDS}")
 
 
@@ -148,3 +169,34 @@ def build_solver(names: Optional[list[str]] = None):
     if len(solvers) == 1:
         return solvers[0][1]
     return FallbackSolver(solvers, safety_margin_s=tuning["safety_margin_s"])
+
+
+def backends(solver) -> list[Any]:
+    """Every leaf backend behind a solver — one, or a whole chain of them."""
+    chain = getattr(solver, "_solvers", None)
+    if chain is None:
+        return [solver._backend]
+    return [inner._backend for _, inner in chain]
+
+
+async def warm_up(solver, min_capacity: int = 1) -> None:
+    """Start any browser pool before serving, and warn if capacity is short.
+
+    Lazy start already covers correctness. What it does not cover is
+    visibility: an expired login would otherwise first surface as a failed
+    solve on a real validator request, minutes or hours later, instead of at
+    launch where someone is watching.
+    """
+    for backend in backends(solver):
+        start = getattr(backend, "start", None)
+        if start is None:
+            continue  # API backends have nothing to warm up
+        await start()
+        tabs = backend.stats().get("tabs", 0)
+        if tabs < min_capacity:
+            print(
+                f"[multi] NOTE: {backend.site.name} has {tabs} tab(s) but "
+                f"MINER_MAX_CONCURRENT_REQUESTS={min_capacity}. Tasks beyond the "
+                "tab count queue and burn their deadline — add browsers/tabs, or "
+                "lower the concurrency."
+            )

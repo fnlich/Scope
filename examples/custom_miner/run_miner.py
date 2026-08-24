@@ -3,7 +3,7 @@
 
     MINER_BACKENDS=claude                  python examples/custom_miner/run_miner.py
     MINER_BACKENDS=claude,gemini           python examples/custom_miner/run_miner.py
-    MINER_BACKENDS=claude,gemini,chatgpt   python examples/custom_miner/run_miner.py
+    MINER_BACKENDS=claude,chatgpt          python examples/custom_miner/run_miner.py
 
 Each backend answers into the same self-verify-and-repair loop, and with more
 than one they form a fallback chain: the first provider whose answer reproduces
@@ -15,10 +15,14 @@ the browser-only launcher; it is equivalent to ``MINER_BACKENDS=chatgpt`` here.
 
 Credentials, by backend:
 
-    claude   ANTHROPIC_API_KEY, or an `ant auth login` profile
-             CLAUDE_MODEL (default claude-opus-5), CLAUDE_EFFORT (default high)
-    gemini   GEMINI_API_KEY or GOOGLE_API_KEY; GEMINI_MODEL
-    chatgpt  a logged-in Chrome on CHATGPT_PORTS (no API key)
+    claude      a logged-in Chrome on CLAUDE_PORTS   (no API key)
+    chatgpt     a logged-in Chrome on CHATGPT_PORTS  (no API key)
+    claude-api  ANTHROPIC_API_KEY, or an `ant auth login` profile
+    gemini      GEMINI_API_KEY or GOOGLE_API_KEY; GEMINI_MODEL
+
+Before a browser backend serves a registered hotkey, verify its selectors once:
+
+    cd examples/custom_miner && python -m solvers.doctor claude --probe
 
 Chain identity comes from .env as usual: NETUID, SUBTENSOR_NETWORK,
 WALLET_NAME, WALLET_HOTKEY, AXON_PORT, AXON_EXTERNAL_IP.
@@ -36,10 +40,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from custom_miner import CustomMiner  # noqa: E402
 from rlvr.neurons.demo_miner import DemoMinerSettings, build_demo_miner_app  # noqa: E402
-from solvers.multi import build_solver  # noqa: E402
+from solvers.config import find_env_file, load_env_file  # noqa: E402
+from solvers.multi import build_solver, warm_up  # noqa: E402
 
 
 def main() -> None:
+    # The miner's own settings come from .env via pydantic-settings, which reads
+    # the file directly and never touches os.environ — so backend knobs written
+    # there (MINER_BACKENDS, CLAUDE_PORTS, selector overrides) would otherwise be
+    # silently ignored. Real environment variables still win.
+    env_file = find_env_file()
+    if load_env_file(env_file):
+        print(f"[miner] loaded {env_file}")
     settings = DemoMinerSettings()
     solver = build_solver()
 
@@ -82,10 +94,13 @@ def main() -> None:
         f"backends={os.environ.get('MINER_BACKENDS', 'claude')}"
     )
 
-    # One event loop for everything: the ChatGPT backend's Playwright objects are
+    # One event loop for everything: the browser backends' Playwright objects are
     # loop-bound, and build_demo_miner_app already installs a `lifespan`, so a
     # FastAPI startup hook would be silently ignored.
     async def serve() -> None:
+        # Start browser pools here, where a failure is visible, rather than
+        # lazily on the first validator request.
+        await warm_up(solver, settings.miner_max_concurrent_requests)
         server = uvicorn.Server(
             uvicorn.Config(
                 app,
