@@ -189,6 +189,8 @@ class ChatGPTPool:
         self._free: asyncio.Queue[_Tab] = asyncio.Queue()
         self._size = 0
         self._lost = 0
+        self._started = False
+        self._start_lock = asyncio.Lock()
 
     async def _spawn(self, context, label: str) -> Optional[_Tab]:
         """Open one logged-in ChatGPT tab, or return None with a reason logged."""
@@ -205,6 +207,21 @@ class ChatGPTPool:
         return _Tab(self, page, context, label)
 
     async def start(self) -> None:
+        """Attach to the browsers and fill the tab pool. Idempotent.
+
+        Safe to call explicitly at startup, and called lazily by ``open()`` so
+        the pool also works under a host that has no startup hook — a local test
+        harness, for instance. Without that, a host which never called start()
+        would leave ``open()`` blocked on an empty queue and every solve would
+        quietly return nothing.
+        """
+        async with self._start_lock:
+            if self._started:
+                return
+            await self._connect()
+            self._started = True
+
+    async def _connect(self) -> None:
         from playwright.async_api import async_playwright
 
         self._pw = await async_playwright().start()
@@ -234,6 +251,8 @@ class ChatGPTPool:
 
     async def open(self) -> _Tab:
         """Lease a tab and put it in a fresh conversation."""
+        if not self._started:
+            await self.start()
         tab = await self._free.get()
         try:
             await tab.start()
@@ -274,6 +293,8 @@ class ChatGPTPool:
         }
 
     async def aclose(self) -> None:
+        if not self._started:
+            return
         while not self._free.empty():
             await (await self._free.get()).dispose()
         for browser in self._browsers:

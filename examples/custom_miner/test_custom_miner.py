@@ -252,3 +252,37 @@ def test_the_submit_phase_is_bounded_so_playwright_cannot_overrun_the_budget():
     # of overrun on a budget the solver carefully computed.
     assert "asyncio.wait_for" in send
     assert submit.count("timeout=ui_ms") == 2
+
+
+def test_the_pool_starts_lazily_so_any_host_can_serve_it():
+    """Regression: start() was only called by run_chatgpt_miner.py, which needs
+    a live chain. Hosted anywhere else the pool stayed empty and open() blocked
+    on the queue forever, so every solve returned nothing."""
+    import inspect
+
+    from solvers.chatgpt_cdp import ChatGPTPool
+
+    assert "await self.start()" in inspect.getsource(ChatGPTPool.open)
+    start = inspect.getsource(ChatGPTPool.start)
+    assert "_start_lock" in start and "if self._started" in start, "start must be idempotent"
+
+
+def test_starting_twice_connects_only_once():
+    import asyncio
+
+    from solvers.chatgpt_cdp import ChatGPTPool
+
+    pool = ChatGPTPool([9222])
+    calls = []
+
+    async def fake_connect():
+        calls.append(1)
+
+    pool._connect = fake_connect
+
+    async def go():
+        await pool.start()   # an explicit start, as run_chatgpt_miner.py does
+        await pool.start()   # a second call, as a lazy start from open() would be
+
+    asyncio.run(go())
+    assert calls == [1], "start() must connect once no matter how often it is called"
