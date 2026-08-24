@@ -63,9 +63,11 @@ run_custom_miner(MySolver())
 ## Run
 
 ```bash
-# Debian/Ubuntu — Python 3.12 and the build tools the chain wheels expect
+# Debian/Ubuntu — Python 3.12, the build tools the chain wheels expect, and
+# (for the browser backends) a virtual screen to log in on.
 sudo apt-get update && sudo apt-get install -y \
-    python3.12 python3.12-venv build-essential pkg-config libssl-dev
+    python3.12 python3.12-venv build-essential pkg-config libssl-dev \
+    xvfb x11vnc
 
 python3.12 -m venv .venv && . .venv/bin/activate
 pip install -e '.[chain,miner]'
@@ -94,7 +96,7 @@ crawl.
 
 **macOS** can install the chain dependencies but is refused here anyway. A
 miner is a long-lived server that has to answer inside a deadline around the
-clock, and the shape of that — systemd, Chrome under Xvfb, a firewall in front
+clock, and the shape of that — systemd, Firefox under Xvfb, a firewall in front
 of the axon port — is Linux shaped. Half-working on a laptop is worse than a
 clear no.
 
@@ -127,13 +129,13 @@ MINER_BACKENDS=claude,chatgpt   python examples/custom_miner/run_miner.py
 
 | Backend | Credentials | Quota you spend |
 |---|---|---|
-| `claude` | a logged-in Chrome on `CLAUDE_PORTS` | your Claude subscription |
-| `chatgpt` | a logged-in Chrome on `CHATGPT_PORTS` | your ChatGPT subscription |
+| `claude` | a logged-in Firefox profile in `CLAUDE_PROFILES` | your Claude subscription |
+| `chatgpt` | a logged-in Firefox profile in `CHATGPT_PROFILES` | your ChatGPT subscription |
 
-Both attach to a browser you are already logged in to. **No API key is read
-anywhere in this package** — there is no API path at all, which is a deliberate
-choice with a real cost attached: see the risks below, and run two providers if
-you can.
+Both drive **Firefox**, launched by Playwright against a profile directory you
+signed in to once. **No API key is read anywhere in this package** — there is no
+API path at all, which is a deliberate choice with a real cost attached: see the
+risks below, and run two providers if you can.
 
 `run_chatgpt_miner.py` still exists and is equivalent to `MINER_BACKENDS=chatgpt`.
 
@@ -161,8 +163,9 @@ little time remains for another provider to be useful.
 | Variable | Default | Meaning |
 |---|---|---|
 | `MINER_BACKENDS` | `claude` | Comma-separated backends, in preference order |
-| `CLAUDE_PORTS` | `9222` | CDP ports, one per Claude account |
-| `CLAUDE_TABS_PER_BROWSER` | `2` | Conversation slots per browser |
+| `CLAUDE_PROFILES` | `~/.hone-miner/firefox/claude-1` | Profile dirs, one per account |
+| `CLAUDE_TABS_PER_PROFILE` | `2` | Conversation slots per profile |
+| `CLAUDE_HEADLESS` | `true` | `false` shows the windows (needs a display) |
 | `SOLVER_MAX_ATTEMPTS` | `3` | Repair rounds per provider |
 
 These are read from the process environment **and** from `.env` — `run_miner.py`
@@ -176,58 +179,79 @@ failing looks exactly like success until the score drops.
 
 ## Running Claude from the browser
 
-`claude` attaches to a Chrome you have already logged in to, over CDP. No API
-key is involved; the quota is whatever your Claude plan gives you.
+`claude` drives Firefox against a profile directory you signed in to once. No
+API key is involved; the quota is whatever your Claude plan gives you.
 
 ```bash
-# Debian/Ubuntu. No `playwright install` is needed — the backends attach over
-# CDP to a Chrome you start yourself, so there is no bundled browser to fetch.
-sudo apt-get install -y chromium xvfb        # or google-chrome-stable
-pip install playwright                       # in no extra; the package only
+pip install playwright
+python -m playwright install firefox     # a second, separate download
 
 cd examples/custom_miner
-./scripts/start_browser.sh --port 9222 --profile ~/.chrome-claude-1 \
-                          --url https://claude.ai/new
-# log in once in that browser (see below for a headless host), then:
+python -m solvers.login claude           # sign in; see below if there is no screen
 python -m solvers.doctor claude --probe
-CLAUDE_PORTS=9222 MINER_BACKENDS=claude python run_miner.py
+MINER_BACKENDS=claude python run_miner.py
 ```
 
-`scripts/start_browser.sh` is the Linux specifics in one place: it finds
-`google-chrome-stable`, `chromium`, `chromium-browser` or `$CHROME_BIN`, adds
-`--no-sandbox` only when you are root, keeps CDP on loopback, refuses to
-double-launch a profile that is already running, and waits for the port before
-telling you it is up.
+### Why Playwright owns the browser
 
-**Logging in on a headless host.** There is no display, so the script runs
-Chrome under `xvfb-run` — a real headful Chrome with a virtual screen, not
-headless mode, because these sites treat headless as a bot and a CAPTCHA on a
-miner is a silent run of zeros. To reach that invisible window, forward the CDP
-port and drive it from your own machine:
+An earlier version attached over CDP to a Chrome you started yourself. Firefox
+cannot do that — Playwright's `connect_over_cdp` is Chromium-only, and Mozilla
+removed its CDP implementation in favour of WebDriver BiDi. So Playwright
+launches Firefox itself against a persistent profile.
+
+That is a better shape for a miner anyway: **one process to supervise instead of
+two**, no debugging port to leave exposed, and a crash restarts already logged
+in. It comes with exactly one rule:
+
+> **A profile directory can be open in one process at a time.** Stop the miner
+> before running the login helper or the doctor, and stop those before starting
+> the miner. All three say so by name when it happens rather than crashing.
+
+### Logging in when the box has no screen
+
+`scripts/login.sh` starts a virtual screen (Xvfb), shares it over VNC bound to
+loopback, opens the login window on it, and prints the tunnel command:
 
 ```bash
-ssh -N -L 9222:127.0.0.1:9222 you@your-miner     # from your laptop
-# then open http://127.0.0.1:9222 and pick the tab; log in there
+sudo apt-get install -y xvfb x11vnc
+./scripts/login.sh claude
+# then from your own machine:
+ssh -N -L 5900:127.0.0.1:5900 you@your-miner
+# point a VNC client at 127.0.0.1:5900, sign in, press Enter in the terminal
 ```
 
-**Keep the CDP port on loopback.** Anyone who can reach it has full control of
-the browser *and* its logged-in sessions, on a box that is already exposing a
-public axon port. Never pass `--remote-debugging-address`; use the SSH tunnel.
+That VNC screen is an unauthenticated view of a browser you are about to type a
+password into, on a box already exposing a public axon port — hence `-localhost`
+and the tunnel. Never publish the port.
 
-**Chrome's log is noisy on a server.** `Failed to connect to the bus`,
-`org.freedesktop.UPower`, and similar D-Bus errors are normal on a headless box
-with no desktop session and do not mean the browser is broken. What matters is
-the `DevTools listening on ws://127.0.0.1:9222/...` line and the script's
-`CDP is up.`
+**Or skip it entirely**: log in on any Linux desktop and copy the directory.
 
-**Keeping it alive.** Run the browser and the miner as two systemd services
-with `Restart=always`. Give the browser the same `--user-data-dir` every time,
-so a crash comes back already logged in rather than at a login page.
+```bash
+rsync -a ~/.hone-miner/firefox/claude-1/ you@your-miner:~/.hone-miner/firefox/claude-1/
+```
 
-As with ChatGPT, the account is the rate-limit unit: one browser per Claude
-account, `CLAUDE_TABS_PER_BROWSER` conversation slots inside each, and at least
+The login helper does not take your word for it — after you press Enter it
+reloads the site and checks the composer actually appears, so a half-finished
+sign-in fails now rather than as a run of zeros later.
+
+### Accounts, profiles and tabs
+
+The account is the rate-limit unit: one profile per Claude account,
+`CLAUDE_TABS_PER_PROFILE` conversation slots inside each, and at least
 `MINER_MAX_CONCURRENT_REQUESTS` tabs in total or extra tasks queue and burn
 their deadline. The launcher warns when it is short.
+
+```dotenv
+CLAUDE_PROFILES=~/.hone-miner/firefox/claude-1,~/.hone-miner/firefox/claude-2
+CLAUDE_TABS_PER_PROFILE=2
+```
+
+**Headless by default.** Set `CLAUDE_HEADLESS=false` and run the miner under
+`xvfb-run` if a provider starts challenging the headless browser; that trades
+some memory for looking more like an ordinary session.
+
+**Keeping it alive.** One systemd service with `Restart=always` is enough now —
+the browser is a child of the miner, and the profile brings the login back.
 
 ### Run the doctor before you point a hotkey at it
 
@@ -267,10 +291,10 @@ Three hazards are handled in code rather than left to the selectors:
 
 The same doctor works for ChatGPT: `python -m solvers.doctor chatgpt`.
 
-## Included backend: ChatGPT over CDP + self-verification
+## Included backend: ChatGPT in Firefox + self-verification
 
 `run_chatgpt_miner.py` wires up a ready-made solver built from
-[fnlich/Automation](https://github.com/fnlich/Automation)'s CDP driver:
+[fnlich/Automation](https://github.com/fnlich/Automation)'s browser driver:
 
 ```
 POST /solve -> fresh ChatGPT conversation -> self-grade against the public
@@ -302,12 +326,12 @@ Accounts are the rate-limit unit, so N accounts give N× throughput (the same
 insight as `run_parallel.py`):
 
 ```bash
-# Same setup as Claude above; one profile and one port per account.
-./scripts/start_browser.sh --port 9222 --profile ~/.chrome-gpt-1 --url https://chatgpt.com
-./scripts/start_browser.sh --port 9223 --profile ~/.chrome-gpt-2 --url https://chatgpt.com
-# log in to each, then check it:
+# Same setup as Claude above; one profile per account.
+python -m solvers.login chatgpt --profile ~/.hone-miner/firefox/chatgpt-1
+python -m solvers.login chatgpt --profile ~/.hone-miner/firefox/chatgpt-2
 python -m solvers.doctor chatgpt --probe
-CHATGPT_PORTS=9222,9223 python run_chatgpt_miner.py
+CHATGPT_PROFILES=~/.hone-miner/firefox/chatgpt-1,~/.hone-miner/firefox/chatgpt-2 \
+    python run_chatgpt_miner.py
 ```
 
 Keep the tab count at or above `MINER_MAX_CONCURRENT_REQUESTS`, or extra tasks
@@ -315,9 +339,9 @@ queue and burn their deadline. The launcher warns when it is short.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CHATGPT_PORTS` | `9222` | Comma-separated CDP ports (one per account) |
-| `CHATGPT_TABS_PER_BROWSER` | `2` | Conversation slots per browser |
-| `CHATGPT_HOST` | `127.0.0.1` | CDP host (`CLAUDE_HOST` for Claude) |
+| `CHATGPT_PROFILES` | `~/.hone-miner/firefox/chatgpt-1` | Profile dirs, one per account |
+| `CHATGPT_TABS_PER_PROFILE` | `2` | Conversation slots per profile |
+| `CHATGPT_HEADLESS` | `true` | `false` shows the windows |
 | `SOLVER_MAX_ATTEMPTS` | `3` | Initial answer + repair rounds |
 | `SOLVER_SAFETY_MARGIN_S` | `15` | Headroom kept before the cutoff |
 | `SOLVER_MAX_BUDGET_S` | `240` | Hard cap on one solve |
@@ -335,7 +359,7 @@ browser-backed miner fails quietly, and silence looks identical to success.
   the API. The realistic downside is account termination, and it applies to
   `claude` and `chatgpt` equally. The supported way to do this is each
   provider's API; this package does not offer that path.
-- **Fragility, with nothing to fall back to.** Chrome updates, DOM changes,
+- **Fragility, with nothing to fall back to.** Firefox updates, DOM changes,
   expired logins, rate limits and CAPTCHAs all break browser automation. A miner
   that does not answer scores zero into a 200-observation window (~2.1 days), so
   one bad night costs most of your score — and there is no `MINER_BACKENDS=...-api`

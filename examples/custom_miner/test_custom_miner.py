@@ -27,9 +27,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from custom_miner import CustomMiner, SolveTask  # noqa: E402
-from solvers.cdp_pool import Site, _Tab, usable_busy_selectors  # noqa: E402
-from solvers.chatgpt_cdp import ChatGPTPool, chatgpt_site  # noqa: E402
-from solvers.claude_cdp import claude_site  # noqa: E402
+from solvers.browser_pool import Site, _Tab, usable_busy_selectors  # noqa: E402
+from solvers.chatgpt_web import ChatGPTPool, chatgpt_site  # noqa: E402
+from solvers.claude_web import claude_site  # noqa: E402
 from solvers.verify import Answer, VerifyingSolver  # noqa: E402
 
 from rlvr.neurons.demo_miner import DemoMinerSettings, build_demo_miner_app  # noqa: E402
@@ -272,7 +272,7 @@ def test_the_pool_starts_lazily_so_any_host_can_serve_it():
     on the queue forever, so every solve returned nothing."""
     import inspect
 
-    from solvers.chatgpt_cdp import ChatGPTPool
+    from solvers.chatgpt_web import ChatGPTPool
 
     assert "await self.start()" in inspect.getsource(ChatGPTPool.open)
     start = inspect.getsource(ChatGPTPool.start)
@@ -282,9 +282,9 @@ def test_the_pool_starts_lazily_so_any_host_can_serve_it():
 def test_starting_twice_connects_only_once():
     import asyncio
 
-    from solvers.chatgpt_cdp import ChatGPTPool
+    from solvers.chatgpt_web import ChatGPTPool
 
-    pool = ChatGPTPool([9222])
+    pool = ChatGPTPool(["/tmp/does-not-need-to-exist"])
     calls = []
 
     async def fake_connect():
@@ -480,7 +480,7 @@ def test_a_non_linux_host_is_refused_with_the_reason(monkeypatch, platform, name
 
 
 def test_wsl2_and_any_linux_pass(monkeypatch):
-    """WSL2 is real Linux to Python and to Chrome; it must not be refused.
+    """WSL2 is real Linux to Python and to Firefox; it must not be refused.
 
     monkeypatch, not assignment: `preflight.sys` IS the stdlib sys module, so a
     bare assignment would change sys.platform for the whole test session.
@@ -509,18 +509,61 @@ def test_every_entrypoint_checks_the_platform_before_importing_anything_heavy():
     assert "require_linux(" in (root / "solvers" / "doctor.py").read_text()
 
 
-def test_the_browser_launcher_is_linux_only_and_keeps_cdp_on_loopback():
-    """The CDP port is full control of a logged-in browser, on a box that is
-    already exposing a public axon port."""
+def test_the_login_helper_is_linux_only_and_keeps_vnc_on_loopback():
+    """That VNC screen is an unauthenticated view of a browser you are about to
+    type a password into, on a box already exposing a public axon port."""
     from pathlib import Path
 
-    script = (Path(__file__).resolve().parent / "scripts" / "start_browser.sh").read_text()
-    assert 'uname -s' in script and 'Linux' in script
-    assert "--remote-debugging-address" not in script.replace(
-        "# Never add --remote-debugging-address", ""
-    ), "must never bind CDP off loopback"
-    assert "--no-sandbox" in script  # needed when running as root
-    assert "xvfb-run" in script      # headless hosts have no display
+    script = (Path(__file__).resolve().parent / "scripts" / "login.sh").read_text()
+    assert "uname -s" in script and "Linux" in script
+    assert "-localhost" in script, "the VNC port must never leave loopback"
+    assert "-nopw" in script and "-localhost" in script
+    assert "Xvfb" in script  # a headless host has no screen to log in on
+
+
+def test_the_backends_use_firefox_with_a_persistent_profile():
+    """Firefox cannot be attached to over CDP — Playwright's connect_over_cdp is
+    Chromium-only and Mozilla dropped CDP for WebDriver BiDi — so Playwright has
+    to launch it, and the login has to live in a profile directory."""
+    import inspect
+
+    from solvers import browser_pool
+    from solvers.multi import build_backend
+
+    source = inspect.getsource(browser_pool)
+    assert "connect_over_cdp" not in source.replace(
+        "cannot do that: Playwright's ``connect_over_cdp`` is Chromium-only", ""
+    ), "CDP cannot drive Firefox"
+    assert "launch_persistent_context" in source
+
+    pool = build_backend("claude")
+    assert pool._profiles and pool._tabs_per_profile >= 1
+
+
+def test_a_profile_that_is_not_there_names_the_login_command(capsys):
+    """The first thing a new operator gets wrong. It must not be a stack trace."""
+    from solvers.claude_web import ClaudeBrowserPool
+
+    pool = ClaudeBrowserPool(["/nonexistent/profile"])
+    with pytest.raises(RuntimeError, match="solvers.login"):
+        asyncio.run(pool.start())
+    assert "python -m solvers.login claude" in capsys.readouterr().out
+
+
+def test_profiles_and_tab_counts_come_from_the_environment(monkeypatch):
+    from solvers.multi import _pool_kwargs
+
+    monkeypatch.delenv("CLAUDE_PROFILES", raising=False)
+    monkeypatch.delenv("CLAUDE_HEADLESS", raising=False)
+    default = _pool_kwargs("CLAUDE")
+    assert default["profiles"][0].endswith("claude-1") and default["headless"] is True
+
+    monkeypatch.setenv("CLAUDE_PROFILES", "/a, /b")
+    monkeypatch.setenv("CLAUDE_TABS_PER_PROFILE", "4")
+    monkeypatch.setenv("CLAUDE_HEADLESS", "false")
+    kwargs = _pool_kwargs("CLAUDE")
+    assert kwargs["profiles"] == ["/a", "/b"]
+    assert kwargs["tabs_per_profile"] == 4 and kwargs["headless"] is False
 
 
 def test_no_backend_anywhere_reads_an_api_key():
@@ -530,16 +573,16 @@ def test_no_backend_anywhere_reads_an_api_key():
     import inspect
     from pathlib import Path
 
-    from solvers import claude_cdp
+    from solvers import claude_web
     from solvers.multi import KNOWN_BACKENDS, build_backend
 
     backend = build_backend("claude")
-    assert isinstance(backend, claude_cdp.ClaudeBrowserPool)
+    assert isinstance(backend, claude_web.ClaudeBrowserPool)
     assert backend.site.name == "claude" and "claude.ai" in backend.site.url
     assert set(KNOWN_BACKENDS) == {"claude", "chatgpt"}
 
     banned = ("API_KEY", "import anthropic", "from anthropic", "google.genai")
-    package = Path(inspect.getfile(claude_cdp)).parent
+    package = Path(inspect.getfile(claude_web)).parent
     for module in sorted(package.glob("*.py")):
         body = module.read_text()
         for needle in banned:
@@ -580,7 +623,7 @@ def test_a_selector_a_page_cannot_evaluate_is_dropped_at_startup():
     """A typo in a `.env` override should cost that one candidate. At answer
     time a raising selector is indistinguishable from a dead page, so the tab
     would be retired on every request instead."""
-    from solvers.cdp_pool import valid_selectors
+    from solvers.browser_pool import valid_selectors
 
     class _Strict(_FakePage):
         def locator(self, selector):
@@ -628,14 +671,14 @@ def test_dotenv_values_fill_in_without_overriding_the_real_environment(monkeypat
     from solvers.config import load_env_file
 
     env = tmp_path / ".env"
-    env.write_text('# comment\nCLAUDE_PORTS=9301,9302\nexport CLAUDE_URL="https://claude.ai/new"\nSHELL_WINS=from-file\n')
+    env.write_text('# comment\nCLAUDE_PROFILES=~/a,~/b\nexport CLAUDE_URL="https://claude.ai/new"\nSHELL_WINS=from-file\n')
     monkeypatch.setenv("SHELL_WINS", "from-shell")
-    monkeypatch.delenv("CLAUDE_PORTS", raising=False)
+    monkeypatch.delenv("CLAUDE_PROFILES", raising=False)
     monkeypatch.delenv("CLAUDE_URL", raising=False)
     assert load_env_file(env) == 2
     import os
 
-    assert os.environ["CLAUDE_PORTS"] == "9301,9302"
+    assert os.environ["CLAUDE_PROFILES"] == "~/a,~/b"
     assert os.environ["CLAUDE_URL"] == "https://claude.ai/new"
     assert os.environ["SHELL_WINS"] == "from-shell"
 
@@ -662,7 +705,7 @@ def test_the_env_file_is_found_from_a_subdirectory(tmp_path, monkeypatch):
     root) and the doctor (run from examples/custom_miner)."""
     from solvers.config import find_env_file
 
-    (tmp_path / ".env").write_text("CLAUDE_PORTS=9222\n")
+    (tmp_path / ".env").write_text("CLAUDE_PROFILES=~/a\n")
     nested = tmp_path / "examples" / "custom_miner"
     nested.mkdir(parents=True)
     assert find_env_file(nested) == tmp_path / ".env"
@@ -673,10 +716,13 @@ def test_a_missing_playwright_names_the_fix_instead_of_raising_importerror():
     makes a bare ImportError the most likely first experience."""
     import inspect
 
-    from solvers.cdp_pool import import_playwright
+    from solvers.browser_pool import import_playwright
 
     source = inspect.getsource(import_playwright)
     assert "pip install playwright" in source and "SystemExit" in source
+    # The Firefox build is a second, separate download; naming only the first
+    # leaves you with a working import and no browser.
+    assert "playwright install firefox" in source
 
 
 def test_a_browser_backend_is_started_before_serving_not_on_first_request():

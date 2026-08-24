@@ -1,19 +1,19 @@
-"""Claude-in-the-browser backend: drive claude.ai over CDP, no API key.
+"""Claude-in-the-browser backend: drive claude.ai in Firefox, no API key.
 
 Same shape as the ChatGPT backend and the same machinery underneath
-(``cdp_pool.py``): attach to a Chrome you already logged in to, hold one tab per
-concurrent solve, start every task in a fresh conversation, and feed the reply
-into the self-verify-and-repair loop in ``verify.py``. Your existing Claude
-subscription is the quota; no API key is read anywhere.
+(``browser_pool.py``): Playwright launches Firefox on a profile directory you
+logged in to once, holds one tab per concurrent solve, starts every task in a
+fresh conversation, and feeds the reply into the self-verify-and-repair loop in
+``verify.py``. Your existing Claude subscription is the quota; no API key is
+read anywhere.
 
-    chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-claude-1
-    # log in to https://claude.ai in it, then:
-    CLAUDE_PORTS=9222 MINER_BACKENDS=claude python examples/custom_miner/run_miner.py
+    python -m solvers.login claude        # once, to log in
+    MINER_BACKENDS=claude python examples/custom_miner/run_miner.py
 
 There is deliberately no API-key path in this package. The consequence is that
 a browser backend has no supported fallback to switch to, which is exactly why
 the doctor tool below is not optional and why running ``claude,chatgpt`` as a
-chain is worth the second browser.
+chain is worth the second account.
 
 ## Read this before you trust the selectors below
 
@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import os
 
-from .cdp_pool import CDPPool, Site
+from .browser_pool import BrowserPool, Site
 from .config import selectors
 
 # Claude answers in the chat by default, but long code can be moved to the
@@ -113,20 +113,21 @@ def claude_site() -> Site:
     )
 
 
-class ClaudeBrowserPool(CDPPool):
-    """A pool of claude.ai tabs, optionally spread across several browsers.
+class ClaudeBrowserPool(BrowserPool):
+    """A pool of claude.ai tabs, optionally spread across several profiles.
 
-    As with ChatGPT, one browser per Claude account is the unit that multiplies
-    throughput; tabs inside one browser share that account's limits.
+    As with ChatGPT, one profile per Claude account is the unit that multiplies
+    throughput; tabs inside one profile share that account's limits.
     """
 
     def __init__(
         self,
-        ports: list[int],
+        profiles: list[str],
         *,
-        host: str = "127.0.0.1",
-        tabs_per_browser: int = 2,
+        tabs_per_profile: int = 2,
+        headless: bool = True,
     ):
         super().__init__(
-            claude_site(), ports, host=host, tabs_per_browser=tabs_per_browser
+            claude_site(), profiles,
+            tabs_per_profile=tabs_per_profile, headless=headless,
         )

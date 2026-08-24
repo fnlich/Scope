@@ -4,12 +4,13 @@
     MINER_BACKENDS=claude           python examples/custom_miner/run_miner.py
     MINER_BACKENDS=claude,chatgpt   python examples/custom_miner/run_miner.py
 
-Both backends drive a browser you are already logged in to, over CDP:
+Both backends drive a Firefox profile you are already logged in to:
 
-    claude    a logged-in Chrome on CLAUDE_PORTS
-    chatgpt   a logged-in Chrome on CHATGPT_PORTS
+    claude    CLAUDE_PROFILES    (default ~/.hone-miner/firefox/claude-1)
+    chatgpt   CHATGPT_PROFILES   (default ~/.hone-miner/firefox/chatgpt-1)
 
-No API key is read anywhere. Each backend answers into the same
+Log in once per account with ``python -m solvers.login <backend>``. No API key
+is read anywhere. Each backend answers into the same
 self-verify-and-repair loop, and with more than one they form a fallback chain:
 the first provider whose answer reproduces every public example wins, and the
 rest are never called for that task.
@@ -57,7 +58,7 @@ from solvers.multi import build_solver, warm_up  # noqa: E402
 def main() -> None:
     # The miner's own settings come from .env via pydantic-settings, which reads
     # the file directly and never touches os.environ — so backend knobs written
-    # there (MINER_BACKENDS, CLAUDE_PORTS, selector overrides) would otherwise be
+    # there (MINER_BACKENDS, CLAUDE_PROFILES, selector overrides) would otherwise be
     # silently ignored. Real environment variables still win.
     env_file = find_env_file()
     if load_env_file(env_file):

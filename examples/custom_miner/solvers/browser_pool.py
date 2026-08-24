@@ -1,19 +1,32 @@
-"""A pool of CDP-attached chat tabs, shared by every browser backend.
+"""A pool of logged-in Firefox tabs, shared by every browser backend.
 
-ChatGPT and Claude need exactly the same machinery: attach to an
-already-running Chrome over CDP, hold N logged-in tabs, lease one per task,
-start every task in a fresh conversation, notice when a tab dies and replace it
-rather than recycle it, and bound every wait by the caller's deadline. Only the
-DOM differs. So the machinery lives here once and each site contributes a
-``Site``: where to type, what to click, what "still generating" looks like, and
-where the reply lands.
+Claude and ChatGPT need exactly the same machinery: keep N logged-in tabs,
+lease one per task, start every task in a fresh conversation, notice when a tab
+dies and replace it rather than recycle it, and bound every wait by the caller's
+deadline. Only the DOM differs. So the machinery lives here once and each site
+contributes a ``Site``: where to type, what to click, what "still generating"
+looks like, and where the reply lands.
 
-That split is not tidiness. Two of the behaviours in this file were real
-failure modes — a tab that dies and gets recycled turns a miner into one that
-answers ``/health`` cheerfully while scoring zero forever, and an unbounded
-Playwright submit overruns the solver's budget by ~90s because auto-wait is 30s
-*per action*. Duplicating them per site means fixing them twice and testing
-them once.
+That split is not tidiness. Two of the behaviours here were real failure modes —
+a tab that dies and gets recycled turns a miner into one that answers
+``/health`` cheerfully while scoring zero forever, and an unbounded submit
+overruns the solver's budget by ~90s because Playwright auto-waits 30s *per
+action*. Duplicating them per site means fixing them twice and testing them
+once.
+
+## Why Playwright owns the browser
+
+An earlier version attached over CDP to a Chrome you started yourself. Firefox
+cannot do that: Playwright's ``connect_over_cdp`` is Chromium-only, and Mozilla
+removed its CDP implementation in favour of WebDriver BiDi. So Playwright
+launches Firefox itself, with ``launch_persistent_context`` against a profile
+directory that keeps the login.
+
+That is a better shape for a miner anyway — one process to supervise instead of
+two, and a crash restarts already logged in — but it comes with one rule worth
+knowing before it bites you: **a profile directory can only be open in one
+process at a time.** Run ``python -m solvers.login`` while the miner is running
+and the launch fails; the message says so.
 
 ## Selectors are configuration, not code
 
@@ -25,16 +38,18 @@ the environment with ``|`` between candidates (``,`` is already CSS's own
 
     CLAUDE_ASSISTANT='div[data-is-streaming]|div.font-claude-message'
 
-``python -m solvers.doctor claude`` attaches to your browser and reports which
-candidate won for each role, so a DOM change is a one-line .env fix instead of
-a patch. Run it before you point a registered hotkey at any browser backend.
+``python -m solvers.doctor claude`` reports which candidate won for each role,
+so a DOM change is a one-line .env fix instead of a patch. Run it before you
+point a registered hotkey at any backend.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 
@@ -63,22 +78,28 @@ class Site:
     ready_timeout_ms: int = 60_000
 
 
+PROFILE_ROOT = Path(os.environ.get("MINER_PROFILE_ROOT", "~/.hone-miner/firefox")).expanduser()
+
+
+def default_profile(backend: str, index: int = 1) -> Path:
+    """Where a profile lives when nobody said otherwise."""
+    return PROFILE_ROOT / f"{backend}-{index}"
+
+
 def import_playwright():
     """Playwright, or an actionable message instead of an ImportError traceback.
 
-    It is in no extra of this project on purpose: the API backends do not need
-    it, and it is a large dependency. Note that no ``playwright install`` is
-    required either — these backends attach over CDP to a Chrome you started
-    yourself, so there is no bundled browser to download.
+    It is in no extra of this project on purpose: it is a large dependency and
+    the browser download is larger still, so the failure has to name both steps.
     """
     try:
         from playwright.async_api import async_playwright
     except ModuleNotFoundError as exc:  # pragma: no cover - environment-specific
         raise SystemExit(
-            "The browser backends need Playwright:\n"
+            "The browser backends need Playwright and its Firefox build:\n"
             "    pip install playwright\n"
-            "No `playwright install` is needed — they attach over CDP to a "
-            "Chrome you start yourself."
+            "    python -m playwright install firefox\n"
+            "Playwright launches Firefox itself, so both steps are required."
         ) from exc
     return async_playwright
 
@@ -369,29 +390,30 @@ class _Tab:
             pass
 
 
-class CDPPool:
-    """Tabs across one or more CDP-attached browsers, leased one per task.
+class BrowserPool:
+    """Tabs across one or more logged-in Firefox profiles, leased one per task.
 
-    Each port is expected to be a browser logged into a DIFFERENT account:
-    accounts are the real rate-limit unit, so N accounts give N times the
-    throughput. Tabs within one browser share that browser's account and
-    therefore its limit.
+    Each profile directory is expected to hold a DIFFERENT account: accounts are
+    the real rate-limit unit, so N accounts give N times the throughput. Tabs
+    within one profile share that account and therefore its limit.
     """
 
     def __init__(
         self,
         site: Site,
-        ports: list[int],
+        profiles: list[str],
         *,
-        host: str = "127.0.0.1",
-        tabs_per_browser: int = 2,
+        tabs_per_profile: int = 2,
+        headless: bool = True,
     ):
         self.site = site
-        self._ports = ports or [9222]
-        self._host = host
-        self._tabs_per_browser = max(1, int(tabs_per_browser))
+        self._profiles = [str(Path(p).expanduser()) for p in profiles] or [
+            str(default_profile(site.name, 1))
+        ]
+        self._tabs_per_profile = max(1, int(tabs_per_profile))
+        self._headless = bool(headless)
         self._pw = None
-        self._browsers: list[Any] = []
+        self._contexts: list[Any] = []
         self._free: asyncio.Queue[_Tab] = asyncio.Queue()
         self._size = 0
         self._lost = 0
@@ -455,17 +477,14 @@ class CDPPool:
         async_playwright = import_playwright()
         site = self.site
         self._pw = await async_playwright().start()
-        for port in self._ports:
-            endpoint = f"http://{self._host}:{port}"
-            try:
-                browser = await self._pw.chromium.connect_over_cdp(endpoint)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[{site.name}] WARN: cannot attach to {endpoint}: {exc}")
+        for profile in self._profiles:
+            context = await self._open_profile(profile)
+            if context is None:
                 continue
-            self._browsers.append(browser)
-            context = browser.contexts[0] if browser.contexts else await browser.new_context()
-            for i in range(self._tabs_per_browser):
-                tab = await self._spawn(context, f"{port}#{i + 1}")
+            self._contexts.append(context)
+            name = Path(profile).name
+            for i in range(self._tabs_per_profile):
+                tab = await self._spawn(context, f"{name}#{i + 1}")
                 if tab is None:
                     continue
                 await self._free.put(tab)
@@ -473,14 +492,41 @@ class CDPPool:
                 print(f"[{site.name}] tab {tab.label} ready")
         if self._size == 0:
             raise RuntimeError(
-                f"No usable {site.name} tabs. Start Chrome with "
-                f"--remote-debugging-port=<port> --user-data-dir=<dir>, open "
-                f"{site.url} in it, and log in."
+                f"No usable {site.name} tabs. Log in once with:\n"
+                f"    python -m solvers.login {site.name}\n"
+                f"then start the miner again."
             )
         print(
             f"[{site.name}] pool ready: {self._size} tab(s) "
-            f"across {len(self._browsers)} browser(s)"
+            f"across {len(self._contexts)} profile(s)"
         )
+
+    async def _open_profile(self, profile: str):
+        """Launch Firefox on one profile directory, or explain why it could not."""
+        site = self.site
+        if not Path(profile).is_dir():
+            print(
+                f"[{site.name}] WARN: no profile at {profile}. Log in once with:\n"
+                f"    python -m solvers.login {site.name} --profile {profile}"
+            )
+            return None
+        try:
+            return await self._pw.firefox.launch_persistent_context(
+                profile, headless=self._headless, viewport={"width": 1280, "height": 900}
+            )
+        except Exception as exc:  # noqa: BLE001
+            detail = str(exc)
+            # A profile can be open in exactly one process. This is the mistake
+            # people make: leaving the login helper running, then starting the
+            # miner, and reading the raw Playwright error as a crash.
+            hint = (
+                "\n         That profile is already open in another process — "
+                "close the login helper (or the other miner) first."
+                if "profile" in detail.lower() or "lock" in detail.lower()
+                else ""
+            )
+            print(f"[{site.name}] WARN: cannot open {profile}: {detail.splitlines()[0]}{hint}")
+            return None
 
     async def open(self) -> _Tab:
         """Lease a tab and put it in a fresh conversation."""
@@ -522,7 +568,8 @@ class CDPPool:
             "backend": self.site.name,
             "tabs": self._size,
             "idle": self._free.qsize(),
-            "browsers": len(self._browsers),
+            "profiles": len(self._contexts),
+            "headless": self._headless,
             "lost": self._lost,
         }
 
@@ -531,9 +578,9 @@ class CDPPool:
             return
         while not self._free.empty():
             await (await self._free.get()).dispose()
-        for browser in self._browsers:
+        for context in self._contexts:
             try:
-                await browser.close()
+                await context.close()  # also stops the Firefox process
             except Exception:  # noqa: BLE001
                 pass
         if self._pw is not None:

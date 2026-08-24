@@ -13,10 +13,10 @@ hotkey, and the hotkey lives in ``bittensor-wallet``.
 **macOS could technically install** the chain dependencies, but is not
 supported here and is not tested: a miner is a long-lived server that has to
 answer within a deadline around the clock, and the operational shape of that —
-systemd, headless Chrome under Xvfb, a firewall in front of the axon port — is
+systemd, headless Firefox, a firewall in front of the axon port — is
 Linux shaped. Silently half-working on a laptop is worse than a clear no.
 
-If you are on Windows, WSL2 is genuinely Linux to Python and to Chrome and is
+If you are on Windows, WSL2 is genuinely Linux to Python and to Firefox and is
 the intended path; ``sys.platform`` there is ``linux`` and this check passes.
 """
 
@@ -35,7 +35,7 @@ What to use instead:
   * a Linux host (any x86-64 distro with glibc 2.28+ — Ubuntu 22.04/24.04,
     Debian 12, Rocky 9); this is what a miner wants anyway, since it has to
     answer around the clock; or
-  * WSL2 on Windows, which is real Linux to both Python and Chrome. Install
+  * WSL2 on Windows, which is real Linux to both Python and Firefox. Install
     into the WSL filesystem, not /mnt/c.
 
 macOS can install the chain dependencies but is not supported or tested here.

@@ -12,7 +12,7 @@ providers cost nothing on tasks the first one solves.
     MINER_BACKENDS=claude,chatgpt   # in preference order
     MINER_BACKENDS=claude           # just one
 
-Both backends drive a browser you are already logged in to, over CDP. No API
+Both backends drive a Firefox profile you are already logged in to. No API
 key is read anywhere in this package.
 
 Running both is also the only redundancy a browser miner has. There is no API
@@ -30,25 +30,23 @@ from typing import Any, Optional
 
 from .verify import Answer, VerifyingSolver
 
-# Both backends drive a logged-in browser over CDP; neither reads an API key.
+# Both backends drive a logged-in Firefox profile; neither reads an API key.
 # Imported lazily inside build_backend so that importing this module does not
 # require Playwright.
 KNOWN_BACKENDS = ["chatgpt", "claude"]
 
 
 def _pool_kwargs(prefix: str) -> dict[str, Any]:
-    """CDP settings for a browser backend: one browser per account."""
-    raw = os.environ.get(f"{prefix}_PORTS", "9222").replace(",", " ").split()
-    ports = []
-    for chunk in raw:
-        try:
-            ports.append(int(chunk))
-        except ValueError:
-            raise SystemExit(f"{prefix}_PORTS: {chunk!r} is not a port number")
+    """Firefox settings for a browser backend: one profile per account."""
+    from .browser_pool import default_profile
+
+    raw = os.environ.get(f"{prefix}_PROFILES", "").replace(",", " ").split()
+    profiles = raw or [str(default_profile(prefix.lower(), 1))]
+    headless = os.environ.get(f"{prefix}_HEADLESS", "true").strip().lower()
     return dict(
-        ports=ports or [9222],
-        host=os.environ.get(f"{prefix}_HOST", "127.0.0.1"),
-        tabs_per_browser=int(os.environ.get(f"{prefix}_TABS_PER_BROWSER", "2")),
+        profiles=profiles,
+        tabs_per_profile=int(os.environ.get(f"{prefix}_TABS_PER_PROFILE", "2")),
+        headless=headless not in ("0", "false", "no"),
     )
 
 
@@ -57,15 +55,15 @@ def build_backend(name: str):
     key = name.strip().lower()
     if key == "claude":
         # The browser, not an API key: your Claude subscription is the quota.
-        from .claude_cdp import ClaudeBrowserPool
+        from .claude_web import ClaudeBrowserPool
 
         kwargs = _pool_kwargs("CLAUDE")
-        return ClaudeBrowserPool(kwargs.pop("ports"), **kwargs)
+        return ClaudeBrowserPool(kwargs.pop("profiles"), **kwargs)
     if key == "chatgpt":
-        from .chatgpt_cdp import ChatGPTPool
+        from .chatgpt_web import ChatGPTPool
 
         kwargs = _pool_kwargs("CHATGPT")
-        return ChatGPTPool(kwargs.pop("ports"), **kwargs)
+        return ChatGPTPool(kwargs.pop("profiles"), **kwargs)
     raise SystemExit(f"unknown backend {name!r}; expected one of {KNOWN_BACKENDS}")
 
 
@@ -191,6 +189,6 @@ async def warm_up(solver, min_capacity: int = 1) -> None:
             print(
                 f"[multi] NOTE: {backend.site.name} has {tabs} tab(s) but "
                 f"MINER_MAX_CONCURRENT_REQUESTS={min_capacity}. Tasks beyond the "
-                "tab count queue and burn their deadline — add browsers/tabs, or "
+                "tab count queue and burn their deadline — add profiles/tabs, or "
                 "lower the concurrency."
             )
