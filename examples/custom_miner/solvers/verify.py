@@ -68,6 +68,20 @@ class Backend(Protocol):
 
 
 @dataclass
+class Answer:
+    """What a solver hands back to the miner.
+
+    Structurally compatible with ``custom_miner.SolveResult`` (the miner only
+    reads ``.code`` and ``.raw_response``) and defined here on purpose: importing
+    the miner module from inside a request would make a path problem surface as
+    a failed solve at serving time rather than at startup.
+    """
+
+    code: str
+    raw_response: str = ""
+
+
+@dataclass
 class Candidate:
     code: str
     raw: str
@@ -193,9 +207,7 @@ class VerifyingSolver:
         self._counts = {"solved": 0, "verified": 0, "cache_hits": 0, "empty": 0}
 
     # -- the Solver interface custom_miner.py expects ---------------------- #
-    async def solve_task(self, task, timeout_s: float):
-        from custom_miner import SolveResult  # local import: avoids a cycle
-
+    async def solve_task(self, task, timeout_s: float) -> Answer:
         started = time.monotonic()
         # The validator advertises one deadline but may enforce the problem
         # server's shorter one, so never spend the full advertised budget.
@@ -207,7 +219,7 @@ class VerifyingSolver:
         if key in self._cache:
             self._counts["cache_hits"] += 1
             code, raw = self._cache[key]
-            return SolveResult(code=code, raw_response=raw)
+            return Answer(code=code, raw_response=raw)
 
         best = Candidate(code="", raw="")
         conversation = None
@@ -259,7 +271,7 @@ class VerifyingSolver:
             f"examples={best.passed}/{best.total} verified={best.verified} "
             f"{elapsed:.1f}s/{budget:.0f}s"
         )
-        return SolveResult(code=best.code, raw_response=best.raw)
+        return Answer(code=best.code, raw_response=best.raw)
 
     # ---------------------------------------------------------------------- #
     def _grade(self, reply: str, task) -> Candidate:

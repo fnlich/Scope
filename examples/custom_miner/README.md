@@ -154,6 +154,18 @@ browser-backed miner fails quietly, and silence looks identical to success.
 - **Rust.** `SOLVER_VERIFY_EXECUTOR=docker` is required to verify Rust answers;
   without it Rust candidates are returned unverified.
 
+## Tests
+
+```bash
+pytest examples/custom_miner
+```
+
+Kept out of `tests/` (the validator's own suite) so the default `pytest -q` is
+unaffected. They lock in the four validator acceptance checks on a real signed
+reply, that the verify loop repairs a wrong answer, that a solve never outruns
+its budget and never returns nothing when it has something, and that a browser
+tab which dies is retired rather than recycled into the pool.
+
 ## Two caveats worth knowing
 
 - **Trust the request's `deadline_s` cautiously.** The validator advertises one

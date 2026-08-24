@@ -40,13 +40,22 @@ POLL_S = float(os.environ.get("CHATGPT_POLL_S", "2"))
 
 
 class _Tab:
-    """One ChatGPT tab: a single conversation slot leased from the pool."""
+    """One ChatGPT tab: a single conversation slot leased from the pool.
 
-    def __init__(self, pool: "ChatGPTPool", page, label: str):
+    ``alive`` is the pool's health signal. A tab whose browser or page has gone
+    away must never be recycled: leasing it again fails the next request too,
+    and a miner that keeps handing out dead tabs returns zeros indefinitely
+    while still answering /health. Any Playwright failure clears the flag, and
+    the pool disposes of the tab and tries to spawn a replacement.
+    """
+
+    def __init__(self, pool: "ChatGPTPool", page, context, label: str):
         self._pool = pool
         self._page = page
+        self.context = context
         self.label = label
         self.uses = 0
+        self.alive = True
 
     async def start(self) -> None:
         """Open a fresh conversation so each task begins with empty context.
@@ -55,42 +64,76 @@ class _Tab:
         still see the previous task's code will happily blend the two, and the
         result fails the hidden suite in a way that is very hard to diagnose.
         """
-        await self._page.goto(CHATGPT_URL, wait_until="domcontentloaded")
-        await self._page.wait_for_selector(COMPOSER, timeout=30_000)
+        try:
+            await self._page.goto(CHATGPT_URL, wait_until="domcontentloaded")
+            await self._page.wait_for_selector(COMPOSER, timeout=30_000)
+        except Exception:
+            self.alive = False
+            raise
+
+    async def _submit(self, text: str, ui_ms: int) -> None:
+        """Type the prompt and press send, with every step bounded.
+
+        Playwright's default auto-wait is 30s PER action, so an unbounded
+        click/insert/click can burn ~90s that the solver's budget never
+        accounted for — which would blow the response deadline and score zero
+        even though the answer was on its way.
+        """
+        composer = self._page.locator(COMPOSER)
+        await composer.click(timeout=ui_ms)
+        # insert_text handles newlines safely — Enter alone would submit early.
+        await self._page.keyboard.insert_text(text)
+        await self._page.locator(SEND_BUTTON).click(timeout=ui_ms)
 
     async def send(self, text: str, timeout_s: float) -> str:
         page = self._page
         self.uses += 1
-        id_before = await self._last_message_id()
-
-        composer = page.locator(COMPOSER)
-        await composer.click()
-        # insert_text handles newlines safely — Enter alone would submit early.
-        await page.keyboard.insert_text(text)
-        await page.locator(SEND_BUTTON).click()
+        # Reserve a slice of the caller's budget for getting the prompt in;
+        # the rest is for waiting on the answer.
+        submit_budget_s = max(5.0, min(20.0, timeout_s * 0.3))
+        try:
+            id_before = await self._last_message_id()
+            await asyncio.wait_for(
+                self._submit(text, int(submit_budget_s * 1000)),
+                timeout=submit_budget_s,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - includes the submit timeout
+            # The prompt never reached ChatGPT. Treat the tab as unusable so
+            # the pool replaces it rather than failing the next request too.
+            self.alive = False
+            print(f"[chatgpt] tab {self.label} failed to submit: {type(exc).__name__}")
+            return ""
 
         deadline = time.monotonic() + max(1.0, timeout_s)
         stable: Optional[str] = None
-        while time.monotonic() < deadline:
-            await asyncio.sleep(POLL_S)
-            # Still generating or thinking while the Stop button is present.
-            if await page.locator(STOP_BUTTON).count() > 0:
-                stable = None
-                continue
-            messages = page.locator(ASSISTANT_MSG)
-            n = await messages.count()
-            if n == 0:
-                continue
-            reply = messages.nth(n - 1)
-            reply_id = await reply.get_attribute("data-message-id")
-            if reply_id is not None and reply_id == id_before:
-                continue  # still the previous answer; ours hasn't rendered yet
-            text_now = await self._read(reply)
-            if text_now is None:
-                continue
-            if text_now == stable:
-                return text_now  # finished: no Stop button and unchanged text
-            stable = text_now
+        try:
+            while time.monotonic() < deadline:
+                await asyncio.sleep(POLL_S)
+                # Still generating or thinking while the Stop button is present.
+                if await page.locator(STOP_BUTTON).count() > 0:
+                    stable = None
+                    continue
+                messages = page.locator(ASSISTANT_MSG)
+                n = await messages.count()
+                if n == 0:
+                    continue
+                reply = messages.nth(n - 1)
+                reply_id = await reply.get_attribute("data-message-id")
+                if reply_id is not None and reply_id == id_before:
+                    continue  # still the previous answer; ours hasn't rendered yet
+                text_now = await self._read(reply)
+                if text_now is None:
+                    continue
+                if text_now == stable:
+                    return text_now  # finished: no Stop button and unchanged text
+                stable = text_now
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the page died mid-read
+            self.alive = False
+            print(f"[chatgpt] tab {self.label} died while reading: {type(exc).__name__}")
         # Timed out mid-stream: a partial answer still beats nothing, because
         # the verifier can grade it and may repair it on the next attempt.
         return stable or ""
@@ -147,6 +190,20 @@ class ChatGPTPool:
         self._size = 0
         self._lost = 0
 
+    async def _spawn(self, context, label: str) -> Optional[_Tab]:
+        """Open one logged-in ChatGPT tab, or return None with a reason logged."""
+        try:
+            page = await context.new_page()
+            await page.goto(CHATGPT_URL, wait_until="domcontentloaded")
+            await page.wait_for_selector(COMPOSER, timeout=60_000)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[chatgpt] WARN: tab {label} never reached the composer "
+                f"({type(exc).__name__}) — is this profile logged in?"
+            )
+            return None
+        return _Tab(self, page, context, label)
+
     async def start(self) -> None:
         from playwright.async_api import async_playwright
 
@@ -161,20 +218,12 @@ class ChatGPTPool:
             self._browsers.append(browser)
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
             for i in range(self._tabs_per_browser):
-                label = f"{port}#{i + 1}"
-                try:
-                    page = await context.new_page()
-                    await page.goto(CHATGPT_URL, wait_until="domcontentloaded")
-                    await page.wait_for_selector(COMPOSER, timeout=60_000)
-                except Exception as exc:  # noqa: BLE001
-                    print(
-                        f"[chatgpt] WARN: tab {label} never reached the composer "
-                        f"({type(exc).__name__}) — is this profile logged in?"
-                    )
+                tab = await self._spawn(context, f"{port}#{i + 1}")
+                if tab is None:
                     continue
-                await self._free.put(_Tab(self, page, label))
+                await self._free.put(tab)
                 self._size += 1
-                print(f"[chatgpt] tab {label} ready")
+                print(f"[chatgpt] tab {tab.label} ready")
         if self._size == 0:
             raise RuntimeError(
                 "No usable ChatGPT tabs. Start Chrome with "
@@ -189,16 +238,32 @@ class ChatGPTPool:
         try:
             await tab.start()
         except Exception:
-            # A tab that cannot even open a chat is dead to us; drop it rather
-            # than cycling it back into the pool to fail the next request too.
-            self._lost += 1
-            self._size -= 1
-            await tab.dispose()
+            # start() already marked it dead; release() disposes and replaces it.
+            await self.release(tab)
             raise
         return tab
 
     async def release(self, tab: _Tab) -> None:
-        await self._free.put(tab)
+        """Return a tab to the pool, or retire and replace a dead one.
+
+        Recycling a dead tab is the failure that matters here: it would fail
+        every future request leased onto it, so capacity is rebuilt instead.
+        """
+        if tab.alive:
+            await self._free.put(tab)
+            return
+        self._lost += 1
+        await tab.dispose()
+        replacement = await self._spawn(tab.context, tab.label)
+        if replacement is not None:
+            await self._free.put(replacement)
+            print(f"[chatgpt] tab {tab.label} replaced after failure")
+            return
+        self._size -= 1
+        print(
+            f"[chatgpt] WARN: tab {tab.label} retired and could not be replaced; "
+            f"{self._size} tab(s) left"
+        )
 
     def stats(self) -> dict[str, Any]:
         return {
