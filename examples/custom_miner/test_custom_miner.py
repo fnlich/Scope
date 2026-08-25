@@ -1414,6 +1414,69 @@ def test_a_busy_selector_that_matches_an_idle_page_is_dropped():
     assert kept == ("#real-stop",)
 
 
+def test_a_rendered_code_block_survives_being_scraped():
+    """Both halves of a real solve that scored zero.
+
+    The reader scrapes a RENDERED page, so what comes back is not the source
+    the model wrote. Two things ride along, and both were seen live:
+
+    1. A Private Use Area character the UI uses for its own bookkeeping. It is
+       invisible, and it makes the whole file `invalid non-printable character
+       U+E027` — after a perfectly good answer.
+    2. The code block's language chip, which sits inside the element being
+       scraped and becomes a bare `python` first line. That is the worse one:
+       it parses, it defines the entrypoint, it passes every check, and then
+       raises NameError the instant the grader imports it.
+    """
+    from solvers.prompts import extract_code, python_defect
+
+    scraped = "python\ndef g(n):" + chr(0xE027) + "\n    return n"
+    code = extract_code(scraped)
+    assert python_defect(code, "g") is None, "the artefacts were not cleaned"
+    exec(compile(code, "<submitted>", "exec"), {})          # must not raise
+
+    # ...and the same with only the chip, which used to pass silently.
+    code = extract_code("python\ndef g(n):\n    return n")
+    assert python_defect(code, "g") is None
+    ns: dict = {}
+    exec(compile(code, "<submitted>", "exec"), ns)
+    assert ns["g"](3) == 3
+
+
+def test_a_language_chip_inside_a_fence_is_dropped_too():
+    """Belt and braces: a fenced reply can carry the chip as its first line."""
+    from solvers.prompts import extract_code
+
+    code = extract_code("```python\npython\ndef g(n):\n    return n\n```")
+    assert code.startswith("def g("), code
+
+
+def test_exotic_spaces_do_not_break_indentation():
+    """A non-breaking space renders like a space and is not one."""
+    from solvers.prompts import extract_code, python_defect
+
+    code = extract_code("def g(n):\n" + "\u00a0" * 4 + "return n")
+    assert python_defect(code, "g") is None, "NBSP indentation was not folded"
+
+
+def test_a_bare_name_at_top_level_is_reported_not_submitted():
+    """The general form of the chip bug. A top-level bare name is never
+    meaningful code and always raises NameError on import, so every hidden test
+    fails. Reporting it turns a silent zero into a repair round."""
+    from solvers.prompts import python_defect
+
+    defect = python_defect("import os\nfoo\ndef g(n):\n    return n", "g")
+    assert defect is not None and "bare name" in defect, defect
+
+
+def test_clean_code_is_left_exactly_alone():
+    """The sanitiser must not be creative with source that was already fine."""
+    from solvers.prompts import extract_code
+
+    source = "def g(n):\n    # keep  spacing\n    return {'ok': True}"
+    assert extract_code(source) == source
+
+
 def test_the_claude_prompt_asks_for_an_inline_code_block():
     """Long code can land in the artifacts panel, outside the message the
     reader scrapes. One sentence is cheaper than scraping the panel."""
