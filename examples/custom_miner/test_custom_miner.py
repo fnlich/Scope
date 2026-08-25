@@ -1015,6 +1015,32 @@ def test_the_doctor_probe_drives_a_real_tab():
         "#assistant", [_Node(code=["print('pong')"])]
     )
     assert asyncio.run(doctor._probe(page, _site(), "#composer", ())) is True
+    # ...and it reports how the next conversation starts. With no new-chat
+    # control that is the reload, which is the honest answer, not a skip.
+    assert page.navigated == ["about:blank"]
+
+
+def test_the_doctor_reports_the_in_app_new_chat_when_the_page_has_one():
+    """The one thing a selector list cannot tell you is whether clicking the
+    control actually clears the transcript. The probe has just left a real one
+    on the page, so this is the only place that can be answered against your
+    own browser rather than assumed."""
+    from solvers import doctor
+
+    page = _chat_page()
+
+    def handler(selector):
+        if selector == "#send":
+            page.dom["#assistant"] = [_Node(code=["print('pong')"])]
+        elif selector == "#newchat":
+            page.dom["#assistant"] = []
+
+    page.on_click = handler
+    assert asyncio.run(
+        doctor._probe(page, _site(new_chat=("#newchat",)), "#composer", ())
+    ) is True
+    assert "#newchat" in page.clicked
+    assert page.navigated == [], "the in-app path should not reload the page"
 
 
 def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():

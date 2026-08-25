@@ -31,6 +31,7 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 
 from .browser_pool import (
@@ -229,7 +230,41 @@ async def _probe(page, site: Site, composer: str, busy) -> bool:
         print("[doctor] !! that does not look like the answer to the probe prompt.")
         return False
     print("[doctor] probe answered correctly — the read path works end to end.")
+    await _report_reset(tab)
     return True
+
+
+async def _report_reset(tab) -> None:
+    """Show how this tab will start its NEXT conversation, and what it costs.
+
+    The probe has just left a real transcript on the page, which is exactly the
+    state a tab is in between two tasks. Whether the in-app new-chat control
+    works here is the one thing a selector list cannot tell you — it either
+    routes and clears the transcript or it does not — and if it does not, the
+    miner falls back to a reload silently and correctly, which is precisely why
+    it is worth measuring rather than assuming.
+    """
+    print("\n[doctor] starting the next conversation the way the miner will...")
+    started = time.monotonic()
+    if await tab._new_chat():
+        print(
+            f"[doctor] in-app new chat: {time.monotonic() - started:.1f}s. The "
+            f"transcript is gone and the page was never reloaded — this is what "
+            f"the miner will do between tasks."
+        )
+        return
+    print(
+        f"[doctor] no usable new-chat control ({time.monotonic() - started:.1f}s "
+        f"to find that out). Falling back to a reload, which always works:"
+    )
+    started = time.monotonic()
+    await tab._reload()
+    print(
+        f"[doctor] reload: {time.monotonic() - started:.1f}s — paid on every "
+        f"task after the first. Not a failure, but set "
+        f"{tab.site.env_prefix}_NEW_CHAT to a selector for this page's "
+        f"'New chat' control and it becomes the line above."
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
