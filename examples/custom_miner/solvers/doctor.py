@@ -30,10 +30,13 @@ import os
 import sys
 from pathlib import Path
 
+from typing import Optional
+
 from .browser_pool import (
     Site,
     default_profile,
     import_playwright,
+    normalize_cdp,
     usable_busy_selectors,
     wait_for_any,
 )
@@ -91,30 +94,59 @@ async def _report_role(
     return True
 
 
-async def run(name: str, profile: str, probe: bool, headless: bool) -> int:
-    site = _site(name)
-    async_playwright = import_playwright()
+async def _acquire(pw, site, cdp: Optional[str], profile: str, headless: bool):
+    """Get a browser context the same way the miner would, and a teardown.
+
+    Returns ``(context, teardown)`` or ``(None, None)`` after printing why.
+    In attach mode the teardown only disconnects; it never kills your browser.
+    """
+    if cdp:
+        endpoint = normalize_cdp(cdp)[0]
+        print(f"[doctor] {site.name}: attaching over CDP to {endpoint}")
+        try:
+            browser = await pw.chromium.connect_over_cdp(endpoint)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[doctor] FAIL: cannot attach: {str(exc).splitlines()[0]}\n"
+                f"         Start Chrome with --remote-debugging-port and confirm "
+                f"{endpoint}/json/version answers."
+            )
+            return None, None
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        return context, browser.close
+
     print(f"[doctor] {site.name}: opening profile {profile}")
     if not Path(profile).is_dir():
         print(
             f"[doctor] FAIL: no profile there. Log in once with:\n"
             f"         python -m solvers.login {site.name} --profile {profile}"
         )
-        return 2
+        return None, None
+    try:
+        context = await pw.firefox.launch_persistent_context(
+            profile, headless=headless, viewport={"width": 1280, "height": 900}
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[doctor] FAIL: cannot open the profile: {str(exc).splitlines()[0]}\n"
+            "         A profile can be open in one process at a time — stop the "
+            "miner (or the login helper) and try again."
+        )
+        return None, None
+    return context, context.close
+
+
+async def run(name: str, cdp: Optional[str], profile: str, probe: bool, headless: bool) -> int:
+    site = _site(name)
+    async_playwright = import_playwright()
     pw = await async_playwright().start()
     try:
-        try:
-            context = await pw.firefox.launch_persistent_context(
-                profile, headless=headless, viewport={"width": 1280, "height": 900}
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"[doctor] FAIL: cannot open the profile: {str(exc).splitlines()[0]}\n"
-                "         A profile can be open in one process at a time — stop the "
-                "miner (or the login helper) and try again."
-            )
+        context, teardown = await _acquire(pw, site, cdp, profile, headless)
+        if context is None:
             return 2
-        page = context.pages[0] if context.pages else await context.new_page()
+        # Always a fresh tab, so in attach mode the doctor never disturbs a tab
+        # you are looking at.
+        page = await context.new_page()
         healthy = True
         try:
             print(f"[doctor] opening {site.url}")
@@ -123,10 +155,12 @@ async def run(name: str, profile: str, probe: bool, headless: bool) -> int:
             if composer is None:
                 print("[doctor] FAIL: no composer selector matched.")
                 await _report_role(page, "composer", site.composer)
-                print(
-                    "         Most often this means the profile is not logged in:\n"
-                    f"         python -m solvers.login {site.name} --profile {profile}"
+                fix = (
+                    f"open {site.url} in the Chrome on {cdp} and sign in by hand"
+                    if cdp
+                    else f"python -m solvers.login {site.name} --profile {profile}"
                 )
+                print(f"         Most often it is not logged in: {fix}")
                 return 1
             print(f"[doctor] page ready (composer: {composer})\n")
             healthy &= await _report_role(page, "composer", site.composer)
@@ -159,8 +193,15 @@ async def run(name: str, profile: str, probe: bool, headless: bool) -> int:
             if probe:
                 healthy &= await _probe(page, site, composer, kept)
         finally:
+            # Close only the tab we opened; teardown disconnects (attach) or
+            # closes (launch) the browser without touching your other tabs.
+            if cdp:
+                try:
+                    await page.close()
+                except Exception:  # noqa: BLE001
+                    pass
             try:
-                await context.close()
+                await teardown()
             except Exception:  # noqa: BLE001
                 pass
         print(f"\n[doctor] {'OK' if healthy else 'PROBLEMS FOUND (see !! above)'}")
@@ -206,6 +247,11 @@ async def _probe(page, site: Site, composer: str, busy) -> bool:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m solvers.doctor")
     parser.add_argument("backend", choices=("claude", "chatgpt"))
+    parser.add_argument(
+        "--cdp", default=None,
+        help="attach over CDP to a Chrome you started (e.g. 9222); default is "
+        "<PREFIX>_CDP from .env, or Firefox-launch if neither is set",
+    )
     parser.add_argument("--profile", default=None, help="Firefox profile directory")
     parser.add_argument(
         "--probe", action="store_true", help="also send a real prompt and read it back"
@@ -223,15 +269,16 @@ def main(argv: list[str] | None = None) -> int:
     if load_env_file(found):
         print(f"[doctor] loaded {found}")
 
-    # The first profile the miner itself would use, so the doctor checks the
-    # same thing the miner will.
+    # Check the same thing the miner will: attach if CDP is configured, else the
+    # first Firefox profile it would use.
     prefix = args.backend.upper()
+    cdp = args.cdp or os.environ.get(f"{prefix}_CDP") or None
     profile = args.profile
     if profile is None:
         listed = os.environ.get(f"{prefix}_PROFILES", "").replace(",", " ").split()
         profile = listed[0] if listed else str(default_profile(args.backend, 1))
     profile = str(Path(profile).expanduser())
-    return asyncio.run(run(args.backend, profile, args.probe, not args.headed))
+    return asyncio.run(run(args.backend, cdp, profile, args.probe, not args.headed))
 
 
 if __name__ == "__main__":

@@ -37,7 +37,13 @@ KNOWN_BACKENDS = ["chatgpt", "claude"]
 
 
 def _pool_kwargs(prefix: str) -> dict[str, Any]:
-    """Firefox settings for a browser backend: one profile per account."""
+    """Browser settings for a backend.
+
+    ``<PREFIX>_CDP`` selects attach mode — a Chrome you started yourself and
+    logged in to, reached over CDP. Left unset, the backend launches Firefox
+    against ``<PREFIX>_PROFILES``. Attach mode is what gets past sign-in checks
+    that refuse a Playwright-launched browser (Google, in particular).
+    """
     from .browser_pool import default_profile
 
     raw = os.environ.get(f"{prefix}_PROFILES", "").replace(",", " ").split()
@@ -47,6 +53,7 @@ def _pool_kwargs(prefix: str) -> dict[str, Any]:
         profiles=profiles,
         tabs_per_profile=int(os.environ.get(f"{prefix}_TABS_PER_PROFILE", "2")),
         headless=headless not in ("0", "false", "no"),
+        cdp=os.environ.get(f"{prefix}_CDP", "") or None,
     )
 
 

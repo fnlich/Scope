@@ -60,8 +60,9 @@ class ChatGPTPool(BrowserPool):
         *,
         tabs_per_profile: int = 2,
         headless: bool = True,
+        cdp=None,
     ):
         super().__init__(
             chatgpt_site(), profiles,
-            tabs_per_profile=tabs_per_profile, headless=headless,
+            tabs_per_profile=tabs_per_profile, headless=headless, cdp=cdp,
         )

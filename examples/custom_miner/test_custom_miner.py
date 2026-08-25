@@ -521,23 +521,66 @@ def test_the_login_helper_is_linux_only_and_keeps_vnc_on_loopback():
     assert "Xvfb" in script  # a headless host has no screen to log in on
 
 
-def test_the_backends_use_firefox_with_a_persistent_profile():
-    """Firefox cannot be attached to over CDP — Playwright's connect_over_cdp is
-    Chromium-only and Mozilla dropped CDP for WebDriver BiDi — so Playwright has
-    to launch it, and the login has to live in a profile directory."""
+def test_launch_mode_uses_firefox_and_attach_mode_uses_cdp():
+    """Two sources: Firefox launched by Playwright, or a Chrome you started
+    yourself reached over CDP. Firefox cannot be attached to (BiDi only, CDP is
+    Chromium-only), so launch mode must use launch_persistent_context and attach
+    mode must use connect_over_cdp — never the reverse."""
     import inspect
 
     from solvers import browser_pool
     from solvers.multi import build_backend
 
     source = inspect.getsource(browser_pool)
-    assert "connect_over_cdp" not in source.replace(
-        "cannot do that: Playwright's ``connect_over_cdp`` is Chromium-only", ""
-    ), "CDP cannot drive Firefox"
-    assert "launch_persistent_context" in source
+    assert "launch_persistent_context" in source     # launch mode: Firefox
+    assert "chromium.connect_over_cdp" in source      # attach mode: Chrome
+    # firefox.connect_over_cdp would be a bug — it does not exist.
+    assert "firefox.connect_over_cdp" not in source
 
+    launch_pool = build_backend("claude")             # no CDP env -> launch mode
+    assert launch_pool._profiles and not launch_pool._attach
+    assert launch_pool.stats()["mode"] == "launch"
+
+
+def test_setting_cdp_switches_a_backend_to_attach_mode(monkeypatch):
+    """CLAUDE_CDP=9222 must arm attach mode, normalising a bare port to a URL."""
+    from solvers.browser_pool import normalize_cdp
+    from solvers.multi import build_backend
+
+    assert normalize_cdp("9222") == ["http://127.0.0.1:9222"]
+    assert normalize_cdp("host:7000, http://1.2.3.4:9/") == [
+        "http://host:7000", "http://1.2.3.4:9"
+    ]
+    assert normalize_cdp(None) == [] and normalize_cdp("") == []
+
+    monkeypatch.setenv("CLAUDE_CDP", "9222,9223")
     pool = build_backend("claude")
-    assert pool._profiles and pool._tabs_per_profile >= 1
+    assert pool._attach and pool._cdp == ["http://127.0.0.1:9222", "http://127.0.0.1:9223"]
+    assert pool.stats()["mode"] == "attach" and pool.stats()["headless"] is None
+
+
+def test_attach_mode_disconnects_but_never_kills_your_browser():
+    """You own the browser in attach mode. aclose must disconnect it, not close
+    it — else a miner restart throws away the hand-made login."""
+    import inspect
+
+    from solvers.browser_pool import BrowserPool
+
+    aclose = inspect.getsource(BrowserPool.aclose)
+    attach = aclose.split("if self._attach:", 1)[1].split("else:", 1)[0]
+    assert "browser.close()" in attach and "context.close()" not in attach
+
+
+def test_the_attach_error_names_the_debug_browser_not_the_login_helper():
+    """A wrong CDP endpoint is a Chrome problem; the fix must not tell you to run
+    the Firefox login helper."""
+    import asyncio
+
+    from solvers.claude_web import ClaudeBrowserPool
+
+    pool = ClaudeBrowserPool([], cdp="59999")  # nothing is listening there
+    with pytest.raises(RuntimeError, match="remote-debugging-port"):
+        asyncio.run(pool.start())
 
 
 def test_a_profile_that_is_not_there_names_the_login_command(capsys):
