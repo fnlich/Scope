@@ -36,6 +36,15 @@ SEND_BUTTON = '[data-testid="send-button"]'
 STOP_BUTTON = '[data-testid="stop-button"]'
 ASSISTANT_MSG = '[data-message-author-role="assistant"]'
 
+# Same hazard as Claude's artifacts panel, different name: a long program is
+# exactly when a model moves the answer out of the message and into a side
+# panel, where the reader cannot see it. The reply then looks like prose with
+# no code, which costs a whole solve to discover.
+NUDGE = (
+    "Reply directly in the chat with one ordinary fenced code block, however "
+    "long the program is. Do not use canvas."
+)
+
 
 def chatgpt_site() -> Site:
     return Site(
@@ -53,5 +62,6 @@ def chatgpt_site() -> Site:
             ('[data-testid="create-new-chat-button"]', 'button[aria-label*="New chat"]'),
         ),
         message_id_attr="data-message-id",
+        nudge=os.environ.get("CHATGPT_NUDGE", NUDGE),
         poll_s=float(os.environ.get("CHATGPT_POLL_S", "2")),
     )

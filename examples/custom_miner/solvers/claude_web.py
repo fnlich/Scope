@@ -59,8 +59,8 @@ from .config import selectors
 # artifacts panel, which lives outside the message the reader scrapes. One
 # sentence is cheaper than trying to scrape the panel.
 NUDGE = (
-    "Reply directly in the chat with one ordinary fenced code block. "
-    "Do not create an artifact."
+    "Reply directly in the chat with one ordinary fenced code block, however "
+    "long the program is. Do not create an artifact."
 )
 
 

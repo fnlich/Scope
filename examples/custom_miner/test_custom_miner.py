@@ -1590,6 +1590,46 @@ def test_clean_code_is_left_exactly_alone():
     assert extract_code(source) == source
 
 
+def test_a_delivery_failure_is_not_reported_as_a_wrong_answer():
+    """The repair round is the second and last chance at a task, and it used to
+    be spent on a contradiction. When nothing arrived, the miner said "I ran the
+    program against the examples and got: the reply contained no code" — nothing
+    was run, there was nothing to run. A model told its program failed the
+    examples rewrites the program, which was never the problem, and the rewrite
+    goes to the same place the first one did.
+
+    Seen live on a Rust task: two complete, plausible programs, both reported as
+    no code, both repaired against evidence that did not exist.
+    """
+    from solvers.prompts import NO_CODE, build_repair_prompt
+
+    prompt = build_repair_prompt([NO_CODE], "rust", "main")
+    assert "did not reach me as code" in prompt
+    assert "artifact" in prompt and "canvas" in prompt
+    assert "I ran" not in prompt, "still claims to have run something"
+    assert "WRONG" not in prompt, "still blames the answer for a delivery fault"
+
+
+def test_a_real_failure_still_quotes_the_evidence():
+    """The other branch must keep working: when code DID arrive and failed, the
+    concrete counter-example is what makes the repair loop converge."""
+    from solvers.prompts import build_repair_prompt
+
+    prompt = build_repair_prompt(["g(*[12345]) returned 14, expected 15"], "python", "g")
+    assert "returned 14, expected 15" in prompt
+    assert "I ran `g` against the examples" in prompt
+
+
+def test_both_providers_are_told_to_keep_long_code_in_the_chat():
+    """A long program is exactly when a model moves the answer into a side panel
+    the reader cannot see, so both nudges have to say so — and say it about
+    length, which is the trigger."""
+    assert "however long" in claude_site().nudge
+    assert "artifact" in claude_site().nudge
+    assert "however long" in chatgpt_site().nudge
+    assert "canvas" in chatgpt_site().nudge
+
+
 def test_the_claude_prompt_asks_for_an_inline_code_block():
     """Long code can land in the artifacts panel, outside the message the
     reader scrapes. One sentence is cheaper than scraping the panel."""

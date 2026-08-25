@@ -137,7 +137,23 @@ def build_repair_prompt(failures: list[str], language: str, entrypoint: str) -> 
     The failures come from running the candidate through the validator's own
     executor, so this is real evidence rather than a vague 'try again' — which
     is the difference between a repair loop that converges and one that drifts.
+
+    Except when nothing arrived to run. Saying "I ran the program and got: the
+    reply contained no code" is not evidence, it is a contradiction, and a model
+    told its program failed the examples will dutifully rewrite the program —
+    which is not the problem and produces the same nothing again. A delivery
+    failure has to be described as one, or the repair round is spent for free.
     """
+    if NO_CODE in failures:
+        return (
+            "Your previous reply did not reach me as code. I can only read the "
+            "chat message itself, so an artifact, a canvas, a preview pane or a "
+            "collapsed block is invisible to me.\n\n"
+            "Send the COMPLETE program again as one ordinary fenced code block "
+            "written directly in the chat. Do not create an artifact or canvas. "
+            "Do not abbreviate it or replace any part with a comment. Same rules "
+            "as before, and nothing outside the code block."
+        )
     detail = "\n".join(f"  - {line}" for line in failures)
     target = "the program" if language == "rust" else f"`{entrypoint}`"
     return (
@@ -185,6 +201,11 @@ def extract_code(
     return blocks[-1]
 
 
+# Said by both defect checks, and recognised by `build_repair_prompt`, because
+# "nothing arrived" needs a different conversation from "what arrived is wrong".
+NO_CODE = "the reply contained no code"
+
+
 def python_defect(code: str, entrypoint: str) -> Optional[str]:
     """Return a reason string if the source can't possibly be graded, else None.
 
@@ -193,7 +214,7 @@ def python_defect(code: str, entrypoint: str) -> Optional[str]:
     it never defines the function the validator is going to call.
     """
     if not code.strip():
-        return "the reply contained no code"
+        return NO_CODE
     try:
         tree = ast.parse(code)
     except SyntaxError as exc:
@@ -222,7 +243,7 @@ def python_defect(code: str, entrypoint: str) -> Optional[str]:
 def rust_defect(code: str) -> Optional[str]:
     """Cheap structural check before paying for a compile."""
     if not code.strip():
-        return "the reply contained no code"
+        return NO_CODE
     if "fn main" not in code:
         return "the program does not define `fn main()`"
     return None
