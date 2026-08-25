@@ -357,7 +357,7 @@ class VerifyingSolver:
 
     # ---------------------------------------------------------------------- #
     def _grade(self, reply: str, task) -> Candidate:
-        code = extract_code(reply)
+        code = extract_code(reply, task.entrypoint, task.language)
         candidate = Candidate(code=code, raw=reply)
         defect = (
             rust_defect(code)

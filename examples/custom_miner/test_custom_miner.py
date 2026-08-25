@@ -36,6 +36,7 @@ from solvers.browser_pool import (  # noqa: E402
 )
 from solvers.chatgpt_web import chatgpt_site  # noqa: E402
 from solvers.claude_web import claude_site  # noqa: E402
+from solvers.prompts import extract_code  # noqa: E402
 from solvers.verify import Answer, VerifyingSolver  # noqa: E402
 
 from rlvr.config import Settings  # noqa: E402
@@ -1314,7 +1315,9 @@ def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():
         "#assistant", [_Node(code=["def g(n):\n    return n"])]
     )
     reply = asyncio.run(_tab(page, _site()).send("solve it", 2.0))
-    assert reply == "def g(n):\n    return n"
+    # The reader re-fences what it scraped so every block reaches the caller;
+    # picking between them needs the entrypoint, which the tab does not have.
+    assert extract_code(reply, "g") == "def g(n):\n    return n"
     assert page.typed == ["solve it"]
 
 
@@ -1441,6 +1444,57 @@ def test_a_rendered_code_block_survives_being_scraped():
     ns: dict = {}
     exec(compile(code, "<submitted>", "exec"), ns)
     assert ns["g"](3) == 3
+
+
+def test_the_reader_hands_over_every_code_block_not_its_favourite():
+    """The tab must not choose. It has no entrypoint and no language, so any
+    choice it makes is a guess -- and the guess it used to make (the last one)
+    threw the answer away whenever a usage example followed it. Re-fence them
+    all and let the grader, which knows the task, decide."""
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__(
+        "#assistant",
+        [_Node(code=["def g(n):\n    return n * 2", "print(g(21))"])],
+    )
+    reply = asyncio.run(_tab(page, _site()).send("solve it", 2.0))
+    assert "def g(n)" in reply and "print(g(21))" in reply, "a block was dropped"
+    assert extract_code(reply, "g") == "def g(n):\n    return n * 2"
+
+
+def test_the_answer_wins_over_a_usage_example_that_follows_it():
+    """Models append `print(solve(21))` demos however firmly the prompt says
+    not to. Taking the last block submitted the demo, and the whole solve was
+    spent reporting that the entrypoint was never defined -- with the real
+    answer sitting in the block just before it."""
+    reply = "```\ndef solve(n):\n    return n * 2\n```\n```\nprint(solve(21))\n```"
+    assert extract_code(reply) == "print(solve(21))", "no target: last block"
+    assert extract_code(reply, "solve") == "def solve(n):\n    return n * 2"
+
+
+def test_a_corrected_answer_still_beats_the_draft_before_it():
+    """The other half of the rule: when both blocks are gradeable, the LAST one
+    wins, because a model that shows a draft then fixes it means the fix."""
+    reply = "```\ndef solve(n):\n    return n\n```\n```\ndef solve(n):\n    return n * 2\n```"
+    assert extract_code(reply, "solve") == "def solve(n):\n    return n * 2"
+
+
+def test_nothing_gradeable_still_returns_something_to_complain_about():
+    """Returning "" would report `no code` when the real defect is more
+    specific, and the repair round is only as good as the evidence it gets."""
+    assert extract_code("```\nnot code\n```\n```\nalso not\n```", "solve") == "also not"
+
+
+def test_a_fence_inside_the_source_does_not_cut_the_block_short():
+    """A docstring showing markdown was enough to truncate the answer: the
+    hard-coded three-backtick closer matched the docstring's own fence."""
+    inner = 'def solve(n):\n    """```md"""\n    return n'
+    assert extract_code("````\n" + inner + "\n````", "solve") == inner
+
+
+def test_a_rust_program_wins_over_a_sample_output_block():
+    """Same rule, other language: `rust_defect` is the gradeability test."""
+    reply = '```\nfn main() { println!("1"); }\n```\n```\n1 2 3\n```'
+    assert extract_code(reply, "main", "rust").startswith("fn main()")
 
 
 def test_a_language_chip_inside_a_fence_is_dropped_too():

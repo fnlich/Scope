@@ -31,7 +31,11 @@ from typing import Any, Optional
 # ChatGPT wraps code in ``` fences; the DOM reader already returns the inner
 # text of a <pre><code> block, but a reply that arrived as plain text (or a
 # non-DOM backend) can still carry fences, so strip them defensively.
-_FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
+# Markdown fences are 3 OR MORE backticks, and the closer must be at least as
+# long as the opener. Hard-coding three cut a block short the moment its own
+# source contained ``` -- a docstring showing markdown was enough -- and missed
+# a longer fence entirely. The backreference makes the closer match the opener.
+_FENCE_RE = re.compile(r"(`{3,})[^\n`]*\n(.*?)\n?\1`*", re.DOTALL)
 
 # Characters that only ever arrive from a RENDERED page, never from source a
 # grader would accept: zero-width marks, line/paragraph separators, the BOM,
@@ -144,7 +148,9 @@ def build_repair_prompt(failures: list[str], language: str, entrypoint: str) -> 
     )
 
 
-def extract_code(reply: str) -> str:
+def extract_code(
+    reply: str, entrypoint: Optional[str] = None, language: str = "python"
+) -> str:
     """Pull the source out of a model reply.
 
     The DOM reader already returns a code block's inner text for ChatGPT, but
@@ -156,10 +162,27 @@ def extract_code(reply: str) -> str:
     # Clean BEFORE matching: a stray invisible character inside the opening
     # fence would stop the block being recognised at all.
     reply = sanitize_code(reply)
-    matches = _FENCE_RE.findall(reply)
-    if matches:
-        return sanitize_code(matches[-1]).strip()
-    return reply.strip()
+    matches = [m.group(2) for m in _FENCE_RE.finditer(reply)]
+    if not matches:
+        return reply.strip()
+    blocks = [b for b in (sanitize_code(m).strip() for m in matches) if b]
+    if not blocks:
+        return ""
+    # With a target in hand, prefer the LAST block that would actually grade.
+    # Models append usage examples and print() demos after the answer, and the
+    # last block is then the demo. Reusing the defect check as the test means
+    # "gradeable" here is exactly what it means everywhere else.
+    if entrypoint:
+        for block in reversed(blocks):
+            defect = (
+                rust_defect(block) if language == "rust"
+                else python_defect(block, entrypoint)
+            )
+            if defect is None:
+                return block
+    # Nothing clean: the last block is still the best guess, and the defect it
+    # reports is what the repair round needs to hear.
+    return blocks[-1]
 
 
 def python_defect(code: str, entrypoint: str) -> Optional[str]:

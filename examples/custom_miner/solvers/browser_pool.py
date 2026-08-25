@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 from dataclasses import dataclass, replace
 from itertools import zip_longest
@@ -601,10 +602,30 @@ class _Tab:
 
     @staticmethod
     async def _read(reply) -> Optional[str]:
+        """The reply's code blocks, re-fenced, or the message text.
+
+        Every block, not a guess at which one matters. Taking only the last
+        used to submit the "example usage" snippet whenever a model appended
+        one -- the solution was right there in the block before it, and the
+        whole solve was spent to report that `solve` was never defined.
+        Choosing between them needs the entrypoint, which belongs to the task
+        rather than the tab, so hand them all over and let the caller pick.
+        """
         code_blocks = reply.locator("pre code")
         count = await code_blocks.count()
         if count > 0:
-            return await code_blocks.nth(count - 1).inner_text()
+            fenced = []
+            for i in range(count):
+                block = await code_blocks.nth(i).inner_text()
+                if not block.strip():
+                    continue
+                # Markdown's own rule: the fence must outrun any backtick run
+                # inside, or a block containing ``` would close itself early.
+                longest = max((len(r) for r in re.findall(r"`+", block)), default=0)
+                fence = "`" * max(3, longest + 1)
+                fenced.append(f"{fence}\n{block}\n{fence}")
+            if fenced:
+                return "\n".join(fenced)
         text = (await reply.inner_text()).strip()
         return text or None
 
