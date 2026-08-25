@@ -215,6 +215,8 @@ class VerifyingSolver:
         self._cache_size = max(0, int(cache_size))
         self._counts = {"solved": 0, "verified": 0, "cache_hits": 0, "empty": 0}
         self._by_provider: dict[str, dict[str, int]] = {}
+        # The no-examples explanation is worth saying, but only once a run.
+        self._warned_ungradeable = False
 
     # -- the Solver interface custom_miner.py expects ---------------------- #
     async def solve_task(self, task, timeout_s: float) -> Answer:
@@ -239,6 +241,21 @@ class VerifyingSolver:
         # full amount, and with a fleet there is usually an idle tab to ask on.
         asked: list[str] = []
         passes = 2 if self._second_opinion else 1
+        if passes > 1 and not task.public_examples:
+            # A task that ships no public examples cannot be graded, so the
+            # second model's answer can never be ranked above the first:
+            # `verified` needs total > 0, and `score` ties at (0, has_code).
+            # Asking anyway spends a second account's quota and doubles the
+            # latency to produce an answer that is then thrown away.
+            passes = 1
+            if not self._warned_ungradeable:
+                self._warned_ungradeable = True
+                print(
+                    "[verify] this task shipped no public examples, so nothing "
+                    "can be graded locally: no repair rounds, no second "
+                    "opinion, and verified=False however good the answer is. "
+                    "Said once per run."
+                )
         for attempt_no in range(passes):
             remaining = budget - (time.monotonic() - started)
             # The first pass always runs, however little is left: bailing here

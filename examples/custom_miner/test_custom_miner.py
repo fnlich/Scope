@@ -944,6 +944,31 @@ def test_a_second_opinion_asks_the_other_model_only_when_the_first_fails():
     assert solver.stats()["providers"]["chatgpt"]["verified"] == 1
 
 
+def test_an_ungradeable_task_does_not_pay_for_a_second_opinion():
+    """Live traffic ships tasks with no public examples, and then the second
+    model's answer can never win: `verified` needs total > 0, and `score` ties
+    at (0, has_code). Asking anyway spends a second account's quota and doubles
+    the latency to produce an answer that is discarded on return."""
+    calls: list[str] = []
+
+    class _Counting(_Backend):
+        async def open(self, avoid=None):
+            calls.append(avoid or "first")
+            return _Chat([RIGHT], "chatgpt" if avoid == "claude" else "claude")
+
+    task = SolveTask(
+        problem_id="none", language="python", statement=DIGITS.statement,
+        entrypoint="g", public_examples=[], deadline_s=120.0,
+    )
+    solver = VerifyingSolver(
+        _Counting([RIGHT]), safety_margin_s=0, max_budget_s=120, second_opinion=True
+    )
+    answer = asyncio.run(solver.solve_task(task, 120.0))
+    assert answer.code, "the answer still comes back"
+    assert answer.verified is False, "nothing can verify it, and it must not claim to"
+    assert calls == ["first"], f"asked a second model for nothing: {calls}"
+
+
 def test_the_second_opinion_can_be_turned_off():
     """Pure throughput: never spend a second account on one task."""
     seen = []
