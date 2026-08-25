@@ -305,9 +305,18 @@ Either lower the concurrency to match your tabs, or add tabs/browsers:
 MINER_MAX_CONCURRENT_REQUESTS=2     # matches one browser at 2 tabs
 ```
 
-One browser can serve both backends — sign the same Chrome in to claude.ai and
-chatgpt.com, and leave `CLAUDE_CDP` and `CHATGPT_CDP` both on `9222`. Separate
-ports are for separate *accounts*, not separate providers.
+**One port, one browser, one provider.** Listing the same port under both
+`CLAUDE_CDP` and `CHATGPT_CDP` does not give you two backends on one Chrome —
+the second is dropped with a warning, and you get the first provider only. It
+has to work that way: the fleet reclaims a browser's leftover tabs each time it
+attaches, so a second attach to the same browser would close the tabs the first
+had just opened. To run both providers, start a second browser on its own port
+and sign it in to the other one:
+
+```dotenv
+CLAUDE_CDP=9222,9223,9224      # three browsers on claude.ai
+CHATGPT_CDP=9225,9226,9227     # three more on chatgpt.com — different ports
+```
 
 **A tab is opened once and kept.** What separates one task from the next is a
 fresh *conversation*, not a fresh tab — a task must never see the previous

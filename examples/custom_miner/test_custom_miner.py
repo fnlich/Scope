@@ -1037,13 +1037,19 @@ def test_an_empty_roster_falls_back_to_one_browser_on_the_default_port():
 
 
 def test_the_same_endpoint_listed_under_two_providers_is_not_double_counted(capsys):
-    """One profile cannot be signed in as both, and attaching twice would
-    invent capacity that does not exist."""
+    """Attaching to one browser twice does not just invent capacity: `_fill`
+    reclaims a browser's leftover tabs on every attach, so the second entry
+    would close the tabs the first had just spawned."""
     from solvers.roster import roster
 
     browsers = roster({"CLAUDE_CDP": "9222", "CHATGPT_CDP": "9222"})
     assert len(browsers) == 1 and browsers[0].site.name == "claude"
-    assert "listed more than once" in capsys.readouterr().out
+    warning = capsys.readouterr().out
+    # The warning has to name the provider that is actually SERVED. Naming the
+    # dropped one instead — which it used to — tells the operator the opposite
+    # of what happened, and they go looking for the fault in the wrong browser.
+    assert "Serving it as claude only" in warning, warning
+    assert "chatgpt on that port is ignored" in warning, warning
 
 
 def test_shutdown_disconnects_but_never_closes_your_browser():
