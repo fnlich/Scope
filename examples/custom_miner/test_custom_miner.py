@@ -969,6 +969,36 @@ def test_an_ungradeable_task_does_not_pay_for_a_second_opinion():
     assert calls == ["first"], f"asked a second model for nothing: {calls}"
 
 
+def test_an_ungradeable_task_still_buys_a_second_opinion_when_the_first_is_empty():
+    """The exception that makes the rule safe, and the case a live log caught.
+
+    Two ungradeable answers cannot be told apart -- unless one of them is
+    EMPTY. `score` is (passed, has_code), so (0,1) beats (0,0): the other model
+    is the only remaining chance at the whole payment. Skipping it because the
+    task happens to ship no examples turns a recoverable submit failure into a
+    guaranteed zero.
+    """
+    calls: list[str] = []
+
+    class _Silent(_Backend):
+        async def open(self, avoid=None):
+            calls.append(avoid or "first")
+            # The first model's tab failed to submit, so send() returns "".
+            return _Chat([""] if avoid is None else [RIGHT],
+                         "chatgpt" if avoid else "claude")
+
+    task = SolveTask(
+        problem_id="none-empty", language="python", statement=DIGITS.statement,
+        entrypoint="g", public_examples=[], deadline_s=120.0,
+    )
+    solver = VerifyingSolver(
+        _Silent([""]), safety_margin_s=0, max_budget_s=120, second_opinion=True
+    )
+    answer = asyncio.run(solver.solve_task(task, 120.0))
+    assert calls == ["first", "claude"], f"never fell back: {calls}"
+    assert "while n > 0" in answer.code, "the fallback answer was not used"
+
+
 def test_the_second_opinion_can_be_turned_off():
     """Pure throughput: never spend a second account on one task."""
     seen = []

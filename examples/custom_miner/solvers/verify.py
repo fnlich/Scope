@@ -241,21 +241,6 @@ class VerifyingSolver:
         # full amount, and with a fleet there is usually an idle tab to ask on.
         asked: list[str] = []
         passes = 2 if self._second_opinion else 1
-        if passes > 1 and not task.public_examples:
-            # A task that ships no public examples cannot be graded, so the
-            # second model's answer can never be ranked above the first:
-            # `verified` needs total > 0, and `score` ties at (0, has_code).
-            # Asking anyway spends a second account's quota and doubles the
-            # latency to produce an answer that is then thrown away.
-            passes = 1
-            if not self._warned_ungradeable:
-                self._warned_ungradeable = True
-                print(
-                    "[verify] this task shipped no public examples, so nothing "
-                    "can be graded locally: no repair rounds, no second "
-                    "opinion, and verified=False however good the answer is. "
-                    "Said once per run."
-                )
         for attempt_no in range(passes):
             remaining = budget - (time.monotonic() - started)
             # The first pass always runs, however little is left: bailing here
@@ -272,6 +257,21 @@ class VerifyingSolver:
                 best = candidate
             if best.verified:
                 break
+            if not task.public_examples:
+                if not self._warned_ungradeable:
+                    self._warned_ungradeable = True
+                    print(
+                        "[verify] no public examples shipped with this task, so "
+                        "nothing can be graded locally: no repair rounds, and "
+                        "verified=False however good the answer is. Once per run."
+                    )
+                # Nothing can rank two ungradeable answers apart -- `score` ties
+                # at (0, has_code) -- so a second opinion is only ever worth
+                # buying when this one came back EMPTY. Then it is worth a lot:
+                # an empty answer scores zero, and the other model is the only
+                # remaining chance at the whole payment.
+                if best.code.strip():
+                    break
             if attempt_no + 1 < passes:
                 print(f"[verify] {provider or 'first'} did not verify; asking another model")
         if asked:
