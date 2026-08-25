@@ -82,6 +82,12 @@ FLAGS=(
   --disable-renderer-backgrounding
   --disable-background-timer-throttling
   --window-size=1280,900
+  # Quiet the alarming-but-harmless server noise: no GPU on a headless/RDP box
+  # (GpuControl errors), and log only fatal messages so the GCM push-registration
+  # and TensorFlow-delegate lines stop looking like failures. CDP is unaffected.
+  --disable-gpu
+  --log-level=3
+  --disable-features=OptimizationHints,MediaRouter,Translate
 )
 if [ "$(id -u)" -eq 0 ]; then
   echo "WARNING: running as root, so Chrome needs --no-sandbox. Prefer a normal user." >&2
