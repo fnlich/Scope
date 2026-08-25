@@ -26,7 +26,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from custom_miner import CustomMiner, SolveTask  # noqa: E402
+from custom_miner import TRUNCATED, CustomMiner, SolveTask, fit_response  # noqa: E402
 from solvers.browser_pool import (  # noqa: E402
     Browser,
     BrowserFleet,
@@ -38,6 +38,7 @@ from solvers.chatgpt_web import chatgpt_site  # noqa: E402
 from solvers.claude_web import claude_site  # noqa: E402
 from solvers.verify import Answer, VerifyingSolver  # noqa: E402
 
+from rlvr.config import Settings  # noqa: E402
 from rlvr.neurons.demo_miner import DemoMinerSettings, build_demo_miner_app  # noqa: E402
 from rlvr.problemserver.api import derive_request_id  # noqa: E402
 from rlvr.protocol import (  # noqa: E402
@@ -134,9 +135,68 @@ def test_reply_passes_every_validator_acceptance_check():
     payload = SolutionPayload.model_validate_json(response.content)
     # 3. the per-dispatch request id is echoed back unchanged
     assert payload.problem_id == request.problem_id
-    # 4. within the per-response byte cap
-    assert len(response.content) <= DemoMinerSettings(_env_file=None).miner_max_request_bytes
+    # 4. within the per-RESPONSE byte cap. Not the request cap, which is eight
+    #    times larger and belongs to the other direction: the validator reads a
+    #    bounded number of bytes back and discards the whole response if it runs
+    #    over, so checking the wrong one here would pass a reply that is thrown
+    #    away on arrival.
+    assert len(response.content) <= Settings().miner_max_response_bytes
     assert "while n > 0" in payload.code  # the repaired answer, not the first draft
+
+
+def test_a_long_transcript_is_trimmed_to_what_the_validator_will_read():
+    """The validator reads a bounded number of bytes and discards the WHOLE
+    response if it runs over. A correct, correctly-signed answer then scores
+    zero and neither log says why — the miner sees 200, the validator sees a
+    reply it never read. `code` is what gets graded and `raw_response` is the
+    transcript kept for the dataset, so the transcript is what gives way."""
+    cap = Settings().miner_max_response_bytes
+    code = "def g(n):\n    return n"
+    payload = fit_response(
+        SolutionPayload(problem_id="p-1", code=code, raw_response="x" * (cap * 2))
+    )
+    assert len(payload.model_dump_json().encode()) <= cap
+    assert payload.code == code, "the graded field must never be trimmed to fit"
+    assert payload.raw_response.endswith(TRUNCATED)
+
+
+def test_a_chatty_model_still_produces_a_reply_the_validator_accepts():
+    """The same thing end to end, because the cap applies to the serialized
+    payload rather than to any field the solver can see."""
+    miner_kp = keypair.create_from_uri("//Bob")
+    validator_kp = keypair.create_from_uri("//Alice")
+    cap = Settings().miner_max_response_bytes
+    rambling = "I will explain at length. " * (cap // 10) + RIGHT
+    miner = CustomMiner(
+        DemoMinerSettings(_env_file=None), _solver([rambling]),
+        wallet=SimpleNamespace(hotkey=miner_kp), subtensor=None, metagraph=None,
+    )
+    request = TaskRequest(
+        problem_id="chatty-1", language="python", statement=DIGITS.statement,
+        entrypoint="g", public_examples=[TestCase(args=[12345], kwargs={}, expected=15)],
+    )
+    body = request.model_dump_json().encode()
+    headers = sign_message(validator_kp, body, signed_for=miner_kp.ss58_address)
+    headers["Content-Type"] = "application/json"
+
+    with TestClient(build_demo_miner_app(miner)) as client:
+        response = client.post("/solve", content=body, headers=headers)
+
+    assert response.status_code == 200
+    assert len(response.content) <= cap, "the validator would discard this unread"
+    reply_headers = {
+        name: response.headers.get(name, "")
+        for name in (
+            "Epistula-Version", "Epistula-Timestamp", "Epistula-Uuid",
+            "Epistula-Signed-By", "Epistula-Signed-For", "Epistula-Request-Signature",
+        )
+    }
+    # Trimming happens before signing, so the signature covers what is sent.
+    assert verify_signature(
+        reply_headers, response.content, expected_signed_for=validator_kp.ss58_address
+    )
+    payload = SolutionPayload.model_validate_json(response.content)
+    assert "while n > 0" in payload.code, "the answer survived the trim intact"
 
 
 # --------------------------------------------------------------------------- #
