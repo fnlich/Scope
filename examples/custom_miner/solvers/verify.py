@@ -103,9 +103,17 @@ class Candidate:
         return self.defect is None and self.total > 0 and self.passed == self.total
 
     @property
-    def score(self) -> tuple[int, int]:
-        """Ranking key for 'best so far' — pass count, then having any code."""
-        return (self.passed, 1 if self.code.strip() else 0)
+    def score(self) -> tuple[int, int, int]:
+        """Ranking key for 'best so far' — passes, then runnable, then non-empty.
+
+        A defect ranks BELOW clean code that merely could not be graded, and
+        that middle term is not cosmetic. Without it a first answer with no
+        `fn main()` scores (0, 1) and a corrected second answer scores (0, 1)
+        too -- a tie, which `>` loses, so the repair round lands a good program
+        and the broken one is submitted anyway. The whole repair loop is dead
+        weight for structural defects until this ranks them apart.
+        """
+        return (self.passed, 0 if self.defect else 1, 1 if self.code.strip() else 0)
 
 
 class _Grader:
@@ -331,10 +339,17 @@ class VerifyingSolver:
                     best = candidate
                 if candidate.verified:
                     break
-                problems = ([candidate.defect] if candidate.defect else []) + candidate.failures
-                if not problems:
+                if not candidate.defect and not candidate.failures:
                     break  # nothing actionable to report (no examples shipped)
-                prompt = build_repair_prompt(problems, task.language, task.entrypoint)
+                # Kept apart, not merged into one list of "problems": a defect
+                # means the code never ran, and the repair prompt has to say so
+                # rather than blame logic that was never executed.
+                prompt = build_repair_prompt(
+                    candidate.failures,
+                    task.language,
+                    task.entrypoint,
+                    defect=candidate.defect,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a failed solve scores zero, never crashes

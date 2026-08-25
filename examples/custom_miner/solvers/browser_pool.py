@@ -457,6 +457,19 @@ class _Tab:
         # `stable` drives the completion test and is reset whenever the model is
         # mid-generation. `best` is the newest text actually read and is never
         # reset, so a deadline that lands mid-answer still returns something.
+        #
+        # What `stable` holds is the WHOLE rendered message, not just the code
+        # `_read` pulls out of it, and that distinction decides whether this
+        # returns an answer or a model's rough work. `_read` discards the prose
+        # whenever the message has code blocks, so a message growing by prose
+        # ALONE reads identically twice running -- which is precisely what a
+        # reply looks like in the gap between a reasoning section that quoted
+        # some code and the final answer, not yet written. Comparing the code
+        # alone accepts that gap as the finished reply and hands the grader a
+        # fragment lifted out of the model's thinking; comparing the message
+        # closes it. The busy selector is supposed to cover this and usually
+        # does, but it is per-site, overridable, and dropped at startup when it
+        # matches an idle page -- so it is a guard, not the guarantee.
         best, stable = "", None
         try:
             while True:
@@ -469,7 +482,7 @@ class _Tab:
                     break
                 # Every DOM call below auto-waits up to 30s on its own, which
                 # would sail past the deadline the loop just checked.
-                text_now, busy = await asyncio.wait_for(
+                text_now, busy, whole = await asyncio.wait_for(
                     self._poll(before), timeout=remaining
                 )
                 if text_now is not None:
@@ -477,9 +490,10 @@ class _Tab:
                 if busy or text_now is None:
                     stable = None  # still typing, or ours has not rendered yet
                     continue
-                if text_now == stable:
-                    return text_now  # finished: not busy, and unchanged text
-                stable = text_now
+                mark = (text_now, whole)
+                if mark == stable:
+                    return text_now  # finished: not busy, and nothing moved
+                stable = mark
         except asyncio.TimeoutError:
             pass  # out of budget mid-read; `best` still holds what we had
         except asyncio.CancelledError:
@@ -491,22 +505,29 @@ class _Tab:
 
     async def _poll(
         self, before: tuple[int, Optional[str]]
-    ) -> tuple[Optional[str], bool]:
-        """One read round: ``(text_or_None, still_generating)``.
+    ) -> tuple[Optional[str], bool, str]:
+        """One read round: ``(code_or_None, still_generating, whole_message)``.
 
         The read happens whether or not the model is still typing. Checking busy
         first and returning early — the obvious shape — means a reply that never
         stops streaming before the deadline is never read at all, so a timeout
         mid-answer returns nothing instead of the part that had arrived.
+
+        The message as rendered comes back beside the code because both of the
+        callers that matter need the prose ``_read`` throws away: the echo guard
+        to recognise the miner's own prompt, and ``send``'s completion test to
+        tell a finished reply from one still being written around code it has
+        already shown. One DOM read serves both.
         """
         busy = await self._busy_now()
         reply = await self._new_reply(before)
         if reply is None:
-            return None, busy  # ours hasn't rendered yet
+            return None, busy, ""  # ours hasn't rendered yet
         text_now = await self._read(reply)
-        if text_now is None or await self._echoes_prompt(reply, text_now):
-            return None, busy
-        return text_now, busy
+        whole = await self._whole(reply)
+        if text_now is None or self._echoes_prompt(whole or text_now):
+            return None, busy, whole
+        return text_now, busy, whole
 
     # -- DOM helpers -------------------------------------------------------- #
     async def _first_match(self, candidates: Sequence[str]) -> Optional[str]:
@@ -618,7 +639,7 @@ class _Tab:
                 return True
         return False
 
-    async def _echoes_prompt(self, reply, text: str) -> bool:
+    def _echoes_prompt(self, whole: str) -> bool:
         """Guard against an assistant selector that matches the USER's message.
 
         Without this the miner would submit its own prompt back as the answer —
@@ -634,10 +655,6 @@ class _Tab:
         head = " ".join(self._sent.split())[:80]
         if not head:
             return False
-        try:
-            whole = await reply.inner_text()
-        except Exception:  # noqa: BLE001 - fall back to what we already read
-            whole = text
         if not " ".join(whole.split()).startswith(head):
             return False
         if not self._warned_echo:
@@ -648,6 +665,20 @@ class _Tab:
                 f"{self.site.name}` and set {self.site.env_prefix}_ASSISTANT."
             )
         return True
+
+    @staticmethod
+    async def _whole(reply) -> str:
+        """The message exactly as rendered, or ``""`` if it cannot be read.
+
+        Swallowing the failure is deliberate: this is only ever used to compare
+        one poll against the next, and a page caught mid-navigation should cost
+        a poll, not the tab. ``send`` degrades to the old code-only test when
+        this returns ``""`` twice, which is what it did before this existed.
+        """
+        try:
+            return await reply.inner_text()
+        except Exception:  # noqa: BLE001 - mid-navigation, or the node went away
+            return ""
 
     @staticmethod
     async def _read(reply) -> Optional[str]:
@@ -665,7 +696,18 @@ class _Tab:
         if count > 0:
             fenced = []
             for i in range(count):
-                block = await code_blocks.nth(i).inner_text()
+                # textContent, not innerText, and measured rather than assumed:
+                # claude.ai splits a <code> into `data-code-line-group` blocks,
+                # and innerText adds a line break at every block boundary -- a
+                # 15-line program came back as 17. Rust does not care about a
+                # stray blank line; a Python multi-line string literal does, and
+                # the corruption is invisible until a hidden test disagrees
+                # about the text. Each line already carries its own newline, so
+                # the raw text IS the source. Only safe on the code block: at
+                # message level textContent returns the markup's own
+                # indentation as whitespace, which is why the fallback below
+                # and the echo guard both still read innerText.
+                block = await code_blocks.nth(i).text_content() or ""
                 if not block.strip():
                     continue
                 # Markdown's own rule: the fence must outrun any backtick run

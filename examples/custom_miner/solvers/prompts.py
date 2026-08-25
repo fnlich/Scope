@@ -50,6 +50,24 @@ _INVISIBLE_RE = re.compile(
 # Exotic spaces render like a space and break indentation. Fold them.
 _ODD_SPACE_RE = re.compile("[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]")
 
+# Some models narrate in a <think> block before answering, and the narration
+# quotes code -- half a struct, a function it then discards. When that block
+# arrives as TEXT rather than as its own collapsed UI element, every fragment in
+# it looks exactly like a candidate answer to the fence scanner, and one of them
+# is the last block whenever the real answer has not arrived. So the reasoning
+# is removed before anything is matched. An unclosed opener takes the rest of
+# the reply with it: there is no answer after a `<think>` that never ended, and
+# "nothing arrived" is a far better thing to report than a fragment of the
+# model's rough work.
+_THINK_RE = re.compile(
+    r"<(think|thinking|reasoning|scratchpad)\b[^>]*>.*?</\1\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_OPEN_THINK_RE = re.compile(
+    r"<(?:think|thinking|reasoning|scratchpad)\b[^>]*>.*",
+    re.DOTALL | re.IGNORECASE,
+)
+
 # A rendered code block puts its language chip inside the element the reader
 # scrapes, so the inner text can begin with a bare "python" line. That is worse
 # than a syntax error: it PARSES, defines the entrypoint, passes every check —
@@ -131,20 +149,28 @@ def build_initial_prompt(
     return "\n".join(parts)
 
 
-def build_repair_prompt(failures: list[str], language: str, entrypoint: str) -> str:
+def build_repair_prompt(
+    failures: list[str],
+    language: str,
+    entrypoint: str,
+    defect: Optional[str] = None,
+) -> str:
     """Ask for a fix, quoting the concrete failures the local grader found.
 
     The failures come from running the candidate through the validator's own
     executor, so this is real evidence rather than a vague 'try again' — which
     is the difference between a repair loop that converges and one that drifts.
 
-    Except when nothing arrived to run. Saying "I ran the program and got: the
-    reply contained no code" is not evidence, it is a contradiction, and a model
-    told its program failed the examples will dutifully rewrite the program —
-    which is not the problem and produces the same nothing again. A delivery
-    failure has to be described as one, or the repair round is spent for free.
+    A ``defect`` is the other kind of problem entirely, and it must not be
+    dressed up as the first. Defects are found BEFORE anything is executed —
+    nothing arrived, it will not parse, there is no ``fn main`` — so telling the
+    model "I ran the program against the examples and got: the program does not
+    define `fn main()`" is not evidence but a contradiction. Faced with one, a
+    model rewrites the logic, which was never the problem, and the repair round
+    is spent for nothing. Ask about delivery when delivery failed, and about
+    shape when the shape is wrong.
     """
-    if NO_CODE in failures:
+    if defect == NO_CODE:
         return (
             "Your previous reply did not reach me as code. I can only read the "
             "chat message itself, so an artifact, a canvas, a preview pane or a "
@@ -153,6 +179,14 @@ def build_repair_prompt(failures: list[str], language: str, entrypoint: str) -> 
             "written directly in the chat. Do not create an artifact or canvas. "
             "Do not abbreviate it or replace any part with a comment. Same rules "
             "as before, and nothing outside the code block."
+        )
+    if defect:
+        return (
+            f"I could not run your previous reply: {defect}.\n\n"
+            "Nothing was executed, so none of this is about your logic yet — it "
+            "is about what arrived. Put that right and send the COMPLETE program "
+            "again as ONE ordinary fenced code block written directly in the "
+            "chat, with nothing outside it. Same rules as before."
         )
     detail = "\n".join(f"  - {line}" for line in failures)
     target = "the program" if language == "rust" else f"`{entrypoint}`"
@@ -178,6 +212,9 @@ def extract_code(
     # Clean BEFORE matching: a stray invisible character inside the opening
     # fence would stop the block being recognised at all.
     reply = sanitize_code(reply)
+    # ...and drop the model's own reasoning before matching too, so the fences
+    # it quoted while thinking never compete with the answer.
+    reply = _OPEN_THINK_RE.sub("", _THINK_RE.sub("", reply))
     matches = [m.group(2) for m in _FENCE_RE.finditer(reply)]
     if not matches:
         return reply.strip()

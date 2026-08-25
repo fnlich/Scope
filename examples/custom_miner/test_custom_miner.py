@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -493,6 +494,10 @@ class _Node:
         return _Loc(None, selector, inner)
 
     async def inner_text(self):
+        return self._text
+
+    async def text_content(self):
+        """`_read` asks code blocks for this; see the note there on why."""
         return self._text
 
     async def get_attribute(self, name):
@@ -1603,7 +1608,7 @@ def test_a_delivery_failure_is_not_reported_as_a_wrong_answer():
     """
     from solvers.prompts import NO_CODE, build_repair_prompt
 
-    prompt = build_repair_prompt([NO_CODE], "rust", "main")
+    prompt = build_repair_prompt([], "rust", "main", defect=NO_CODE)
     assert "did not reach me as code" in prompt
     assert "artifact" in prompt and "canvas" in prompt
     assert "I ran" not in prompt, "still claims to have run something"
@@ -1618,6 +1623,197 @@ def test_a_real_failure_still_quotes_the_evidence():
     prompt = build_repair_prompt(["g(*[12345]) returned 14, expected 15"], "python", "g")
     assert "returned 14, expected 15" in prompt
     assert "I ran `g` against the examples" in prompt
+
+
+# --- a model that reasons before it answers ------------------------------- #
+# Reasoning quotes code, and quoted code is not an answer. Three separate
+# things had to hold for a fragment out of the model's rough work to reach the
+# grader, and each of these pins one of them: the read must not stop in the gap
+# between the reasoning and the answer, the extractor must not treat reasoning
+# as a candidate, and a defect must be reported as one rather than as a failed
+# run. Live symptom on a Rust task, three attempts running: "no code", then
+# "does not define fn main()", then "no code" again.
+
+
+def test_a_pause_between_the_reasoning_and_the_answer_is_not_the_answer():
+    """`_read` keeps a message's code blocks and drops its prose. So while the
+    model writes the sentence that introduces its real answer, the read does not
+    move at all -- two identical polls, which is exactly what "finished" used to
+    mean. The reasoning's fragment is returned, `fn main` is missing from it,
+    and the repair round is spent on a program that was never the answer.
+
+    The busy selector normally covers this, but it is per-site, overridable and
+    dropped at startup when it matches an idle page, so the completion test has
+    to hold without one. There is none here on purpose.
+    """
+    from solvers.prompts import rust_defect
+
+    FRAGMENT = "struct SegTree { n: usize }"          # quoted mid-reasoning
+    ANSWER = 'fn main() {\n    println!("42");\n}'    # written much later
+    intro = "Let me think. A segment tree works."
+    frames = [
+        ([FRAGMENT], "Let me think."),
+        ([FRAGMENT], intro),                          # code identical, prose grew
+        ([FRAGMENT], intro + " Here it is:"),         # and again
+        ([FRAGMENT, ANSWER], intro + " Here it is:"), # the answer finally lands
+        ([FRAGMENT, ANSWER], intro + " Here it is:"), # settled
+    ]
+
+    class _StreamNode(_Node):
+        """One assistant message that advances a frame each time it is polled."""
+
+        def __init__(self):
+            super().__init__()
+            self._i = 0
+
+        def _frame(self):
+            return frames[min(self._i, len(frames) - 1)]
+
+        def locator(self, selector):
+            self._code = list(self._frame()[0])
+            return super().locator(selector)
+
+        async def inner_text(self):
+            text = self._frame()[1]
+            self._i += 1     # `_whole` reads this last, so one poll is one frame
+            return text
+
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [_StreamNode()])
+    reply = asyncio.run(_tab(page, _site(busy=())).send("solve it", 5.0))
+
+    code = extract_code(reply, "main", "rust")
+    assert rust_defect(code) is None, f"stopped reading mid-reasoning: {reply!r}"
+    assert "println!" in code, "handed over the fragment instead of the answer"
+
+
+def test_code_quoted_while_thinking_is_not_a_candidate_answer():
+    """Some replies carry the reasoning as literal `<think>` text, and the
+    reasoning quotes code. Every fragment in it looks like a candidate to a
+    fence scanner -- and one of them is the LAST block whenever the answer did
+    not arrive, so rough work goes to the grader looking like a solution.
+
+    An opener with no closer is the same problem with no bottom: there is no
+    answer after it, and "nothing arrived" is the only honest thing to report.
+    It is also the more useful one, because it is the branch of the repair
+    prompt that asks for the code again instead of blaming the logic.
+    """
+    from solvers.prompts import NO_CODE, rust_defect
+
+    reply = (
+        "<think>\nA segment tree, maybe:\n"
+        "```rust\nstruct SegTree { n: usize }\n```\n"
+        "no, too slow.\n</think>\n"
+        'Here it is:\n```rust\nfn main() { println!("42"); }\n```'
+    )
+    code = extract_code(reply, "main", "rust")
+    assert rust_defect(code) is None and "println!" in code
+    assert "SegTree" not in code, "mined the model's own reasoning for an answer"
+
+    cut = reply.split("</think>")[0]        # the read landed mid-thought
+    assert rust_defect(extract_code(cut, "main", "rust")) == NO_CODE
+
+
+def test_the_reader_returns_a_code_block_byte_for_byte():
+    """Only a real browser can answer this, so this one uses one.
+
+    claude.ai splits a <code> into `data-code-line-group` blocks. `innerText`
+    puts a line break at every block boundary, so a 15-line program comes back
+    as 17 -- measured, on the DOM of a real answer. Rust shrugs at a stray blank
+    line. A Python multi-line string literal does not, and nothing anywhere
+    reports the corruption: the code parses, defines the entrypoint, passes
+    every check, and disagrees with a hidden test about the contents of a
+    string. textContent is the raw text, and each line already carries its own
+    newline, so it round-trips exactly.
+    """
+    chrome = Path("/opt/pw-browsers/chromium-1194/chrome-linux/chrome")
+    if not chrome.exists():
+        pytest.skip("no browser on this host")
+    playwright = pytest.importorskip("playwright.async_api")
+
+    source = "\n".join(
+        ['fn main() {', '    let s = "line one', 'line two";', '    println!("{}", s);', '}']
+    )
+    # The real shape: per-line spans, chunked into display:block line groups.
+    lines = source.split("\n")
+    groups = "".join(
+        '<span class="block" data-code-line-group="">'
+        + "".join(f"<span>{ln}\n</span>" for ln in lines[i : i + 2])
+        + "</span>"
+        for i in range(0, len(lines), 2)
+    )
+    html = (
+        '<!doctype html><meta charset="utf-8"><style>.block{display:block}'
+        "code{white-space:pre}</style>"
+        '<div data-is-streaming="false"><div class="p-3.5">rust</div>'
+        f'<pre><code class="language-rust">{groups}</code></pre></div>'
+    )
+    page_file = Path(tempfile.mkdtemp()) / "reply.html"
+    page_file.write_text(html, encoding="utf-8")
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(
+                executable_path=str(chrome), args=["--no-sandbox"]
+            )
+            page = await (await browser.new_context()).new_page()
+            await page.goto(page_file.as_uri())
+            read = await _Tab._read(page.locator("div[data-is-streaming]").first)
+            await browser.close()
+            return read
+
+    code = extract_code(asyncio.run(go()), "main", "rust")
+    assert code == source, f"the reader did not return the block verbatim:\n{code!r}"
+    assert not code.lstrip().startswith("rust"), "the language chip leaked in"
+
+
+def test_a_defect_is_not_reported_as_a_failed_run():
+    """Defects are found BEFORE anything executes. "I ran the program against
+    the examples and got: the program does not define `fn main()`" is not
+    evidence, it is a contradiction -- and a model told its logic failed will
+    rewrite the logic, which was never the problem."""
+    from solvers.prompts import build_repair_prompt
+
+    prompt = build_repair_prompt(
+        [], "rust", "main", defect="the program does not define `fn main()`"
+    )
+    assert "does not define `fn main()`" in prompt
+    assert "could not run" in prompt
+    assert "I ran" not in prompt, "still claims to have executed it"
+    assert "WRONG" not in prompt, "still blames logic that never ran"
+
+
+def test_the_repair_round_hears_about_the_defect_not_about_the_examples():
+    """The wiring, not the wording: `_grade` returns a defect OR failures, never
+    both, and merging them into one list of "problems" was what put a defect
+    under the "I ran it" heading in the first place."""
+    prompts: list[str] = []
+
+    class _Recording(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            return await super().send(text, timeout_s)
+
+    class _Backend2(_Backend):
+        async def open(self, avoid=None):
+            return _Recording(self._replies, self._provider)
+
+    task = SolveTask(
+        problem_id="defect", language="rust", statement="Print 42.",
+        entrypoint="main", public_examples=[], deadline_s=120.0,
+    )
+    solver = VerifyingSolver(
+        # First reply is a helper with no `fn main`; second is a real program.
+        _Backend2(["```rust\nfn helper() {}\n```",
+                   '```rust\nfn main() { println!("42"); }\n```']),
+        safety_margin_s=0, max_budget_s=120,
+    )
+    answer = asyncio.run(solver.solve_task(task, 120.0))
+
+    assert "println!" in answer.code, "never got past the defect"
+    assert len(prompts) == 2, f"expected one repair round, got {len(prompts)}"
+    assert "could not run" in prompts[1] and "fn main" in prompts[1]
+    assert "against the examples" not in prompts[1]
 
 
 def test_both_providers_are_told_to_keep_long_code_in_the_chat():
