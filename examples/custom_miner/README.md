@@ -294,6 +294,25 @@ One browser can serve both backends — sign the same Chrome in to claude.ai and
 chatgpt.com, and leave `CLAUDE_CDP` and `CHATGPT_CDP` both on `9222`. Separate
 ports are for separate *accounts*, not separate providers.
 
+**A tab is opened once and kept.** What separates one task from the next is a
+fresh *conversation*, not a fresh tab — a task must never see the previous
+task's code, or the model blends the two and fails the hidden suite in a way
+that is very hard to diagnose. The tab itself is the expensive part: signed in
+by hand, warm, and only ever replaced when it dies. So the reset is done as
+cheaply as it can be:
+
+1. **Nothing to do** — a tab that has just been opened is already in an empty
+   conversation. Its first task reloads nothing.
+2. **The site's own "new chat"** — an in-app route change: no bundle refetch,
+   no app boot, no re-auth. Taken only when the transcript is demonstrably gone
+   afterwards, because a control that quietly did not route would leave the last
+   task in view and the next answer would come back promptly and wrong.
+3. **Reload the page** — what every task used to do, now only when 1 and 2
+   cannot be proven.
+
+Because tabs are replaced *only* on death, tab churn in your browser is a real
+signal that something is wrong. It is not what ordinary work looks like.
+
 **Keeping it alive.** Two systemd services with `Restart=always`: the debug
 browser (with the same `--profile`, so it restarts already signed in) and the
 miner, which reconnects on its next start.
@@ -319,7 +338,13 @@ CLAUDE_COMPOSER='div[contenteditable="true"].ProseMirror'
 CLAUDE_ASSISTANT='div[data-is-streaming]'
 CLAUDE_SEND_BUTTON='button[aria-label="Send message"]'
 CLAUDE_STOP_BUTTON='button[aria-label="Stop response"]'
+CLAUDE_NEW_CHAT='a[href$="/new"]'
 ```
+
+`*_NEW_CHAT` is the one role that is optional: it is how a tab starts its next
+conversation without a page load, and if nothing matches, the tab reloads
+instead — a few seconds per task, never a wrong answer. The doctor reports it
+like any other role.
 
 Three hazards are handled in code rather than left to the selectors:
 
