@@ -51,7 +51,9 @@ from .config import find_env_file, load_env_file
 # second prompt of the operator's quota to learn the same thing.
 PROBE = (
     "Reply with exactly TWO fenced code blocks and no other text.\n"
-    "Block 1: `def pong():` returning the string 'pong'.\n"
+    "Block 1: a Python function `def pong():` whose body is 60 comment lines "
+    "`# line 1` through `# line 60`, one per line, and whose LAST statement is "
+    "`return 'pong'`.\n"
     "Block 2: a single line calling it, like `print(pong())`."
 )
 
@@ -280,6 +282,18 @@ async def _probe(page, site: Site, composer: str, busy) -> bool:
     if result != "pong":
         print(f"[doctor] !! it ran but returned {result!r}, not 'pong'.")
         return False
+    lines = code.count("\n") + 1
+    tail_intact = "# line 60" in code
+    print(f"    long-block check: {lines} lines through, "
+          f"last comment line present: {tail_intact}")
+    if not tail_intact:
+        # It ran and returned 'pong', so nothing is broken -- but a page that
+        # virtualises or collapses long code would drop the middle and still
+        # look fine on a short answer, and real solutions are not short.
+        print("[doctor] note: the tail of the long block did not arrive. Either")
+        print("         the model ignored the line count, or this page does not")
+        print("         render long code in full — re-run, and if it repeats,")
+        print("         long answers are being truncated on the way out.")
     if blocks > 1:
         print("[doctor] probe answered correctly, and with TWO blocks offered the")
         print("         ANSWER was chosen, not the usage example. This page's")

@@ -1312,6 +1312,59 @@ def test_the_doctor_reports_the_in_app_new_chat_when_the_page_has_one():
     assert page.navigated == [], "the in-app path should not reload the page"
 
 
+def test_a_long_answer_survives_the_reader_intact():
+    """Real solutions are not three lines. Re-fencing every block and choosing
+    between them must not quietly lose the middle of a big one, and the tail is
+    where truncation shows: a cut answer still parses surprisingly often, and
+    then fails the hidden tests for reasons nothing logs."""
+    body = "\n".join(f"    # line {i}" for i in range(1, 2001))
+    answer = f"def pong():\n{body}\n    return 'pong'"
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__(
+        "#assistant", [_Node(code=[answer, "print(pong())"])]
+    )
+    reply = asyncio.run(_tab(page, _site()).send("solve it", 2.0))
+    code = extract_code(reply, "pong")
+    assert "# line 1\n" in code and "# line 2000" in code, "the block was truncated"
+    scope: dict = {}
+    exec(compile(code, "<submitted>", "exec"), scope)
+    assert scope["pong"]() == "pong"
+
+
+def test_two_answers_to_one_prompt_do_not_flip_between_polls():
+    """ChatGPT sometimes streams TWO candidate answers for a single prompt and
+    asks which you prefer. Reading "the last message" then means reading
+    whichever branch is last at that instant, and while both stream that
+    changes: the text never repeats across two polls, the completion test never
+    fires, and the whole budget is spent before the deadline forces a partial
+    answer out. Latch one branch on sight and read only that.
+
+    Latched by message id, not by index -- an index still drifts if the two are
+    repainted in the other order, which is the failure this reproduces.
+    """
+    A = _Node(code=["def pong():\n    return 'A'"], attrs={"data-message-id": "id-A"})
+    B = _Node(code=["def pong():\n    return 'B'"], attrs={"data-message-id": "id-B"})
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    site = _site(message_id_attr="data-message-id")
+    tab = _tab(page, site)
+
+    async def go():
+        before = await tab._fingerprint()          # empty conversation
+        page.dom["#assistant"] = [A]               # first branch renders
+        seen = set()
+        for poll in range(6):
+            if poll:                               # then both, order flipping
+                page.dom["#assistant"] = [A, B] if poll % 2 else [B, A]
+            reply = await tab._new_reply(before)
+            if reply is not None:
+                seen.add(await _Tab._read(reply))
+        return seen
+
+    seen = asyncio.run(go())
+    assert len(seen) == 1, f"read drifted between branches: {seen}"
+    assert "return 'A'" in seen.pop(), "did not commit to the branch it saw first"
+
+
 def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():
     """claude.ai has no per-message id, so the reply is 'an assistant message
     that was not there before we pressed send'. Sound only because every task

@@ -255,7 +255,12 @@ class _Tab:
         self._sent = ""
         # Assistant selector latched for the current send(); see _messages().
         self._assistant: Optional[str] = None
+        # ...and the index of the reply element, so two streaming branches
+        # cannot be read alternately. See _new_reply.
+        self._reply_index: Optional[int] = None
+        self._reply_key: Optional[str] = None
         self._warned_echo = False
+        self._warned_branches = False
         self.uses = 0
         self.alive = True
         # True while this tab is known to be sitting in an EMPTY conversation.
@@ -429,6 +434,8 @@ class _Tab:
         # different candidate once the reply renders, and comparing a count taken
         # from one selector against a count taken from another is meaningless.
         self._assistant = None
+        self._reply_index = None
+        self._reply_key = None
         # Reserve a slice of the caller's budget for getting the prompt in;
         # the rest is for waiting on the answer.
         submit_budget_s = max(5.0, min(20.0, timeout_s * 0.3))
@@ -545,7 +552,21 @@ class _Tab:
         return count, mid
 
     async def _new_reply(self, before: tuple[int, Optional[str]]):
-        """The last assistant message, if it is not the one that was there before."""
+        """The reply to THIS send, latched for the rest of it.
+
+        One send can produce more than one assistant message: ChatGPT sometimes
+        runs a side-by-side comparison and streams two candidate answers for a
+        single prompt. Reading "the last message" then means reading whichever
+        branch happens to be last at that instant — and while both are
+        streaming, that flips. The text never settles, so the poll loop never
+        sees two identical reads, and the whole budget is spent before the
+        deadline forces a partial answer out.
+
+        So the FIRST message that was not there before is latched on sight and
+        read for the rest of the send. Both branches are real answers; what
+        matters is committing to one. With a single reply this is exactly the
+        old behaviour — index ``count_before`` is the only new message.
+        """
         count_before, id_before = before
         messages = await self._messages()
         if messages is None:
@@ -553,15 +574,43 @@ class _Tab:
         count = await messages.count()
         if count == 0:
             return None
-        last = messages.nth(count - 1)
+        if self._reply_key is not None:
+            # Latched by id: survives the branches being reordered, which an
+            # index does not. Cheap — there are never many messages on screen.
+            for i in range(count):
+                node = messages.nth(i)
+                if await node.get_attribute(self.site.message_id_attr) == self._reply_key:
+                    return node
+            return None
+        if self._reply_index is not None:
+            return messages.nth(self._reply_index) if count > self._reply_index else None
+
+        if count > count_before:
+            if count - count_before > 1 and not self._warned_branches:
+                self._warned_branches = True
+                print(
+                    f"[{self.site.name}] note: tab {self.label} got "
+                    f"{count - count_before} answers to one prompt (a "
+                    f"side-by-side comparison). Reading the first and ignoring "
+                    f"the rest."
+                )
+            fresh = messages.nth(count_before)
+            # Prefer an id: two branches keep their ids whatever order they are
+            # painted in, so the read cannot drift from one answer to the other.
+            if self.site.message_id_attr:
+                self._reply_key = await fresh.get_attribute(self.site.message_id_attr)
+            if self._reply_key is None:
+                self._reply_index = count_before
+            return fresh
+        # Some sites replace the last message rather than appending one, so a
+        # changed id still means a new reply even when the count did not move.
         if self.site.message_id_attr:
+            last = messages.nth(count - 1)
             mid = await last.get_attribute(self.site.message_id_attr)
-            if mid is not None:
-                return None if mid == id_before else last
-        # No id attribute: identify by position. Sound because every task opens
-        # a fresh conversation, so the reply we want is simply an assistant
-        # message that was not there when we pressed send.
-        return last if count > count_before else None
+            if mid is not None and mid != id_before:
+                self._reply_key = mid
+                return last
+        return None
 
     async def _busy_now(self) -> bool:
         for selector in self.site.busy:
