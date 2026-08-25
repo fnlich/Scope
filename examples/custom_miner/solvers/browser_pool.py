@@ -669,6 +669,15 @@ class BrowserFleet:
         # free-queue-only sweep would leave behind.
         self._tabs: list[_Tab] = []
         self._free: asyncio.Queue[_Tab] = asyncio.Queue()
+        # The rotation: the endpoints that actually produced tabs, in the order
+        # you configured them, and whose turn is next. Requests go 1st browser,
+        # 2nd, ... nth, 1st again. Seeding the queue interleaved gives that too
+        # while tabs come back in the order they went out, but they do not: a
+        # tab is released when its task ENDS, and concurrent tasks end out of
+        # order, so a queue alone drifts out of rotation within a few requests.
+        # This makes the rotation the rule rather than a side effect of timing.
+        self._order: list[str] = []
+        self._cursor = 0
         self._size = 0
         self._lost = 0
         self._reclaimed = 0
@@ -729,6 +738,11 @@ class BrowserFleet:
             if spawned:
                 columns.append(spawned)
 
+        # Only browsers that produced a tab are in the rotation: one that could
+        # not be attached to is not an active browser, and leaving it in would
+        # spend a turn on nothing.
+        self._order = [column[0].source for column in columns if column]
+        self._cursor = 0
         for row in zip_longest(*columns):
             for tab in row:
                 if tab is not None:
@@ -905,25 +919,73 @@ class BrowserFleet:
         raise last if last is not None else RuntimeError("could not lease a tab")
 
     async def _lease(self, avoid: Optional[str], wait_s: float) -> _Tab:
-        """Next free tab, preferring one whose provider is not ``avoid``."""
+        """The next free tab, taken in browser rotation order.
+
+        Request 1 goes to the 1st browser, request 2 to the 2nd, ... request n
+        to the nth, request n+1 back to the 1st. That is the point of running
+        several browsers at all: the account is the rate limit, so spreading
+        consecutive tasks across accounts is what buys the throughput.
+
+        The one deviation, and it is deliberate: if the browser whose turn it is
+        has no free tab, the turn passes to the next browser that does rather
+        than waiting for it. A miner is paid for answers that arrive before the
+        deadline, so idling behind one busy account while another sits free
+        would trade real money for a tidier sequence. The cursor follows the
+        browser actually used, so the rotation resumes from there instead of
+        replaying the gap.
+        """
         try:
-            tab = await asyncio.wait_for(self._free.get(), timeout=wait_s)
+            first = await asyncio.wait_for(self._free.get(), timeout=wait_s)
         except asyncio.TimeoutError:
             raise RuntimeError(
                 f"no free tab within {wait_s:g}s — every tab is busy. Add a "
-                f"browser, raise <PROVIDER>_TABS_PER_BROWSER, or lower "
+                f"browser, raise MINER_TABS_PER_BROWSER, or lower "
                 f"MINER_MAX_CONCURRENT_REQUESTS."
             ) from None
-        if avoid is None or tab.site.name != avoid:
-            return tab
-        # Rotate past same-provider tabs, bounded by what is queued right now so
-        # this cannot spin, and never dropping the one we already hold.
-        for _ in range(self._free.qsize()):
-            self._free.put_nowait(tab)
-            tab = self._free.get_nowait()
-            if tab.site.name != avoid:
-                break
-        return tab
+        # Everything from here down is synchronous, and has to be: draining the
+        # queue and putting back what we did not take is one step, and an await
+        # in the middle of it is a cancellation point that would drop every
+        # drained tab on the floor.
+        pool = [first]
+        while not self._free.empty():
+            pool.append(self._free.get_nowait())
+        chosen = self._pick(pool, avoid)
+        for tab in pool:
+            if tab is not chosen:
+                self._free.put_nowait(tab)
+        return chosen
+
+    def _pick(self, pool: list[_Tab], avoid: Optional[str]) -> _Tab:
+        """Choose from the free tabs and advance the rotation. No I/O.
+
+        ``avoid`` outranks the rotation. It is asked for only by the second
+        opinion, after the first model has already failed to produce a
+        verifiable answer, and getting the OTHER model is the entire value of
+        that attempt — spending it on the same model to keep the browsers in
+        order would be the wrong trade. Among the tabs that satisfy it, the one
+        whose browser is nearest in rotation order wins, so the ordinary case is
+        unaffected.
+        """
+        n = len(self._order)
+        position = {endpoint: i for i, endpoint in enumerate(self._order)}
+
+        def rank(tab: _Tab) -> tuple[int, int]:
+            wrong_model = 1 if (avoid is not None and tab.site.name == avoid) else 0
+            if n == 0:  # a fleet assembled without _fill, i.e. in a test
+                return (wrong_model, 0)
+            index = position.get(tab.source)
+            # Distance forward from whoever's turn it is, so the browser due
+            # next is 0, the one after it 1, and so on around the ring.
+            turn = n if index is None else (index - self._cursor) % n
+            return (wrong_model, turn)
+
+        # min() keeps the first of any tie, so tabs of equal standing are still
+        # handed out in the order they were freed.
+        chosen = min(pool, key=rank)
+        index = position.get(chosen.source)
+        if index is not None:
+            self._cursor = (index + 1) % n
+        return chosen
 
     def _retire(self, tab: _Tab) -> None:
         """Book-keeping for a tab that is gone. No I/O, so it is cancel-safe."""

@@ -682,6 +682,134 @@ def test_tabs_are_enqueued_interleaved_across_browsers():
     assert order[1].split(":")[1].startswith("9223")
 
 
+# --- the browser rotation ------------------------------------------------ #
+# Request 1 to the 1st browser, 2 to the 2nd, ... n to the nth, n+1 back to the
+# 1st. The account is what rate-limits, so this is the whole reason for running
+# several browsers rather than several tabs in one.
+
+
+async def _filled(n_browsers: int, tabs: int = 2, attach_fails=()) -> BrowserFleet:
+    """A fleet through the REAL `_fill`, so `_order` is what production sets.
+
+    Building the queue by hand instead would test the rotation against a fleet
+    state no miner ever has, which is how the pre-fleet doctor call rotted.
+    """
+    sites = [claude_site(), chatgpt_site()]
+    fleet = _fleet(*[sites[i % 2] for i in range(n_browsers)], tabs_per_browser=tabs)
+
+    async def spawn(context, browser, label):
+        return _Tab(
+            fleet, _DeadPage(), None, label, browser.site, source=browser.endpoint
+        )
+
+    fleet._spawn = spawn
+    fleet._attach = lambda b: _done(None if b.endpoint in attach_fails else object())
+    fleet._reclaim = lambda context, browser: _done(None)
+    fleet._pw = object()
+    await fleet._fill()
+    return fleet
+
+
+def _port(tab) -> str:
+    return tab.source.rsplit(":", 1)[-1]
+
+
+async def _take(fleet, avoid=None):
+    tab = await fleet._lease(avoid, 5)
+    tab.leased = True                    # release() ignores a tab never leased
+    return tab
+
+
+def test_requests_go_round_the_browsers_in_order():
+    """The plain case: one task at a time, three browsers, nine requests."""
+
+    async def go():
+        fleet = await _filled(3)
+        seen = []
+        for _ in range(9):
+            tab = await _take(fleet)
+            seen.append(_port(tab))
+            await fleet.release(tab)
+        return seen
+
+    assert asyncio.run(go()) == ["9222", "9223", "9224"] * 3
+
+
+def test_the_rotation_survives_tasks_finishing_out_of_order():
+    """The case a queue alone gets wrong, and the reason the cursor exists.
+
+    A tab is freed when its task ENDS, and concurrent tasks end in whatever
+    order the models happen to answer. Take the next free tab and the sequence
+    stops being a rotation within a few requests — two hard problems on one
+    account and an easy one on another, and the fast account starts taking more
+    than its share of the tasks. Here the second of each pair always finishes
+    first, which is enough to scramble a queue and must not scramble this.
+    """
+
+    async def go():
+        fleet = await _filled(3)                    # 3 browsers, 2 tabs each
+        seen = []
+        for _ in range(6):
+            first = await _take(fleet)
+            second = await _take(fleet)
+            seen += [_port(first), _port(second)]
+            await fleet.release(second)             # out of order, deliberately
+            await fleet.release(first)
+        return seen
+
+    assert asyncio.run(go()) == ["9222", "9223", "9224"] * 4
+
+
+def test_a_busy_browser_passes_its_turn_instead_of_stalling_the_fleet():
+    """The one deliberate deviation. A miner is paid for answers that beat the
+    deadline, so waiting for the browser whose turn it is while another sits
+    free would trade money for a tidier sequence."""
+
+    async def go():
+        fleet = await _filled(3, tabs=1)
+        held = [await _take(fleet) for _ in range(3)]
+        assert [_port(t) for t in held] == ["9222", "9223", "9224"]
+        await fleet.release(held[1])                # only 9223 is free again
+        # It is 9222's turn, but 9222 is still working. Take 9223 rather than
+        # wait, and resume the rotation from there.
+        return _port(await _take(fleet))
+
+    assert asyncio.run(go()) == "9223"
+
+
+def test_a_browser_that_never_attached_is_not_in_the_rotation():
+    """`n` is the number of browsers actually serving. One that could not be
+    attached to — not started, wrong port — is not one of them, and leaving it
+    in the ring would spend every nth turn discovering that again."""
+
+    async def go():
+        fleet = await _filled(3, attach_fails={"http://127.0.0.1:9223"})
+        seen = []
+        for _ in range(4):
+            tab = await _take(fleet)
+            seen.append(_port(tab))
+            await fleet.release(tab)
+        return seen, fleet._order
+
+    seen, order = asyncio.run(go())
+    assert seen == ["9222", "9224", "9222", "9224"]
+    assert order == ["http://127.0.0.1:9222", "http://127.0.0.1:9224"]
+
+
+def test_the_second_opinion_outranks_the_rotation():
+    """`avoid` is asked for only after the first model failed to produce a
+    verifiable answer, and reaching the OTHER model is the entire value of that
+    attempt. Spending it on the same model to keep the browsers in order would
+    be the wrong trade."""
+
+    async def go():
+        fleet = await _filled(2, tabs=1)            # 9222 claude, 9223 chatgpt
+        tab = await _take(fleet, avoid="claude")    # 9222's turn, but avoid it
+        return _port(tab), tab.site.name
+
+    assert asyncio.run(go()) == ("9223", "chatgpt")
+
+
 def test_a_lease_can_ask_for_a_different_provider():
     """The second opinion is only worth asking if it reaches the OTHER model."""
     async def go():
