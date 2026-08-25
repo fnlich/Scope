@@ -184,6 +184,15 @@ class CustomMiner(DemoMiner):
 # Entry point: register-checked, axon-advertised, HTTP-served. No model key.
 # --------------------------------------------------------------------------- #
 def run_custom_miner(solver: Optional[Solver] = None) -> None:
+    # DemoMinerSettings reads .env itself, but through pydantic-settings, which
+    # never populates os.environ. MY_APP_URL is read from os.environ below and
+    # is not one of its fields, so without this a MY_APP_URL written into .env —
+    # exactly as the README says to — was silently ignored.
+    from solvers.config import find_env_file, load_env_file
+
+    env_file = find_env_file()
+    if load_env_file(env_file):
+        print(f"[custom-miner] loaded {env_file}")
     settings = DemoMinerSettings()
     if solver is None:
         solver = HttpAppSolver(os.environ.get("MY_APP_URL", ""))

@@ -1,8 +1,9 @@
 """Use several model providers for one task, and pick backends from the env.
 
 The subnet pays only for a complete hidden-suite pass, so a second opinion is
-worth far more than a faster first one: the latency tiebreaker spans about 3.5%,
-while being wrong costs 100%. ``FallbackSolver`` therefore runs providers in
+worth far more than a faster first one: the latency tiebreaker spans 5 points
+(`payment_speed_floor` is 0.95, so the multiplier lives in [0.95, 1.0]), while
+being wrong costs 100%. ``FallbackSolver`` therefore runs providers in
 order and stops at the first answer that reproduces every public example.
 
 Ordering is a cost decision, not a quality one — put the provider you would
@@ -12,8 +13,8 @@ providers cost nothing on tasks the first one solves.
     MINER_BACKENDS=claude,chatgpt   # in preference order
     MINER_BACKENDS=claude           # just one
 
-Both backends drive a Firefox profile you are already logged in to. No API
-key is read anywhere in this package.
+Both backends drive a Chrome you started and signed in to yourself, attached
+over CDP. No API key is read anywhere in this package.
 
 Running both is also the only redundancy a browser miner has. There is no API
 path to fall back to, so when one provider's DOM changes or its login expires,
@@ -30,30 +31,25 @@ from typing import Any, Optional
 
 from .verify import Answer, VerifyingSolver
 
-# Both backends drive a logged-in Firefox profile; neither reads an API key.
+# Both backends attach to a logged-in Chrome; neither reads an API key.
 # Imported lazily inside build_backend so that importing this module does not
 # require Playwright.
 KNOWN_BACKENDS = ["chatgpt", "claude"]
 
 
 def _pool_kwargs(prefix: str) -> dict[str, Any]:
-    """Browser settings for a backend.
+    """Which browsers a backend attaches to, and how many tabs in each.
 
-    ``<PREFIX>_CDP`` selects attach mode — a Chrome you started yourself and
-    logged in to, reached over CDP. Left unset, the backend launches Firefox
-    against ``<PREFIX>_PROFILES``. Attach mode is what gets past sign-in checks
-    that refuse a Playwright-launched browser (Google, in particular).
+    ``<PREFIX>_CDP`` is the endpoint list — a bare port, ``host:port``, a full
+    URL, or several separated by commas, one per account. Unset, it defaults to
+    the port ``scripts/start_debug_browser.sh`` uses, so the common
+    one-browser setup needs no configuration at all.
     """
-    from .browser_pool import default_profile
+    from .browser_pool import DEFAULT_CDP_PORT
 
-    raw = os.environ.get(f"{prefix}_PROFILES", "").replace(",", " ").split()
-    profiles = raw or [str(default_profile(prefix.lower(), 1))]
-    headless = os.environ.get(f"{prefix}_HEADLESS", "true").strip().lower()
     return dict(
-        profiles=profiles,
-        tabs_per_profile=int(os.environ.get(f"{prefix}_TABS_PER_PROFILE", "2")),
-        headless=headless not in ("0", "false", "no"),
-        cdp=os.environ.get(f"{prefix}_CDP", "") or None,
+        cdp=os.environ.get(f"{prefix}_CDP", "").strip() or str(DEFAULT_CDP_PORT),
+        tabs_per_browser=int(os.environ.get(f"{prefix}_TABS_PER_BROWSER", "2")),
     )
 
 
@@ -64,13 +60,11 @@ def build_backend(name: str):
         # The browser, not an API key: your Claude subscription is the quota.
         from .claude_web import ClaudeBrowserPool
 
-        kwargs = _pool_kwargs("CLAUDE")
-        return ClaudeBrowserPool(kwargs.pop("profiles"), **kwargs)
+        return ClaudeBrowserPool(**_pool_kwargs("CLAUDE"))
     if key == "chatgpt":
         from .chatgpt_web import ChatGPTPool
 
-        kwargs = _pool_kwargs("CHATGPT")
-        return ChatGPTPool(kwargs.pop("profiles"), **kwargs)
+        return ChatGPTPool(**_pool_kwargs("CHATGPT"))
     raise SystemExit(f"unknown backend {name!r}; expected one of {KNOWN_BACKENDS}")
 
 
@@ -112,8 +106,16 @@ class FallbackSolver:
         for index, (name, solver) in enumerate(self._solvers):
             elapsed = time.monotonic() - started
             remaining = budget - elapsed
+            # Never skip the FIRST provider. With a short deadline the margin can
+            # eat the whole budget, and bailing here would return an empty answer
+            # having called nobody — no attempt recorded, nothing logged, a
+            # guaranteed zero that looks like the model failed. VerifyingSolver
+            # has the same floor for the same reason.
+            if remaining < 12.0 and index > 0:
+                print(f"[multi] {remaining:.0f}s left; stopping before {name}")
+                break
             if remaining < 12.0:
-                break  # not enough left for another provider to be useful
+                remaining = max(5.0, float(timeout_s) * 0.5)
             # Give each remaining provider an equal share of what is left, so a
             # slow first provider cannot starve the rest.
             share = remaining / max(1, len(self._solvers) - index)
@@ -196,6 +198,6 @@ async def warm_up(solver, min_capacity: int = 1) -> None:
             print(
                 f"[multi] NOTE: {backend.site.name} has {tabs} tab(s) but "
                 f"MINER_MAX_CONCURRENT_REQUESTS={min_capacity}. Tasks beyond the "
-                "tab count queue and burn their deadline — add profiles/tabs, or "
+                "tab count queue and burn their deadline — add browsers/tabs, or "
                 "lower the concurrency."
             )

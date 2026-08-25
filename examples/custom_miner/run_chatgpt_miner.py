@@ -9,22 +9,22 @@ Everything the subnet cares about (signature verification, replay defence,
 validator-permit authorisation, response signing, byte and concurrency caps)
 comes from the reference miner unchanged; only the answer is ours.
 
-Setup — one Firefox profile per ChatGPT account gives a true N-fold rate limit:
+Setup — one browser per ChatGPT account gives a true N-fold rate limit. Start
+each with ``scripts/start_debug_browser.sh`` on its own port and sign in to
+chatgpt.com by hand:
 
-    python -m solvers.login chatgpt --profile ~/.hone-miner/firefox/chatgpt-1
-    python -m solvers.login chatgpt --profile ~/.hone-miner/firefox/chatgpt-2
-    CHATGPT_PROFILES=~/.hone-miner/firefox/chatgpt-1,~/.hone-miner/firefox/chatgpt-2 \
-        python examples/custom_miner/run_chatgpt_miner.py
+    ./scripts/start_debug_browser.sh --port 9222 --profile ~/.hone-miner/chrome/gpt-1
+    ./scripts/start_debug_browser.sh --port 9223 --profile ~/.hone-miner/chrome/gpt-2
+    CHATGPT_CDP=9222,9223 python examples/custom_miner/run_chatgpt_miner.py
 
 Environment (miner settings come from .env as usual):
 
-    CHATGPT_PROFILES          profile dirs, one per account
-    CHATGPT_TABS_PER_PROFILE  conversations per profile     (default 2)
-    CHATGPT_HEADLESS          false to show windows         (default true)
-    SOLVER_MAX_ATTEMPTS       initial answer + repairs      (default 3)
+    CHATGPT_CDP               CDP endpoints, one per account  (default 9222)
+    CHATGPT_TABS_PER_BROWSER  conversations per browser       (default 2)
+    SOLVER_MAX_ATTEMPTS       initial answer + repairs        (default 3)
     SOLVER_SAFETY_MARGIN_S    headroom kept before the cutoff (default 15)
-    SOLVER_MAX_BUDGET_S       hard cap on one solve         (default 240)
-    SOLVER_VERIFY_EXECUTOR    subprocess | docker           (default subprocess)
+    SOLVER_MAX_BUDGET_S       hard cap on one solve           (default 240)
+    SOLVER_VERIFY_EXECUTOR    subprocess | docker             (default subprocess)
 """
 
 from __future__ import annotations
@@ -49,22 +49,21 @@ from typing import Any  # noqa: E402
 from custom_miner import CustomMiner  # noqa: E402
 from rlvr.neurons.demo_miner import DemoMinerSettings, build_demo_miner_app  # noqa: E402
 from solvers.chatgpt_web import ChatGPTPool  # noqa: E402
+from solvers.config import find_env_file, load_env_file  # noqa: E402
 from solvers.verify import VerifyingSolver  # noqa: E402
 
 
-def _profiles() -> list[str]:
-    from solvers.browser_pool import default_profile
+def _cdp() -> str:
+    """CDP endpoints for the ChatGPT browsers, one per account."""
+    from solvers.browser_pool import DEFAULT_CDP_PORT
 
-    raw = os.environ.get("CHATGPT_PROFILES", "").replace(",", " ").split()
-    return raw or [str(default_profile("chatgpt", 1))]
+    return os.environ.get("CHATGPT_CDP", "").strip() or str(DEFAULT_CDP_PORT)
 
 
 def build_solver() -> VerifyingSolver:
-    headless = os.environ.get("CHATGPT_HEADLESS", "true").strip().lower()
     pool = ChatGPTPool(
-        _profiles(),
-        tabs_per_profile=int(os.environ.get("CHATGPT_TABS_PER_PROFILE", "2")),
-        headless=headless not in ("0", "false", "no"),
+        _cdp(),
+        tabs_per_browser=int(os.environ.get("CHATGPT_TABS_PER_BROWSER", "2")),
     )
     return VerifyingSolver(
         pool,
@@ -75,6 +74,12 @@ def build_solver() -> VerifyingSolver:
 
 
 def main() -> None:
+    # Same reason as run_miner.py: pydantic-settings reads .env directly and
+    # leaves os.environ untouched, so every CHATGPT_*/SOLVER_* knob documented
+    # as living in .env would otherwise be silently ignored here.
+    env_file = find_env_file()
+    if load_env_file(env_file):
+        print(f"[chatgpt-miner] loaded {env_file}")
     settings = DemoMinerSettings()
     solver = build_solver()
     pool: ChatGPTPool = solver._backend  # type: ignore[assignment]
@@ -113,7 +118,7 @@ def main() -> None:
     print(
         f"[chatgpt-miner] netuid={settings.netuid} "
         f"wallet={settings.wallet_name}/{settings.wallet_hotkey} "
-        f"port={settings.axon_port} profiles={len(_profiles())}"
+        f"port={settings.axon_port} cdp={_cdp()}"
     )
 
     # The browser pool and the HTTP server must share ONE event loop: Playwright
@@ -128,7 +133,7 @@ def main() -> None:
                 f"[chatgpt] NOTE: {pool.stats()['tabs']} tab(s) but "
                 f"MINER_MAX_CONCURRENT_REQUESTS={settings.miner_max_concurrent_requests}. "
                 "Tasks beyond the tab count queue and burn their deadline — add "
-                "profiles/tabs, or lower the concurrency."
+                "browsers/tabs, or lower the concurrency."
             )
         server = uvicorn.Server(
             uvicorn.Config(
