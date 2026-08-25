@@ -133,7 +133,9 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 
 You start N browsers — six to ten is a normal fleet — each signed in **by hand**
 to one provider, each on its own debugging port. The miner attaches to all of
-them and treats their tabs as **one fleet**. Each task goes to the next free tab.
+them and treats their tabs as **one fleet**, and takes the browsers **in turn**:
+request 1 to the 1st browser, request 2 to the 2nd, ... request n to the nth,
+request n+1 back to the 1st.
 
 ```dotenv
 CLAUDE_CDP=9222,9223,9224      # three browsers signed in to claude.ai
@@ -153,9 +155,22 @@ scaling — and a task does not care which model answers it. So the useful unit 
   concurrent conversations. There is deliberately no provider-preference
   setting: naming one provider "first" would queue tasks on its browsers while
   the others sat idle.
-- **Leases rotate.** Tabs are handed out first-in-first-out and enqueued
-  *browser-interleaved*, so two tasks arriving together land on two different
-  accounts rather than doubling up on one.
+- **Leases rotate, by rule.** A cursor walks the browsers in the order you
+  configured them and each request takes the next one's turn, so consecutive
+  tasks are spread across accounts by construction. Handing out the next free
+  tab instead gets the same answer only while tasks finish in the order they
+  started — and they do not: a tab is freed when its task *ends*, so one
+  account drawing easy problems finishes sooner, comes back to the front, and
+  quietly starts taking more than its share.
+
+  One deliberate exception: if the browser whose turn it is has no free tab, the
+  turn passes to the next browser that does. A miner is paid for answers that
+  beat the deadline, so idling behind one busy account while another sits free
+  would trade money for a tidier sequence. The cursor follows the browser
+  actually used and carries on from there.
+
+  Browsers that failed to attach are not in the rotation — `n` is the number of
+  browsers actually serving, not the number of ports in your `.env`.
 
 ### The one time the provider matters
 
@@ -290,9 +305,18 @@ Either lower the concurrency to match your tabs, or add tabs/browsers:
 MINER_MAX_CONCURRENT_REQUESTS=2     # matches one browser at 2 tabs
 ```
 
-One browser can serve both backends — sign the same Chrome in to claude.ai and
-chatgpt.com, and leave `CLAUDE_CDP` and `CHATGPT_CDP` both on `9222`. Separate
-ports are for separate *accounts*, not separate providers.
+**One port, one browser, one provider.** Listing the same port under both
+`CLAUDE_CDP` and `CHATGPT_CDP` does not give you two backends on one Chrome —
+the second is dropped with a warning, and you get the first provider only. It
+has to work that way: the fleet reclaims a browser's leftover tabs each time it
+attaches, so a second attach to the same browser would close the tabs the first
+had just opened. To run both providers, start a second browser on its own port
+and sign it in to the other one:
+
+```dotenv
+CLAUDE_CDP=9222,9223,9224      # three browsers on claude.ai
+CHATGPT_CDP=9225,9226,9227     # three more on chatgpt.com — different ports
+```
 
 **A tab is opened once and kept.** What separates one task from the next is a
 fresh *conversation*, not a fresh tab — a task must never see the previous

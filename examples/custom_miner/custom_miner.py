@@ -149,6 +149,61 @@ class HttpAppSolver:
 # --------------------------------------------------------------------------- #
 # The miner: reuse every security check, replace only solve().
 # --------------------------------------------------------------------------- #
+# The validator reads a bounded number of bytes from the miner and DISCARDS the
+# whole response if it runs over — a correctly signed, correct answer scores
+# zero, and nothing in either log says why. `code` is what gets graded;
+# `raw_response` is the model transcript, archived for the dataset. So when the
+# reply is too long, the transcript is what gives way.
+TRUNCATED = "\n...[truncated by the miner to fit the validator's response cap]"
+
+
+def response_limit() -> int:
+    """The validator's cap. Fixed by the release; override only to match it."""
+    try:
+        return max(1024, int(os.environ.get("MINER_MAX_RESPONSE_BYTES", "128000")))
+    except ValueError:
+        return 128_000
+
+
+def fit_response(payload: SolutionPayload, limit: Optional[int] = None) -> SolutionPayload:
+    """Trim ``raw_response`` until the serialized payload fits ``limit`` bytes.
+
+    Measures after every cut rather than computing a character budget, because
+    JSON escaping is not one byte per character: a newline becomes two and a
+    non-ASCII character can become six, so a budget in characters can still
+    produce a body over the cap.
+
+    ``code`` is never touched. Truncating the graded field to fit would turn a
+    discarded answer into a confidently wrong one, which is worse: the first
+    scores zero, the second can score zero *and* teach the repair loop nothing.
+    """
+    limit = response_limit() if limit is None else limit
+    body = payload.model_dump_json().encode("utf-8")
+    if len(body) <= limit:
+        return payload
+    raw = payload.raw_response
+    kept = len(raw)
+    while kept > 0:
+        candidate = payload.model_copy(update={"raw_response": raw[:kept] + TRUNCATED})
+        body = candidate.model_dump_json().encode("utf-8")
+        if len(body) <= limit:
+            print(
+                f"[custom-miner] trimmed the transcript from {len(raw)} to {kept} "
+                f"chars to fit the validator's {limit}-byte cap"
+            )
+            return candidate
+        # Cut at least the overshoot, so this converges instead of creeping.
+        kept -= max(1, len(body) - limit)
+    stripped = payload.model_copy(update={"raw_response": TRUNCATED.strip()})
+    if len(stripped.model_dump_json().encode("utf-8")) > limit:
+        print(
+            f"[custom-miner] WARN: the solution alone is over the validator's "
+            f"{limit}-byte cap; it will be discarded. Nothing can be trimmed — "
+            f"the code itself is too long."
+        )
+    return stripped
+
+
 class CustomMiner(DemoMiner):
     """A DemoMiner whose answers come from your Solver instead of GLM."""
 
@@ -174,7 +229,9 @@ class CustomMiner(DemoMiner):
             print(f"[custom-miner] solve failed: {type(exc).__name__}: {exc}")
             code, raw = "", "<solver failed>"
         # problem_id MUST equal the request's, or the validator rejects the reply.
-        return SolutionPayload(problem_id=request.problem_id, code=code, raw_response=raw)
+        return fit_response(
+            SolutionPayload(problem_id=request.problem_id, code=code, raw_response=raw)
+        )
 
     async def aclose(self) -> None:
         await self._solver.aclose()

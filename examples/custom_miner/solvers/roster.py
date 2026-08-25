@@ -56,17 +56,26 @@ def roster(env: Optional[dict[str, str]] = None) -> list[Browser]:
         browsers.append(
             Browser(normalize_cdp(str(DEFAULT_CDP_PORT))[0], site_for("claude"))
         )
-    seen, unique = set(), []
+    # One endpoint, one browser, one provider. Attaching to the same browser
+    # twice is not merely double-counted capacity: `_fill` reclaims a browser's
+    # leftover tabs each time it attaches, so the second entry would close the
+    # tabs the first had just spawned. Sign a second provider in to a SECOND
+    # browser on its own port instead.
+    kept: dict[str, Browser] = {}
+    unique: list[Browser] = []
     for browser in browsers:
-        # One browser cannot be signed in to two providers at once in the same
-        # profile, and attaching twice would double-count its capacity.
-        if browser.endpoint in seen:
+        winner = kept.get(browser.endpoint)
+        if winner is not None:
             print(
-                f"[fleet] WARN: {browser.endpoint} is listed more than once; "
-                f"using it as {browser.site.name} only"
+                f"[fleet] WARN: {browser.endpoint} is listed under both "
+                f"{winner.site.name.upper()}_CDP and "
+                f"{browser.site.name.upper()}_CDP. Serving it as "
+                f"{winner.site.name} only — {browser.site.name} on that port is "
+                f"ignored. Give {browser.site.name} its own browser on its own "
+                f"port to use both."
             )
             continue
-        seen.add(browser.endpoint)
+        kept[browser.endpoint] = browser
         unique.append(browser)
     return unique
 

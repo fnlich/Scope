@@ -26,7 +26,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from custom_miner import CustomMiner, SolveTask  # noqa: E402
+from custom_miner import TRUNCATED, CustomMiner, SolveTask, fit_response  # noqa: E402
 from solvers.browser_pool import (  # noqa: E402
     Browser,
     BrowserFleet,
@@ -38,6 +38,7 @@ from solvers.chatgpt_web import chatgpt_site  # noqa: E402
 from solvers.claude_web import claude_site  # noqa: E402
 from solvers.verify import Answer, VerifyingSolver  # noqa: E402
 
+from rlvr.config import Settings  # noqa: E402
 from rlvr.neurons.demo_miner import DemoMinerSettings, build_demo_miner_app  # noqa: E402
 from rlvr.problemserver.api import derive_request_id  # noqa: E402
 from rlvr.protocol import (  # noqa: E402
@@ -134,9 +135,68 @@ def test_reply_passes_every_validator_acceptance_check():
     payload = SolutionPayload.model_validate_json(response.content)
     # 3. the per-dispatch request id is echoed back unchanged
     assert payload.problem_id == request.problem_id
-    # 4. within the per-response byte cap
-    assert len(response.content) <= DemoMinerSettings(_env_file=None).miner_max_request_bytes
+    # 4. within the per-RESPONSE byte cap. Not the request cap, which is eight
+    #    times larger and belongs to the other direction: the validator reads a
+    #    bounded number of bytes back and discards the whole response if it runs
+    #    over, so checking the wrong one here would pass a reply that is thrown
+    #    away on arrival.
+    assert len(response.content) <= Settings().miner_max_response_bytes
     assert "while n > 0" in payload.code  # the repaired answer, not the first draft
+
+
+def test_a_long_transcript_is_trimmed_to_what_the_validator_will_read():
+    """The validator reads a bounded number of bytes and discards the WHOLE
+    response if it runs over. A correct, correctly-signed answer then scores
+    zero and neither log says why — the miner sees 200, the validator sees a
+    reply it never read. `code` is what gets graded and `raw_response` is the
+    transcript kept for the dataset, so the transcript is what gives way."""
+    cap = Settings().miner_max_response_bytes
+    code = "def g(n):\n    return n"
+    payload = fit_response(
+        SolutionPayload(problem_id="p-1", code=code, raw_response="x" * (cap * 2))
+    )
+    assert len(payload.model_dump_json().encode()) <= cap
+    assert payload.code == code, "the graded field must never be trimmed to fit"
+    assert payload.raw_response.endswith(TRUNCATED)
+
+
+def test_a_chatty_model_still_produces_a_reply_the_validator_accepts():
+    """The same thing end to end, because the cap applies to the serialized
+    payload rather than to any field the solver can see."""
+    miner_kp = keypair.create_from_uri("//Bob")
+    validator_kp = keypair.create_from_uri("//Alice")
+    cap = Settings().miner_max_response_bytes
+    rambling = "I will explain at length. " * (cap // 10) + RIGHT
+    miner = CustomMiner(
+        DemoMinerSettings(_env_file=None), _solver([rambling]),
+        wallet=SimpleNamespace(hotkey=miner_kp), subtensor=None, metagraph=None,
+    )
+    request = TaskRequest(
+        problem_id="chatty-1", language="python", statement=DIGITS.statement,
+        entrypoint="g", public_examples=[TestCase(args=[12345], kwargs={}, expected=15)],
+    )
+    body = request.model_dump_json().encode()
+    headers = sign_message(validator_kp, body, signed_for=miner_kp.ss58_address)
+    headers["Content-Type"] = "application/json"
+
+    with TestClient(build_demo_miner_app(miner)) as client:
+        response = client.post("/solve", content=body, headers=headers)
+
+    assert response.status_code == 200
+    assert len(response.content) <= cap, "the validator would discard this unread"
+    reply_headers = {
+        name: response.headers.get(name, "")
+        for name in (
+            "Epistula-Version", "Epistula-Timestamp", "Epistula-Uuid",
+            "Epistula-Signed-By", "Epistula-Signed-For", "Epistula-Request-Signature",
+        )
+    }
+    # Trimming happens before signing, so the signature covers what is sent.
+    assert verify_signature(
+        reply_headers, response.content, expected_signed_for=validator_kp.ss58_address
+    )
+    payload = SolutionPayload.model_validate_json(response.content)
+    assert "while n > 0" in payload.code, "the answer survived the trim intact"
 
 
 # --------------------------------------------------------------------------- #
@@ -682,6 +742,134 @@ def test_tabs_are_enqueued_interleaved_across_browsers():
     assert order[1].split(":")[1].startswith("9223")
 
 
+# --- the browser rotation ------------------------------------------------ #
+# Request 1 to the 1st browser, 2 to the 2nd, ... n to the nth, n+1 back to the
+# 1st. The account is what rate-limits, so this is the whole reason for running
+# several browsers rather than several tabs in one.
+
+
+async def _filled(n_browsers: int, tabs: int = 2, attach_fails=()) -> BrowserFleet:
+    """A fleet through the REAL `_fill`, so `_order` is what production sets.
+
+    Building the queue by hand instead would test the rotation against a fleet
+    state no miner ever has, which is how the pre-fleet doctor call rotted.
+    """
+    sites = [claude_site(), chatgpt_site()]
+    fleet = _fleet(*[sites[i % 2] for i in range(n_browsers)], tabs_per_browser=tabs)
+
+    async def spawn(context, browser, label):
+        return _Tab(
+            fleet, _DeadPage(), None, label, browser.site, source=browser.endpoint
+        )
+
+    fleet._spawn = spawn
+    fleet._attach = lambda b: _done(None if b.endpoint in attach_fails else object())
+    fleet._reclaim = lambda context, browser: _done(None)
+    fleet._pw = object()
+    await fleet._fill()
+    return fleet
+
+
+def _port(tab) -> str:
+    return tab.source.rsplit(":", 1)[-1]
+
+
+async def _take(fleet, avoid=None):
+    tab = await fleet._lease(avoid, 5)
+    tab.leased = True                    # release() ignores a tab never leased
+    return tab
+
+
+def test_requests_go_round_the_browsers_in_order():
+    """The plain case: one task at a time, three browsers, nine requests."""
+
+    async def go():
+        fleet = await _filled(3)
+        seen = []
+        for _ in range(9):
+            tab = await _take(fleet)
+            seen.append(_port(tab))
+            await fleet.release(tab)
+        return seen
+
+    assert asyncio.run(go()) == ["9222", "9223", "9224"] * 3
+
+
+def test_the_rotation_survives_tasks_finishing_out_of_order():
+    """The case a queue alone gets wrong, and the reason the cursor exists.
+
+    A tab is freed when its task ENDS, and concurrent tasks end in whatever
+    order the models happen to answer. Take the next free tab and the sequence
+    stops being a rotation within a few requests — two hard problems on one
+    account and an easy one on another, and the fast account starts taking more
+    than its share of the tasks. Here the second of each pair always finishes
+    first, which is enough to scramble a queue and must not scramble this.
+    """
+
+    async def go():
+        fleet = await _filled(3)                    # 3 browsers, 2 tabs each
+        seen = []
+        for _ in range(6):
+            first = await _take(fleet)
+            second = await _take(fleet)
+            seen += [_port(first), _port(second)]
+            await fleet.release(second)             # out of order, deliberately
+            await fleet.release(first)
+        return seen
+
+    assert asyncio.run(go()) == ["9222", "9223", "9224"] * 4
+
+
+def test_a_busy_browser_passes_its_turn_instead_of_stalling_the_fleet():
+    """The one deliberate deviation. A miner is paid for answers that beat the
+    deadline, so waiting for the browser whose turn it is while another sits
+    free would trade money for a tidier sequence."""
+
+    async def go():
+        fleet = await _filled(3, tabs=1)
+        held = [await _take(fleet) for _ in range(3)]
+        assert [_port(t) for t in held] == ["9222", "9223", "9224"]
+        await fleet.release(held[1])                # only 9223 is free again
+        # It is 9222's turn, but 9222 is still working. Take 9223 rather than
+        # wait, and resume the rotation from there.
+        return _port(await _take(fleet))
+
+    assert asyncio.run(go()) == "9223"
+
+
+def test_a_browser_that_never_attached_is_not_in_the_rotation():
+    """`n` is the number of browsers actually serving. One that could not be
+    attached to — not started, wrong port — is not one of them, and leaving it
+    in the ring would spend every nth turn discovering that again."""
+
+    async def go():
+        fleet = await _filled(3, attach_fails={"http://127.0.0.1:9223"})
+        seen = []
+        for _ in range(4):
+            tab = await _take(fleet)
+            seen.append(_port(tab))
+            await fleet.release(tab)
+        return seen, fleet._order
+
+    seen, order = asyncio.run(go())
+    assert seen == ["9222", "9224", "9222", "9224"]
+    assert order == ["http://127.0.0.1:9222", "http://127.0.0.1:9224"]
+
+
+def test_the_second_opinion_outranks_the_rotation():
+    """`avoid` is asked for only after the first model failed to produce a
+    verifiable answer, and reaching the OTHER model is the entire value of that
+    attempt. Spending it on the same model to keep the browsers in order would
+    be the wrong trade."""
+
+    async def go():
+        fleet = await _filled(2, tabs=1)            # 9222 claude, 9223 chatgpt
+        tab = await _take(fleet, avoid="claude")    # 9222's turn, but avoid it
+        return _port(tab), tab.site.name
+
+    assert asyncio.run(go()) == ("9223", "chatgpt")
+
+
 def test_a_lease_can_ask_for_a_different_provider():
     """The second opinion is only worth asking if it reaches the OTHER model."""
     async def go():
@@ -849,13 +1037,19 @@ def test_an_empty_roster_falls_back_to_one_browser_on_the_default_port():
 
 
 def test_the_same_endpoint_listed_under_two_providers_is_not_double_counted(capsys):
-    """One profile cannot be signed in as both, and attaching twice would
-    invent capacity that does not exist."""
+    """Attaching to one browser twice does not just invent capacity: `_fill`
+    reclaims a browser's leftover tabs on every attach, so the second entry
+    would close the tabs the first had just spawned."""
     from solvers.roster import roster
 
     browsers = roster({"CLAUDE_CDP": "9222", "CHATGPT_CDP": "9222"})
     assert len(browsers) == 1 and browsers[0].site.name == "claude"
-    assert "listed more than once" in capsys.readouterr().out
+    warning = capsys.readouterr().out
+    # The warning has to name the provider that is actually SERVED. Naming the
+    # dropped one instead — which it used to — tells the operator the opposite
+    # of what happened, and they go looking for the fault in the wrong browser.
+    assert "Serving it as claude only" in warning, warning
+    assert "chatgpt on that port is ignored" in warning, warning
 
 
 def test_shutdown_disconnects_but_never_closes_your_browser():
