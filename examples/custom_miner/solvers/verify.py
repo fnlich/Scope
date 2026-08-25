@@ -215,6 +215,8 @@ class VerifyingSolver:
         self._cache_size = max(0, int(cache_size))
         self._counts = {"solved": 0, "verified": 0, "cache_hits": 0, "empty": 0}
         self._by_provider: dict[str, dict[str, int]] = {}
+        # The no-examples explanation is worth saying, but only once a run.
+        self._warned_ungradeable = False
 
     # -- the Solver interface custom_miner.py expects ---------------------- #
     async def solve_task(self, task, timeout_s: float) -> Answer:
@@ -255,6 +257,21 @@ class VerifyingSolver:
                 best = candidate
             if best.verified:
                 break
+            if not task.public_examples:
+                if not self._warned_ungradeable:
+                    self._warned_ungradeable = True
+                    print(
+                        "[verify] no public examples shipped with this task, so "
+                        "nothing can be graded locally: no repair rounds, and "
+                        "verified=False however good the answer is. Once per run."
+                    )
+                # Nothing can rank two ungradeable answers apart -- `score` ties
+                # at (0, has_code) -- so a second opinion is only ever worth
+                # buying when this one came back EMPTY. Then it is worth a lot:
+                # an empty answer scores zero, and the other model is the only
+                # remaining chance at the whole payment.
+                if best.code.strip():
+                    break
             if attempt_no + 1 < passes:
                 print(f"[verify] {provider or 'first'} did not verify; asking another model")
         if asked:
@@ -340,7 +357,7 @@ class VerifyingSolver:
 
     # ---------------------------------------------------------------------- #
     def _grade(self, reply: str, task) -> Candidate:
-        code = extract_code(reply)
+        code = extract_code(reply, task.entrypoint, task.language)
         candidate = Candidate(code=code, raw=reply)
         defect = (
             rust_defect(code)

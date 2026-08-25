@@ -36,6 +36,7 @@ from solvers.browser_pool import (  # noqa: E402
 )
 from solvers.chatgpt_web import chatgpt_site  # noqa: E402
 from solvers.claude_web import claude_site  # noqa: E402
+from solvers.prompts import extract_code  # noqa: E402
 from solvers.verify import Answer, VerifyingSolver  # noqa: E402
 
 from rlvr.config import Settings  # noqa: E402
@@ -217,6 +218,19 @@ def test_a_verified_answer_is_cached_by_statement():
     asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
     asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
     assert solver.stats()["solver"]["cache_hits"] == 1
+
+
+def test_a_zero_cache_size_disables_caching_without_crashing():
+    """`try_solver.py --repeat` sets `_cache_size = 0` so each round really
+    drives the browser; a cached answer would make the flag a no-op and show
+    nothing. Zero must therefore mean OFF rather than "evict every time", which
+    on an empty dict would raise."""
+    solver = _solver([RIGHT])
+    solver._cache_size = 0
+    for _ in range(3):
+        assert asyncio.run(solver.solve_task(DIGITS, 60.0)).verified
+    assert solver.stats()["solver"].get("cache_hits", 0) == 0
+    assert solver._cache == {}
 
 
 def test_an_unverified_answer_is_not_cached():
@@ -931,6 +945,61 @@ def test_a_second_opinion_asks_the_other_model_only_when_the_first_fails():
     assert solver.stats()["providers"]["chatgpt"]["verified"] == 1
 
 
+def test_an_ungradeable_task_does_not_pay_for_a_second_opinion():
+    """Live traffic ships tasks with no public examples, and then the second
+    model's answer can never win: `verified` needs total > 0, and `score` ties
+    at (0, has_code). Asking anyway spends a second account's quota and doubles
+    the latency to produce an answer that is discarded on return."""
+    calls: list[str] = []
+
+    class _Counting(_Backend):
+        async def open(self, avoid=None):
+            calls.append(avoid or "first")
+            return _Chat([RIGHT], "chatgpt" if avoid == "claude" else "claude")
+
+    task = SolveTask(
+        problem_id="none", language="python", statement=DIGITS.statement,
+        entrypoint="g", public_examples=[], deadline_s=120.0,
+    )
+    solver = VerifyingSolver(
+        _Counting([RIGHT]), safety_margin_s=0, max_budget_s=120, second_opinion=True
+    )
+    answer = asyncio.run(solver.solve_task(task, 120.0))
+    assert answer.code, "the answer still comes back"
+    assert answer.verified is False, "nothing can verify it, and it must not claim to"
+    assert calls == ["first"], f"asked a second model for nothing: {calls}"
+
+
+def test_an_ungradeable_task_still_buys_a_second_opinion_when_the_first_is_empty():
+    """The exception that makes the rule safe, and the case a live log caught.
+
+    Two ungradeable answers cannot be told apart -- unless one of them is
+    EMPTY. `score` is (passed, has_code), so (0,1) beats (0,0): the other model
+    is the only remaining chance at the whole payment. Skipping it because the
+    task happens to ship no examples turns a recoverable submit failure into a
+    guaranteed zero.
+    """
+    calls: list[str] = []
+
+    class _Silent(_Backend):
+        async def open(self, avoid=None):
+            calls.append(avoid or "first")
+            # The first model's tab failed to submit, so send() returns "".
+            return _Chat([""] if avoid is None else [RIGHT],
+                         "chatgpt" if avoid else "claude")
+
+    task = SolveTask(
+        problem_id="none-empty", language="python", statement=DIGITS.statement,
+        entrypoint="g", public_examples=[], deadline_s=120.0,
+    )
+    solver = VerifyingSolver(
+        _Silent([""]), safety_margin_s=0, max_budget_s=120, second_opinion=True
+    )
+    answer = asyncio.run(solver.solve_task(task, 120.0))
+    assert calls == ["first", "claude"], f"never fell back: {calls}"
+    assert "while n > 0" in answer.code, "the fallback answer was not used"
+
+
 def test_the_second_opinion_can_be_turned_off():
     """Pure throughput: never spend a second account on one task."""
     seen = []
@@ -1205,8 +1274,12 @@ def test_the_doctor_probe_drives_a_real_tab():
     from solvers import doctor
 
     page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    # Two blocks, as the probe now asks for: the answer and a usage example.
+    # `print(pong())` alone used to satisfy the doctor, which is exactly the
+    # weakness that let a page shipping only the usage example look healthy.
     page.on_click = lambda _: page.dom.__setitem__(
-        "#assistant", [_Node(code=["print('pong')"])]
+        "#assistant",
+        [_Node(code=["def pong():\n    return 'pong'", "print(pong())"])],
     )
     assert asyncio.run(doctor._probe(page, _site(), "#composer", ())) is True
     # ...and it reports how the next conversation starts. With no new-chat
@@ -1225,7 +1298,9 @@ def test_the_doctor_reports_the_in_app_new_chat_when_the_page_has_one():
 
     def handler(selector):
         if selector == "#send":
-            page.dom["#assistant"] = [_Node(code=["print('pong')"])]
+            page.dom["#assistant"] = [
+                _Node(code=["def pong():\n    return 'pong'", "print(pong())"])
+            ]
         elif selector == "#newchat":
             page.dom["#assistant"] = []
 
@@ -1237,6 +1312,59 @@ def test_the_doctor_reports_the_in_app_new_chat_when_the_page_has_one():
     assert page.navigated == [], "the in-app path should not reload the page"
 
 
+def test_a_long_answer_survives_the_reader_intact():
+    """Real solutions are not three lines. Re-fencing every block and choosing
+    between them must not quietly lose the middle of a big one, and the tail is
+    where truncation shows: a cut answer still parses surprisingly often, and
+    then fails the hidden tests for reasons nothing logs."""
+    body = "\n".join(f"    # line {i}" for i in range(1, 2001))
+    answer = f"def pong():\n{body}\n    return 'pong'"
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__(
+        "#assistant", [_Node(code=[answer, "print(pong())"])]
+    )
+    reply = asyncio.run(_tab(page, _site()).send("solve it", 2.0))
+    code = extract_code(reply, "pong")
+    assert "# line 1\n" in code and "# line 2000" in code, "the block was truncated"
+    scope: dict = {}
+    exec(compile(code, "<submitted>", "exec"), scope)
+    assert scope["pong"]() == "pong"
+
+
+def test_two_answers_to_one_prompt_do_not_flip_between_polls():
+    """ChatGPT sometimes streams TWO candidate answers for a single prompt and
+    asks which you prefer. Reading "the last message" then means reading
+    whichever branch is last at that instant, and while both stream that
+    changes: the text never repeats across two polls, the completion test never
+    fires, and the whole budget is spent before the deadline forces a partial
+    answer out. Latch one branch on sight and read only that.
+
+    Latched by message id, not by index -- an index still drifts if the two are
+    repainted in the other order, which is the failure this reproduces.
+    """
+    A = _Node(code=["def pong():\n    return 'A'"], attrs={"data-message-id": "id-A"})
+    B = _Node(code=["def pong():\n    return 'B'"], attrs={"data-message-id": "id-B"})
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    site = _site(message_id_attr="data-message-id")
+    tab = _tab(page, site)
+
+    async def go():
+        before = await tab._fingerprint()          # empty conversation
+        page.dom["#assistant"] = [A]               # first branch renders
+        seen = set()
+        for poll in range(6):
+            if poll:                               # then both, order flipping
+                page.dom["#assistant"] = [A, B] if poll % 2 else [B, A]
+            reply = await tab._new_reply(before)
+            if reply is not None:
+                seen.add(await _Tab._read(reply))
+        return seen
+
+    seen = asyncio.run(go())
+    assert len(seen) == 1, f"read drifted between branches: {seen}"
+    assert "return 'A'" in seen.pop(), "did not commit to the branch it saw first"
+
+
 def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():
     """claude.ai has no per-message id, so the reply is 'an assistant message
     that was not there before we pressed send'. Sound only because every task
@@ -1246,7 +1374,9 @@ def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():
         "#assistant", [_Node(code=["def g(n):\n    return n"])]
     )
     reply = asyncio.run(_tab(page, _site()).send("solve it", 2.0))
-    assert reply == "def g(n):\n    return n"
+    # The reader re-fences what it scraped so every block reaches the caller;
+    # picking between them needs the entrypoint, which the tab does not have.
+    assert extract_code(reply, "g") == "def g(n):\n    return n"
     assert page.typed == ["solve it"]
 
 
@@ -1344,6 +1474,120 @@ def test_a_busy_selector_that_matches_an_idle_page_is_dropped():
     page = _FakePage({"#always": [_Node()], "#real-stop": []})
     kept = asyncio.run(usable_busy_selectors(page, ("#always", "#real-stop"), "t"))
     assert kept == ("#real-stop",)
+
+
+def test_a_rendered_code_block_survives_being_scraped():
+    """Both halves of a real solve that scored zero.
+
+    The reader scrapes a RENDERED page, so what comes back is not the source
+    the model wrote. Two things ride along, and both were seen live:
+
+    1. A Private Use Area character the UI uses for its own bookkeeping. It is
+       invisible, and it makes the whole file `invalid non-printable character
+       U+E027` — after a perfectly good answer.
+    2. The code block's language chip, which sits inside the element being
+       scraped and becomes a bare `python` first line. That is the worse one:
+       it parses, it defines the entrypoint, it passes every check, and then
+       raises NameError the instant the grader imports it.
+    """
+    from solvers.prompts import extract_code, python_defect
+
+    scraped = "python\ndef g(n):" + chr(0xE027) + "\n    return n"
+    code = extract_code(scraped)
+    assert python_defect(code, "g") is None, "the artefacts were not cleaned"
+    exec(compile(code, "<submitted>", "exec"), {})          # must not raise
+
+    # ...and the same with only the chip, which used to pass silently.
+    code = extract_code("python\ndef g(n):\n    return n")
+    assert python_defect(code, "g") is None
+    ns: dict = {}
+    exec(compile(code, "<submitted>", "exec"), ns)
+    assert ns["g"](3) == 3
+
+
+def test_the_reader_hands_over_every_code_block_not_its_favourite():
+    """The tab must not choose. It has no entrypoint and no language, so any
+    choice it makes is a guess -- and the guess it used to make (the last one)
+    threw the answer away whenever a usage example followed it. Re-fence them
+    all and let the grader, which knows the task, decide."""
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__(
+        "#assistant",
+        [_Node(code=["def g(n):\n    return n * 2", "print(g(21))"])],
+    )
+    reply = asyncio.run(_tab(page, _site()).send("solve it", 2.0))
+    assert "def g(n)" in reply and "print(g(21))" in reply, "a block was dropped"
+    assert extract_code(reply, "g") == "def g(n):\n    return n * 2"
+
+
+def test_the_answer_wins_over_a_usage_example_that_follows_it():
+    """Models append `print(solve(21))` demos however firmly the prompt says
+    not to. Taking the last block submitted the demo, and the whole solve was
+    spent reporting that the entrypoint was never defined -- with the real
+    answer sitting in the block just before it."""
+    reply = "```\ndef solve(n):\n    return n * 2\n```\n```\nprint(solve(21))\n```"
+    assert extract_code(reply) == "print(solve(21))", "no target: last block"
+    assert extract_code(reply, "solve") == "def solve(n):\n    return n * 2"
+
+
+def test_a_corrected_answer_still_beats_the_draft_before_it():
+    """The other half of the rule: when both blocks are gradeable, the LAST one
+    wins, because a model that shows a draft then fixes it means the fix."""
+    reply = "```\ndef solve(n):\n    return n\n```\n```\ndef solve(n):\n    return n * 2\n```"
+    assert extract_code(reply, "solve") == "def solve(n):\n    return n * 2"
+
+
+def test_nothing_gradeable_still_returns_something_to_complain_about():
+    """Returning "" would report `no code` when the real defect is more
+    specific, and the repair round is only as good as the evidence it gets."""
+    assert extract_code("```\nnot code\n```\n```\nalso not\n```", "solve") == "also not"
+
+
+def test_a_fence_inside_the_source_does_not_cut_the_block_short():
+    """A docstring showing markdown was enough to truncate the answer: the
+    hard-coded three-backtick closer matched the docstring's own fence."""
+    inner = 'def solve(n):\n    """```md"""\n    return n'
+    assert extract_code("````\n" + inner + "\n````", "solve") == inner
+
+
+def test_a_rust_program_wins_over_a_sample_output_block():
+    """Same rule, other language: `rust_defect` is the gradeability test."""
+    reply = '```\nfn main() { println!("1"); }\n```\n```\n1 2 3\n```'
+    assert extract_code(reply, "main", "rust").startswith("fn main()")
+
+
+def test_a_language_chip_inside_a_fence_is_dropped_too():
+    """Belt and braces: a fenced reply can carry the chip as its first line."""
+    from solvers.prompts import extract_code
+
+    code = extract_code("```python\npython\ndef g(n):\n    return n\n```")
+    assert code.startswith("def g("), code
+
+
+def test_exotic_spaces_do_not_break_indentation():
+    """A non-breaking space renders like a space and is not one."""
+    from solvers.prompts import extract_code, python_defect
+
+    code = extract_code("def g(n):\n" + "\u00a0" * 4 + "return n")
+    assert python_defect(code, "g") is None, "NBSP indentation was not folded"
+
+
+def test_a_bare_name_at_top_level_is_reported_not_submitted():
+    """The general form of the chip bug. A top-level bare name is never
+    meaningful code and always raises NameError on import, so every hidden test
+    fails. Reporting it turns a silent zero into a repair round."""
+    from solvers.prompts import python_defect
+
+    defect = python_defect("import os\nfoo\ndef g(n):\n    return n", "g")
+    assert defect is not None and "bare name" in defect, defect
+
+
+def test_clean_code_is_left_exactly_alone():
+    """The sanitiser must not be creative with source that was already fine."""
+    from solvers.prompts import extract_code
+
+    source = "def g(n):\n    # keep  spacing\n    return {'ok': True}"
+    assert extract_code(source) == source
 
 
 def test_the_claude_prompt_asks_for_an_inline_code_block():

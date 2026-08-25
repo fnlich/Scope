@@ -31,7 +31,46 @@ from typing import Any, Optional
 # ChatGPT wraps code in ``` fences; the DOM reader already returns the inner
 # text of a <pre><code> block, but a reply that arrived as plain text (or a
 # non-DOM backend) can still carry fences, so strip them defensively.
-_FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
+# Markdown fences are 3 OR MORE backticks, and the closer must be at least as
+# long as the opener. Hard-coding three cut a block short the moment its own
+# source contained ``` -- a docstring showing markdown was enough -- and missed
+# a longer fence entirely. The backreference makes the closer match the opener.
+_FENCE_RE = re.compile(r"(`{3,})[^\n`]*\n(.*?)\n?\1`*", re.DOTALL)
+
+# Characters that only ever arrive from a RENDERED page, never from source a
+# grader would accept: zero-width marks, line/paragraph separators, the BOM,
+# and the Private Use Area, which chat UIs use for syntax-highlight and cursor
+# bookkeeping. One of these is enough to make the whole file a SyntaxError —
+# `invalid non-printable character U+E027` — after the model wrote a perfectly
+# good answer, so they are stripped rather than reported.
+_INVISIBLE_RE = re.compile(
+    "[\u200b-\u200f\u2028\u2029\u2060\ufeff\ue000-\uf8ff]"
+    "|[\U000f0000-\U000ffffd]|[\U00100000-\U0010fffd]"
+)
+# Exotic spaces render like a space and break indentation. Fold them.
+_ODD_SPACE_RE = re.compile("[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]")
+
+# A rendered code block puts its language chip inside the element the reader
+# scrapes, so the inner text can begin with a bare "python" line. That is worse
+# than a syntax error: it PARSES, defines the entrypoint, passes every check —
+# and then raises NameError the moment the grader imports it, failing every
+# hidden test with nothing anywhere saying why.
+_LANG_LABEL_RE = re.compile(
+    r"^[ \t]*(?:python|python3|py|rust|rs|javascript|js|typescript|ts|json"
+    r"|bash|sh|shell|text|plaintext|plain|code|output)[ \t]*\r?\n",
+    re.IGNORECASE,
+)
+
+
+def sanitize_code(text: str) -> str:
+    """Undo what rendering did to the source, without touching the source."""
+    if not text:
+        return ""
+    text = _INVISIBLE_RE.sub("", text)
+    text = _ODD_SPACE_RE.sub(" ", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Only ever one chip, and only at the very front.
+    return _LANG_LABEL_RE.sub("", text, count=1)
 
 
 PYTHON_RULES = """\
@@ -109,7 +148,9 @@ def build_repair_prompt(failures: list[str], language: str, entrypoint: str) -> 
     )
 
 
-def extract_code(reply: str) -> str:
+def extract_code(
+    reply: str, entrypoint: Optional[str] = None, language: str = "python"
+) -> str:
     """Pull the source out of a model reply.
 
     The DOM reader already returns a code block's inner text for ChatGPT, but
@@ -118,10 +159,30 @@ def extract_code(reply: str) -> str:
     """
     if not reply:
         return ""
-    matches = _FENCE_RE.findall(reply)
-    if matches:
-        return matches[-1].strip()
-    return reply.strip()
+    # Clean BEFORE matching: a stray invisible character inside the opening
+    # fence would stop the block being recognised at all.
+    reply = sanitize_code(reply)
+    matches = [m.group(2) for m in _FENCE_RE.finditer(reply)]
+    if not matches:
+        return reply.strip()
+    blocks = [b for b in (sanitize_code(m).strip() for m in matches) if b]
+    if not blocks:
+        return ""
+    # With a target in hand, prefer the LAST block that would actually grade.
+    # Models append usage examples and print() demos after the answer, and the
+    # last block is then the demo. Reusing the defect check as the test means
+    # "gradeable" here is exactly what it means everywhere else.
+    if entrypoint:
+        for block in reversed(blocks):
+            defect = (
+                rust_defect(block) if language == "rust"
+                else python_defect(block, entrypoint)
+            )
+            if defect is None:
+                return block
+    # Nothing clean: the last block is still the best guess, and the defect it
+    # reports is what the repair round needs to hear.
+    return blocks[-1]
 
 
 def python_defect(code: str, entrypoint: str) -> Optional[str]:
@@ -137,6 +198,15 @@ def python_defect(code: str, entrypoint: str) -> Optional[str]:
         tree = ast.parse(code)
     except SyntaxError as exc:
         return f"the code is not valid Python ({exc.msg}, line {exc.lineno})"
+    # A top-level statement that is just a bare name runs at import time and
+    # raises NameError, so every hidden test fails. It is never meaningful code,
+    # and it is exactly what a leaked language chip looks like once it parses.
+    for node in tree.body:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Name):
+            return (
+                f"line {node.lineno} is a bare name `{node.value.id}` at top "
+                f"level; it raises NameError on import and fails every test"
+            )
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == entrypoint:
             return None
