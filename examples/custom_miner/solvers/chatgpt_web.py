@@ -46,6 +46,12 @@ def chatgpt_site() -> Site:
         send=selectors("CHATGPT_SEND_BUTTON", (SEND_BUTTON, 'button[aria-label*="Send"]')),
         busy=selectors("CHATGPT_STOP_BUTTON", (STOP_BUTTON, 'button[aria-label*="Stop"]')),
         assistant=selectors("CHATGPT_ASSISTANT", (ASSISTANT_MSG,)),
+        # An in-app new chat rather than a reload; see `_Tab.start`. A miss here
+        # only costs speed, since the reset falls back to loading `url`.
+        new_chat=selectors(
+            "CHATGPT_NEW_CHAT",
+            ('[data-testid="create-new-chat-button"]', 'button[aria-label*="New chat"]'),
+        ),
         message_id_attr="data-message-id",
         poll_s=float(os.environ.get("CHATGPT_POLL_S", "2")),
     )

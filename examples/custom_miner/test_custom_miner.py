@@ -454,6 +454,10 @@ class _FakePage:
     def __init__(self, dom, on_click=None):
         self.dom, self.on_click = dom, on_click
         self.typed, self.pressed, self.clicked = [], [], []
+        # Every navigation and close, so "did this reload?" and "did this throw
+        # the tab away?" are assertable rather than inferred.
+        self.navigated, self.closed = [], False
+        self.on_goto = None
 
         page = self
 
@@ -472,7 +476,12 @@ class _FakePage:
         return _Loc(self, selector, self.dom.get(selector, []))
 
     async def goto(self, url, wait_until=None):
-        pass
+        self.navigated.append(url)
+        if self.on_goto:
+            self.on_goto(url)
+
+    async def close(self):
+        self.closed = True
 
 
 class _SoloPool:
@@ -494,6 +503,156 @@ def _site(**kw) -> Site:
 
 def _tab(page, site) -> _Tab:
     return _Tab(_SoloPool(site), page, None, "probe", site, composer="#composer")
+
+
+# --- one tab, opened once, reused for every task ------------------------- #
+# The tab is the expensive object here: it is signed in by hand and warm. So a
+# tab is opened once and kept, and each task is separated from the last by a
+# fresh CONVERSATION, not a fresh tab. `_Tab.start` does that in three tiers --
+# already-empty, the site's new-chat control, a reload -- and these pin all
+# three, plus the guard that keeps tier 2 from bleeding context.
+
+
+def _chat_page(new_chat: bool = True) -> _FakePage:
+    dom = {"#composer": [_Node()], "#send": [_Node()], "#assistant": []}
+    if new_chat:
+        dom["#newchat"] = [_Node()]
+    return _FakePage(dom)
+
+
+def _answers(page, *, clears: bool = True):
+    """Click handler: sending produces a reply, new-chat clears the transcript."""
+
+    def handler(selector):
+        if selector == "#send":
+            page.dom["#assistant"] = [_Node(code=["def f():\n    return 1"])]
+        elif selector == "#newchat" and clears:
+            page.dom["#assistant"] = []
+
+    return handler
+
+
+def test_the_first_task_on_a_new_tab_does_not_reload_the_page():
+    """`_spawn` builds a tab only after loading the site's new-conversation URL
+    and seeing the composer, so the tab arrives empty. Reloading it before the
+    first task is a full app boot spent to reach the state the page is already
+    in — paid once per tab at startup, on the first task's clock."""
+    page = _chat_page()
+    asyncio.run(_tab(page, _site(new_chat=("#newchat",))).start())
+    assert page.navigated == []
+    assert page.clicked == []
+
+
+def test_a_later_task_gets_a_new_chat_without_reloading_the_page():
+    """Tier 2. Once a task has run the transcript must go, but reloading throws
+    away a booted SPA to reach a state the app can route to itself."""
+    page = _chat_page()
+    tab = _tab(page, _site(new_chat=("#newchat",)))
+    page.on_click = _answers(page)
+    assert asyncio.run(tab.send("first task", 2.0))       # tab is now dirty
+
+    asyncio.run(tab.start())
+    assert "#newchat" in page.clicked
+    assert page.navigated == []
+
+
+def test_a_new_chat_that_leaves_the_transcript_behind_falls_back_to_a_reload():
+    """The failure tier 2 must never cause. A new-chat control that did not
+    route — changed DOM, a modal in the way, a disabled button — leaves the last
+    task's transcript in place, and the next answer comes back promptly and
+    quietly wrong. So the click is never trusted: the transcript is checked, and
+    anything short of proof pays for the reload."""
+    page = _chat_page()
+    tab = _tab(page, _site(new_chat=("#newchat",)))
+    page.on_click = _answers(page)
+    assert asyncio.run(tab.send("first task", 2.0))
+    page.on_click = _answers(page, clears=False)          # the click does nothing
+
+    asyncio.run(tab.start())
+    assert page.navigated == ["about:blank"]
+
+
+def test_a_site_with_no_new_chat_control_still_gets_a_fresh_conversation():
+    """Tier 3 alone. These selectors are candidate lists against markup nobody
+    publishes, so 'none of them matched' is a state to design for, not an
+    accident: it costs the reload it always cost, never correctness."""
+    page = _chat_page(new_chat=False)
+    tab = _tab(page, _site())
+    page.on_click = _answers(page)
+    assert asyncio.run(tab.send("first task", 2.0))
+
+    asyncio.run(tab.start())
+    assert page.navigated == ["about:blank"]
+
+
+def test_a_tab_that_looked_fresh_but_went_stale_is_reset_not_trusted():
+    """A tab can idle for hours between tasks, and the site may reload or
+    redirect the page underneath it. The freshness flag would then describe a
+    page that no longer exists, and submitting into it wastes a whole task to
+    learn that. One count of the composer is cheap enough to spend every time."""
+    page = _chat_page(new_chat=False)
+    page.dom["#composer"] = []                            # the app moved on
+    page.on_goto = lambda _: page.dom.__setitem__("#composer", [_Node()])
+    asyncio.run(_tab(page, _site()).start())
+    assert page.navigated == ["about:blank"]
+
+
+def test_a_new_chat_selector_that_raises_falls_back_instead_of_escaping():
+    """`open()` retires a tab whose `start()` raised, on the promise that
+    `start()` marked it dead first — and only the reload does that. So every
+    other tier has to swallow its own failures, selector resolution included: a
+    raise from the fast path would reach `open()` with the tab still flagged
+    alive, and it would be requeued. That is the recycled-dead-tab failure the
+    pool exists to prevent, and it would come back through the door added to
+    make the pool faster."""
+
+    class _Raising(_FakePage):
+        def locator(self, selector):
+            if selector == "#boom":
+                raise RuntimeError("Execution context was destroyed")
+            return super().locator(selector)
+
+    page = _Raising({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    tab = _tab(page, _site(new_chat=("#boom",)))
+    page.on_click = _answers(page)
+    assert asyncio.run(tab.send("first task", 2.0))
+
+    asyncio.run(tab.start())                              # must not raise
+    assert page.navigated == ["about:blank"]
+    assert tab.alive is True
+
+
+def test_a_tab_is_opened_once_and_never_closed_between_tasks():
+    """The whole lifecycle, end to end: two tasks, one page, no reload, no
+    close. It matters that tab churn is NOT what ordinary work looks like —
+    the fleet replaces a tab only when it dies, so a tab closing is the signal
+    that something is wrong, and a design that closed one per task would hide
+    every real failure in the noise."""
+    site = _site(new_chat=("#newchat",))
+    fleet = _fleet(site)
+    pages = []
+
+    async def spawn(context, browser, label):
+        page = _chat_page()
+        page.on_click = _answers(page)
+        pages.append(page)
+        return _Tab(fleet, page, context, label, browser.site, composer="#composer")
+
+    fleet._spawn = spawn
+
+    async def two_tasks():
+        fleet._started = True                             # no browser to attach to
+        fleet._free.put_nowait(await spawn(None, fleet._browsers_wanted[0], "t#1"))
+        fleet._size = 1
+        for _ in range(2):
+            tab = await fleet.open()
+            assert await tab.send("solve it", 2.0)
+            await tab.close()
+
+    asyncio.run(two_tasks())
+    assert len(pages) == 1, "a second tab was opened; the first should be reused"
+    assert pages[0].closed is False, "the tab was closed between tasks"
+    assert pages[0].navigated == [], "the page was reloaded between tasks"
 
 
 def test_tabs_are_enqueued_interleaved_across_browsers():

@@ -162,6 +162,16 @@ async def run(name: str, cdp: str, probe: bool) -> int:
             healthy &= await _report_role(
                 page, "assistant message", site.assistant, expect_zero=True
             )
+            print()
+            await _report_role(
+                page,
+                "new chat control",
+                site.new_chat,
+                on_miss="Not fatal: with no new-chat control each task starts its "
+                "conversation by reloading the page instead, which always works "
+                "but costs a few seconds per task. Set "
+                f"{site.env_prefix}_NEW_CHAT to get them back.",
+            )
             if site.message_id_attr:
                 print(f"\n  message id attribute: {site.message_id_attr}")
             else:

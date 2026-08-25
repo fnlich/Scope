@@ -104,6 +104,18 @@ def claude_site() -> Site:
                 '[data-testid="assistant-message"]',
             ),
         ),
+        # Starting a new chat in the app beats reloading the page: no bundle
+        # refetch, no app boot. `$=` on the href so a full URL matches as well
+        # as a bare path. Nothing here matching is not a failure -- the reset
+        # falls back to loading `url`, which is what it always did.
+        new_chat=selectors(
+            "CLAUDE_NEW_CHAT",
+            (
+                'a[href$="/new"]',
+                'button[aria-label="New chat"]',
+                'a[aria-label="New chat"]',
+            ),
+        ),
         # claude.ai has no per-message id attribute we can rely on, so the reply
         # is identified by position. Sound here because every task starts a
         # fresh conversation.

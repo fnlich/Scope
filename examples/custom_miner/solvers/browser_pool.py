@@ -65,6 +65,12 @@ from typing import Any, NamedTuple, Optional, Sequence
 # the port every backend assumes when `<PREFIX>_CDP` is not set.
 DEFAULT_CDP_PORT = 9222
 
+# How long the in-app "new chat" click gets before the reload takes over. Short
+# on purpose: the click exists only because it is faster than a reload, so
+# waiting the site's full ready timeout for one that did not route would make
+# the fast path slower than the thing it replaces.
+NEW_CHAT_TIMEOUT_MS = 5_000
+
 
 @dataclass(frozen=True)
 class Site:
@@ -80,6 +86,10 @@ class Site:
     # Selectors for an ASSISTANT message. Must not be able to match the user's
     # own message — see the echo guard in ``_Tab.send``.
     assistant: tuple[str, ...]
+    # The site's own "new chat" control. Optional: when nothing here matches,
+    # a fresh conversation is had by reloading ``url`` instead, which always
+    # works. So a wrong or missing candidate costs speed, never correctness.
+    new_chat: tuple[str, ...] = ()
     # Attribute that uniquely identifies a message, if the site has one.
     # ChatGPT does (``data-message-id``); without one the reply is identified
     # by position, which works because every task starts a fresh conversation.
@@ -247,18 +257,116 @@ class _Tab:
         self._warned_echo = False
         self.uses = 0
         self.alive = True
+        # True while this tab is known to be sitting in an EMPTY conversation.
+        # It starts true because `_spawn` builds a tab only after loading
+        # `site.url` — the site's own new-conversation URL — and seeing the
+        # composer. That is what makes the first task on a new tab need no
+        # reset at all, rather than reloading a page that just loaded.
+        self._fresh = True
         # Set while this tab is out on loan. The pool uses it to make a second
         # release() a no-op: without it a double close would queue the same tab
         # twice and two tasks would end up driving one page.
         self.leased = False
 
     async def start(self) -> None:
-        """Open a fresh conversation so each task begins with empty context.
+        """Put this tab in an empty conversation, as cheaply as that can be done.
 
         Context bleed is not a cosmetic problem for a miner: a model that can
         still see the previous task's code will happily blend the two, and the
         result fails the hidden suite in a way that is very hard to diagnose.
+        So every task must begin with an empty transcript. What *is* negotiable
+        is the price, and it used to be the highest one available — a full page
+        load per task, on the task's own clock:
+
+        1. **Already empty** — a tab straight from ``_spawn``, or one whose last
+           task never submitted. Nothing to do. This is the whole of the "open
+           the tab once" saving: without it every tab reloads the page it just
+           loaded before it may answer anything.
+        2. **The site's own new-chat control** — an in-app route change. No
+           bundle refetch, no app boot, no re-auth; typically under a second
+           against several for a reload. Taken only when the transcript is
+           demonstrably gone afterwards (see ``_new_chat``).
+        3. **Reload ``site.url``** — slow but certain, and therefore the
+           fallback that lets tiers 1 and 2 be attempted at no risk.
+
+        Note what is NOT here: closing the tab. A tab is opened once and reused
+        for the life of the miner. Closing and reopening per task would throw
+        away the page's warm state for nothing, and — since a tab is only
+        replaced when it *dies* — would make ordinary work indistinguishable
+        from failure in the logs.
         """
+        if self._fresh and await self._composer_present():
+            return
+        if await self._new_chat():
+            return
+        await self._reload()
+
+    async def _composer_present(self) -> bool:
+        """Is the composer still there? One count — no navigation, no wait.
+
+        Guards the tier-1 shortcut. A tab can sit idle for hours between tasks
+        and the page under it may have been reloaded or redirected by the site
+        in the meantime, which would leave ``_fresh`` describing a page that no
+        longer exists. Confirming the composer costs a millisecond and turns
+        that from a failed task into a reset.
+        """
+        try:
+            return await self._page.locator(self._composer).count() > 0
+        except Exception:  # noqa: BLE001 - a dead page cannot be shortcut past
+            return False
+
+    async def _new_chat(self) -> bool:
+        """Start a new conversation from inside the app. True only if it worked.
+
+        Never trusts the click: a control that did not route — a changed DOM, a
+        modal in the way, a click landing on a disabled button — leaves the
+        previous task's transcript in place, and the next prompt would then be
+        answered with that context in view. That is precisely the failure this
+        method exists to avoid, and it is invisible from the outside: the answer
+        comes back promptly and is simply wrong. So the transcript is checked
+        afterwards, and anything short of proof falls through to the reload.
+
+        Raises nothing, ever — including from resolving the selectors, which is
+        why that happens inside the try. ``open()`` retires a tab whose
+        ``start()`` raised, on the promise that ``start()`` marked it dead
+        first; only ``_reload`` does that. A raise from here would reach
+        ``open()`` with ``alive`` still true, and the tab would be requeued —
+        the recycled-dead-tab failure this pool exists to prevent.
+        """
+        try:
+            button = await self._first_match(self.site.new_chat)
+            if button is None:
+                return False
+            await self._page.locator(button).first.click(timeout=NEW_CHAT_TIMEOUT_MS)
+            found = await wait_for_any(
+                self._page, self.site.composer, NEW_CHAT_TIMEOUT_MS
+            )
+            if found is None or not await self._transcript_cleared():
+                return False
+            self._composer = found
+        except Exception:  # noqa: BLE001 - the reload below is the fallback
+            return False
+        self._fresh = True
+        return True
+
+    async def _transcript_cleared(self) -> bool:
+        """No assistant message anywhere on the page.
+
+        Deliberately reads every candidate rather than the latched one: this
+        runs between sends, when the latch is meaningless, and a transcript that
+        survives under *any* candidate is a transcript that survived. A selector
+        that raises proves nothing, so it counts as not cleared.
+        """
+        for selector in self.site.assistant:
+            try:
+                if await self._page.locator(selector).count() > 0:
+                    return False
+            except Exception:  # noqa: BLE001
+                return False
+        return True
+
+    async def _reload(self) -> None:
+        """Reload the site's new-conversation URL. Slow, but always works."""
         try:
             await self._page.goto(self.site.url, wait_until="domcontentloaded")
             found = await wait_for_any(self._page, self.site.composer, 30_000)
@@ -268,6 +376,7 @@ class _Tab:
         except Exception:
             self.alive = False
             raise
+        self._fresh = True
 
     async def _submit(self, text: str, ui_ms: int) -> None:
         """Type the prompt and press send, with every step bounded.
@@ -307,6 +416,11 @@ class _Tab:
         started = time.monotonic()
         deadline = started + max(1.0, timeout_s)
         self.uses += 1
+        # Dirty from here on, whatever happens next: a submit that raises
+        # part-way may still have left the prompt in the composer or even sent
+        # it. Claiming freshness we cannot prove would skip the next reset and
+        # bleed this task into the following one.
+        self._fresh = False
         if self.site.nudge:
             text = f"{text}\n\n{self.site.nudge}"
         self._sent = text
@@ -716,6 +830,11 @@ class BrowserFleet:
         checked = replace(
             site,
             send=await valid_selectors(page, site.send, site.name, "send"),
+            # Unlike the roles below, an empty result here is survivable: with
+            # no usable new-chat control every reset falls back to a reload.
+            new_chat=await valid_selectors(
+                page, site.new_chat, site.name, "new chat"
+            ),
             assistant=await valid_selectors(page, site.assistant, site.name, "assistant"),
             # Chained so a typo'd busy override is named, not just dropped.
             busy=await usable_busy_selectors(
