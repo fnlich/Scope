@@ -32,7 +32,7 @@ import os
 import sys
 from pathlib import Path
 
-from .browser_pool import default_profile, import_playwright, wait_for_any
+from .browser_pool import default_profile, import_playwright, normalize_cdp, wait_for_any
 from .config import find_env_file, load_env_file
 
 SITES = {"claude": "https://claude.ai/", "chatgpt": "https://chatgpt.com/"}
@@ -112,6 +112,20 @@ def main(argv: list[str] | None = None) -> int:
 
     require_linux("The login helper")
     load_env_file(find_env_file())
+
+    # In attach mode there is nothing for this helper to launch: you log in by
+    # hand in the Chrome you started yourself. Say so instead of opening Firefox.
+    cdp = os.environ.get(f"{args.backend.upper()}_CDP")
+    if cdp:
+        print(
+            f"[login] {args.backend} is in attach mode ({args.backend.upper()}_CDP={cdp}).\n"
+            "        There is no Firefox to launch. Instead:\n"
+            f"          1. start Chrome:  ./scripts/start_debug_browser.sh --port "
+            f"{normalize_cdp(cdp)[0].rsplit(':', 1)[-1]}\n"
+            f"          2. open {SITES[args.backend]} in it and sign in by hand\n"
+            f"          3. verify:  python -m solvers.doctor {args.backend} --probe"
+        )
+        return 0
 
     profile = args.profile
     if profile is None:

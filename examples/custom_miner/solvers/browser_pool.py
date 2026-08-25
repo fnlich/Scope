@@ -390,12 +390,46 @@ class _Tab:
             pass
 
 
-class BrowserPool:
-    """Tabs across one or more logged-in Firefox profiles, leased one per task.
+def normalize_cdp(value: str | Sequence[str] | None) -> list[str]:
+    """Turn ``"9222"`` / ``"host:9222"`` / a full URL / a list into CDP URLs.
 
-    Each profile directory is expected to hold a DIFFERENT account: accounts are
-    the real rate-limit unit, so N accounts give N times the throughput. Tabs
-    within one profile share that account and therefore its limit.
+    A bare port is the common case, so ``9222`` means ``http://127.0.0.1:9222``.
+    """
+    if value is None:
+        return []
+    parts = value if isinstance(value, (list, tuple)) else str(value).replace(",", " ").split()
+    endpoints: list[str] = []
+    for raw in parts:
+        item = str(raw).strip()
+        if not item:
+            continue
+        if "://" in item:
+            endpoints.append(item.rstrip("/"))
+        elif ":" in item:
+            endpoints.append(f"http://{item}")
+        else:
+            endpoints.append(f"http://127.0.0.1:{item}")
+    return endpoints
+
+
+class BrowserPool:
+    """Tabs leased one per task, from one of two browser sources.
+
+    **Launch mode (default).** Playwright launches Firefox against a persistent
+    profile directory. Simple — one process, no ports — but a Playwright-driven
+    Firefox is a distinctive automation build, and providers that fingerprint
+    aggressively (Google sign-in, above all) refuse it.
+
+    **Attach mode.** You start an ordinary Chrome/Chromium yourself with
+    ``--remote-debugging-port`` and log in by hand; the pool attaches over CDP.
+    Because *you* launched it, it is not in automation mode — ``navigator.webdriver``
+    is false and it looks like the normal browser it is, which is what gets past
+    those sign-in checks. Pass ``cdp=[...]`` (or set ``<PREFIX>_CDP``) to select
+    it. Only Chromium exposes CDP; Firefox cannot be attached to this way.
+
+    Either way, each source (profile *or* browser) is expected to hold a DIFFERENT
+    account: accounts are the rate-limit unit, so N sources give N times the
+    throughput. Tabs within one source share that account and its limit.
     """
 
     def __init__(
@@ -405,8 +439,11 @@ class BrowserPool:
         *,
         tabs_per_profile: int = 2,
         headless: bool = True,
+        cdp: str | Sequence[str] | None = None,
     ):
         self.site = site
+        self._cdp = normalize_cdp(cdp)
+        self._attach = bool(self._cdp)
         self._profiles = [str(Path(p).expanduser()) for p in profiles] or [
             str(default_profile(site.name, 1))
         ]
@@ -414,13 +451,26 @@ class BrowserPool:
         self._headless = bool(headless)
         self._pw = None
         self._contexts: list[Any] = []
+        self._browsers: list[Any] = []  # CDP-attached; disconnected, never killed
         self._free: asyncio.Queue[_Tab] = asyncio.Queue()
         self._size = 0
         self._lost = 0
         self._started = False
         self._start_lock = asyncio.Lock()
 
-    async def _spawn(self, context, label: str) -> Optional[_Tab]:
+    def _login_hint(self, source: str = "") -> str:
+        """How to fix 'not logged in', worded for whichever mode is in use."""
+        if self._attach:
+            where = f" on {source}" if source else ""
+            return (
+                f"open {self.site.url} in the Chrome{where} you started with "
+                f"--remote-debugging-port and sign in by hand"
+            )
+        return f"python -m solvers.login {self.site.name}" + (
+            f" --profile {source}" if source else ""
+        )
+
+    async def _spawn(self, context, label: str, source: str = "") -> Optional[_Tab]:
         """Open one logged-in tab, or return None with a reason logged."""
         site = self.site
         page = None
@@ -431,14 +481,15 @@ class BrowserPool:
         except Exception as exc:  # noqa: BLE001
             print(
                 f"[{site.name}] WARN: tab {label} never loaded {site.url} "
-                f"({type(exc).__name__}) — is this profile logged in?"
+                f"({type(exc).__name__}) — is it logged in? {self._login_hint(source)}"
             )
             return None
         if composer is None:
             print(
                 f"[{site.name}] WARN: tab {label}: no composer selector matched. "
-                f"Either the profile is not logged in, or the DOM changed — run "
-                f"`python -m solvers.doctor {site.name}` and set {site.env_prefix}_COMPOSER."
+                f"Either it is not logged in ({self._login_hint(source)}), or the DOM "
+                f"changed — run `python -m solvers.doctor {site.name}` and set "
+                f"{site.env_prefix}_COMPOSER."
             )
             try:
                 await page.close()
@@ -477,29 +528,61 @@ class BrowserPool:
         async_playwright = import_playwright()
         site = self.site
         self._pw = await async_playwright().start()
-        for profile in self._profiles:
-            context = await self._open_profile(profile)
+        # (context, label_base, source_description) per browser source.
+        sources = (
+            [(await self._attach_cdp(e), self._label(e), e) for e in self._cdp]
+            if self._attach
+            else [(await self._open_profile(p), Path(p).name, p) for p in self._profiles]
+        )
+        for context, label_base, source in sources:
             if context is None:
                 continue
             self._contexts.append(context)
-            name = Path(profile).name
             for i in range(self._tabs_per_profile):
-                tab = await self._spawn(context, f"{name}#{i + 1}")
+                tab = await self._spawn(context, f"{label_base}#{i + 1}", source)
                 if tab is None:
                     continue
                 await self._free.put(tab)
                 self._size += 1
                 print(f"[{site.name}] tab {tab.label} ready")
         if self._size == 0:
-            raise RuntimeError(
-                f"No usable {site.name} tabs. Log in once with:\n"
-                f"    python -m solvers.login {site.name}\n"
-                f"then start the miner again."
+            how = (
+                f"start Chrome with --remote-debugging-port, {self._login_hint()}, "
+                "and check the endpoint is reachable"
+                if self._attach
+                else f"log in once with:\n    {self._login_hint()}"
             )
+            raise RuntimeError(f"No usable {site.name} tabs. To fix: {how}")
+        kind = "browser" if self._attach else "profile"
         print(
             f"[{site.name}] pool ready: {self._size} tab(s) "
-            f"across {len(self._contexts)} profile(s)"
+            f"across {len(self._contexts)} {kind}(s)"
         )
+
+    @staticmethod
+    def _label(endpoint: str) -> str:
+        """A short, stable tab-label base from a CDP endpoint (its host:port)."""
+        return endpoint.split("://", 1)[-1]
+
+    async def _attach_cdp(self, endpoint: str):
+        """Attach to a browser you started yourself, or explain why it could not.
+
+        The browser is NOT owned here: ``aclose`` disconnects but never kills it,
+        so restarting the miner keeps your hand-made login.
+        """
+        site = self.site
+        try:
+            browser = await self._pw.chromium.connect_over_cdp(endpoint)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[{site.name}] WARN: cannot attach to {endpoint}: "
+                f"{str(exc).splitlines()[0]}\n"
+                f"         Start Chrome/Chromium with --remote-debugging-port and a "
+                f"--user-data-dir, and confirm {endpoint}/json/version answers."
+            )
+            return None
+        self._browsers.append(browser)
+        return browser.contexts[0] if browser.contexts else await browser.new_context()
 
     async def _open_profile(self, profile: str):
         """Launch Firefox on one profile directory, or explain why it could not."""
@@ -566,10 +649,11 @@ class BrowserPool:
     def stats(self) -> dict[str, Any]:
         return {
             "backend": self.site.name,
+            "mode": "attach" if self._attach else "launch",
             "tabs": self._size,
             "idle": self._free.qsize(),
-            "profiles": len(self._contexts),
-            "headless": self._headless,
+            "sources": len(self._contexts),
+            "headless": None if self._attach else self._headless,
             "lost": self._lost,
         }
 
@@ -578,10 +662,19 @@ class BrowserPool:
             return
         while not self._free.empty():
             await (await self._free.get()).dispose()
-        for context in self._contexts:
-            try:
-                await context.close()  # also stops the Firefox process
-            except Exception:  # noqa: BLE001
-                pass
+        if self._attach:
+            # Disconnect, do NOT kill: you own these browsers, and the login in
+            # them is what we do not want to throw away on a miner restart.
+            for browser in self._browsers:
+                try:
+                    await browser.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            for context in self._contexts:
+                try:
+                    await context.close()  # also stops the Firefox process
+                except Exception:  # noqa: BLE001
+                    pass
         if self._pw is not None:
             await self._pw.stop()
