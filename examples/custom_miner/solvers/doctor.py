@@ -190,10 +190,8 @@ async def _probe(page, site: Site, composer: str, busy) -> bool:
     from .browser_pool import _Tab
 
     class _Solo:
-        """Minimal pool: the probe never releases the tab."""
-
-        def __init__(self, site: Site):
-            self.site = site
+        """Minimal pool: the probe never releases the tab, so `release` is all
+        a tab asks of the fleet it came from."""
 
         async def release(self, tab) -> None:
             pass
@@ -201,7 +199,12 @@ async def _probe(page, site: Site, composer: str, busy) -> bool:
     print("\n[doctor] probing with a real prompt (up to 120s)...")
     from dataclasses import replace
 
-    tab = _Tab(_Solo(replace(site, busy=busy)), page, None, "probe", composer=composer)
+    # The tab carries its own Site: a fleet spans providers and has no single
+    # one to fall back on. Hand it the site with only the busy selectors this
+    # page proved usable, which is exactly what the fleet hands a real tab.
+    tab = _Tab(
+        _Solo(), page, None, "probe", replace(site, busy=busy), composer=composer
+    )
     reply = await tab.send(PROBE, 120.0)
     if not reply.strip():
         print("[doctor] !! the probe read nothing back. The assistant selector or the")

@@ -842,6 +842,22 @@ def test_no_backend_anywhere_reads_an_api_key():
             assert needle not in body, f"{module.name} references {needle!r}"
 
 
+def test_the_doctor_probe_drives_a_real_tab():
+    """The doctor builds a `_Tab` by hand, so it is the one caller that a change
+    to that constructor can break without any other test noticing — and did:
+    it kept passing the pre-fleet argument list and died with a TypeError at the
+    probe, after all the selector checks had already printed OK. Call the
+    doctor's own function, not a hand-built tab, so the signature stays bound.
+    """
+    from solvers import doctor
+
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__(
+        "#assistant", [_Node(code=["print('pong')"])]
+    )
+    assert asyncio.run(doctor._probe(page, _site(), "#composer", ())) is True
+
+
 def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():
     """claude.ai has no per-message id, so the reply is 'an assistant message
     that was not there before we pressed send'. Sound only because every task
