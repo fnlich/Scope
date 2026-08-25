@@ -1274,8 +1274,12 @@ def test_the_doctor_probe_drives_a_real_tab():
     from solvers import doctor
 
     page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    # Two blocks, as the probe now asks for: the answer and a usage example.
+    # `print(pong())` alone used to satisfy the doctor, which is exactly the
+    # weakness that let a page shipping only the usage example look healthy.
     page.on_click = lambda _: page.dom.__setitem__(
-        "#assistant", [_Node(code=["print('pong')"])]
+        "#assistant",
+        [_Node(code=["def pong():\n    return 'pong'", "print(pong())"])],
     )
     assert asyncio.run(doctor._probe(page, _site(), "#composer", ())) is True
     # ...and it reports how the next conversation starts. With no new-chat
@@ -1294,7 +1298,9 @@ def test_the_doctor_reports_the_in_app_new_chat_when_the_page_has_one():
 
     def handler(selector):
         if selector == "#send":
-            page.dom["#assistant"] = [_Node(code=["print('pong')"])]
+            page.dom["#assistant"] = [
+                _Node(code=["def pong():\n    return 'pong'", "print(pong())"])
+            ]
         elif selector == "#newchat":
             page.dom["#assistant"] = []
 

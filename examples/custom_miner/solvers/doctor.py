@@ -44,10 +44,37 @@ from .browser_pool import (
 )
 from .config import find_env_file, load_env_file
 
+# One prompt, asked in the shape that used to break. Two blocks on purpose:
+# the reader takes every block and the grader picks the one that defines the
+# entrypoint, so a usage example appended after the answer must not win. Asking
+# for one block would leave that untested, and asking twice would spend a
+# second prompt of the operator's quota to learn the same thing.
 PROBE = (
-    "Reply with exactly one fenced Python code block containing only "
-    "`def pong():\n    return 'pong'` and nothing else."
+    "Reply with exactly TWO fenced code blocks and no other text.\n"
+    "Block 1: `def pong():` returning the string 'pong'.\n"
+    "Block 2: a single line calling it, like `print(pong())`."
 )
+
+
+def _forensics(label: str, text: str) -> None:
+    """Show what the page actually handed over, byte for byte where it matters.
+
+    A rendered page is not a text file. Characters the UI uses for its own
+    bookkeeping are invisible on screen and fatal in source, so the only honest
+    way to know what a provider's DOM yields is to look at the codepoints.
+    """
+    odd: dict[str, int] = {}
+    for ch in text:
+        if ch in "\n\t" or " " <= ch <= "~":
+            continue
+        name = f"U+{ord(ch):04X}"
+        odd[name] = odd.get(name, 0) + 1
+    print(f"    {label}: {len(text)} chars")
+    if odd:
+        listed = ", ".join(f"{k}x{v}" for k, v in sorted(odd.items())[:12])
+        print(f"      non-ASCII/invisible: {listed}")
+    else:
+        print("      non-ASCII/invisible: none")
 
 
 def _site(name: str) -> Site:
@@ -221,15 +248,46 @@ async def _probe(page, site: Site, composer: str, busy) -> bool:
         print("[doctor] !! the probe read nothing back. The assistant selector or the")
         print("            still-generating selector is wrong for this page.")
         return False
-    from .prompts import extract_code
+    from .prompts import extract_code, python_defect
 
-    print(f"[doctor] read {len(reply)} chars back:")
-    print("    " + "\n    ".join(reply.strip().splitlines()[:12]))
-    code = extract_code(reply)
-    if "pong" not in code:
-        print("[doctor] !! that does not look like the answer to the probe prompt.")
+    blocks = reply.count("```") // 2
+    print(f"[doctor] read {len(reply)} chars back; code blocks seen: {blocks}")
+    _forensics("raw reply", reply)
+
+    # Not `extract_code(reply)`: the grader always knows the entrypoint, so the
+    # doctor must ask the same question the miner asks, or it would pass on a
+    # page where the miner picks the wrong block.
+    code = extract_code(reply, "pong")
+    _forensics("what would be submitted", code)
+    print("    ----- what the miner would submit -----")
+    for line in code.splitlines()[:12]:
+        print(f"    | {line}")
+    print("    ---------------------------------------")
+
+    defect = python_defect(code, "pong")
+    if defect is not None:
+        print(f"[doctor] !! this page's replies do not survive extraction: {defect}")
+        print("           That is a DOM difference, not a broken selector — the")
+        print("           block above is what the reader got.")
         return False
-    print("[doctor] probe answered correctly — the read path works end to end.")
+    scope: dict = {}
+    try:
+        exec(compile(code, "<doctor>", "exec"), scope)
+        result = scope["pong"]()
+    except Exception as exc:  # noqa: BLE001 - that is the finding
+        print(f"[doctor] !! the extracted code parses but will not run: {exc!r}")
+        return False
+    if result != "pong":
+        print(f"[doctor] !! it ran but returned {result!r}, not 'pong'.")
+        return False
+    if blocks > 1:
+        print("[doctor] probe answered correctly, and with TWO blocks offered the")
+        print("         ANSWER was chosen, not the usage example. This page's")
+        print("         markup is handled end to end.")
+    else:
+        print("[doctor] probe answered correctly. The model sent one block rather")
+        print("         than the two asked for, so multi-block choice is untested")
+        print("         here — re-run if you want that covered.")
     await _report_reset(tab)
     return True
 
