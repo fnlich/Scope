@@ -1,14 +1,14 @@
-"""Claude-in-the-browser backend: drive claude.ai in Firefox, no API key.
+"""Claude-in-the-browser backend: drive claude.ai in Chrome, no API key.
 
 Same shape as the ChatGPT backend and the same machinery underneath
-(``browser_pool.py``): Playwright launches Firefox on a profile directory you
-logged in to once, holds one tab per concurrent solve, starts every task in a
-fresh conversation, and feeds the reply into the self-verify-and-repair loop in
+(``browser_pool.py``): the pool attaches to a Chrome you started and signed in
+to, holds one tab per concurrent solve, starts every task in a fresh
+conversation, and feeds the reply into the self-verify-and-repair loop in
 ``verify.py``. Your existing Claude subscription is the quota; no API key is
 read anywhere.
 
-    python -m solvers.login claude        # once, to log in
-    MINER_BACKENDS=claude python examples/custom_miner/run_miner.py
+    ./scripts/start_debug_browser.sh --port 9222   # then sign in to claude.ai
+    CLAUDE_CDP=9222 python examples/custom_miner/run_miner.py
 
 There is deliberately no API-key path in this package. The consequence is that
 a browser backend has no supported fallback to switch to, which is exactly why
@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import os
 
-from .browser_pool import BrowserPool, Site
+from .browser_pool import Site
 from .config import selectors
 
 # Claude answers in the chat by default, but long code can be moved to the
@@ -111,24 +111,3 @@ def claude_site() -> Site:
         nudge=os.environ.get("CLAUDE_NUDGE", NUDGE),
         poll_s=float(os.environ.get("CLAUDE_POLL_S", "2")),
     )
-
-
-class ClaudeBrowserPool(BrowserPool):
-    """A pool of claude.ai tabs, optionally spread across several profiles.
-
-    As with ChatGPT, one profile per Claude account is the unit that multiplies
-    throughput; tabs inside one profile share that account's limits.
-    """
-
-    def __init__(
-        self,
-        profiles: list[str],
-        *,
-        tabs_per_profile: int = 2,
-        headless: bool = True,
-        cdp=None,
-    ):
-        super().__init__(
-            claude_site(), profiles,
-            tabs_per_profile=tabs_per_profile, headless=headless, cdp=cdp,
-        )

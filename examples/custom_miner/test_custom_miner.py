@@ -27,8 +27,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from custom_miner import CustomMiner, SolveTask  # noqa: E402
-from solvers.browser_pool import Site, _Tab, usable_busy_selectors  # noqa: E402
-from solvers.chatgpt_web import ChatGPTPool, chatgpt_site  # noqa: E402
+from solvers.browser_pool import (  # noqa: E402
+    Browser,
+    BrowserFleet,
+    Site,
+    _Tab,
+    usable_busy_selectors,
+)
+from solvers.chatgpt_web import chatgpt_site  # noqa: E402
 from solvers.claude_web import claude_site  # noqa: E402
 from solvers.verify import Answer, VerifyingSolver  # noqa: E402
 
@@ -63,7 +69,8 @@ RIGHT = "```python\ndef g(n):\n    s = 0\n    while n > 0:\n        s += n % 10\
 
 
 class _Chat:
-    def __init__(self, replies): self._replies, self._n = replies, -1
+    def __init__(self, replies, provider="claude"):
+        self._replies, self._n, self.provider = replies, -1, provider
     async def send(self, text, timeout_s):
         self._n += 1
         return self._replies[min(self._n, len(self._replies) - 1)]
@@ -71,8 +78,9 @@ class _Chat:
 
 
 class _Backend:
-    def __init__(self, replies): self._replies = replies
-    async def open(self): return _Chat(self._replies)
+    def __init__(self, replies, provider="claude"):
+        self._replies, self._provider = replies, provider
+    async def open(self, avoid=None): return _Chat(self._replies, self._provider)
     async def aclose(self): pass
     def stats(self): return {}
 
@@ -162,7 +170,7 @@ def test_an_unverified_answer_is_not_cached():
 # Budget: a correct answer after the cutoff pays exactly the same as a wrong one.
 # --------------------------------------------------------------------------- #
 class _SlowBackend:
-    async def open(self):
+    async def open(self, avoid=None):
         class Slow:
             async def send(self, text, timeout_s):
                 await asyncio.sleep(4)
@@ -209,13 +217,36 @@ class _DeadPage:
         return boom
 
 
-def _pool(replaceable: bool, site=None) -> ChatGPTPool:
-    pool = ChatGPTPool.__new__(ChatGPTPool)
-    pool.site = site or chatgpt_site()
-    pool._free, pool._size, pool._lost, pool._browsers = asyncio.Queue(), 1, 0, []
+async def _done(value):
+    """An already-resolved awaitable, for stubbing out async methods."""
+    return value
 
-    async def spawn(context, label):
-        return _Tab(pool, _DeadPage(), context, f"{label}-new") if replaceable else None
+
+def _fleet(*sites, tabs_per_browser: int = 2) -> BrowserFleet:
+    """A real fleet, no browser and no network — __init__ does no I/O."""
+    sites = sites or (chatgpt_site(),)
+    browsers = [
+        Browser(f"http://127.0.0.1:{9222 + i}", s) for i, s in enumerate(sites)
+    ]
+    return BrowserFleet(browsers, tabs_per_browser=tabs_per_browser)
+
+
+def _pool(replaceable: bool, site=None) -> BrowserFleet:
+    """A real fleet with a stubbed _spawn.
+
+    Built through the real constructor on purpose. An earlier version assembled
+    the object with __new__ and set four attributes by hand, which silently went
+    stale the moment it grew a fifth; the resulting AttributeError was then
+    swallowed by the solver's catch-all and surfaced as a confusing count.
+    """
+    pool = _fleet(site or chatgpt_site())
+    pool._size = 1                       # pretend one tab was spawned at startup
+
+    async def spawn(context, browser, label):
+        if not replaceable:
+            return None
+        tab = _Tab(pool, _DeadPage(), context, f"{label}-new", site=browser.site)
+        return tab
 
     pool._spawn = spawn
     return pool
@@ -228,16 +259,25 @@ SITES = pytest.mark.parametrize(
 )
 
 
-async def _use_dead_tab(pool: ChatGPTPool) -> None:
-    await pool._free.put(_Tab(pool, _DeadPage(), object(), "dead#1"))
+async def _use_dead_tab(pool: BrowserFleet) -> None:
+    await pool._free.put(_Tab(pool, _DeadPage(), object(), "dead#1", chatgpt_site()))
 
     class LeaseOnly:
-        async def open(self): return await pool._free.get()
+        # Leases exactly as BrowserPool.open() does, minus tab.start() (which
+        # would fail first on a dead page). Setting `leased` matters: release()
+        # ignores a tab that was never leased, so skipping it here would make
+        # the test assert against a no-op.
+        async def open(self, avoid=None):
+            tab = await pool._free.get()
+            tab.leased = True
+            return tab
+
         async def aclose(self): pass
         def stats(self): return pool.stats()
 
     await VerifyingSolver(
-        LeaseOnly(), max_attempts=1, safety_margin_s=0, max_budget_s=30
+        LeaseOnly(), max_attempts=1, safety_margin_s=0, max_budget_s=30,
+        second_opinion=False,   # this is about tab replacement, not two models
     ).solve_task(DIGITS, timeout_s=30)
 
 
@@ -267,24 +307,20 @@ def test_the_submit_phase_is_bounded_so_playwright_cannot_overrun_the_budget():
 
 
 def test_the_pool_starts_lazily_so_any_host_can_serve_it():
-    """Regression: start() was only called by run_chatgpt_miner.py, which needs
-    a live chain. Hosted anywhere else the pool stayed empty and open() blocked
-    on the queue forever, so every solve returned nothing."""
+    """Regression: start() was once only called by a launcher that needs a live
+    chain. Hosted anywhere else the fleet stayed empty and open() blocked on the
+    queue forever, so every solve returned nothing."""
     import inspect
 
-    from solvers.chatgpt_web import ChatGPTPool
-
-    assert "await self.start()" in inspect.getsource(ChatGPTPool.open)
-    start = inspect.getsource(ChatGPTPool.start)
+    assert "await self.start()" in inspect.getsource(BrowserFleet.open)
+    start = inspect.getsource(BrowserFleet.start)
     assert "_start_lock" in start and "if self._started" in start, "start must be idempotent"
 
 
 def test_starting_twice_connects_only_once():
     import asyncio
 
-    from solvers.chatgpt_web import ChatGPTPool
-
-    pool = ChatGPTPool(["/tmp/does-not-need-to-exist"])
+    pool = _fleet()
     calls = []
 
     async def fake_connect():
@@ -293,7 +329,7 @@ def test_starting_twice_connects_only_once():
     pool._connect = fake_connect
 
     async def go():
-        await pool.start()   # an explicit start, as run_chatgpt_miner.py does
+        await pool.start()   # an explicit start, as run_miner.py does
         await pool.start()   # a second call, as a lazy start from open() would be
 
     asyncio.run(go())
@@ -303,81 +339,76 @@ def test_starting_twice_connects_only_once():
 # --------------------------------------------------------------------------- #
 # Multi-provider chain
 # --------------------------------------------------------------------------- #
-def test_answer_reports_whether_it_verified():
-    verified = asyncio.run(_solver([RIGHT]).solve_task(DIGITS, timeout_s=120))
-    assert verified.verified and verified.passed == verified.total > 0
-    unverified = asyncio.run(_solver([WRONG]).solve_task(DIGITS, timeout_s=120))
-    assert not unverified.verified
+# --------------------------------------------------------------------------- #
+# Linux only.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "platform,name", [("win32", "Windows"), ("cygwin", "Windows"), ("darwin", "macOS")]
+)
+def test_a_non_linux_host_is_refused_with_the_reason(monkeypatch, platform, name):
+    """A Windows install dies compiling bittensor-wallet through Rust, three
+    layers below anything this repo wrote. One clear line beats that."""
+    import preflight
+
+    monkeypatch.setattr(preflight.sys, "platform", platform)
+    with pytest.raises(SystemExit) as raised:
+        preflight.require_linux("The custom miner")
+    message = str(raised.value)
+    assert name in message and "bittensor-wallet" in message
+    assert "WSL2" in message, "Windows users need to be told where to go"
 
 
-def test_the_chain_stops_at_the_first_verified_provider():
-    """A verified answer must end the chain — later providers cost real money."""
-    from solvers.multi import FallbackSolver
+def test_wsl2_and_any_linux_pass(monkeypatch):
+    """WSL2 is real Linux to Python and to Chrome; it must not be refused.
 
-    second = _solver([RIGHT])
-    chain = FallbackSolver(
-        [("first", _solver([RIGHT])), ("second", second)], safety_margin_s=0
-    )
-    answer = asyncio.run(chain.solve_task(DIGITS, timeout_s=120))
-    assert answer.verified
-    stats = chain.stats()
-    assert stats["verified_by"]["first"] == 1
-    assert stats["attempts"]["second"] == 0, "second provider must not be called"
+    monkeypatch, not assignment: `preflight.sys` IS the stdlib sys module, so a
+    bare assignment would change sys.platform for the whole test session.
+    """
+    import preflight
+
+    for platform in ("linux", "linux2"):
+        monkeypatch.setattr(preflight.sys, "platform", platform)
+        preflight.require_linux()  # must not raise
 
 
-def test_the_chain_falls_through_to_a_provider_that_can_solve_it():
-    from solvers.multi import FallbackSolver
+def test_every_entrypoint_checks_the_platform_before_importing_anything_heavy():
+    """A guard only one launcher calls is a guard nobody has — and one that runs
+    after `import rlvr` never speaks at all, because on a Windows box that
+    import is what already failed."""
+    from pathlib import Path
 
-    chain = FallbackSolver(
-        [("weak", _solver([WRONG, WRONG, WRONG])), ("strong", _solver([RIGHT]))],
-        safety_margin_s=0,
-    )
-    answer = asyncio.run(chain.solve_task(DIGITS, timeout_s=120))
-    assert answer.verified and "while n > 0" in answer.code
-    assert chain.stats()["verified_by"]["strong"] == 1
-
-
-def test_when_nothing_verifies_the_best_partial_answer_is_returned():
-    """Never return nothing when some provider produced runnable code."""
-    from solvers.multi import FallbackSolver
-
-    chain = FallbackSolver(
-        [("a", _solver(["no code here"])), ("b", _solver([WRONG]))], safety_margin_s=0
-    )
-    answer = asyncio.run(chain.solve_task(DIGITS, timeout_s=120))
-    assert not answer.verified
-    assert answer.code.strip(), "the runnable-but-wrong answer beats an empty one"
+    root = Path(__file__).resolve().parent
+    for name in ("custom_miner.py", "run_miner.py"):
+        body = (root / name).read_text()
+        assert "require_linux(" in body, name
+        guard = body.index('require_linux("')
+        for heavy in ("import httpx", "from rlvr", "from custom_miner"):
+            if heavy in body:
+                assert guard < body.index(heavy), f"{name}: guard runs after {heavy}"
+    assert "require_linux(" in (root / "solvers" / "doctor.py").read_text()
 
 
-def test_an_unknown_backend_name_is_rejected_by_name():
-    from solvers.multi import KNOWN_BACKENDS, build_backend
+def test_the_debug_browser_script_is_linux_only_and_keeps_cdp_on_loopback():
+    """That debug port is full control of a browser holding your logged-in
+    sessions, on a box already exposing a public axon port."""
+    from pathlib import Path
 
-    with pytest.raises(SystemExit, match="unknown backend"):
-        build_backend("llama")
-    assert {"claude", "chatgpt"} == set(KNOWN_BACKENDS)
-
-
-def test_a_single_backend_builds_a_plain_verifying_solver(monkeypatch):
-    """One name must not pay the chain's budget-splitting overhead."""
-    import solvers.multi as multi
-
-    monkeypatch.setattr(multi, "build_backend", lambda name: _Backend([RIGHT]))
-    assert isinstance(multi.build_solver(["claude"]), VerifyingSolver)
-    assert isinstance(multi.build_solver(["claude", "chatgpt"]), multi.FallbackSolver)
+    script = (
+        Path(__file__).resolve().parent / "scripts" / "start_debug_browser.sh"
+    ).read_text()
+    assert "uname -s" in script and "Linux" in script
+    # The default binds to loopback; naming the address flag would undo that.
+    # It appears once, in the comment warning never to use it.
+    assert script.count("--remote-debugging-address") == 1
+    assert "NEVER add --remote-debugging-address" in script
+    assert "--no-sandbox" in script   # needed when running as root
+    assert "xvfb-run" in script       # a headless host has no screen
 
 
 # --------------------------------------------------------------------------- #
-# The Claude browser backend.
-#
-# There is no browser in CI, so these use a fake page. What they pin down is
-# everything that does NOT need a real DOM: that `claude` means the browser and
-# never an API key, that a reply is found by position (claude.ai has no
-# per-message id), that a selector matching the user's own turn can never be
-# returned as an answer, and that a "still generating" selector which is always
-# true is thrown out before it can freeze every solve.
-#
-# The selectors themselves cannot be tested here — that is what
-# `python -m solvers.doctor claude --probe` is for, against a real login.
+# Fake page objects. There is no browser in CI, so these stand in for Playwright
+# where the logic under test is ours rather than the DOM's. `_Loc.first` exists
+# because real locators have it and the click path relies on it.
 # --------------------------------------------------------------------------- #
 class _Node:
     def __init__(self, text="", code=(), attrs=None):
@@ -397,6 +428,11 @@ class _Node:
 class _Loc:
     def __init__(self, page, selector, nodes):
         self._page, self._selector, self._nodes = page, selector, list(nodes)
+
+    @property
+    def first(self):
+        """Playwright locators have this; clicks use it to avoid strict mode."""
+        return _Loc(self._page, self._selector, self._nodes[:1])
 
     async def count(self):
         return len(self._nodes)
@@ -457,156 +493,331 @@ def _site(**kw) -> Site:
 
 
 def _tab(page, site) -> _Tab:
-    return _Tab(_SoloPool(site), page, None, "probe", composer="#composer")
+    return _Tab(_SoloPool(site), page, None, "probe", site, composer="#composer")
 
 
-# --------------------------------------------------------------------------- #
-# Linux only.
-# --------------------------------------------------------------------------- #
-@pytest.mark.parametrize(
-    "platform,name", [("win32", "Windows"), ("cygwin", "Windows"), ("darwin", "macOS")]
-)
-def test_a_non_linux_host_is_refused_with_the_reason(monkeypatch, platform, name):
-    """A Windows install dies compiling bittensor-wallet through Rust, three
-    layers below anything this repo wrote. One clear line beats that."""
-    import preflight
+def test_tabs_are_enqueued_interleaved_across_browsers():
+    """Two tasks arriving together must land on two different accounts. Enqueuing
+    browser-by-browser would give both to the first account, which is the one
+    thing that actually rate-limits."""
+    async def go():
+        fleet = _fleet(claude_site(), chatgpt_site(), tabs_per_browser=2)
+        made = []
 
-    monkeypatch.setattr(preflight.sys, "platform", platform)
-    with pytest.raises(SystemExit) as raised:
-        preflight.require_linux("The custom miner")
-    message = str(raised.value)
-    assert name in message and "bittensor-wallet" in message
-    assert "WSL2" in message, "Windows users need to be told where to go"
+        async def spawn(context, browser, label):
+            tab = _Tab(fleet, _DeadPage(), None, label, browser.site)
+            made.append(tab)
+            return tab
 
+        fleet._spawn = spawn
+        fleet._attach = lambda browser: _done(object())
+        fleet._reclaim = lambda context, browser: _done(None)
+        fleet._pw = object()
+        await fleet._fill()
+        return [t.label for t in list(fleet._free._queue)]
 
-def test_wsl2_and_any_linux_pass(monkeypatch):
-    """WSL2 is real Linux to Python and to Firefox; it must not be refused.
-
-    monkeypatch, not assignment: `preflight.sys` IS the stdlib sys module, so a
-    bare assignment would change sys.platform for the whole test session.
-    """
-    import preflight
-
-    for platform in ("linux", "linux2"):
-        monkeypatch.setattr(preflight.sys, "platform", platform)
-        preflight.require_linux()  # must not raise
+    order = asyncio.run(go())
+    # A#1, B#1, A#2, B#2 — not A#1, A#2, B#1, B#2.
+    assert [l.split("#")[1] for l in order] == ["1", "1", "2", "2"], order
+    assert order[0].split(":")[1].startswith("9222")
+    assert order[1].split(":")[1].startswith("9223")
 
 
-def test_every_entrypoint_checks_the_platform_before_importing_anything_heavy():
-    """A guard only one launcher calls is a guard nobody has — and one that runs
-    after `import rlvr` never speaks at all, because on a Windows box that
-    import is what already failed."""
+def test_a_lease_can_ask_for_a_different_provider():
+    """The second opinion is only worth asking if it reaches the OTHER model."""
+    async def go():
+        fleet = _fleet()
+        claude = _Tab(fleet, _DeadPage(), None, "c#1", claude_site())
+        gpt = _Tab(fleet, _DeadPage(), None, "g#1", chatgpt_site())
+        fleet._free.put_nowait(claude)
+        fleet._free.put_nowait(gpt)
+        first = await fleet._lease(None, 1.0)
+        second = await fleet._lease(avoid=first.provider, wait_s=1.0)
+        return first.provider, second.provider
+
+    first, second = asyncio.run(go())
+    assert first == "claude" and second == "chatgpt"
+
+
+def test_avoiding_a_provider_still_returns_a_tab_when_it_is_the_only_one():
+    """A preference, not a guarantee: one of the avoided provider's tabs still
+    beats failing the task."""
+    async def go():
+        fleet = _fleet()
+        fleet._free.put_nowait(_Tab(fleet, _DeadPage(), None, "c#1", claude_site()))
+        fleet._free.put_nowait(_Tab(fleet, _DeadPage(), None, "c#2", claude_site()))
+        tab = await fleet._lease(avoid="claude", wait_s=1.0)
+        return tab.provider, fleet._free.qsize()
+
+    provider, left = asyncio.run(go())
+    assert provider == "claude" and left == 1, "it must not drop or duplicate tabs"
+
+
+def test_a_second_opinion_asks_the_other_model_only_when_the_first_fails():
+    """A verified answer must end it — the second model costs a real account's
+    quota and a tab another task could be using."""
+    seen = []
+
+    class _Fleet:
+        def __init__(self, replies): self._replies = replies
+        async def open(self, avoid=None):
+            provider = "chatgpt" if avoid == "claude" else "claude"
+            seen.append(provider)
+            return _Chat(self._replies[len(seen) - 1], provider)
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    # First model gets it right: one provider asked.
+    seen.clear()
+    solver = VerifyingSolver(_Fleet([[RIGHT], [RIGHT]]), safety_margin_s=0, max_budget_s=120)
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.verified and seen == ["claude"], seen
+    assert solver.stats()["providers"]["claude"]["verified"] == 1
+
+    # First model keeps failing: the other one is asked and wins.
+    seen.clear()
+    solver = VerifyingSolver(
+        _Fleet([[WRONG, WRONG, WRONG], [RIGHT]]), safety_margin_s=0, max_budget_s=120
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.verified and seen == ["claude", "chatgpt"], seen
+    assert solver.stats()["providers"]["chatgpt"]["verified"] == 1
+
+
+def test_the_second_opinion_can_be_turned_off():
+    """Pure throughput: never spend a second account on one task."""
+    seen = []
+
+    class _Fleet:
+        async def open(self, avoid=None):
+            seen.append(avoid)
+            return _Chat([WRONG], "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(
+        _Fleet(), max_attempts=1, safety_margin_s=0, max_budget_s=120, second_opinion=False
+    )
+    asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert seen == [None], seen
+
+
+def test_shutdown_is_armed_before_the_slow_attach_not_after():
+    """A supervisor restarting while the miner is attaching to eight browsers
+    would otherwise raise KeyboardInterrupt straight through the cleanup and
+    leave the tabs already opened behind."""
+    import inspect
     from pathlib import Path
 
-    root = Path(__file__).resolve().parent
-    for name in ("custom_miner.py", "run_miner.py", "run_chatgpt_miner.py"):
-        body = (root / name).read_text()
-        assert "require_linux(" in body, name
-        guard = body.index('require_linux("')
-        for heavy in ("import httpx", "from rlvr", "from custom_miner"):
-            if heavy in body:
-                assert guard < body.index(heavy), f"{name}: guard runs after {heavy}"
-    assert "require_linux(" in (root / "solvers" / "doctor.py").read_text()
+    serve = Path(__file__).resolve().parent.joinpath("run_miner.py").read_text()
+    body = serve[serve.index("async def serve()"):serve.index("asyncio.run(serve())")]
+    handler = body.index("add_signal_handler")
+    attach = body.index("await warm_up(")
+    assert handler < attach, "signal handlers must be installed before attaching"
+    # Both signals a supervisor uses, and cleanup that a second one cannot cut short.
+    assert "signal.SIGINT" in body and "signal.SIGTERM" in body
+    assert "asyncio.shield" in body
+    assert "solver.aclose()" in body
 
 
-def test_the_login_helper_is_linux_only_and_keeps_vnc_on_loopback():
-    """That VNC screen is an unauthenticated view of a browser you are about to
-    type a password into, on a box already exposing a public axon port."""
-    from pathlib import Path
+def test_a_restart_reclaims_the_tabs_its_predecessor_left_behind():
+    """A supervised miner gets SIGKILLed sooner or later, and an unclean exit
+    never runs shutdown. Without this, every restart adds dead tabs to a browser
+    that stays up for weeks."""
+    from solvers.browser_pool import TAB_MARK
 
-    script = (Path(__file__).resolve().parent / "scripts" / "login.sh").read_text()
-    assert "uname -s" in script and "Linux" in script
-    assert "-localhost" in script, "the VNC port must never leave loopback"
-    assert "-nopw" in script and "-localhost" in script
-    assert "Xvfb" in script  # a headless host has no screen to log in on
+    closed = []
+
+    class _Page:
+        def __init__(self, name): self._name = name
+        async def evaluate(self, script): return self._name
+        async def close(self): closed.append(self._name)
+
+    class _Unreadable(_Page):
+        async def evaluate(self, script): raise RuntimeError("page is gone")
+
+    class _Ctx:
+        pages = [
+            _Page(""),                       # your own tab: never touched
+            _Page(f"{TAB_MARK}/claude"),     # ours, from a previous run
+            _Page(f"{TAB_MARK}/chatgpt"),    # ours
+            _Unreadable("weird"),            # cannot be asked -> not ours
+        ]
+
+    async def go():
+        fleet = _fleet()
+        await fleet._reclaim(_Ctx(), Browser("http://127.0.0.1:9222", claude_site()))
+        return fleet._reclaimed
+
+    count = asyncio.run(go())
+    assert closed == [f"{TAB_MARK}/claude", f"{TAB_MARK}/chatgpt"], closed
+    assert count == 2
 
 
-def test_launch_mode_uses_firefox_and_attach_mode_uses_cdp():
-    """Two sources: Firefox launched by Playwright, or a Chrome you started
-    yourself reached over CDP. Firefox cannot be attached to (BiDi only, CDP is
-    Chromium-only), so launch mode must use launch_persistent_context and attach
-    mode must use connect_over_cdp — never the reverse."""
+def test_the_fleet_attaches_over_cdp_and_never_launches_a_browser():
+    """Launching it here would put the browser back in automation mode, which is
+    exactly what provider sign-in checks reject — the reason this design exists."""
     import inspect
 
     from solvers import browser_pool
-    from solvers.multi import build_backend
 
     source = inspect.getsource(browser_pool)
-    assert "launch_persistent_context" in source     # launch mode: Firefox
-    assert "chromium.connect_over_cdp" in source      # attach mode: Chrome
-    # firefox.connect_over_cdp would be a bug — it does not exist.
-    assert "firefox.connect_over_cdp" not in source
-
-    launch_pool = build_backend("claude")             # no CDP env -> launch mode
-    assert launch_pool._profiles and not launch_pool._attach
-    assert launch_pool.stats()["mode"] == "launch"
+    assert "chromium.connect_over_cdp" in source
+    for launcher in ("launch_persistent_context", ".launch(", "launch_server"):
+        assert launcher not in source, f"the fleet must not call {launcher}"
 
 
-def test_setting_cdp_switches_a_backend_to_attach_mode(monkeypatch):
-    """CLAUDE_CDP=9222 must arm attach mode, normalising a bare port to a URL."""
-    from solvers.browser_pool import normalize_cdp
-    from solvers.multi import build_backend
+def test_the_roster_reads_both_provider_lists_into_one_fleet():
+    """Six to ten browsers, mixed providers, is the shape this is built for."""
+    from solvers.roster import roster
 
-    assert normalize_cdp("9222") == ["http://127.0.0.1:9222"]
-    assert normalize_cdp("host:7000, http://1.2.3.4:9/") == [
-        "http://host:7000", "http://1.2.3.4:9"
+    browsers = roster({"CLAUDE_CDP": "9222,9223,9224", "CHATGPT_CDP": "9225,9226"})
+    assert [b.endpoint for b in browsers] == [
+        "http://127.0.0.1:9222", "http://127.0.0.1:9223", "http://127.0.0.1:9224",
+        "http://127.0.0.1:9225", "http://127.0.0.1:9226",
     ]
-    assert normalize_cdp(None) == [] and normalize_cdp("") == []
-
-    monkeypatch.setenv("CLAUDE_CDP", "9222,9223")
-    pool = build_backend("claude")
-    assert pool._attach and pool._cdp == ["http://127.0.0.1:9222", "http://127.0.0.1:9223"]
-    assert pool.stats()["mode"] == "attach" and pool.stats()["headless"] is None
+    assert [b.site.name for b in browsers] == ["claude"] * 3 + ["chatgpt"] * 2
 
 
-def test_attach_mode_disconnects_but_never_kills_your_browser():
-    """You own the browser in attach mode. aclose must disconnect it, not close
-    it — else a miner restart throws away the hand-made login."""
+def test_an_empty_roster_falls_back_to_one_browser_on_the_default_port():
+    """The single-browser case must need no configuration at all."""
+    from solvers.roster import roster
+
+    browsers = roster({})
+    assert len(browsers) == 1
+    assert browsers[0].endpoint == "http://127.0.0.1:9222"
+    assert browsers[0].site.name == "claude"
+
+
+def test_the_same_endpoint_listed_under_two_providers_is_not_double_counted(capsys):
+    """One profile cannot be signed in as both, and attaching twice would
+    invent capacity that does not exist."""
+    from solvers.roster import roster
+
+    browsers = roster({"CLAUDE_CDP": "9222", "CHATGPT_CDP": "9222"})
+    assert len(browsers) == 1 and browsers[0].site.name == "claude"
+    assert "listed more than once" in capsys.readouterr().out
+
+
+def test_shutdown_disconnects_but_never_closes_your_browser():
+    """The operator owns the browser. Closing it would throw away the login they
+    made by hand, which a miner restart must never do."""
     import inspect
 
-    from solvers.browser_pool import BrowserPool
 
-    aclose = inspect.getsource(BrowserPool.aclose)
-    attach = aclose.split("if self._attach:", 1)[1].split("else:", 1)[0]
-    assert "browser.close()" in attach and "context.close()" not in attach
+    teardown = inspect.getsource(BrowserFleet._teardown)
+    # Tabs this pool opened are closed; the browser is only disconnected.
+    assert "tab.dispose()" in teardown
+    assert "connection.close()" in teardown, "the attachment is severed, not the browser"
+    assert "context.close()" not in teardown, "closing the context would close your window"
 
 
-def test_the_attach_error_names_the_debug_browser_not_the_login_helper():
-    """A wrong CDP endpoint is a Chrome problem; the fix must not tell you to run
-    the Firefox login helper."""
+def test_shutdown_closes_leased_tabs_too_not_just_idle_ones():
+    """A free-queue-only sweep leaves every in-flight tab open in your browser.
+
+    Behavioural, not a source grep: build a pool holding one idle tab and one
+    leased tab (leased = tracked but not in the queue, which is what a shutdown
+    mid-solve looks like) and assert both pages get closed.
+    """
+    closed = []
+
+    class _Page:
+        def __init__(self, name): self.name = name
+        async def close(self): closed.append(self.name)
+
+    class _Browser:
+        def __init__(self): self.disconnected = False
+        async def close(self): self.disconnected = True
+
+    class _Driver:
+        def __init__(self): self.stopped = False
+        async def stop(self): self.stopped = True
+
+    async def go():
+        pool = _fleet()
+        idle = _Tab(pool, _Page("idle"), None, "idle", chatgpt_site())
+        leased = _Tab(pool, _Page("leased"), None, "leased", chatgpt_site())
+        pool._tabs = [idle, leased]
+        await pool._free.put(idle)          # only the idle one is in the queue
+        browser, driver = _Browser(), _Driver()
+        pool._connections = [browser]
+        pool._pw = driver                   # teardown keys off the driver
+        pool._started = True
+        await pool.aclose()
+        return browser, driver
+
+    browser, driver = asyncio.run(go())
+    assert sorted(closed) == ["idle", "leased"], f"only closed {closed}"
+    assert browser.disconnected, "the pool must disconnect from the browser"
+    assert driver.stopped, "the Playwright driver must be stopped too"
+
+
+def test_releasing_a_tab_twice_does_not_queue_it_twice():
+    """Two tasks driving one page corrupt both answers, and the symptom — two
+    solves interleaving in one conversation — looks like a model failure."""
+    async def go():
+        pool = _fleet()
+        tab = _Tab(pool, _DeadPage(), None, "t#1", chatgpt_site())
+        tab.leased = True
+        await pool.release(tab)
+        await pool.release(tab)     # a second close must be a no-op
+        return pool._free.qsize()
+
+    assert asyncio.run(go()) == 1, "the tab was queued twice"
+
+
+def test_a_start_that_fails_stops_the_playwright_driver():
+    """Otherwise the driver process leaks, and because start() left _started
+    False the next open() would spawn a second one."""
+    async def go():
+        pool = BrowserFleet([Browser("http://127.0.0.1:59999", chatgpt_site())])
+
+        class _Driver:
+            def __init__(self): self.stopped = False
+            async def stop(self): self.stopped = True
+
+        driver = _Driver()
+
+        async def fake_pw_start():
+            pool._pw = driver
+
+        # Stand in for `async_playwright().start()`, then let _fill() fail for
+        # real by finding no reachable endpoint.
+        async def connect():
+            await fake_pw_start()
+            try:
+                await pool._fill()
+            except Exception:
+                await pool._teardown()
+                raise
+
+        pool._connect = connect
+        with pytest.raises(RuntimeError):
+            await pool.start()
+        return driver, pool
+
+    driver, pool = asyncio.run(go())
+    assert driver.stopped, "a failed start must stop the driver it started"
+    assert pool._pw is None and not pool._started
+
+
+def test_an_unreachable_endpoint_names_the_debug_browser_script():
+    """A wrong CDP endpoint is a browser-setup problem, and the message must say
+    so rather than leaving the operator to guess."""
     import asyncio
 
-    from solvers.claude_web import ClaudeBrowserPool
-
-    pool = ClaudeBrowserPool([], cdp="59999")  # nothing is listening there
+    pool = BrowserFleet([Browser("http://127.0.0.1:59999", claude_site())])
     with pytest.raises(RuntimeError, match="remote-debugging-port"):
         asyncio.run(pool.start())
 
 
-def test_a_profile_that_is_not_there_names_the_login_command(capsys):
-    """The first thing a new operator gets wrong. It must not be a stack trace."""
-    from solvers.claude_web import ClaudeBrowserPool
+def test_tabs_per_browser_comes_from_the_environment(monkeypatch):
+    from solvers.roster import tabs_per_browser
 
-    pool = ClaudeBrowserPool(["/nonexistent/profile"])
-    with pytest.raises(RuntimeError, match="solvers.login"):
-        asyncio.run(pool.start())
-    assert "python -m solvers.login claude" in capsys.readouterr().out
-
-
-def test_profiles_and_tab_counts_come_from_the_environment(monkeypatch):
-    from solvers.multi import _pool_kwargs
-
-    monkeypatch.delenv("CLAUDE_PROFILES", raising=False)
-    monkeypatch.delenv("CLAUDE_HEADLESS", raising=False)
-    default = _pool_kwargs("CLAUDE")
-    assert default["profiles"][0].endswith("claude-1") and default["headless"] is True
-
-    monkeypatch.setenv("CLAUDE_PROFILES", "/a, /b")
-    monkeypatch.setenv("CLAUDE_TABS_PER_PROFILE", "4")
-    monkeypatch.setenv("CLAUDE_HEADLESS", "false")
-    kwargs = _pool_kwargs("CLAUDE")
-    assert kwargs["profiles"] == ["/a", "/b"]
-    assert kwargs["tabs_per_profile"] == 4 and kwargs["headless"] is False
+    monkeypatch.delenv("MINER_TABS_PER_BROWSER", raising=False)
+    assert tabs_per_browser() == 2
+    monkeypatch.setenv("MINER_TABS_PER_BROWSER", "4")
+    assert tabs_per_browser() == 4
 
 
 def test_no_backend_anywhere_reads_an_api_key():
@@ -617,12 +828,11 @@ def test_no_backend_anywhere_reads_an_api_key():
     from pathlib import Path
 
     from solvers import claude_web
-    from solvers.multi import KNOWN_BACKENDS, build_backend
+    from solvers.roster import PROVIDERS, site_for
 
-    backend = build_backend("claude")
-    assert isinstance(backend, claude_web.ClaudeBrowserPool)
-    assert backend.site.name == "claude" and "claude.ai" in backend.site.url
-    assert set(KNOWN_BACKENDS) == {"claude", "chatgpt"}
+    assert set(PROVIDERS) == {"claude", "chatgpt"}
+    assert "claude.ai" in site_for("claude").url
+    assert "chatgpt.com" in site_for("chatgpt").url
 
     banned = ("API_KEY", "import anthropic", "from anthropic", "google.genai")
     package = Path(inspect.getfile(claude_web)).parent
@@ -643,6 +853,59 @@ def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():
     reply = asyncio.run(_tab(page, _site()).send("solve it", 2.0))
     assert reply == "def g(n):\n    return n"
     assert page.typed == ["solve it"]
+
+
+def test_a_partial_answer_survives_a_deadline_that_lands_mid_stream():
+    """The commonest timeout there is: the model is still typing when the budget
+    runs out. Returning "" there throws away a gradeable answer and hands the
+    repair round nothing to work with."""
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+
+    def stream(_):
+        page.dom["#assistant"] = [_Node(text="half an answer")]
+        page.dom["#stop"] = [_Node()]        # still generating, and stays that way
+
+    page.on_click = stream
+    site = _site(busy=("#stop",))
+    assert asyncio.run(_tab(page, site).send("solve it", 1.5)) == "half an answer"
+
+
+def test_send_honours_its_deadline_including_the_time_spent_submitting():
+    """Deriving the read deadline after the submit hands the read a fresh full
+    budget on top of it — an overrun bigger than the solver's safety margin."""
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+
+    async def slow_insert(text):
+        await asyncio.sleep(1.0)
+        page.typed.append(text)
+
+    page.keyboard.insert_text = slow_insert
+    started = time.monotonic()
+    asyncio.run(_tab(page, _site()).send("solve it", 2.0))
+    assert time.monotonic() - started < 3.0, "the submit time was added on top"
+
+
+def test_a_dead_tab_is_not_driven_again():
+    """Retrying a known-dead tab burns the budget one submit-timeout at a time."""
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    tab = _tab(page, _site())
+    tab.alive = False
+    assert asyncio.run(tab.send("solve it", 30.0)) == ""
+    assert page.typed == [], "it typed into a tab it knew was dead"
+
+
+def test_the_echo_guard_reads_the_whole_message_not_the_code_block():
+    """`_read` prefers the last `pre code`, and task statements routinely contain
+    fenced code — so comparing the extracted block against the prompt would never
+    match and the guard would never fire, exactly when it is needed."""
+    prompt = "Solve this problem.\n```\nexample\n```\nReturn the digit sum."
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    # The assistant selector wrongly matches the user's turn: whole text echoes
+    # the prompt, while the code block inside it does not.
+    page.on_click = lambda _: page.dom.__setitem__(
+        "#assistant", [_Node(text=prompt, code=["print('lifted from my own prompt')"])]
+    )
+    assert asyncio.run(_tab(page, _site()).send(prompt, 1.5)) == ""
 
 
 def test_a_reply_that_echoes_the_prompt_is_refused():
@@ -714,14 +977,14 @@ def test_dotenv_values_fill_in_without_overriding_the_real_environment(monkeypat
     from solvers.config import load_env_file
 
     env = tmp_path / ".env"
-    env.write_text('# comment\nCLAUDE_PROFILES=~/a,~/b\nexport CLAUDE_URL="https://claude.ai/new"\nSHELL_WINS=from-file\n')
+    env.write_text('# comment\nCLAUDE_CDP=9222,9223\nexport CLAUDE_URL="https://claude.ai/new"\nSHELL_WINS=from-file\n')
     monkeypatch.setenv("SHELL_WINS", "from-shell")
-    monkeypatch.delenv("CLAUDE_PROFILES", raising=False)
+    monkeypatch.delenv("CLAUDE_CDP", raising=False)
     monkeypatch.delenv("CLAUDE_URL", raising=False)
     assert load_env_file(env) == 2
     import os
 
-    assert os.environ["CLAUDE_PROFILES"] == "~/a,~/b"
+    assert os.environ["CLAUDE_CDP"] == "9222,9223"
     assert os.environ["CLAUDE_URL"] == "https://claude.ai/new"
     assert os.environ["SHELL_WINS"] == "from-shell"
 
@@ -748,7 +1011,7 @@ def test_the_env_file_is_found_from_a_subdirectory(tmp_path, monkeypatch):
     root) and the doctor (run from examples/custom_miner)."""
     from solvers.config import find_env_file
 
-    (tmp_path / ".env").write_text("CLAUDE_PROFILES=~/a\n")
+    (tmp_path / ".env").write_text("CLAUDE_CDP=9222\n")
     nested = tmp_path / "examples" / "custom_miner"
     nested.mkdir(parents=True)
     assert find_env_file(nested) == tmp_path / ".env"
@@ -763,15 +1026,15 @@ def test_a_missing_playwright_names_the_fix_instead_of_raising_importerror():
 
     source = inspect.getsource(import_playwright)
     assert "pip install playwright" in source and "SystemExit" in source
-    # The Firefox build is a second, separate download; naming only the first
-    # leaves you with a working import and no browser.
-    assert "playwright install firefox" in source
+    # No browser download is needed — the pool attaches to one you started —
+    # so the message must not send anyone chasing a `playwright install`.
+    assert "No `playwright install` is needed" in source
 
 
 def test_a_browser_backend_is_started_before_serving_not_on_first_request():
     """An expired login must surface at launch, where someone is watching, not
     hours later as a failed solve on a real validator request."""
-    from solvers.multi import warm_up
+    from solvers.roster import warm_up
 
     started = []
 

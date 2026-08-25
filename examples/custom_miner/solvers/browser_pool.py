@@ -1,4 +1,4 @@
-"""A pool of logged-in Firefox tabs, shared by every browser backend.
+"""A pool of logged-in Chrome tabs, shared by every browser backend.
 
 Claude and ChatGPT need exactly the same machinery: keep N logged-in tabs,
 lease one per task, start every task in a fresh conversation, notice when a tab
@@ -14,19 +14,28 @@ overruns the solver's budget by ~90s because Playwright auto-waits 30s *per
 action*. Duplicating them per site means fixing them twice and testing them
 once.
 
-## Why Playwright owns the browser
+## You start the browser; this attaches to it
 
-An earlier version attached over CDP to a Chrome you started yourself. Firefox
-cannot do that: Playwright's ``connect_over_cdp`` is Chromium-only, and Mozilla
-removed its CDP implementation in favour of WebDriver BiDi. So Playwright
-launches Firefox itself, with ``launch_persistent_context`` against a profile
-directory that keeps the login.
+This pool never launches a browser. You start an ordinary Chrome or Chromium
+yourself with ``--remote-debugging-port`` (``scripts/start_debug_browser.sh``
+does it), sign in **by hand**, and the pool attaches over the Chrome DevTools
+Protocol.
 
-That is a better shape for a miner anyway — one process to supervise instead of
-two, and a crash restarts already logged in — but it comes with one rule worth
-knowing before it bites you: **a profile directory can only be open in one
-process at a time.** Run ``python -m solvers.login`` while the miner is running
-and the launch fails; the message says so.
+That division of labour is the point, not an inconvenience. A browser launched
+by an automation driver announces itself as one — ``navigator.webdriver`` is
+true and the build is distinctive — and provider sign-in flows reject it. The
+most visible of those is Google's OAuth, which answers *"Couldn't sign you in.
+This browser or app may not be secure."* A browser **you** started is not in
+automation mode, so the same sign-in succeeds; attaching afterwards does not
+change that.
+
+Two consequences worth knowing before they surprise you:
+
+* **The browser is yours, not ours.** ``aclose`` closes the tabs this pool
+  opened and then *disconnects*; it never closes your browser. Restarting the
+  miner therefore keeps the login you made by hand.
+* **CDP is a Chromium protocol.** Only Chrome and Chromium expose it. That is
+  what fixes the browser choice here — it is a constraint, not a preference.
 
 ## Selectors are configuration, not code
 
@@ -49,8 +58,12 @@ import asyncio
 import os
 import time
 from dataclasses import dataclass, replace
-from pathlib import Path
-from typing import Any, Optional, Sequence
+from itertools import zip_longest
+from typing import Any, NamedTuple, Optional, Sequence
+
+# The port `scripts/start_debug_browser.sh` uses unless told otherwise, and so
+# the port every backend assumes when `<PREFIX>_CDP` is not set.
+DEFAULT_CDP_PORT = 9222
 
 
 @dataclass(frozen=True)
@@ -78,30 +91,46 @@ class Site:
     ready_timeout_ms: int = 60_000
 
 
-PROFILE_ROOT = Path(os.environ.get("MINER_PROFILE_ROOT", "~/.hone-miner/firefox")).expanduser()
-
-
-def default_profile(backend: str, index: int = 1) -> Path:
-    """Where a profile lives when nobody said otherwise."""
-    return PROFILE_ROOT / f"{backend}-{index}"
-
-
 def import_playwright():
     """Playwright, or an actionable message instead of an ImportError traceback.
 
     It is in no extra of this project on purpose: it is a large dependency and
-    the browser download is larger still, so the failure has to name both steps.
+    most of this example does not need it. Note that no ``playwright install``
+    step is required — this attaches to a browser you started, so there is no
+    bundled browser to download.
     """
     try:
         from playwright.async_api import async_playwright
     except ModuleNotFoundError as exc:  # pragma: no cover - environment-specific
         raise SystemExit(
-            "The browser backends need Playwright and its Firefox build:\n"
+            "The browser backends need Playwright:\n"
             "    pip install playwright\n"
-            "    python -m playwright install firefox\n"
-            "Playwright launches Firefox itself, so both steps are required."
+            "No `playwright install` is needed — the backends attach over CDP to "
+            "a Chrome you start yourself."
         ) from exc
     return async_playwright
+
+
+def normalize_cdp(value: str | Sequence[str] | None) -> list[str]:
+    """Turn ``"9222"`` / ``"host:9222"`` / a full URL / a list into CDP URLs.
+
+    A bare port is the common case, so ``9222`` means ``http://127.0.0.1:9222``.
+    """
+    if value is None:
+        return []
+    parts = value if isinstance(value, (list, tuple)) else str(value).replace(",", " ").split()
+    endpoints: list[str] = []
+    for raw in parts:
+        item = str(raw).strip()
+        if not item:
+            continue
+        if "://" in item:
+            endpoints.append(item.rstrip("/"))
+        elif ":" in item:
+            endpoints.append(f"http://{item}")
+        else:
+            endpoints.append(f"http://127.0.0.1:{item}")
+    return endpoints
 
 
 async def wait_for_any(page, candidates: Sequence[str], timeout_ms: int) -> Optional[str]:
@@ -156,9 +185,12 @@ async def usable_busy_selectors(page, candidates: Sequence[str], name: str) -> t
     idle, freshly-loaded page is exactly the ground truth needed to catch it,
     and it costs one DOM query per candidate at startup.
 
-    The opposite mistake — a busy selector that never matches — is harmless
-    here, because the reader also requires the text to be unchanged across two
-    polls before it accepts an answer.
+    The opposite mistake — a busy selector that never matches — is survivable
+    rather than harmless: the reader falls back to requiring the text to be
+    unchanged across two polls, so an answer is accepted after ~2x poll_s of
+    quiet. A model that pauses longer than that mid-generation can have a
+    truncated answer accepted as final, which the repair round then has to
+    catch. Keeping one working busy selector is worth it.
     """
     kept: list[str] = []
     for selector in candidates:
@@ -187,27 +219,38 @@ class _Tab:
 
     def __init__(
         self,
-        pool: "CDPPool",
+        pool: "BrowserFleet",
         page,
         context,
         label: str,
+        site: Site,
         *,
-        site: Optional[Site] = None,
         composer: Optional[str] = None,
+        source: str = "",
     ):
         self._pool = pool
         self._page = page
         self.context = context
         self.label = label
-        # A per-tab Site: the pool prunes the selectors this page cannot use
-        # before handing it over, so the answer path never has to guess whether
-        # a raising selector means a bad override or a dead page.
-        self.site: Site = site or pool.site
+        # Which browser this tab came from. Carried so a replacement spawned
+        # after a failure can still name the right endpoint in its log.
+        self.source = source
+        # A per-tab Site — required, because a fleet spans providers and has no
+        # single one of its own. The fleet prunes the selectors this page cannot
+        # use before handing it over, so the answer path never has to guess
+        # whether a raising selector means a bad override or a dead page.
+        self.site: Site = site
         self._composer = composer or (self.site.composer[0] if self.site.composer else "")
         self._sent = ""
+        # Assistant selector latched for the current send(); see _messages().
+        self._assistant: Optional[str] = None
         self._warned_echo = False
         self.uses = 0
         self.alive = True
+        # Set while this tab is out on loan. The pool uses it to make a second
+        # release() a no-op: without it a double close would queue the same tab
+        # twice and two tasks would end up driving one page.
+        self.leased = False
 
     async def start(self) -> None:
         """Open a fresh conversation so each task begins with empty context.
@@ -233,8 +276,14 @@ class _Tab:
         click/insert/click can burn ~90s that the solver's budget never
         accounted for — which would blow the response deadline and score zero
         even though the answer was on its way.
+
+        ``.first`` on both clicks is not cosmetic: a Locator click is strict and
+        RAISES when the selector matches more than one node, while the candidate
+        lists deliberately end in broad fallbacks that can. Without it a page
+        with two matching nodes fails every submit, and since a failed submit
+        retires the tab, the pool would churn tabs forever and never answer.
         """
-        composer = self._page.locator(self._composer)
+        composer = self._page.locator(self._composer).first
         await composer.click(timeout=ui_ms)
         # insert_text handles newlines safely — typing them would submit early.
         await self._page.keyboard.insert_text(text)
@@ -245,13 +294,26 @@ class _Tab:
             # newlines included, is already in the box via insert_text.
             await self._page.keyboard.press("Enter")
             return
-        await self._page.locator(button).click(timeout=ui_ms)
+        await self._page.locator(button).first.click(timeout=ui_ms)
 
     async def send(self, text: str, timeout_s: float) -> str:
+        if not self.alive:
+            # The pool has not recycled this tab yet. Retrying a known-dead tab
+            # only burns the caller's budget one submit-timeout at a time.
+            return ""
+        # Start the clock BEFORE the submit. Deriving the read deadline after it
+        # would hand the read a fresh `timeout_s` on top of however long typing
+        # took — an overrun larger than the solver's whole safety margin.
+        started = time.monotonic()
+        deadline = started + max(1.0, timeout_s)
         self.uses += 1
         if self.site.nudge:
             text = f"{text}\n\n{self.site.nudge}"
         self._sent = text
+        # One selector for the whole call: `_first_match` is free to pick a
+        # different candidate once the reply renders, and comparing a count taken
+        # from one selector against a count taken from another is meaningless.
+        self._assistant = None
         # Reserve a slice of the caller's budget for getting the prompt in;
         # the rest is for waiting on the answer.
         submit_budget_s = max(5.0, min(20.0, timeout_s * 0.3))
@@ -270,31 +332,59 @@ class _Tab:
             print(f"[{self.site.name}] tab {self.label} failed to submit: {type(exc).__name__}")
             return ""
 
-        deadline = time.monotonic() + max(1.0, timeout_s)
-        stable: Optional[str] = None
+        # `stable` drives the completion test and is reset whenever the model is
+        # mid-generation. `best` is the newest text actually read and is never
+        # reset, so a deadline that lands mid-answer still returns something.
+        best, stable = "", None
         try:
-            while time.monotonic() < deadline:
-                await asyncio.sleep(self.site.poll_s)
-                if await self._busy_now():
-                    stable = None
-                    continue
-                reply = await self._new_reply(before)
-                if reply is None:
-                    continue  # ours hasn't rendered yet
-                text_now = await self._read(reply)
-                if text_now is None or self._echoes_prompt(text_now):
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(self.site.poll_s, remaining))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # Every DOM call below auto-waits up to 30s on its own, which
+                # would sail past the deadline the loop just checked.
+                text_now, busy = await asyncio.wait_for(
+                    self._poll(before), timeout=remaining
+                )
+                if text_now is not None:
+                    best = text_now  # keep it even mid-generation
+                if busy or text_now is None:
+                    stable = None  # still typing, or ours has not rendered yet
                     continue
                 if text_now == stable:
                     return text_now  # finished: not busy, and unchanged text
                 stable = text_now
+        except asyncio.TimeoutError:
+            pass  # out of budget mid-read; `best` still holds what we had
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the page died mid-read
             self.alive = False
             print(f"[{self.site.name}] tab {self.label} died while reading: {type(exc).__name__}")
-        # Timed out mid-stream: a partial answer still beats nothing, because
-        # the verifier can grade it and may repair it on the next attempt.
-        return stable or ""
+        return best
+
+    async def _poll(
+        self, before: tuple[int, Optional[str]]
+    ) -> tuple[Optional[str], bool]:
+        """One read round: ``(text_or_None, still_generating)``.
+
+        The read happens whether or not the model is still typing. Checking busy
+        first and returning early — the obvious shape — means a reply that never
+        stops streaming before the deadline is never read at all, so a timeout
+        mid-answer returns nothing instead of the part that had arrived.
+        """
+        busy = await self._busy_now()
+        reply = await self._new_reply(before)
+        if reply is None:
+            return None, busy  # ours hasn't rendered yet
+        text_now = await self._read(reply)
+        if text_now is None or await self._echoes_prompt(reply, text_now):
+            return None, busy
+        return text_now, busy
 
     # -- DOM helpers -------------------------------------------------------- #
     async def _first_match(self, candidates: Sequence[str]) -> Optional[str]:
@@ -307,8 +397,21 @@ class _Tab:
         return None
 
     async def _messages(self):
-        selector = await self._first_match(self.site.assistant)
-        return None if selector is None else self._page.locator(selector)
+        """Assistant messages, through ONE selector for the whole send().
+
+        Latched on first match and reset by ``send()``. Re-resolving per call
+        would let the fingerprint count nodes matching one candidate and the
+        poll count nodes matching another, and ``_new_reply`` compares those two
+        numbers directly — so a site with several viable candidates and no
+        message id (claude.ai exactly) would mis-detect replies on every repair
+        round. Latching per send, not per tab, still lets a later send pick a
+        better candidate once the DOM settles.
+        """
+        if self._assistant is None:
+            self._assistant = await self._first_match(self.site.assistant)
+            if self._assistant is None:
+                return None
+        return self._page.locator(self._assistant)
 
     async def _fingerprint(self) -> tuple[int, Optional[str]]:
         """How the conversation looked before we submitted."""
@@ -351,15 +454,27 @@ class _Tab:
                 return True
         return False
 
-    def _echoes_prompt(self, text: str) -> bool:
+    async def _echoes_prompt(self, reply, text: str) -> bool:
         """Guard against an assistant selector that matches the USER's message.
 
         Without this the miner would submit its own prompt back as the answer —
         a total failure that produces no error and no empty reply, just a
         permanent zero. Cheap to check, and it names the fix in the log.
+
+        Checked against the WHOLE message, not the text ``_read`` returned:
+        ``_read`` prefers the last ``pre code`` block, and task statements
+        routinely contain fenced code, so comparing against the extracted block
+        would never match the prompt's opening words and the guard would never
+        fire — precisely when it is needed.
         """
         head = " ".join(self._sent.split())[:80]
-        if not head or not " ".join(text.split()).startswith(head):
+        if not head:
+            return False
+        try:
+            whole = await reply.inner_text()
+        except Exception:  # noqa: BLE001 - fall back to what we already read
+            whole = text
+        if not " ".join(whole.split()).startswith(head):
             return False
         if not self._warned_echo:
             self._warned_echo = True
@@ -379,141 +494,84 @@ class _Tab:
         text = (await reply.inner_text()).strip()
         return text or None
 
+    @property
+    def provider(self) -> str:
+        """Which model answers in this tab — 'claude' or 'chatgpt'."""
+        return self.site.name
+
     async def close(self) -> None:
-        """Release the tab back to the pool (the tab itself is reused)."""
+        """Hand the tab back. Reused if it is still healthy, retired if not."""
         await self._pool.release(self)
 
     async def dispose(self) -> None:
+        """Close this tab's page. Safe to call twice."""
         try:
             await self._page.close()
         except Exception:  # noqa: BLE001 - the browser may already be gone
             pass
 
 
-def normalize_cdp(value: str | Sequence[str] | None) -> list[str]:
-    """Turn ``"9222"`` / ``"host:9222"`` / a full URL / a list into CDP URLs.
+class Browser(NamedTuple):
+    """One browser you started, and which provider is signed in to it."""
 
-    A bare port is the common case, so ``9222`` means ``http://127.0.0.1:9222``.
-    """
-    if value is None:
-        return []
-    parts = value if isinstance(value, (list, tuple)) else str(value).replace(",", " ").split()
-    endpoints: list[str] = []
-    for raw in parts:
-        item = str(raw).strip()
-        if not item:
-            continue
-        if "://" in item:
-            endpoints.append(item.rstrip("/"))
-        elif ":" in item:
-            endpoints.append(f"http://{item}")
-        else:
-            endpoints.append(f"http://127.0.0.1:{item}")
-    return endpoints
+    endpoint: str
+    site: Site
 
 
-class BrowserPool:
-    """Tabs leased one per task, from one of two browser sources.
+# Written into `window.name` on every tab this fleet opens. It is per-tab, it
+# survives navigation, and it reads back as "" on tabs you opened yourself — so
+# a restart can find its own leftovers without ever touching yours.
+TAB_MARK = "hone-miner"
 
-    **Launch mode (default).** Playwright launches Firefox against a persistent
-    profile directory. Simple — one process, no ports — but a Playwright-driven
-    Firefox is a distinctive automation build, and providers that fingerprint
-    aggressively (Google sign-in, above all) refuse it.
 
-    **Attach mode.** You start an ordinary Chrome/Chromium yourself with
-    ``--remote-debugging-port`` and log in by hand; the pool attaches over CDP.
-    Because *you* launched it, it is not in automation mode — ``navigator.webdriver``
-    is false and it looks like the normal browser it is, which is what gets past
-    those sign-in checks. Pass ``cdp=[...]`` (or set ``<PREFIX>_CDP``) to select
-    it. Only Chromium exposes CDP; Firefox cannot be attached to this way.
+class BrowserFleet:
+    """Every tab across every browser you started, leased one per task.
 
-    Either way, each source (profile *or* browser) is expected to hold a DIFFERENT
-    account: accounts are the rate-limit unit, so N sources give N times the
-    throughput. Tabs within one source share that account and its limit.
+    One fleet, not one pool per provider. A task does not care whether it is
+    answered by Claude or ChatGPT, so the useful unit is "the next free tab in
+    the fleet" — which spreads load over your accounts, the thing that actually
+    limits throughput. Tabs are handed out first-in-first-out and returned to the
+    back, so leases rotate; they are also enqueued browser-interleaved, so two
+    tasks arriving together land on two different accounts rather than doubling
+    up on one.
+
+    Nothing here launches or closes a browser. See the module docstring for why
+    that is the whole point rather than a limitation.
     """
 
     def __init__(
         self,
-        site: Site,
-        profiles: list[str],
+        browsers: Sequence[Browser],
         *,
-        tabs_per_profile: int = 2,
-        headless: bool = True,
-        cdp: str | Sequence[str] | None = None,
+        tabs_per_browser: int = 2,
     ):
-        self.site = site
-        self._cdp = normalize_cdp(cdp)
-        self._attach = bool(self._cdp)
-        self._profiles = [str(Path(p).expanduser()) for p in profiles] or [
-            str(default_profile(site.name, 1))
-        ]
-        self._tabs_per_profile = max(1, int(tabs_per_profile))
-        self._headless = bool(headless)
+        self._browsers_wanted = list(browsers)
+        self._tabs_per_browser = max(1, int(tabs_per_browser))
         self._pw = None
         self._contexts: list[Any] = []
-        self._browsers: list[Any] = []  # CDP-attached; disconnected, never killed
+        self._connections: list[Any] = []  # attached; disconnected, never closed
+        # Every tab ever handed out, so shutdown can close the pages this fleet
+        # opened in YOUR browsers — including the ones currently leased, which a
+        # free-queue-only sweep would leave behind.
+        self._tabs: list[_Tab] = []
         self._free: asyncio.Queue[_Tab] = asyncio.Queue()
         self._size = 0
         self._lost = 0
+        self._reclaimed = 0
         self._started = False
+        self._closing = False
+        # How long open() waits for a free tab before saying so. Unbounded would
+        # be worse: a caller with its own deadline gets cancelled, and a caller
+        # without one hangs with no explanation.
+        self._lease_timeout_s = float(os.environ.get("MINER_TAB_WAIT_S", "120"))
         self._start_lock = asyncio.Lock()
 
-    def _login_hint(self, source: str = "") -> str:
-        """How to fix 'not logged in', worded for whichever mode is in use."""
-        if self._attach:
-            where = f" on {source}" if source else ""
-            return (
-                f"open {self.site.url} in the Chrome{where} you started with "
-                f"--remote-debugging-port and sign in by hand"
-            )
-        return f"python -m solvers.login {self.site.name}" + (
-            f" --profile {source}" if source else ""
-        )
-
-    async def _spawn(self, context, label: str, source: str = "") -> Optional[_Tab]:
-        """Open one logged-in tab, or return None with a reason logged."""
-        site = self.site
-        page = None
-        try:
-            page = await context.new_page()
-            await page.goto(site.url, wait_until="domcontentloaded")
-            composer = await wait_for_any(page, site.composer, site.ready_timeout_ms)
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"[{site.name}] WARN: tab {label} never loaded {site.url} "
-                f"({type(exc).__name__}) — is it logged in? {self._login_hint(source)}"
-            )
-            return None
-        if composer is None:
-            print(
-                f"[{site.name}] WARN: tab {label}: no composer selector matched. "
-                f"Either it is not logged in ({self._login_hint(source)}), or the DOM "
-                f"changed — run `python -m solvers.doctor {site.name}` and set "
-                f"{site.env_prefix}_COMPOSER."
-            )
-            try:
-                await page.close()
-            except Exception:  # noqa: BLE001
-                pass
-            return None
-        checked = replace(
-            site,
-            send=await valid_selectors(page, site.send, site.name, "send"),
-            assistant=await valid_selectors(page, site.assistant, site.name, "assistant"),
-            # Chained so a typo'd busy override is named, not just dropped.
-            busy=await usable_busy_selectors(
-                page,
-                await valid_selectors(page, site.busy, site.name, "busy"),
-                site.name,
-            ),
-        )
-        return _Tab(self, page, context, label, site=checked, composer=composer)
-
+    # -- setup -------------------------------------------------------------- #
     async def start(self) -> None:
-        """Attach to the browsers and fill the tab pool. Idempotent.
+        """Attach to every browser and fill the fleet. Idempotent.
 
         Safe to call explicitly at startup, and called lazily by ``open()`` so
-        the pool also works under a host that has no startup hook — a local test
+        the fleet also works under a host that has no startup hook — a local test
         harness, for instance. Without that, a host which never called start()
         would leave ``open()`` blocked on an empty queue and every solve would
         quietly return nothing.
@@ -526,155 +584,334 @@ class BrowserPool:
 
     async def _connect(self) -> None:
         async_playwright = import_playwright()
-        site = self.site
         self._pw = await async_playwright().start()
-        # (context, label_base, source_description) per browser source.
-        sources = (
-            [(await self._attach_cdp(e), self._label(e), e) for e in self._cdp]
-            if self._attach
-            else [(await self._open_profile(p), Path(p).name, p) for p in self._profiles]
-        )
-        for context, label_base, source in sources:
+        try:
+            await self._fill()
+        except Exception:
+            # Started the driver, then failed. Without this the driver process
+            # and every attached connection leak, and the next open() — start()
+            # having left _started False — would spawn a second set.
+            await self._teardown()
+            raise
+
+    async def _fill(self) -> None:
+        # Spawned per browser, then enqueued interleaved: with two tabs each
+        # across browsers A and B the queue is A1, B1, A2, B2, so the first two
+        # concurrent tasks use two different accounts instead of hammering one.
+        columns: list[list[_Tab]] = []
+        for browser in self._browsers_wanted:
+            context = await self._attach(browser)
             if context is None:
                 continue
             self._contexts.append(context)
-            for i in range(self._tabs_per_profile):
-                tab = await self._spawn(context, f"{label_base}#{i + 1}", source)
-                if tab is None:
-                    continue
-                await self._free.put(tab)
-                self._size += 1
-                print(f"[{site.name}] tab {tab.label} ready")
+            await self._reclaim(context, browser)
+            label = browser.endpoint.split("://", 1)[-1]
+            spawned: list[_Tab] = []
+            for i in range(self._tabs_per_browser):
+                tab = await self._spawn(context, browser, f"{label}#{i + 1}")
+                if tab is not None:
+                    spawned.append(tab)
+                    print(f"[{browser.site.name}] tab {tab.label} ready")
+            if spawned:
+                columns.append(spawned)
+
+        for row in zip_longest(*columns):
+            for tab in row:
+                if tab is not None:
+                    self._free.put_nowait(tab)
+                    self._size += 1
+
         if self._size == 0:
-            how = (
-                f"start Chrome with --remote-debugging-port, {self._login_hint()}, "
-                "and check the endpoint is reachable"
-                if self._attach
-                else f"log in once with:\n    {self._login_hint()}"
+            wanted = ", ".join(
+                f"{b.site.name}@{b.endpoint}" for b in self._browsers_wanted
+            ) or "(none configured)"
+            raise RuntimeError(
+                f"No usable tabs. Wanted: {wanted}. To fix: start each browser "
+                f"with --remote-debugging-port (scripts/start_debug_browser.sh "
+                f"does it), sign in to the provider by hand, and confirm the "
+                f"endpoint answers."
             )
-            raise RuntimeError(f"No usable {site.name} tabs. To fix: {how}")
-        kind = "browser" if self._attach else "profile"
-        print(
-            f"[{site.name}] pool ready: {self._size} tab(s) "
-            f"across {len(self._contexts)} {kind}(s)"
-        )
+        print(f"[fleet] ready: {self._size} tab(s) across {self._describe()}")
 
-    @staticmethod
-    def _label(endpoint: str) -> str:
-        """A short, stable tab-label base from a CDP endpoint (its host:port)."""
-        return endpoint.split("://", 1)[-1]
+    def _describe(self) -> str:
+        counts: dict[str, int] = {}
+        for tab in self._tabs:
+            counts[tab.site.name] = counts.get(tab.site.name, 0) + 1
+        return ", ".join(f"{n}×{c}" for c, n in sorted(counts.items())) or "nothing"
 
-    async def _attach_cdp(self, endpoint: str):
-        """Attach to a browser you started yourself, or explain why it could not.
-
-        The browser is NOT owned here: ``aclose`` disconnects but never kills it,
-        so restarting the miner keeps your hand-made login.
-        """
-        site = self.site
+    async def _attach(self, browser: Browser):
+        """Attach to a browser you started yourself, or explain why it could not."""
+        site = browser.site
         try:
-            browser = await self._pw.chromium.connect_over_cdp(endpoint)
+            connection = await self._pw.chromium.connect_over_cdp(browser.endpoint)
         except Exception as exc:  # noqa: BLE001
             print(
-                f"[{site.name}] WARN: cannot attach to {endpoint}: "
+                f"[{site.name}] WARN: cannot attach to {browser.endpoint}: "
                 f"{str(exc).splitlines()[0]}\n"
                 f"         Start Chrome/Chromium with --remote-debugging-port and a "
-                f"--user-data-dir, and confirm {endpoint}/json/version answers."
+                f"--user-data-dir, and confirm {browser.endpoint}/json/version answers."
             )
             return None
-        self._browsers.append(browser)
-        return browser.contexts[0] if browser.contexts else await browser.new_context()
+        self._connections.append(connection)
+        return (
+            connection.contexts[0]
+            if connection.contexts
+            else await connection.new_context()
+        )
 
-    async def _open_profile(self, profile: str):
-        """Launch Firefox on one profile directory, or explain why it could not."""
-        site = self.site
-        if not Path(profile).is_dir():
+    async def _reclaim(self, context, browser: Browser) -> None:
+        """Close tabs a previous run left behind in this browser.
+
+        A miner under a process supervisor gets SIGKILLed sooner or later, and an
+        unclean exit never runs shutdown — so every restart would add another set
+        of dead tabs to a browser that stays up for weeks. Ours are identifiable
+        because ``_spawn`` stamps ``window.name``; yours never are, so signing-in
+        tabs are never touched.
+        """
+        found = 0
+        for page in list(getattr(context, "pages", []) or []):
+            try:
+                if not str(await page.evaluate("window.name") or "").startswith(TAB_MARK):
+                    continue
+                await page.close()
+            except Exception:  # noqa: BLE001 - a page we cannot ask about is not ours
+                continue
+            found += 1
+        self._reclaimed += found
+        if found:
             print(
-                f"[{site.name}] WARN: no profile at {profile}. Log in once with:\n"
-                f"    python -m solvers.login {site.name} --profile {profile}"
+                f"[{browser.site.name}] reclaimed {found} tab(s) at {browser.endpoint} "
+                f"left by an earlier run of this miner"
             )
-            return None
-        try:
-            return await self._pw.firefox.launch_persistent_context(
-                profile, headless=self._headless, viewport={"width": 1280, "height": 900}
-            )
-        except Exception as exc:  # noqa: BLE001
-            detail = str(exc)
-            # A profile can be open in exactly one process. This is the mistake
-            # people make: leaving the login helper running, then starting the
-            # miner, and reading the raw Playwright error as a crash.
-            hint = (
-                "\n         That profile is already open in another process — "
-                "close the login helper (or the other miner) first."
-                if "profile" in detail.lower() or "lock" in detail.lower()
-                else ""
-            )
-            print(f"[{site.name}] WARN: cannot open {profile}: {detail.splitlines()[0]}{hint}")
-            return None
 
-    async def open(self) -> _Tab:
-        """Lease a tab and put it in a fresh conversation."""
-        if not self._started:
-            await self.start()
-        tab = await self._free.get()
+    async def _spawn(self, context, browser: Browser, label: str) -> Optional[_Tab]:
+        """Open one signed-in tab, or return None with a reason logged."""
+        site, page = browser.site, None
+        hint = (
+            f"open {site.url} in the Chrome on {browser.endpoint} and sign in by hand"
+        )
         try:
-            await tab.start()
-        except Exception:
-            # start() already marked it dead; release() disposes and replaces it.
-            await self.release(tab)
-            raise
+            page = await context.new_page()
+            await page.goto(site.url, wait_until="domcontentloaded")
+            # Stamp it before anything can go wrong later, so even a tab that
+            # fails its checks below is reclaimable after an unclean exit.
+            await page.evaluate(f"window.name = {TAB_MARK + '/' + site.name!r}")
+            composer = await wait_for_any(page, site.composer, site.ready_timeout_ms)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[{site.name}] WARN: tab {label} never loaded {site.url} "
+                f"({type(exc).__name__}) — is it signed in? {hint}"
+            )
+            await _close_quietly(page)
+            return None
+        if composer is None:
+            print(
+                f"[{site.name}] WARN: tab {label}: no composer selector matched. "
+                f"Either it is not signed in ({hint}), or the DOM changed — run "
+                f"`python -m solvers.doctor {site.name}` and set "
+                f"{site.env_prefix}_COMPOSER."
+            )
+            await _close_quietly(page)
+            return None
+        checked = replace(
+            site,
+            send=await valid_selectors(page, site.send, site.name, "send"),
+            assistant=await valid_selectors(page, site.assistant, site.name, "assistant"),
+            # Chained so a typo'd busy override is named, not just dropped.
+            busy=await usable_busy_selectors(
+                page,
+                await valid_selectors(page, site.busy, site.name, "busy"),
+                site.name,
+            ),
+        )
+        if not checked.assistant:
+            # Every assistant candidate was unusable — a one-entry .env override
+            # with a typo does this. Such a tab can never find a reply, so it
+            # would burn the whole budget on every request and return nothing,
+            # while still being logged as ready. Refuse it loudly instead.
+            print(
+                f"[{site.name}] WARN: tab {label}: no usable assistant selector "
+                f"(tried {list(site.assistant)}). Fix {site.env_prefix}_ASSISTANT — "
+                f"without one this tab could never read a reply."
+            )
+            await _close_quietly(page)
+            return None
+        tab = _Tab(
+            self, page, context, label, checked,
+            composer=composer, source=browser.endpoint,
+        )
+        self._tabs.append(tab)
         return tab
 
+    # -- leasing ------------------------------------------------------------ #
+    async def open(
+        self, avoid: Optional[str] = None, timeout_s: Optional[float] = None
+    ) -> _Tab:
+        """Lease the next free tab and put it in a fresh conversation.
+
+        ``avoid`` asks for a different provider than the one named — used to get
+        a second opinion from the other model. It is a preference, not a
+        guarantee: if every free tab is the avoided provider, one of those is
+        still better than failing the task.
+        """
+        if not self._started:
+            await self.start()
+        wait_s = self._lease_timeout_s if timeout_s is None else timeout_s
+        last: Optional[BaseException] = None
+        for _ in range(2):
+            tab = await self._lease(avoid, wait_s)
+            tab.leased = True
+            try:
+                await tab.start()
+                return tab
+            except asyncio.CancelledError:
+                # CancelledError is a BaseException, so the `except Exception`
+                # below would miss it and the tab would be lost: never requeued,
+                # never disposed, still counted. Enough cancellations and the
+                # fleet bleeds to zero and open() blocks on an empty queue while
+                # /health stays green. Requeue synchronously — awaiting while
+                # unwinding a cancellation is not guaranteed to complete.
+                tab.leased = False
+                if tab.alive:
+                    self._free.put_nowait(tab)
+                else:
+                    self._retire(tab)
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # start() already marked it dead; release() disposes and replaces
+                # it, so the second pass gets the healthy replacement rather than
+                # failing the task while a good tab sits idle.
+                last = exc
+                await self.release(tab)
+        raise last if last is not None else RuntimeError("could not lease a tab")
+
+    async def _lease(self, avoid: Optional[str], wait_s: float) -> _Tab:
+        """Next free tab, preferring one whose provider is not ``avoid``."""
+        try:
+            tab = await asyncio.wait_for(self._free.get(), timeout=wait_s)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"no free tab within {wait_s:g}s — every tab is busy. Add a "
+                f"browser, raise <PROVIDER>_TABS_PER_BROWSER, or lower "
+                f"MINER_MAX_CONCURRENT_REQUESTS."
+            ) from None
+        if avoid is None or tab.site.name != avoid:
+            return tab
+        # Rotate past same-provider tabs, bounded by what is queued right now so
+        # this cannot spin, and never dropping the one we already hold.
+        for _ in range(self._free.qsize()):
+            self._free.put_nowait(tab)
+            tab = self._free.get_nowait()
+            if tab.site.name != avoid:
+                break
+        return tab
+
+    def _retire(self, tab: _Tab) -> None:
+        """Book-keeping for a tab that is gone. No I/O, so it is cancel-safe."""
+        self._lost += 1
+        if tab in self._tabs:
+            self._tabs.remove(tab)
+        self._size = max(0, self._size - 1)
+
     async def release(self, tab: _Tab) -> None:
-        """Return a tab to the pool, or retire and replace a dead one.
+        """Return a tab to the fleet, or retire and replace a dead one.
 
         Recycling a dead tab is the failure that matters here: it would fail
         every future request leased onto it, so capacity is rebuilt instead.
         """
+        if not tab.leased:
+            # Already released. Queuing it again would hand one page to two
+            # tasks, which corrupts both answers and is near-impossible to
+            # diagnose from the outside.
+            return
+        tab.leased = False
+        if self._closing:
+            # A solve cancelled by shutdown releases its tab AFTER aclose() has
+            # run. Requeuing then would put a closed page back in the fleet and
+            # respawning would talk to a severed connection, driving _size
+            # negative and blaming a login for what is purely ordering.
+            await tab.dispose()
+            return
         if tab.alive:
             await self._free.put(tab)
             return
-        self._lost += 1
         await tab.dispose()
-        replacement = await self._spawn(tab.context, tab.label)
+        self._retire(tab)
+        browser = Browser(tab.source, tab.site)
+        replacement = await self._spawn(tab.context, browser, tab.label)
         if replacement is not None:
             await self._free.put(replacement)
-            print(f"[{self.site.name}] tab {tab.label} replaced after failure")
+            self._size += 1  # _retire took one off; this puts the capacity back
+            print(f"[{tab.site.name}] tab {tab.label} replaced after failure")
             return
-        self._size -= 1
         print(
-            f"[{self.site.name}] WARN: tab {tab.label} retired and could not be "
+            f"[{tab.site.name}] WARN: tab {tab.label} retired and could not be "
             f"replaced; {self._size} tab(s) left"
         )
 
+    # -- reporting and shutdown --------------------------------------------- #
     def stats(self) -> dict[str, Any]:
+        per_provider: dict[str, int] = {}
+        for tab in self._tabs:
+            per_provider[tab.site.name] = per_provider.get(tab.site.name, 0) + 1
         return {
-            "backend": self.site.name,
-            "mode": "attach" if self._attach else "launch",
             "tabs": self._size,
             "idle": self._free.qsize(),
-            "sources": len(self._contexts),
-            "headless": None if self._attach else self._headless,
+            "by_provider": per_provider,
+            "browsers": len(self._contexts),
+            "endpoints": [b.endpoint for b in self._browsers_wanted],
             "lost": self._lost,
+            "reclaimed": self._reclaimed,
         }
 
     async def aclose(self) -> None:
-        if not self._started:
+        """Close the tabs this fleet opened, then disconnect. Never closes a browser."""
+        await self._teardown()
+
+    async def _teardown(self) -> None:
+        """Undo whatever was set up, from any stage. Safe to call twice.
+
+        Keyed off ``_pw`` rather than ``_started`` so a start() that failed
+        part-way is still cleaned up — that is the path where the driver
+        process would otherwise be left running.
+        """
+        if self._pw is None:
             return
+        # Announce it before any awaiting: a solve cancelled by this shutdown
+        # releases its tab part-way through, and release() has to know not to
+        # requeue a page that is about to be closed.
+        self._closing = True
+        # Drain the queue first so nothing is handed out mid-shutdown, then
+        # close every tab this fleet opened — leased ones included, or they would
+        # be left open in your browser.
         while not self._free.empty():
-            await (await self._free.get()).dispose()
-        if self._attach:
-            # Disconnect, do NOT kill: you own these browsers, and the login in
-            # them is what we do not want to throw away on a miner restart.
-            for browser in self._browsers:
-                try:
-                    await browser.close()
-                except Exception:  # noqa: BLE001
-                    pass
-        else:
-            for context in self._contexts:
-                try:
-                    await context.close()  # also stops the Firefox process
-                except Exception:  # noqa: BLE001
-                    pass
-        if self._pw is not None:
+            self._free.get_nowait()
+        for tab in self._tabs:
+            tab.alive = False
+            await tab.dispose()
+        self._tabs.clear()
+        for connection in self._connections:
+            try:
+                # For a CDP-attached browser this severs the connection; the
+                # browser process you started keeps running, with your login.
+                await connection.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._connections.clear()
+        self._contexts.clear()
+        self._size = 0
+        try:
             await self._pw.stop()
+        finally:
+            self._pw = None
+            self._started = False
+            self._closing = False
+
+
+async def _close_quietly(page) -> None:
+    if page is None:
+        return
+    try:
+        await page.close()
+    except Exception:  # noqa: BLE001 - do not leave a stray tab behind
+        pass

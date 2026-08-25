@@ -6,20 +6,23 @@ miner, and by the time the score drops the zeros are already inside the
 
     cd examples/custom_miner
     python -m solvers.doctor claude
-    python -m solvers.doctor claude --probe      # also send a real prompt
-    python -m solvers.doctor chatgpt --profile ~/.gpt-2
+    python -m solvers.doctor claude --probe        # also send a real prompt
+    python -m solvers.doctor chatgpt --cdp 9223    # a second browser
 
-It opens your logged-in Firefox profile and reports, for every role, which
-candidate selector your page actually has,
-and it flags the three mistakes that matter: no composer (not logged in, or the
-DOM moved), a "still generating" selector that matches an idle page (every
-answer would look unfinished forever), and an assistant selector that already
-matches in an empty conversation (it is matching something that is not a reply
-— possibly your own message, which would make the miner answer with its own
-prompt). Every role is overridable in ``.env`` with ``|`` between candidates.
+It attaches to the same Chrome the miner would, opens its own tab, and reports
+for every role which candidate selector your page actually has. It flags the
+three mistakes that matter: no composer (not signed in, or the DOM moved), a
+"still generating" selector that matches an idle page (every answer would look
+unfinished forever), and an assistant selector that already matches in an empty
+conversation (it is matching something that is not a reply — possibly your own
+message, which would make the miner answer with its own prompt). Every role is
+overridable in ``.env`` with ``|`` between candidates.
 
 ``--probe`` goes further and drives the real ``_Tab.send`` path with a trivial
 prompt, so what you see is exactly what the miner would read.
+
+Safe to run while nothing else is using the browser: it opens a fresh tab,
+closes that tab, and disconnects without closing your browser.
 """
 
 from __future__ import annotations
@@ -30,11 +33,9 @@ import os
 import sys
 from pathlib import Path
 
-from typing import Optional
-
 from .browser_pool import (
+    DEFAULT_CDP_PORT,
     Site,
-    default_profile,
     import_playwright,
     normalize_cdp,
     usable_busy_selectors,
@@ -94,58 +95,36 @@ async def _report_role(
     return True
 
 
-async def _acquire(pw, site, cdp: Optional[str], profile: str, headless: bool):
-    """Get a browser context the same way the miner would, and a teardown.
+async def _attach(pw, site, endpoint: str):
+    """Attach the way the miner does, or print why it could not.
 
-    Returns ``(context, teardown)`` or ``(None, None)`` after printing why.
-    In attach mode the teardown only disconnects; it never kills your browser.
+    Returns the browser, or None. The caller disconnects it; nothing here ever
+    closes the browser you started.
     """
-    if cdp:
-        endpoint = normalize_cdp(cdp)[0]
-        print(f"[doctor] {site.name}: attaching over CDP to {endpoint}")
-        try:
-            browser = await pw.chromium.connect_over_cdp(endpoint)
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"[doctor] FAIL: cannot attach: {str(exc).splitlines()[0]}\n"
-                f"         Start Chrome with --remote-debugging-port and confirm "
-                f"{endpoint}/json/version answers."
-            )
-            return None, None
-        context = browser.contexts[0] if browser.contexts else await browser.new_context()
-        return context, browser.close
-
-    print(f"[doctor] {site.name}: opening profile {profile}")
-    if not Path(profile).is_dir():
-        print(
-            f"[doctor] FAIL: no profile there. Log in once with:\n"
-            f"         python -m solvers.login {site.name} --profile {profile}"
-        )
-        return None, None
+    print(f"[doctor] {site.name}: attaching over CDP to {endpoint}")
     try:
-        context = await pw.firefox.launch_persistent_context(
-            profile, headless=headless, viewport={"width": 1280, "height": 900}
-        )
+        return await pw.chromium.connect_over_cdp(endpoint)
     except Exception as exc:  # noqa: BLE001
         print(
-            f"[doctor] FAIL: cannot open the profile: {str(exc).splitlines()[0]}\n"
-            "         A profile can be open in one process at a time — stop the "
-            "miner (or the login helper) and try again."
+            f"[doctor] FAIL: cannot attach: {str(exc).splitlines()[0]}\n"
+            f"         Start Chrome with --remote-debugging-port "
+            f"(scripts/start_debug_browser.sh does it) and confirm "
+            f"{endpoint}/json/version answers."
         )
-        return None, None
-    return context, context.close
+        return None
 
 
-async def run(name: str, cdp: Optional[str], profile: str, probe: bool, headless: bool) -> int:
+async def run(name: str, cdp: str, probe: bool) -> int:
     site = _site(name)
+    endpoint = normalize_cdp(cdp)[0]
     async_playwright = import_playwright()
     pw = await async_playwright().start()
     try:
-        context, teardown = await _acquire(pw, site, cdp, profile, headless)
-        if context is None:
+        browser = await _attach(pw, site, endpoint)
+        if browser is None:
             return 2
-        # Always a fresh tab, so in attach mode the doctor never disturbs a tab
-        # you are looking at.
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        # Our own tab, so the doctor never disturbs one you are looking at.
         page = await context.new_page()
         healthy = True
         try:
@@ -155,12 +134,10 @@ async def run(name: str, cdp: Optional[str], profile: str, probe: bool, headless
             if composer is None:
                 print("[doctor] FAIL: no composer selector matched.")
                 await _report_role(page, "composer", site.composer)
-                fix = (
-                    f"open {site.url} in the Chrome on {cdp} and sign in by hand"
-                    if cdp
-                    else f"python -m solvers.login {site.name} --profile {profile}"
+                print(
+                    f"         Most often it is not signed in: open {site.url} in the "
+                    f"Chrome on {endpoint} and sign in by hand."
                 )
-                print(f"         Most often it is not logged in: {fix}")
                 return 1
             print(f"[doctor] page ready (composer: {composer})\n")
             healthy &= await _report_role(page, "composer", site.composer)
@@ -193,15 +170,13 @@ async def run(name: str, cdp: Optional[str], profile: str, probe: bool, headless
             if probe:
                 healthy &= await _probe(page, site, composer, kept)
         finally:
-            # Close only the tab we opened; teardown disconnects (attach) or
-            # closes (launch) the browser without touching your other tabs.
-            if cdp:
-                try:
-                    await page.close()
-                except Exception:  # noqa: BLE001
-                    pass
+            # Close only our tab, then disconnect. Your browser keeps running.
             try:
-                await teardown()
+                await page.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await browser.close()
             except Exception:  # noqa: BLE001
                 pass
         print(f"\n[doctor] {'OK' if healthy else 'PROBLEMS FOUND (see !! above)'}")
@@ -249,15 +224,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("backend", choices=("claude", "chatgpt"))
     parser.add_argument(
         "--cdp", default=None,
-        help="attach over CDP to a Chrome you started (e.g. 9222); default is "
-        "<PREFIX>_CDP from .env, or Firefox-launch if neither is set",
+        help=f"CDP endpoint of the Chrome you started: a port, host:port or URL "
+        f"(default: <BACKEND>_CDP from .env, else {DEFAULT_CDP_PORT})",
     )
-    parser.add_argument("--profile", default=None, help="Firefox profile directory")
     parser.add_argument(
         "--probe", action="store_true", help="also send a real prompt and read it back"
-    )
-    parser.add_argument(
-        "--headed", action="store_true", help="show the window (needs a display)"
     )
     args = parser.parse_args(argv)
     # preflight.py sits beside custom_miner.py, one level above this package.
@@ -269,16 +240,11 @@ def main(argv: list[str] | None = None) -> int:
     if load_env_file(found):
         print(f"[doctor] loaded {found}")
 
-    # Check the same thing the miner will: attach if CDP is configured, else the
-    # first Firefox profile it would use.
-    prefix = args.backend.upper()
-    cdp = args.cdp or os.environ.get(f"{prefix}_CDP") or None
-    profile = args.profile
-    if profile is None:
-        listed = os.environ.get(f"{prefix}_PROFILES", "").replace(",", " ").split()
-        profile = listed[0] if listed else str(default_profile(args.backend, 1))
-    profile = str(Path(profile).expanduser())
-    return asyncio.run(run(args.backend, cdp, profile, args.probe, not args.headed))
+    # Check the same browser the miner would: the first endpoint it would use.
+    cdp = args.cdp or os.environ.get(f"{args.backend.upper()}_CDP") or str(DEFAULT_CDP_PORT)
+    if not normalize_cdp(cdp):
+        raise SystemExit(f"--cdp {cdp!r} is not a port, host:port or URL")
+    return asyncio.run(run(args.backend, cdp, args.probe))
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@
                                 --example '{"args": [5], "expected": 120}'
 
 This is the layer worth testing first, because it is where nearly all the risk
-lives: Firefox launching, the profile still being logged in, the selectors
+lives: attaching to your browser, it still being signed in, the selectors
 matching, the model answering, and the self-verification loop grading that
 answer with the validator's own executor.
 
@@ -38,7 +38,7 @@ from preflight import require_linux  # noqa: E402
 require_linux("The solver test")
 
 from solvers.config import find_env_file, load_env_file  # noqa: E402
-from solvers.multi import build_solver, warm_up  # noqa: E402
+from solvers.roster import build_solver, warm_up  # noqa: E402
 
 # A task the model should get right first try, with examples that catch the
 # classic off-by-one. If this one does not verify, the problem is the setup.
@@ -111,7 +111,7 @@ async def main(args: argparse.Namespace) -> int:
         return 1
     print(
         "\n[try] FAIL — nothing came back. In order of likelihood:\n"
-        "      1. the profile is not logged in   -> python -m solvers.login <backend>\n"
+        "      1. the browser is not signed in   -> sign in to the provider in it\n"
         "      2. a selector no longer matches   -> python -m solvers.doctor <backend> --probe\n"
         "      3. the deadline was too short     -> --timeout 300"
     )

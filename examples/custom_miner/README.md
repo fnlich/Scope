@@ -63,25 +63,37 @@ run_custom_miner(MySolver())
 ## Run
 
 ```bash
-# Debian/Ubuntu — Python 3.12, the build tools the chain wheels expect, and
-# (for the browser backends) a virtual screen to log in on.
+# Debian/Ubuntu — Python, the build tools the chain wheels expect, curl, and
+# (for the browser backends) a virtual screen to sign in on.
 sudo apt-get update && sudo apt-get install -y \
-    python3.12 python3.12-venv build-essential pkg-config libssl-dev \
-    xvfb x11vnc
+    python3 python3-venv build-essential pkg-config libssl-dev \
+    curl xvfb x11vnc
 
-python3.12 -m venv .venv && . .venv/bin/activate
-pip install -e '.[chain,miner]'
+python3 -m venv .venv && . .venv/bin/activate   # needs Python 3.10-3.12
+pip install -e '.[chain,miner,dev]'             # dev brings pytest
 cp .env.example .env        # set NETUID, SUBTENSOR_NETWORK, WALLET_NAME,
-                            # WALLET_HOTKEY, AXON_PORT, AXON_EXTERNAL_IP, MY_APP_URL
+                            # WALLET_HOTKEY, AXON_PORT, AXON_EXTERNAL_IP
+echo 'MY_APP_URL=http://127.0.0.1:9000/solve' >> .env   # Option 1 only
 python examples/custom_miner/custom_miner.py
 ```
 
+`requires-python` is `>=3.10,<3.13`. Ubuntu 24.04 ships 3.12; Ubuntu 22.04 and
+Debian 12 ship 3.10/3.11, which are fine. Include `dev` in the extras or
+`pytest` will not be installed and the bare `pytest` on your PATH will be the
+system one, running against a different interpreter with none of these
+dependencies.
+
 Register the hotkey first (see `scripts/register_testnet.sh`), open the axon
-port to the internet, and confirm `curl http://127.0.0.1:$AXON_PORT/health`.
+port to the internet, and confirm the health endpoint. `AXON_PORT` lives in
+`.env`, which the shell does not read, so name the port explicitly:
+
+```bash
+curl http://127.0.0.1:8091/health          # or whichever AXON_PORT you set
+```
 
 ### Linux only, and why
 
-`custom_miner.py`, `run_miner.py`, `run_chatgpt_miner.py` and the doctor all
+`custom_miner.py`, `run_miner.py`, the doctor and the login helper all
 call `require_linux()` before doing anything, so a wrong platform costs one
 clear line instead of a build failure three layers down.
 
@@ -96,8 +108,8 @@ crawl.
 
 **macOS** can install the chain dependencies but is refused here anyway. A
 miner is a long-lived server that has to answer inside a deadline around the
-clock, and the shape of that — systemd, Firefox under Xvfb, a firewall in front
-of the axon port — is Linux shaped. Half-working on a laptop is worse than a
+clock, and the shape of that — systemd, a browser under Xvfb, a firewall in
+front of the axon port — is Linux shaped. Half-working on a laptop is worse than a
 clear no.
 
 Tested against x86-64 glibc 2.28+ (Ubuntu 22.04/24.04, Debian 12, Rocky 9).
@@ -117,227 +129,174 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 - **Never raise.** On any failure return empty `code` — a zero is survivable, a
   crash loop is not. `custom_miner.py` already wraps your solver this way.
 
-## Backends: Claude and ChatGPT, both from the browser
+## How it works: you run the browsers, the miner uses them
 
-Two backends ship, behind the same `open()` → `send()`/`close()` protocol, both
-feeding the same self-verify-and-repair loop. Pick with `MINER_BACKENDS`:
+You start N browsers — six to ten is a normal fleet — each signed in **by hand**
+to one provider, each on its own debugging port. The miner attaches to all of
+them and treats their tabs as **one fleet**. Each task goes to the next free tab.
 
-```bash
-MINER_BACKENDS=claude           python examples/custom_miner/run_miner.py
-MINER_BACKENDS=claude,chatgpt   python examples/custom_miner/run_miner.py
+```dotenv
+CLAUDE_CDP=9222,9223,9224      # three browsers signed in to claude.ai
+CHATGPT_CDP=9225,9226,9227     # three signed in to chatgpt.com
+MINER_TABS_PER_BROWSER=2       # conversation slots inside each -> 12 tabs
 ```
 
-| Backend | Signs in as | Quota you spend |
-|---|---|---|
-| `claude` | you, in a real browser | your Claude subscription |
-| `chatgpt` | you, in a real browser | your ChatGPT subscription |
+Set either list or both. **No API key is read anywhere in this package.**
 
-**No API key is read anywhere in this package** — there is no API path at all,
-which is a deliberate choice with a real cost attached: see the risks below, and
-run two providers if you can.
+### Why one fleet and not one pool per provider
 
-Each backend gets its browser one of two ways, and **which one you pick is the
-single most important setup decision**, so it has its own section:
-[Two ways to run the browser](#two-ways-to-run-the-browser-attach-vs-launch).
-In one line: if a provider's sign-in refuses an automated browser — Google's
-"Couldn't sign you in" is the usual one — use **attach mode**, because a browser
-you started yourself is not flagged as automation.
+Accounts are what actually rate-limits you, so accounts are the axis worth
+scaling — and a task does not care which model answers it. So the useful unit is
+"the next free tab", not "which provider do we prefer". Two consequences:
 
-`run_chatgpt_miner.py` still exists and is equivalent to `MINER_BACKENDS=chatgpt`.
+- **Throughput scales with browsers.** Six browsers at two tabs is twelve
+  concurrent conversations. There is deliberately no provider-preference
+  setting: naming one provider "first" would queue tasks on its browsers while
+  the others sat idle.
+- **Leases rotate.** Tabs are handed out first-in-first-out and enqueued
+  *browser-interleaved*, so two tasks arriving together land on two different
+  accounts rather than doubling up on one.
 
-### More than one backend is a fallback chain — and your only redundancy
+### The one time the provider matters
 
-With both names, providers run **in order and stop at the first answer that
-reproduces every public example**. Ordering is a cost decision, not a quality
-one: a verified answer ends the chain, so the second provider costs nothing on
-tasks the first one solves. Put the account you would rather spend first.
+If an answer still cannot reproduce the task's public examples after its repair
+rounds, the odds it passes the **hidden** suite are poor — and the whole payment
+rides on that. So the solver asks the *other* model once, on a tab from a
+different provider. With a fleet there is usually an idle one, and a second
+chance at the full payment is worth far more than the time it costs.
 
-It is also the only redundancy a browser miner has. With no API backend to fall
-back to, a second logged-in provider is what stands between one expired login
-and a run of zeros — and the two do not share a DOM, a login, or a rate limit.
+```dotenv
+SOLVER_SECOND_OPINION=false     # turn it off for pure throughput
+```
 
-This is worth doing because of how the subnet pays. The latency tiebreaker spans
-about 3.5%; being wrong costs 100%. A second opinion is therefore worth far more
-than a faster first one. If no provider verifies, the best partial answer across
-all of them is still returned — never nothing when some provider produced
-runnable code.
+Turn it off if you would rather never spend two accounts on one task.
 
-Budget is split across the remaining providers rather than handed to the first,
-so a slow leader cannot starve the rest, and the chain stops early when too
-little time remains for another provider to be useful.
+## Running a backend: you start the browser, the miner attaches
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `MINER_BACKENDS` | `claude` | Comma-separated backends, in preference order |
-| `CLAUDE_CDP` | *(unset)* | **Attach mode**: CDP port(s)/URL(s) of Chrome you started |
-| `CLAUDE_PROFILES` | `~/.hone-miner/firefox/claude-1` | **Launch mode**: profile dirs, one per account |
-| `CLAUDE_TABS_PER_PROFILE` | `2` | Conversation slots per browser source |
-| `CLAUDE_HEADLESS` | `true` | Launch mode only; `false` shows the window (needs a display) |
-| `SOLVER_MAX_ATTEMPTS` | `3` | Repair rounds per provider |
+Each backend needs a browser that is signed in to the provider. You start it and
+sign in **by hand**; the miner attaches to it over the Chrome DevTools Protocol
+(CDP) and opens its own tabs. Nothing here launches or closes a browser.
 
-Setting `CLAUDE_CDP` selects attach mode; leaving it unset uses launch mode with
-`CLAUDE_PROFILES`. `CHATGPT_*` are the exact analogues.
+**That division of labour is the whole design, not a limitation.** A browser
+launched by an automation driver announces itself as one, and provider sign-in
+flows reject it — the visible case is Google's OAuth answering *"Couldn't sign
+you in. This browser or app may not be secure."* A browser **you** started is
+not in automation mode: `navigator.webdriver` is `false` and it is the ordinary
+browser it appears to be, so the same sign-in succeeds. Attaching afterwards
+does not change that.
 
-These are read from the process environment **and** from `.env` — `run_miner.py`
-loads that file into the environment itself, because the miner's own settings go
-through pydantic-settings, which reads `.env` directly and leaves `os.environ`
-untouched. A shell variable still wins over the file.
+It also means **the browser is yours**. On shutdown the miner closes the tabs it
+opened and disconnects; it never closes your browser. Restarting the miner
+therefore keeps the login you made by hand — you sign in once and rarely again.
 
-`GET /solver-status` reports the chain, which provider verified each task, and
-per-provider turn and error counts — watch it, because a provider that starts
-failing looks exactly like success until the score drops.
+CDP is a Chromium protocol, so the browser is Chrome or Chromium. That is a
+constraint, not a preference.
 
-## Two ways to run the browser: attach vs launch
-
-Each backend needs a logged-in browser. There are two ways to give it one, and
-the difference is not cosmetic — it decides whether you can log in at all.
-
-| | **attach mode** (recommended) | **launch mode** (default) |
-|---|---|---|
-| Browser | Chrome/Chromium **you** start | Firefox Playwright starts |
-| Sign-in | you, by hand, in a normal browser | you, by hand, in Playwright's Firefox |
-| Looks automated? | **no** — `navigator.webdriver` is false | yes — a Playwright build |
-| Google / hard sign-in checks | **pass** | often refused |
-| Processes to run | two (browser + miner) | one (miner owns the browser) |
-| Config | `CLAUDE_CDP=9222` | `CLAUDE_PROFILES=…` (a default exists) |
-
-**Why attach mode exists.** Providers fingerprint the browser. A
-Playwright-launched Firefox is a recognisable automation build, and some
-sign-in flows — Google's OAuth most visibly, with *"Couldn't sign you in. This
-browser or app may not be secure."* — refuse it outright. A browser **you**
-started with a debugging port is not in automation mode: `navigator.webdriver`
-is `false` and it is the ordinary browser it appears to be, so the same sign-in
-succeeds. The miner then attaches over the Chrome DevTools Protocol (CDP), which
-is Chromium-only — Firefox exposes WebDriver BiDi instead and cannot be attached
-to, which is the whole reason launch mode uses Firefox and attach mode uses
-Chrome.
-
-Both were verified end to end on a real browser before this was written: attach
-mode solves a task through a hand-started Chrome, and disconnecting the miner
-leaves that Chrome (and its login) running.
-
-### Attach mode, step by step (use this if sign-in is refusing you)
+### Step by step
 
 ```bash
-pip install playwright                    # the Python package
-# No `playwright install` is needed for attach mode — you bring your own Chrome.
-sudo apt-get install -y chromium xvfb     # a browser, and a virtual screen for headless hosts
+pip install playwright                  # the Python package only
+# No `playwright install` is needed: you bring your own browser.
+sudo apt-get install -y chromium xvfb   # a browser, and a virtual screen for headless hosts
 
 cd examples/custom_miner
 
-# 1. Start a real Chrome in debug mode. It stays running; you log in in it.
+# 1. Start a real Chrome in debug mode. This BLOCKS for the life of the browser,
+#    so run it in its own terminal and use a second one for steps 2-3.
 ./scripts/start_debug_browser.sh --port 9222 --profile ~/.hone-miner/chrome/claude-1
 
-# 2. Log in to https://claude.ai in that browser, by hand. On a headless box,
-#    reach its window over VNC — see "Logging in with no screen" below.
+# 2. Sign in to https://claude.ai in that browser, by hand. On a headless box,
+#    reach its window over VNC — see "Signing in when the box has no screen".
 
-# 3. Point .env at it and verify, then run:
-echo 'CLAUDE_CDP=9222' >> ../../.env
+# 3. Verify, then run. CLAUDE_CDP defaults to 9222, so with one browser on the
+#    default port there is nothing to configure.
 python -m solvers.doctor claude --probe
-MINER_BACKENDS=claude python run_miner.py
+python run_miner.py
 ```
 
-`start_debug_browser.sh` finds `google-chrome-stable` / `chromium` / `$CHROME_BIN`,
-keeps the CDP port on loopback, adds `--no-sandbox` only when you are root,
-refuses to double-launch a port already in use, and waits for the port before
-telling you it is up. On a headless host it runs Chrome under `xvfb-run`.
+`start_debug_browser.sh` uses `$CHROME_BIN` if you set it, else the first of
+`google-chrome-stable`, `google-chrome`, `chromium`, `chromium-browser` on your
+PATH, else a Playwright-bundled Chromium if one is present. It keeps the CDP
+port on loopback, adds
+`--no-sandbox` only when you are root, refuses to double-launch a port already in
+use, and waits for the port before telling you it is up. On a headless host it
+runs Chrome under `xvfb-run`.
 
-On a server, Chrome prints a wall of `Failed to connect to the bus` / D-Bus
-errors — those are normal with no desktop session and do **not** mean it failed.
-The line that matters is `CDP is up on http://127.0.0.1:9222`.
-
-`CLAUDE_CDP` accepts a bare port (`9222` → `http://127.0.0.1:9222`), a `host:port`,
-a full URL, or a comma-separated list for several accounts. Set `CHATGPT_CDP` the
-same way for ChatGPT.
-
-**Attach mode's one rule and its one strength:**
-
-- The miner does **not** own the browser. On shutdown it disconnects but never
-  closes it, so **restarting the miner keeps your hand-made login** — you log in
-  once and rarely again.
-- Keep the debug port on loopback. Anyone who reaches it has full control of a
-  browser holding your logged-in sessions, on a box already exposing a public
-  axon port. `start_debug_browser.sh` never binds it off `127.0.0.1`; reach it
-  over an SSH tunnel.
-
-### Launch mode, step by step (simpler, when sign-in is not fussy)
-
-`claude` launches Firefox against a profile directory you signed in to once — one
-process, no ports. Use it when the provider does not refuse the automated
-browser.
+The line that means success is `CDP is up on http://127.0.0.1:9222`. Chrome may
+print GPU, D-Bus or push-registration errors after it on a server — those are
+normal with no desktop session and no Google account, and none of them touch CDP
+or the login. Check the browser yourself any time with:
 
 ```bash
-pip install playwright
-python -m playwright install firefox      # a second, separate download
-
-cd examples/custom_miner
-python -m solvers.login claude            # opens Firefox; sign in, press Enter
-python -m solvers.doctor claude --probe
-MINER_BACKENDS=claude python run_miner.py
+curl -s http://127.0.0.1:9222/json/version     # JSON back = healthy
 ```
 
-Firefox is used here because Playwright cannot attach to an externally-started
-Firefox (Chromium-only CDP), so in launch mode Playwright owns the browser. That
-brings one rule: **a profile directory can be open in one process at a time.**
-Stop the miner before running the login helper or the doctor, and vice versa —
-all three say so by name rather than crashing. The login helper verifies the
-session stuck (it reloads and checks the composer appears) so a half-finished
-sign-in fails now, not as a run of zeros later.
+**Keep the debug port on loopback.** Anyone who reaches it has full control of a
+browser holding your logged-in sessions, on a box already exposing a public axon
+port. The script never binds it off `127.0.0.1`; reach it over an SSH tunnel.
 
-If Google's sign-in refuses this Firefox, that is exactly what attach mode is
-for — switch to it.
+### Signing in when the box has no screen
 
-### Logging in when the box has no screen
+The debug browser runs under Xvfb, so its window exists but nothing is showing
+it. `start_debug_browser.sh` prints the exact `x11vnc` command to share that
+screen — **copy it from the script's own output** rather than from here, because
+the display number and the X auth cookie differ per browser:
 
-Either mode needs you to type a password into a browser once, and a server has
-no display. Two ways, both fine:
+```
+display: :99 (xauth /root/.hone-miner/chrome/claude-1/.Xauthority)
+...
+  x11vnc -display :99 -auth /root/.hone-miner/chrome/claude-1/.Xauthority \
+         -rfbport 5900 -localhost -nopw -forever
+```
 
-**Attach mode** — the debug Chrome runs under Xvfb; view it over VNC.
+Run that in a second terminal, then from your own machine:
 
 ```bash
-sudo apt-get install -y x11vnc
-# in another terminal, after start_debug_browser.sh is running under Xvfb:
-DISPLAY=:99 x11vnc -display :99 -rfbport 5900 -localhost -nopw -forever &
-ssh -N -L 5900:127.0.0.1:5900 you@your-miner    # from your own machine
+ssh -N -L 5900:127.0.0.1:5900 you@your-miner
 # point a VNC client at 127.0.0.1:5900, sign in, leave the browser running
 ```
 
-**Launch mode** — `scripts/login.sh` does the Xvfb+VNC dance for you:
-
-```bash
-sudo apt-get install -y xvfb x11vnc
-./scripts/login.sh claude
-ssh -N -L 5900:127.0.0.1:5900 you@your-miner
-# VNC to 127.0.0.1:5900, sign in, press Enter in the terminal
-```
+The display is derived from the port, so a second browser gets its own screen
+and its own printed command. The `-auth` argument is not optional: `xvfb-run`
+writes a private cookie, and without it `x11vnc` exits with *"No protocol
+specified"*.
 
 That VNC screen is an unauthenticated view of a browser you are about to type a
 password into — hence `-localhost` and the tunnel. Never publish the port.
 
-**Or skip screens entirely**: log in on any Linux desktop and copy the profile
-over. Launch mode: `rsync -a ~/.hone-miner/firefox/claude-1/
-you@host:~/.hone-miner/firefox/claude-1/`. Attach mode: same, with the
-`~/.hone-miner/chrome/…` directory `start_debug_browser.sh` created.
+**If a sign-in is refused**, prefer email plus a one-time code over "Continue
+with Google". Do not try to defeat the check by spoofing a user agent or
+patching out automation flags — starting the browser yourself is the supported
+way past it, and that is what this design already does.
 
-### Accounts, profiles and tabs
+### Accounts, browsers and tabs
 
-The account is the rate-limit unit: one browser source per account,
-`*_TABS_PER_PROFILE` conversation slots inside each, and at least
+The account is the rate-limit unit: one browser per account on its own port,
+`*_TABS_PER_BROWSER` conversation slots inside each, and at least
 `MINER_MAX_CONCURRENT_REQUESTS` tabs in total or extra tasks queue and burn
 their deadline. The launcher warns when it is short.
 
 ```dotenv
-# attach mode: one debug Chrome per account, each on its own port
+# one debug Chrome per account, each on its own port
 CLAUDE_CDP=9222,9223
-# launch mode: one Firefox profile per account
-CLAUDE_PROFILES=~/.hone-miner/firefox/claude-1,~/.hone-miner/firefox/claude-2
-CLAUDE_TABS_PER_PROFILE=2
+MINER_TABS_PER_BROWSER=2
 ```
 
-**Keeping it alive.** In launch mode, one systemd service with `Restart=always`
-is enough — the browser is a child of the miner. In attach mode, run two
-services: the debug browser (with the same `--profile`, so it restarts logged
-in) and the miner; the miner reconnects on its next start.
+⚠ `MINER_MAX_CONCURRENT_REQUESTS` defaults to **4** while one browser gives
+**2** tabs, so the single-browser setup logs a capacity warning on every launch.
+Either lower the concurrency to match your tabs, or add tabs/browsers:
+
+```dotenv
+MINER_MAX_CONCURRENT_REQUESTS=2     # matches one browser at 2 tabs
+```
+
+One browser can serve both backends — sign the same Chrome in to claude.ai and
+chatgpt.com, and leave `CLAUDE_CDP` and `CHATGPT_CDP` both on `9222`. Separate
+ports are for separate *accounts*, not separate providers.
+
+**Keeping it alive.** Two systemd services with `Restart=always`: the debug
+browser (with the same `--profile`, so it restarts already signed in) and the
+miner, which reconnects on its next start.
 
 ### Run the doctor before you point a hotkey at it
 
@@ -368,26 +327,17 @@ Three hazards are handled in code rather than left to the selectors:
   miner hand its own prompt back as the answer — no error, no empty reply, just
   a permanent zero. Any reply that starts with the prompt just sent is refused,
   and the log names the doctor.
-- **Artifacts.** Long code can land in the side panel, outside the message the
-  reader scrapes, so every prompt asks for an inline code block
-  (`CLAUDE_NUDGE` overrides the wording).
+- **Artifacts.** Long code can land in Claude's side panel, outside the message
+  the reader scrapes, so every *Claude* prompt asks for an inline code block
+  (`CLAUDE_NUDGE` overrides the wording). ChatGPT gets no such suffix; its
+  shared instructions already ask for a single code block.
 - **A "still generating" selector that is always true** would make every answer
   look unfinished and burn the whole budget. Each candidate is checked against
   a freshly-loaded idle page at startup, and any that matches is dropped.
 
 The same doctor works for ChatGPT: `python -m solvers.doctor chatgpt`.
 
-## Included backend: ChatGPT in Firefox + self-verification
-
-`run_chatgpt_miner.py` wires up a ready-made solver built from
-[fnlich/Automation](https://github.com/fnlich/Automation)'s browser driver:
-
-```
-POST /solve -> fresh ChatGPT conversation -> self-grade against the public
-examples with the validator's own executor -> repair on failure -> signed reply
-```
-
-### Why the self-verification matters
+## Self-verification: the part that earns the money
 
 Scoring is accuracy-or-nothing, and models routinely produce *nearly* right
 answers. But every task ships real `public_examples`, and the comparators the
@@ -404,43 +354,53 @@ Your solution is WRONG. I ran `sum_of_digits` against the examples and got:
 
 That turns a one-shot paste into a repair loop that converges. Passing the
 public examples is not proof of passing the hidden suite, but it eliminates the
-large class of answers that are simply wrong on the stated contract.
+large class of answers that are simply wrong on the stated contract. When even
+that is not enough, the second opinion asks the other model — see
+[The one time the provider matters](#the-one-time-the-provider-matters).
 
-### Setup — one browser per ChatGPT account
-
-Accounts are the rate-limit unit, so N accounts give N× throughput. ChatGPT's
-own login often routes through Google, so **attach mode is usually the one that
-works** here — the same two modes as Claude, chosen with `CHATGPT_CDP` vs
-`CHATGPT_PROFILES`:
-
-```bash
-# Attach mode (recommended): a debug Chrome per account, logged in by hand.
-./scripts/start_debug_browser.sh --port 9222 --profile ~/.hone-miner/chrome/gpt-1
-./scripts/start_debug_browser.sh --port 9223 --profile ~/.hone-miner/chrome/gpt-2
-python -m solvers.doctor chatgpt --cdp 9222 --probe
-CHATGPT_CDP=9222,9223 python run_chatgpt_miner.py
-
-# Launch mode: one Firefox profile per account (if sign-in is not fussy).
-python -m solvers.login chatgpt --profile ~/.hone-miner/firefox/chatgpt-1
-CHATGPT_PROFILES=~/.hone-miner/firefox/chatgpt-1 python run_chatgpt_miner.py
-```
-
-Keep the tab count at or above `MINER_MAX_CONCURRENT_REQUESTS`, or extra tasks
-queue and burn their deadline. The launcher warns when it is short.
+The ChatGPT reader is a direct port of
+[fnlich/Automation](https://github.com/fnlich/Automation)'s driver: identify the
+reply by its `data-message-id`, treat it as finished only when the Stop button
+is gone *and* the text is unchanged across two polls, and start every task in a
+fresh conversation.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CHATGPT_CDP` | *(unset)* | Attach mode: CDP port(s)/URL(s) of Chrome you started |
-| `CHATGPT_PROFILES` | `~/.hone-miner/firefox/chatgpt-1` | Launch mode: profile dirs, one per account |
-| `CHATGPT_TABS_PER_PROFILE` | `2` | Conversation slots per browser source |
-| `CHATGPT_HEADLESS` | `true` | Launch mode only; `false` shows the window |
-| `SOLVER_MAX_ATTEMPTS` | `3` | Initial answer + repair rounds |
 | `SOLVER_SAFETY_MARGIN_S` | `15` | Headroom kept before the cutoff |
 | `SOLVER_MAX_BUDGET_S` | `240` | Hard cap on one solve |
-| `SOLVER_VERIFY_EXECUTOR` | `subprocess` | `docker` also verifies Rust |
+| `SOLVER_VERIFY_EXECUTOR` | `subprocess` | Python grading backend; Rust always uses Docker |
 
-`GET /solver-status` reports pool health and solve counts. Watch it — a
-browser-backed miner fails quietly, and silence looks identical to success.
+`GET /solver-status` reports per-provider counters and fleet health. Watch it —
+a browser miner fails quietly, and silence looks identical to success.
+
+## Running under pm2
+
+pm2 supervises **only the miner**. The browsers are yours: you start them, you
+sign in, and they stay up across miner restarts — which is exactly why sign-in
+works at all.
+
+```bash
+cd examples/custom_miner
+pm2 start ecosystem.config.js
+pm2 logs hone-miner
+pm2 save && pm2 startup        # survive a reboot
+```
+
+Restarts are safe by design, and both halves of that were tested:
+
+- **Clean stop** (`pm2 stop`/`restart` sends SIGINT, then SIGTERM). The miner
+  handles both, closes the tabs it opened, and disconnects without touching your
+  browsers. The handlers are installed *before* it attaches, so a restart during
+  startup — when attaching to eight browsers takes a while — is still clean.
+- **Unclean kill** (OOM, `kill -9`, a crash). Nothing runs, so the tabs are
+  orphaned. The next start finds them and closes them: every tab this miner
+  opens is stamped in `window.name`, which your own tabs never carry. Verified
+  over three kill/restart cycles — the tab count stays flat instead of growing
+  by `MINER_TABS_PER_BROWSER` each time.
+
+If a browser is down when the miner starts, it logs which endpoint failed and
+serves with the rest of the fleet. Bring the browser back and restart the miner
+to pick it up again.
 
 ### Know the risks before running either browser backend for money
 
@@ -452,40 +412,51 @@ browser-backed miner fails quietly, and silence looks identical to success.
   `claude` and `chatgpt` equally. The supported way to do this is each
   provider's API; this package does not offer that path.
 - **Detection is the failure you will hit first.** Providers fingerprint the
-  browser, and a launched Firefox is the most detectable option — Google's
-  sign-in refuses it outright ("Couldn't sign you in"). Attach mode (a real
-  Chrome you started) is the answer to that specific wall, because it is not in
-  automation mode. This is not an arms race worth entering: do not spoof user
-  agents or patch out automation flags — pick the mode that a given provider's
-  login actually accepts, and prefer email/one-time-code sign-in over "Continue
-  with Google".
+  browser, and a driver-launched one is rejected outright by some sign-in flows
+  — Google's answers "Couldn't sign you in". Starting the browser yourself is
+  the answer to that specific wall, because it is not in automation mode, and it
+  is what this design already does. Do not go further: spoofing user agents or
+  patching out automation flags is an arms race on someone else's schedule.
+  Prefer email plus a one-time code over "Continue with Google".
 - **Fragility, with nothing to fall back to.** Browser/DOM updates, expired
   logins, rate limits and CAPTCHAs all break browser automation. A miner that
   does not answer scores zero into a 200-observation window (~2.1 days), so one
-  bad night costs most of your score — and there is no `MINER_BACKENDS=...-api`
-  to switch to when it happens. Three things stand in for that: run both
-  providers so they are not down together, run the doctor before you serve, and
+  bad night costs most of your score — and there is no API backend to switch to
+  when it happens. Three things stand in for that: run both providers so they
+  are not down together, run the doctor before you serve, and
   watch `/solver-status`, because a provider that has started failing looks
   exactly like one that is merely quiet.
 - **The `Backend` protocol is three methods.** If you do want an API path,
   `open()` returning something with `send(text, timeout_s)` and `close()` is the
-  whole interface; `verify.py` and the fallback chain take it unchanged.
-- **Rust.** `SOLVER_VERIFY_EXECUTOR=docker` is required to verify Rust answers;
-  without it Rust candidates are returned unverified.
+  whole interface; `verify.py` and the fleet take it unchanged.
+- **Rust.** Rust verification always uses the Docker executor — the solver
+  forces it regardless of `SOLVER_VERIFY_EXECUTOR`, because there is no
+  subprocess path to `rustc`. What it actually needs is a working Docker daemon
+  and the pinned image; without those, grading is skipped and Rust candidates
+  come back unverified.
 
 ## Testing your setup
 
 Four layers, cheapest first, each isolating a different failure:
 
 ```bash
-pytest examples/custom_miner        # 1. code only — no browser, no chain
-python -m solvers.doctor claude --probe   # 2. login + selectors (add --cdp 9222 in attach mode)
-python scripts/try_solver.py        # 3. a real solve, end to end, no wallet
-                                    # 4. testnet, then finney
+# from the repo root
+python -m pytest examples/custom_miner    # 1. code only — no browser, no chain
+
+# from examples/custom_miner
+cd examples/custom_miner
+python -m solvers.doctor claude --probe   # 2. the browser's sign-in + selectors
+python scripts/try_solver.py              # 3. a real solve, end to end, no wallet
+                                          # 4. testnet, then finney
 ```
 
-`try_solver.py` honours the same `.env` as the miner, so it exercises whichever
-mode you configured — attach or launch — with no extra flags.
+Layer 1 runs from the repo root; layers 2 and 3 run from `examples/custom_miner`
+— they are a package and a sibling script. Use `python -m pytest`, not bare
+`pytest`: the bare binary silently falls through to a system install if the
+`dev` extra is missing.
+
+`try_solver.py` honours the same `.env` as the miner, so it drives the same
+browsers the miner would, with no extra flags.
 
 `scripts/try_solver.py` is the one to reach for when something is wrong. It
 builds the solver exactly as the miner does, hands it one task with public
@@ -497,6 +468,7 @@ missed), and nothing-came-back (login, selector, or deadline — it names all
 three in likelihood order).
 
 ```bash
+cd examples/custom_miner
 python scripts/try_solver.py --statement "Return n factorial." \
     --entrypoint fact --example '{"args": [5], "expected": 120}'
 ```
