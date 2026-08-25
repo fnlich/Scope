@@ -82,13 +82,34 @@ async def main(args: argparse.Namespace) -> int:
 
     solver = build_solver()
     started = time.monotonic()
+    if args.repeat > 1:
+        # A verified answer is cached by statement, so repeating the same task
+        # would serve the cache and never touch the browser -- the opposite of
+        # what the flag is for. Zero is the documented "off": the store is
+        # guarded by `if best.verified and self._cache_size`.
+        solver._cache_size = 0
+        solver._cache.clear()
     try:
         await warm_up(solver, 1)
-        print(f"[try] solving: {task.statement!r} -> {task.entrypoint}()")
-        answer = await solver.solve_task(task, task.deadline_s)
+        # `--repeat` exists to make the tab lifecycle visible. A one-shot run
+        # cannot show it: any short-lived process opens a tab and closes it on
+        # the way out, which looks identical to "a tab per task". Only the
+        # SECOND task proves the tab was kept and merely given a new
+        # conversation -- which is what the miner does for its whole life.
+        for round_no in range(1, max(1, args.repeat) + 1):
+            if args.repeat > 1:
+                print(f"\n[try] --- task {round_no} of {args.repeat} ---")
+                print("[try] watch the browser: same tab, new conversation")
+            print(f"[try] solving: {task.statement!r} -> {task.entrypoint}()")
+            answer = await solver.solve_task(task, task.deadline_s)
+            if round_no < args.repeat:
+                print(f"[try] task {round_no}: verified={answer.verified} "
+                      f"({answer.passed}/{answer.total})")
         # Before aclose(), which drains the pool and would report idle=0.
         stats = solver.stats()
     finally:
+        # Only now, at process exit, are the tabs closed -- because the whole
+        # fleet is going away. A running miner never reaches this point.
         await solver.aclose()
     elapsed = time.monotonic() - started
 
@@ -128,6 +149,11 @@ if __name__ == "__main__":
         help='JSON case, repeatable: \'{"args": [5], "expected": 120}\'',
     )
     parser.add_argument("--timeout", default=180, type=float)
+    parser.add_argument(
+        "--repeat", default=1, type=int,
+        help="solve the same task N times in one process. Use it to watch the "
+        "tab being REUSED: one tab, N conversations, closed only at exit.",
+    )
     try:
         sys.exit(asyncio.run(main(parser.parse_args())))
     except KeyboardInterrupt:

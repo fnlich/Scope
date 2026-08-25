@@ -219,6 +219,19 @@ def test_a_verified_answer_is_cached_by_statement():
     assert solver.stats()["solver"]["cache_hits"] == 1
 
 
+def test_a_zero_cache_size_disables_caching_without_crashing():
+    """`try_solver.py --repeat` sets `_cache_size = 0` so each round really
+    drives the browser; a cached answer would make the flag a no-op and show
+    nothing. Zero must therefore mean OFF rather than "evict every time", which
+    on an empty dict would raise."""
+    solver = _solver([RIGHT])
+    solver._cache_size = 0
+    for _ in range(3):
+        assert asyncio.run(solver.solve_task(DIGITS, 60.0)).verified
+    assert solver.stats()["solver"].get("cache_hits", 0) == 0
+    assert solver._cache == {}
+
+
 def test_an_unverified_answer_is_not_cached():
     solver = _solver([WRONG])
     asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
