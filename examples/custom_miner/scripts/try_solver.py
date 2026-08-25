@@ -38,7 +38,7 @@ from preflight import require_linux  # noqa: E402
 require_linux("The solver test")
 
 from solvers.config import find_env_file, load_env_file  # noqa: E402
-from solvers.multi import build_solver, warm_up  # noqa: E402
+from solvers.roster import build_solver, warm_up  # noqa: E402
 
 # A task the model should get right first try, with examples that catch the
 # classic off-by-one. If this one does not verify, the problem is the setup.

@@ -8,7 +8,7 @@ conversation, and feeds the reply into the self-verify-and-repair loop in
 read anywhere.
 
     ./scripts/start_debug_browser.sh --port 9222   # then sign in to claude.ai
-    MINER_BACKENDS=claude python examples/custom_miner/run_miner.py
+    CLAUDE_CDP=9222 python examples/custom_miner/run_miner.py
 
 There is deliberately no API-key path in this package. The consequence is that
 a browser backend has no supported fallback to switch to, which is exactly why
@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import os
 
-from .browser_pool import BrowserPool, Site
+from .browser_pool import Site
 from .config import selectors
 
 # Claude answers in the chat by default, but long code can be moved to the
@@ -111,14 +111,3 @@ def claude_site() -> Site:
         nudge=os.environ.get("CLAUDE_NUDGE", NUDGE),
         poll_s=float(os.environ.get("CLAUDE_POLL_S", "2")),
     )
-
-
-class ClaudeBrowserPool(BrowserPool):
-    """A pool of claude.ai tabs, optionally spread across several browsers.
-
-    As with ChatGPT, one browser per Claude account is the unit that multiplies
-    throughput; tabs inside one browser share that account's limits.
-    """
-
-    def __init__(self, cdp=None, *, tabs_per_browser: int = 2):
-        super().__init__(claude_site(), cdp, tabs_per_browser=tabs_per_browser)

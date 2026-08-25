@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
-"""Run the miner on-chain with Claude and/or ChatGPT as the solver.
+"""Run the miner on-chain, answering with the browsers you started.
 
-    MINER_BACKENDS=claude           python examples/custom_miner/run_miner.py
-    MINER_BACKENDS=claude,chatgpt   python examples/custom_miner/run_miner.py
+    python examples/custom_miner/run_miner.py
 
-Both backends attach to a Chrome you started and signed in to yourself:
+You run the browsers — several Chrome instances, each signed in by hand to one
+provider, each on its own debugging port. This attaches to all of them and
+treats their tabs as ONE fleet, handing each task to the next free tab:
 
-    claude    CLAUDE_CDP     (default 9222)
-    chatgpt   CHATGPT_CDP    (default 9222)
+    CLAUDE_CDP=9222,9223,9224     browsers signed in to claude.ai
+    CHATGPT_CDP=9225,9226         browsers signed in to chatgpt.com
 
-Start it with ``./scripts/start_debug_browser.sh`` and sign in by hand, once
-per account. No API key is read anywhere. Each backend answers into the same
-self-verify-and-repair loop, and with more than one they form a fallback chain:
-the first provider whose answer reproduces every public example wins, and the
-rest are never called for that task.
+Set either list or both. N browsers give N accounts' worth of throughput,
+because a task goes to one tab rather than to every provider in turn. Accounts
+are the rate limit that actually binds, so that is the axis worth scaling.
 
-Run two, if you can. A browser miner has no API path to fall back to, so a
-second logged-in provider is the only thing standing between one expired login
-and a run of zeros.
+Start each browser with ``./scripts/start_debug_browser.sh`` and sign in by
+hand. No API key is read anywhere.
 
-This is the provider-agnostic entrypoint. ``run_chatgpt_miner.py`` remains as
-the ChatGPT-only launcher; it is equivalent to ``MINER_BACKENDS=chatgpt`` here.
+Every answer goes through the self-verify-and-repair loop in ``verify.py``: it
+is graded against the task's public examples with the validator's own executor,
+and a failure is handed back to the model as concrete evidence. If a task still
+will not verify, ``SOLVER_SECOND_OPINION`` (on by default) asks the *other*
+model once — cheap insurance when the whole payment rides on a complete pass.
 
-Before either backend serves a registered hotkey, verify its selectors once:
+Before serving a registered hotkey, verify the selectors once per provider:
 
     cd examples/custom_miner && python -m solvers.doctor claude --probe
 
@@ -46,25 +47,29 @@ from preflight import require_linux  # noqa: E402
 require_linux("The custom miner")
 
 import asyncio  # noqa: E402
+import signal  # noqa: E402
 import os  # noqa: E402
 from typing import Any  # noqa: E402
 
 from custom_miner import CustomMiner  # noqa: E402
 from rlvr.neurons.demo_miner import DemoMinerSettings, build_demo_miner_app  # noqa: E402
 from solvers.config import find_env_file, load_env_file  # noqa: E402
-from solvers.multi import build_solver, warm_up  # noqa: E402
+from solvers.roster import build_solver, describe, roster, warm_up  # noqa: E402
 
 
 def main() -> None:
     # The miner's own settings come from .env via pydantic-settings, which reads
     # the file directly and never touches os.environ — so backend knobs written
-    # there (MINER_BACKENDS, CLAUDE_CDP, selector overrides) would otherwise be
+    # there (CLAUDE_CDP, CHATGPT_CDP, selector overrides) would otherwise be
     # silently ignored. Real environment variables still win.
     env_file = find_env_file()
     if load_env_file(env_file):
         print(f"[miner] loaded {env_file}")
     settings = DemoMinerSettings()
-    solver = build_solver()
+    # Read the roster once: building it twice would repeat its warnings, and
+    # the printed summary must describe the fleet the solver actually got.
+    browsers = roster()
+    solver = build_solver(browsers)
 
     import bittensor as bt  # type: ignore[import-not-found]
     import uvicorn
@@ -101,17 +106,13 @@ def main() -> None:
     print(
         f"[miner] netuid={settings.netuid} "
         f"wallet={settings.wallet_name}/{settings.wallet_hotkey} "
-        f"port={settings.axon_port} "
-        f"backends={os.environ.get('MINER_BACKENDS', 'claude')}"
+        f"port={settings.axon_port} browsers: {describe(browsers)}"
     )
 
     # One event loop for everything: the browser backends' Playwright objects are
     # loop-bound, and build_demo_miner_app already installs a `lifespan`, so a
     # FastAPI startup hook would be silently ignored.
     async def serve() -> None:
-        # Start browser pools here, where a failure is visible, rather than
-        # lazily on the first validator request.
-        await warm_up(solver, settings.miner_max_concurrent_requests)
         server = uvicorn.Server(
             uvicorn.Config(
                 app,
@@ -120,10 +121,39 @@ def main() -> None:
                 log_level="info",
             )
         )
+        # Install the stop handlers BEFORE the slow part. uvicorn installs its
+        # own once serving, but attaching to a fleet of browsers takes seconds,
+        # and a supervisor restarting during that window would otherwise raise
+        # KeyboardInterrupt straight through the cleanup — leaving the tabs it
+        # had already opened behind in your browsers.
+        loop = asyncio.get_running_loop()
+
+        stopped = False
+
+        def stop(signame: str) -> None:
+            # uvicorn installs its own handler once it is serving, so both can
+            # fire for one signal; say it once and let the second be a no-op.
+            nonlocal stopped
+            if stopped:
+                return
+            stopped = True
+            print(f"[miner] {signame}: closing tabs and disconnecting")
+            server.should_exit = True
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop, sig.name)
+            except NotImplementedError:  # pragma: no cover - not on Linux
+                pass
+
+        # Attach here, where a failure is visible, rather than lazily on the
+        # first validator request.
+        await warm_up(solver, settings.miner_max_concurrent_requests)
         try:
             await server.serve()
         finally:
-            await solver.aclose()
+            # Shielded so a second signal cannot interrupt the cleanup itself.
+            await asyncio.shield(asyncio.ensure_future(solver.aclose()))
 
     asyncio.run(serve())
 

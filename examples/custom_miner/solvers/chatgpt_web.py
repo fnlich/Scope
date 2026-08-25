@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import os
 
-from .browser_pool import BrowserPool, Site, _Tab  # noqa: F401  (_Tab re-exported for tests)
+from .browser_pool import Site, _Tab  # noqa: F401  (_Tab re-exported for tests)
 from .config import selectors
 
 # Selectors, unchanged from the automation script, but each is now the first
@@ -49,10 +49,3 @@ def chatgpt_site() -> Site:
         message_id_attr="data-message-id",
         poll_s=float(os.environ.get("CHATGPT_POLL_S", "2")),
     )
-
-
-class ChatGPTPool(BrowserPool):
-    """A pool of ChatGPT tabs, optionally spread across several browsers."""
-
-    def __init__(self, cdp=None, *, tabs_per_browser: int = 2):
-        super().__init__(chatgpt_site(), cdp, tabs_per_browser=tabs_per_browser)

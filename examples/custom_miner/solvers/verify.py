@@ -62,7 +62,9 @@ class Conversation(Protocol):
 
 
 class Backend(Protocol):
-    async def open(self) -> Conversation: ...
+    # ``avoid`` names a provider to steer away from, so a second attempt can ask
+    # a different model. It is a preference, not a guarantee.
+    async def open(self, avoid: Optional[str] = None) -> Conversation: ...
     async def aclose(self) -> None: ...
     def stats(self) -> dict[str, Any]: ...
 
@@ -201,15 +203,18 @@ class VerifyingSolver:
         safety_margin_s: float = 15.0,
         max_budget_s: float = 240.0,
         cache_size: int = 256,
+        second_opinion: bool = True,
     ):
         self._backend = backend
         self._max_attempts = max(1, int(max_attempts))
         self._margin = max(0.0, float(safety_margin_s))
         self._max_budget = max(5.0, float(max_budget_s))
+        self._second_opinion = bool(second_opinion)
         self._grader = _Grader()
         self._cache: dict[str, tuple[str, str]] = {}
         self._cache_size = max(0, int(cache_size))
         self._counts = {"solved": 0, "verified": 0, "cache_hits": 0, "empty": 0}
+        self._by_provider: dict[str, dict[str, int]] = {}
 
     # -- the Solver interface custom_miner.py expects ---------------------- #
     async def solve_task(self, task, timeout_s: float) -> Answer:
@@ -227,41 +232,36 @@ class VerifyingSolver:
             return Answer(code=code, raw_response=raw, verified=True)
 
         best = Candidate(code="", raw="")
-        conversation = None
-        try:
-            conversation = await self._backend.open()
-            prompt = build_initial_prompt(
-                task.language, task.statement, task.entrypoint, task.public_examples
+        # One pass per model. The second only happens if the first could not
+        # reproduce the public examples even after its repair rounds — at which
+        # point the odds it passes the HIDDEN suite are poor, and the whole
+        # payment rides on that. Asking the other model is a fresh chance at the
+        # full amount, and with a fleet there is usually an idle tab to ask on.
+        asked: list[str] = []
+        passes = 2 if self._second_opinion else 1
+        for attempt_no in range(passes):
+            remaining = budget - (time.monotonic() - started)
+            # The first pass always runs, however little is left: bailing here
+            # would return nothing having asked nobody.
+            if attempt_no and remaining < 20.0:
+                print(f"[verify] {remaining:.0f}s left; no time for a second opinion")
+                break
+            candidate, provider = await self._attempt(
+                task, remaining, avoid=asked[-1] if asked else None
             )
-            for attempt in range(1, self._max_attempts + 1):
-                remaining = budget - (time.monotonic() - started)
-                if remaining < 12.0:
-                    break  # not enough left to be worth another round trip
-                # Give the first attempt the larger share; repairs are cheaper.
-                slice_s = remaining if attempt == self._max_attempts else remaining * 0.6
+            if provider:
+                asked.append(provider)
+            if candidate is not None and candidate.score > best.score:
+                best = candidate
+            if best.verified:
+                break
+            if attempt_no + 1 < passes:
+                print(f"[verify] {provider or 'first'} did not verify; asking another model")
+        if asked:
+            self._note(asked[-1] if best.verified else None, asked)
 
-                reply = await conversation.send(prompt, slice_s)
-                candidate = self._grade(reply, task)
-                if candidate.score > best.score:
-                    best = candidate
-                if candidate.verified:
-                    self._counts["verified"] += 1
-                    break
-                problems = ([candidate.defect] if candidate.defect else []) + candidate.failures
-                if not problems:
-                    break  # nothing actionable to report (no examples shipped)
-                prompt = build_repair_prompt(problems, task.language, task.entrypoint)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - a failed solve scores zero, never crashes
-            print(f"[verify] backend failure: {type(exc).__name__}: {exc}")
-        finally:
-            if conversation is not None:
-                try:
-                    await conversation.close()
-                except Exception:  # noqa: BLE001 - cleanup must not mask a result
-                    pass
-
+        if best.verified:
+            self._counts["verified"] += 1
         if best.code.strip():
             self._counts["solved"] += 1
             if best.verified and self._cache_size:
@@ -280,6 +280,63 @@ class VerifyingSolver:
             code=best.code, raw_response=best.raw,
             verified=best.verified, passed=best.passed, total=best.total,
         )
+
+    async def _attempt(
+        self, task, remaining: float, avoid: Optional[str]
+    ) -> tuple[Optional[Candidate], Optional[str]]:
+        """One model, one conversation: initial answer plus repair rounds.
+
+        The repair rounds deliberately stay in that single conversation so the
+        model sees its own previous attempt beside the failure report. Returns
+        the best candidate it produced and which provider produced it.
+        """
+        started = time.monotonic()
+        budget = max(5.0, remaining)
+        best: Optional[Candidate] = None
+        conversation = None
+        provider: Optional[str] = None
+        try:
+            conversation = await self._backend.open(avoid=avoid)
+            provider = getattr(conversation, "provider", None)
+            prompt = build_initial_prompt(
+                task.language, task.statement, task.entrypoint, task.public_examples
+            )
+            for attempt in range(1, self._max_attempts + 1):
+                left = budget - (time.monotonic() - started)
+                if left < 12.0:
+                    break  # not enough left to be worth another round trip
+                # Give the first attempt the larger share; repairs are cheaper.
+                slice_s = left if attempt == self._max_attempts else left * 0.6
+
+                reply = await conversation.send(prompt, slice_s)
+                candidate = self._grade(reply, task)
+                if best is None or candidate.score > best.score:
+                    best = candidate
+                if candidate.verified:
+                    break
+                problems = ([candidate.defect] if candidate.defect else []) + candidate.failures
+                if not problems:
+                    break  # nothing actionable to report (no examples shipped)
+                prompt = build_repair_prompt(problems, task.language, task.entrypoint)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a failed solve scores zero, never crashes
+            print(f"[verify] backend failure: {type(exc).__name__}: {exc}")
+        finally:
+            if conversation is not None:
+                try:
+                    await conversation.close()
+                except Exception:  # noqa: BLE001 - cleanup must not mask a result
+                    pass
+        return best, provider
+
+    def _note(self, winner: Optional[str], asked: list[str]) -> None:
+        """Per-provider tally, so a model that has started failing is visible."""
+        for name in asked:
+            row = self._by_provider.setdefault(name, {"asked": 0, "verified": 0})
+            row["asked"] += 1
+        if winner:
+            self._by_provider[winner]["verified"] += 1
 
     # ---------------------------------------------------------------------- #
     def _grade(self, reply: str, task) -> Candidate:
@@ -308,7 +365,11 @@ class VerifyingSolver:
         return candidate
 
     def stats(self) -> dict[str, Any]:
-        return {"solver": dict(self._counts), "backend": self._backend.stats()}
+        return {
+            "solver": dict(self._counts),
+            "providers": {k: dict(v) for k, v in self._by_provider.items()},
+            "fleet": self._backend.stats(),
+        }
 
     async def aclose(self) -> None:
         await self._backend.aclose()

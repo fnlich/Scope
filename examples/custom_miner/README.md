@@ -93,7 +93,7 @@ curl http://127.0.0.1:8091/health          # or whichever AXON_PORT you set
 
 ### Linux only, and why
 
-`custom_miner.py`, `run_miner.py`, `run_chatgpt_miner.py` and the doctor all
+`custom_miner.py`, `run_miner.py`, the doctor and the login helper all
 call `require_linux()` before doing anything, so a wrong platform costs one
 clear line instead of a build failure three layers down.
 
@@ -129,76 +129,47 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 - **Never raise.** On any failure return empty `code` — a zero is survivable, a
   crash loop is not. `custom_miner.py` already wraps your solver this way.
 
-## Backends: Claude and ChatGPT, both from the browser
+## How it works: you run the browsers, the miner uses them
 
-Two backends ship, behind the same `open()` → `send()`/`close()` protocol, both
-feeding the same self-verify-and-repair loop. Pick with `MINER_BACKENDS`:
+You start N browsers — six to ten is a normal fleet — each signed in **by hand**
+to one provider, each on its own debugging port. The miner attaches to all of
+them and treats their tabs as **one fleet**. Each task goes to the next free tab.
 
-```bash
-MINER_BACKENDS=claude           python examples/custom_miner/run_miner.py
-MINER_BACKENDS=claude,chatgpt   python examples/custom_miner/run_miner.py
+```dotenv
+CLAUDE_CDP=9222,9223,9224      # three browsers signed in to claude.ai
+CHATGPT_CDP=9225,9226,9227     # three signed in to chatgpt.com
+MINER_TABS_PER_BROWSER=2       # conversation slots inside each -> 12 tabs
 ```
 
-| Backend | Signs in as | Quota you spend |
-|---|---|---|
-| `claude` | you, in a real browser | your Claude subscription |
-| `chatgpt` | you, in a real browser | your ChatGPT subscription |
+Set either list or both. **No API key is read anywhere in this package.**
 
-**No API key is read anywhere in this package** — there is no API path at all,
-which is a deliberate choice with a real cost attached: see the risks below, and
-run two providers if you can.
+### Why one fleet and not one pool per provider
 
-You start the browser and sign in by hand; the miner attaches to it. That is
-what gets past sign-in checks which reject automated browsers — Google's
-"Couldn't sign you in" being the usual one. See
-[Running a backend](#running-a-backend-you-start-the-browser-the-miner-attaches).
+Accounts are what actually rate-limits you, so accounts are the axis worth
+scaling — and a task does not care which model answers it. So the useful unit is
+"the next free tab", not "which provider do we prefer". Two consequences:
 
-`run_chatgpt_miner.py` still exists and is equivalent to `MINER_BACKENDS=chatgpt`.
+- **Throughput scales with browsers.** Six browsers at two tabs is twelve
+  concurrent conversations. There is deliberately no provider-preference
+  setting: naming one provider "first" would queue tasks on its browsers while
+  the others sat idle.
+- **Leases rotate.** Tabs are handed out first-in-first-out and enqueued
+  *browser-interleaved*, so two tasks arriving together land on two different
+  accounts rather than doubling up on one.
 
-### More than one backend is a fallback chain — and your only redundancy
+### The one time the provider matters
 
-With both names, providers run **in order and stop at the first answer that
-reproduces every public example**. Ordering is a cost decision, not a quality
-one: a verified answer ends the chain, so the second provider costs nothing on
-tasks the first one solves. Put the account you would rather spend first.
+If an answer still cannot reproduce the task's public examples after its repair
+rounds, the odds it passes the **hidden** suite are poor — and the whole payment
+rides on that. So the solver asks the *other* model once, on a tab from a
+different provider. With a fleet there is usually an idle one, and a second
+chance at the full payment is worth far more than the time it costs.
 
-It is also the only redundancy a browser miner has. With no API backend to fall
-back to, a second logged-in provider is what stands between one expired login
-and a run of zeros — and the two do not share a DOM, a login, or a rate limit.
+```dotenv
+SOLVER_SECOND_OPINION=false     # turn it off for pure throughput
+```
 
-This is worth doing because of how the subnet pays. The latency tiebreaker spans
-5 points — `payment_speed_floor` is `0.95`, so the speed multiplier lives in
-`[0.95, 1.0]` — while being wrong costs 100%. A second opinion is therefore
-worth far more than a faster first one. If no provider verifies, the best partial answer across
-all of them is still returned — never nothing when some provider produced
-runnable code.
-
-Budget is split across the remaining providers rather than handed to the first,
-so a slow leader cannot starve the rest, and the chain stops early when too
-little time remains for another provider to be useful.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `MINER_BACKENDS` | `claude` | Comma-separated backends, in preference order |
-| `CLAUDE_CDP` | `9222` | CDP endpoint(s) of the Chrome you started, one per account |
-| `CLAUDE_TABS_PER_BROWSER` | `2` | Conversation slots per browser |
-| `SOLVER_MAX_ATTEMPTS` | `3` | Model round-trips per provider: 1 initial answer + 2 repairs |
-
-`CLAUDE_CDP` accepts a bare port (`9222` → `http://127.0.0.1:9222`), a
-`host:port`, a full URL, or a comma-separated list for several accounts.
-`CHATGPT_*` are the exact analogues.
-
-These are read from the process environment **and** from `.env` — `run_miner.py`
-loads that file into the environment itself, because the miner's own settings go
-through pydantic-settings, which reads `.env` directly and leaves `os.environ`
-untouched. A shell variable still wins over the file.
-
-`GET /solver-status` reports per-provider counters — `solved`, `verified`,
-`cache_hits`, `empty`, plus pool health (`tabs`, `idle`, `browsers`, `lost`).
-With more than one backend it also reports the `chain`, and `verified_by` /
-`attempts` totals per provider; with a single backend those two keys are absent,
-because there is no chain to describe. Watch it either way: a provider that has
-started failing looks exactly like success until the score drops.
+Turn it off if you would rather never spend two accounts on one task.
 
 ## Running a backend: you start the browser, the miner attaches
 
@@ -240,7 +211,7 @@ cd examples/custom_miner
 # 3. Verify, then run. CLAUDE_CDP defaults to 9222, so with one browser on the
 #    default port there is nothing to configure.
 python -m solvers.doctor claude --probe
-MINER_BACKENDS=claude python run_miner.py
+python run_miner.py
 ```
 
 `start_debug_browser.sh` uses `$CHROME_BIN` if you set it, else the first of
@@ -308,7 +279,7 @@ their deadline. The launcher warns when it is short.
 ```dotenv
 # one debug Chrome per account, each on its own port
 CLAUDE_CDP=9222,9223
-CLAUDE_TABS_PER_BROWSER=2
+MINER_TABS_PER_BROWSER=2
 ```
 
 ⚠ `MINER_MAX_CONCURRENT_REQUESTS` defaults to **4** while one browser gives
@@ -366,17 +337,7 @@ Three hazards are handled in code rather than left to the selectors:
 
 The same doctor works for ChatGPT: `python -m solvers.doctor chatgpt`.
 
-## Included backend: ChatGPT in the browser + self-verification
-
-`run_chatgpt_miner.py` wires up a ready-made solver built from
-[fnlich/Automation](https://github.com/fnlich/Automation)'s browser driver:
-
-```
-POST /solve -> fresh ChatGPT conversation -> self-grade against the public
-examples with the validator's own executor -> repair on failure -> signed reply
-```
-
-### Why the self-verification matters
+## Self-verification: the part that earns the money
 
 Scoring is accuracy-or-nothing, and models routinely produce *nearly* right
 answers. But every task ships real `public_examples`, and the comparators the
@@ -393,44 +354,53 @@ Your solution is WRONG. I ran `sum_of_digits` against the examples and got:
 
 That turns a one-shot paste into a repair loop that converges. Passing the
 public examples is not proof of passing the hidden suite, but it eliminates the
-large class of answers that are simply wrong on the stated contract.
+large class of answers that are simply wrong on the stated contract. When even
+that is not enough, the second opinion asks the other model — see
+[The one time the provider matters](#the-one-time-the-provider-matters).
 
-### Setup — one browser per ChatGPT account
-
-Accounts are the rate-limit unit, so N accounts give N× throughput. ChatGPT's
-own sign-in often routes through Google, which is exactly the check that rejects
-a driver-launched browser — so signing in by hand, as below, is not optional
-here. Point `CHATGPT_CDP` at the browsers you started:
-
-Each launcher **stays in the foreground for the life of its browser**, so give
-each one its own terminal — they are not a sequence to paste in one go.
-
-```bash
-# terminal 1 — stays busy
-./scripts/start_debug_browser.sh --port 9222 --profile ~/.hone-miner/chrome/gpt-1
-
-# terminal 2 — stays busy
-./scripts/start_debug_browser.sh --port 9223 --profile ~/.hone-miner/chrome/gpt-2
-
-# terminal 3, after signing in to chatgpt.com in both
-python -m solvers.doctor chatgpt --cdp 9222 --probe
-CHATGPT_CDP=9222,9223 python run_chatgpt_miner.py
-```
-
-Keep the tab count at or above `MINER_MAX_CONCURRENT_REQUESTS`, or extra tasks
-queue and burn their deadline. The launcher warns when it is short.
+The ChatGPT reader is a direct port of
+[fnlich/Automation](https://github.com/fnlich/Automation)'s driver: identify the
+reply by its `data-message-id`, treat it as finished only when the Stop button
+is gone *and* the text is unchanged across two polls, and start every task in a
+fresh conversation.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CHATGPT_CDP` | `9222` | CDP endpoint(s) of the Chrome you started, one per account |
-| `CHATGPT_TABS_PER_BROWSER` | `2` | Conversation slots per browser |
-| `SOLVER_MAX_ATTEMPTS` | `3` | Model round-trips: 1 initial answer + 2 repairs |
 | `SOLVER_SAFETY_MARGIN_S` | `15` | Headroom kept before the cutoff |
 | `SOLVER_MAX_BUDGET_S` | `240` | Hard cap on one solve |
 | `SOLVER_VERIFY_EXECUTOR` | `subprocess` | Python grading backend; Rust always uses Docker |
 
-`GET /solver-status` reports pool health and solve counts. Watch it — a
-browser-backed miner fails quietly, and silence looks identical to success.
+`GET /solver-status` reports per-provider counters and fleet health. Watch it —
+a browser miner fails quietly, and silence looks identical to success.
+
+## Running under pm2
+
+pm2 supervises **only the miner**. The browsers are yours: you start them, you
+sign in, and they stay up across miner restarts — which is exactly why sign-in
+works at all.
+
+```bash
+cd examples/custom_miner
+pm2 start ecosystem.config.js
+pm2 logs hone-miner
+pm2 save && pm2 startup        # survive a reboot
+```
+
+Restarts are safe by design, and both halves of that were tested:
+
+- **Clean stop** (`pm2 stop`/`restart` sends SIGINT, then SIGTERM). The miner
+  handles both, closes the tabs it opened, and disconnects without touching your
+  browsers. The handlers are installed *before* it attaches, so a restart during
+  startup — when attaching to eight browsers takes a while — is still clean.
+- **Unclean kill** (OOM, `kill -9`, a crash). Nothing runs, so the tabs are
+  orphaned. The next start finds them and closes them: every tab this miner
+  opens is stamped in `window.name`, which your own tabs never carry. Verified
+  over three kill/restart cycles — the tab count stays flat instead of growing
+  by `MINER_TABS_PER_BROWSER` each time.
+
+If a browser is down when the miner starts, it logs which endpoint failed and
+serves with the rest of the fleet. Bring the browser back and restart the miner
+to pick it up again.
 
 ### Know the risks before running either browser backend for money
 
@@ -451,14 +421,14 @@ browser-backed miner fails quietly, and silence looks identical to success.
 - **Fragility, with nothing to fall back to.** Browser/DOM updates, expired
   logins, rate limits and CAPTCHAs all break browser automation. A miner that
   does not answer scores zero into a 200-observation window (~2.1 days), so one
-  bad night costs most of your score — and there is no `MINER_BACKENDS=...-api`
-  to switch to when it happens. Three things stand in for that: run both
-  providers so they are not down together, run the doctor before you serve, and
+  bad night costs most of your score — and there is no API backend to switch to
+  when it happens. Three things stand in for that: run both providers so they
+  are not down together, run the doctor before you serve, and
   watch `/solver-status`, because a provider that has started failing looks
   exactly like one that is merely quiet.
 - **The `Backend` protocol is three methods.** If you do want an API path,
   `open()` returning something with `send(text, timeout_s)` and `close()` is the
-  whole interface; `verify.py` and the fallback chain take it unchanged.
+  whole interface; `verify.py` and the fleet take it unchanged.
 - **Rust.** Rust verification always uses the Docker executor — the solver
   forces it regardless of `SOLVER_VERIFY_EXECUTOR`, because there is no
   subprocess path to `rustc`. What it actually needs is a working Docker daemon
