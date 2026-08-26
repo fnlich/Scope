@@ -2881,38 +2881,92 @@ def test_the_prompt_quotes_the_real_per_test_timeout():
     assert "5 seconds" in PYTHON_EDGE_CASES and "5 seconds" in RUST_EDGE_CASES
 
 
-def test_the_examples_are_framed_as_a_floor_and_come_after_the_checklist():
-    """The examples are the friendliest thing in the message and the easiest to
-    over-fit to. Read first, they become the specification and the checklist
-    reads as an afterthought; read last, they are a lower bound."""
+def test_the_examples_are_framed_as_a_floor_not_the_specification():
+    """The examples now sit WITH the problem rather than after the checklists,
+    and the reversal is deliberate.
+
+    They used to come last so the checklist would be read first. That bought
+    one thing and cost another: instructions about how to solve something are
+    unreadable before you know what it is, and the task was buried under two
+    kilobytes of advice. The label does the anti-over-fitting work on its own —
+    it says in the same breath that these are a floor and that the cases below
+    still apply — so the task can be where a task belongs.
+    """
     from solvers.prompts import build_initial_prompt
 
     prompt = build_initial_prompt(
         "python", "Do a thing.", "solve",
         [{"args": [[1]], "kwargs": {}, "expected": 1}],
     )
-    assert prompt.index("Edge cases are where") < prompt.index("PUBLIC EXAMPLES"), (
-        "the examples are read before the checklist"
-    )
     assert "a floor, not the specification" in prompt
+    assert "survive the cases below" in prompt, "the label does not point forward"
+    assert prompt.index("<problem") < prompt.index("<examples"), (
+        "the examples are separated from the problem they belong to"
+    )
 
 
-def test_the_prompt_asks_for_code_with_nothing_explaining_it():
-    """The grader imports the source and calls it. Nothing ever reads a comment
-    or a docstring, and every one of them is output the model spends before the
-    answer is finished — on a subnet that tiebreaks on latency, that is the only
-    thing they cost. Both languages are told, and neither is asked to narrate
-    its own edge-case reasoning back in a comment."""
+def test_how_to_answer_comes_last_where_it_is_most_likely_to_be_obeyed():
+    """Everything that shapes HOW to answer sits closest to where generation
+    begins. The problem and its examples come first, because that is the thing
+    being reasoned about; the method comes last, because that is the thing being
+    obeyed."""
     from solvers.prompts import build_initial_prompt
 
-    for language, entry in (("python", "solve"), ("rust", "main")):
+    for language, entry in (("rust", "main"), ("python", "solve")):
         prompt = build_initial_prompt(language, "Do a thing.", entry, [])
-        assert "Write no comments and no docstrings" in prompt, (
-            f"the {language} prompt never says to leave the code unexplained"
-        )
-        assert "comment at the top" not in prompt, (
-            f"the {language} prompt still asks for an explanatory comment"
-        )
+        assert prompt.index("<problem") < prompt.index("<method>")
+        assert prompt.index("<contract>") < prompt.index("<method>")
+        assert prompt.rstrip().endswith("</method>"), prompt[-80:]
+
+
+def test_the_output_contract_holds_the_first_word_and_the_nudge_the_last():
+    """The only instruction whose failure costs the ENTIRE answer rather than
+    degrading it, so it gets both ends and nothing competes for either."""
+    from solvers.prompts import build_initial_prompt
+
+    for site, language, entry in ((claude_site(), "rust", "main"),
+                                  (chatgpt_site(), "python", "solve")):
+        prompt = build_initial_prompt(language, "Do a thing.", entry, [])
+        assert prompt.startswith("<output>"), prompt[:40]
+        assert "ONE fenced" in prompt.split("</output>")[0]
+        # ...and the site's nudge, appended after everything, repeats it.
+        assert site.nudge.startswith("START your reply with the code block")
+
+
+def test_the_section_that_asks_for_a_check_does_not_say_before_you_answer():
+    """The phrase itself is what caused the narration. A model told to do
+    something "before you answer" writes it down, at length, and only then
+    starts the program — so the section is not named that either."""
+    from solvers.prompts import build_initial_prompt
+
+    prompt = build_initial_prompt("rust", "Do a thing.", "main", [])
+    assert "before_you_answer" not in prompt, "the tag name reintroduces the phrase"
+    assert "Write the program FIRST" in prompt
+    assert "silently" in prompt
+
+
+def test_the_self_check_names_the_bugs_that_actually_reached_the_grader():
+    """Read off 43 real submissions. Ten were the model's own bugs and EIGHT of
+    those were visible on a careful re-read of the program itself — a helper
+    called but never written, a `[-1]` on a list the program's own parser can
+    empty, a sentinel of 255 used to index five buckets, an id used where a
+    position was meant, a condition already guaranteed by the arm it sat in.
+
+    Generic advice does not reach any of that. Each line below is one of them.
+    """
+    from solvers.prompts import SELF_CHECK, build_initial_prompt
+
+    for phrase in (
+        "you also wrote",          # helper called but never defined
+        "index is in range",       # sentinel-as-index, id-as-position
+        "branch is reachable",     # dead arm, arm that discards its result
+        "empty case",              # [-1] on a list its own code can empty
+        "rebuild ALL of it",       # refresh that forgets one field
+        "that branch can undo",    # counter committed before the wrong path
+    ):
+        assert phrase in SELF_CHECK, f"the self-check dropped {phrase!r}"
+    for language, entry in (("rust", "main"), ("python", "solve")):
+        assert SELF_CHECK in build_initial_prompt(language, "Do a thing.", entry, [])
 
 
 def test_a_repair_round_is_sent_back_through_the_checklist():
@@ -3907,7 +3961,9 @@ def test_the_checklist_asks_for_the_program_first_not_a_walkthrough():
     )
     for language, entry in (("rust", "main"), ("python", "solve")):
         prompt = build_initial_prompt(language, "Do a thing.", entry, [])
-        assert prompt.index("Write the program FIRST") < prompt.index("PROBLEM:")
+        # The instruction now lives in <method>, which comes last on purpose —
+        # see test_how_to_answer_comes_last_where_it_is_most_likely_to_be_obeyed.
+        assert "Write the program FIRST" in prompt.split("<method>")[1]
 
 
 def test_both_nudges_use_the_last_word_to_demand_code_first():

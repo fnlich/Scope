@@ -129,6 +129,26 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 - **Never raise.** On any failure return empty `code` — a zero is survivable, a
   crash loop is not. `custom_miner.py` already wraps your solver this way.
 
+### The prompt is one delimited document, and the order is the argument
+
+```
+<output>    one fenced block, nothing else          ← first
+<problem>   the statement
+<examples>  labelled a floor, not the specification
+<contract>  how the grader runs and compares it
+<method>    edge cases, then read the program back  ← last
+```
+…then the site's nudge, appended after everything, repeats the output rule.
+
+The output contract holds **both ends**. It is the only instruction whose
+failure costs the entire answer rather than degrading it, so it gets primacy and
+recency and nothing else competes for either. The problem comes next, because
+instructions about how to solve something are unreadable before you know what it
+is. Everything shaping *how* to answer comes last, closest to where generation
+begins — and the section is called `<method>`, not `<before_you_answer>`, because
+that phrase is exactly what used to make models narrate a walkthrough instead of
+writing the program.
+
 ### The hidden suite is where the score is, so the prompt is written for it
 
 The public examples are the friendly ones. Grading is on the **complete hidden
@@ -182,6 +202,29 @@ they are not the same failure:
   at: `True` is not `1`, two integers must match exactly, a dict must have
   exactly the expected keys — and a list and a tuple *are* interchangeable, so
   no repair round need be spent converting one.
+
+### Then the program is read back against itself
+
+Read off 43 answers a live miner submitted: ten were the model's own bugs, and
+**eight of those ten were visible on a careful re-read of the program itself** —
+no test, no execution, no cleverness required.
+
+| what shipped | what a re-read would have caught |
+| --- | --- |
+| `failed_any(&output)` | called, never written |
+| `constrained[-1]` | on a list its own parser returns empty |
+| `reason.push(255)` then indexed | a sentinel used as a position, into 5 buckets |
+| `id = cmd_idx` | an id used where a push-order position was meant |
+| `if s.len() != 11` inside `10 =>` | already guaranteed false, so the arm is dead |
+| rebuild of `fcnt/first/last/rcnt` | forgot `size`, so every rank descent ran on 1 |
+| `pc[jid] = pos + 1` | committed before a branch that must not commit it |
+
+That is not a hard-problem failure. It is a re-reading failure — the model had
+everything it needed and did not look again. So `<method>` ends by asking it to,
+once, against a list of exactly those things. Generic advice reaches none of
+them; naming them is the whole point.
+
+The check is explicitly silent — it happens in reasoning, never in the reply.
 
 Both are told the real per-test budget (5 seconds), because a budget quoted
 generously invites an algorithm that does not fit.

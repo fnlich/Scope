@@ -91,9 +91,15 @@ def sanitize_code(text: str) -> str:
     return _LANG_LABEL_RE.sub("", text, count=1)
 
 
+# Stated first, and again last by the site's nudge. It is the only instruction
+# whose failure costs the whole answer rather than degrading it, so it gets both
+# the primacy and the recency slot and nothing else competes for either.
+OUTPUT_CONTRACT = """\
+Reply with ONE fenced {language} code block and nothing else. No preamble, no
+explanation before it or after it. Only the code inside the fence is ever read."""
+
 PYTHON_RULES = """\
 Rules — the grader is automated and unforgiving:
-- Reply with ONLY ONE Python code block and nothing else outside it.
 - Define exactly one top-level function named `{entrypoint}`. It is called
   directly as `{entrypoint}(*args, **kwargs)`.
 - RETURN the answer. Do not print it, do not read stdin, do not call input().
@@ -105,7 +111,6 @@ Rules — the grader is automated and unforgiving:
 
 RUST_RULES = """\
 Rules — the grader is automated and unforgiving:
-- Reply with ONLY ONE Rust code block and nothing else outside it.
 - Write ONE complete program with `fn main()`, compiled as a single file with
   `rustc --edition=2021 -C opt-level=2`. No Cargo, no crates, std only.
 - READ the input from stdin and WRITE only the requested answer to stdout.
@@ -183,6 +188,38 @@ RUST_EDGE_CASES = """\
   BufWriter rather than printing in a loop."""
 
 
+# Read off 43 answers a live miner submitted. Ten were the model's own bugs, and
+# EIGHT of those ten were visible on a careful re-read of the program itself --
+# no test, no execution, no cleverness required. A helper called but never
+# written. A `[-1]` on a list the program's own parser can empty. A sentinel of
+# 255 pushed into a list and later used to index five buckets. An id used where
+# a position was meant. A condition already guaranteed by the match arm it sat
+# in, so the arm was dead. An index of 16 into a length-16 string.
+#
+# None of that is a hard-problem failure. It is a re-reading failure, and it is
+# the one kind of mistake a prompt can actually reach: the model has everything
+# it needs to catch these and simply does not look again. So it is asked to,
+# once, against a list of exactly the things that have gone wrong.
+SELF_CHECK = """\
+Then read the program back against itself. Every line here is a bug that has
+reached this grader inside a program that looked finished:
+- Every function you CALL, you also wrote. A helper you meant to add and did not
+  is a compile error sitting in a file that otherwise looks complete.
+- Every index is in range. Watch for two numberings of the same objects — an id
+  used where a position is meant — and for a sentinel value that later reaches a
+  subscript.
+- Every branch is reachable and every branch produces its answer. A condition
+  already guaranteed by the arm it sits in is dead code; an arm that computes a
+  value and then discards it emits nothing at all.
+- Every `[0]`, `[-1]`, `.pop()`, `.first()`, `.last()` has an answer for the
+  empty case — including the empty case your OWN code can produce.
+- When you rebuild derived state, you rebuild ALL of it. A refresh that updates
+  four fields and forgets the fifth leaves the fifth silently stale.
+- State you commit before a branch, that branch can undo. A counter advanced and
+  not rewound on the path that should not have advanced it is a wrong answer
+  that shows up under one ordering and not another."""
+
+
 def _render_examples(language: str, examples: list[dict[str, Any]]) -> str:
     """Render public examples in the shape the grader will actually use."""
     if not examples:
@@ -210,28 +247,43 @@ def build_initial_prompt(
 ) -> str:
     """The one prompt that has to carry the whole contract.
 
-    The examples come LAST on purpose. They are the friendliest thing in the
-    message and the easiest to over-fit to, so the edge-case checklist is read
-    first and the examples arrive already framed as a lower bound rather than
-    as the specification.
+    Laid out in delimited sections, and the order is the argument. The output
+    contract goes FIRST because it is the only instruction whose failure costs
+    the entire answer rather than degrading it; the site's nudge repeats it last,
+    so it holds both the primacy and the recency slot. The problem and its
+    examples come next, because instructions about how to solve something are
+    unreadable before you know what it is. Everything that shapes HOW to answer
+    comes last, closest to where generation begins.
+
+    The examples are labelled a floor rather than the specification. They are the
+    friendliest thing in the message and the easiest to over-fit to, and the
+    label is what stops them being read as the whole job.
     """
     is_rust = language == "rust"
     rules = (RUST_RULES if is_rust else PYTHON_RULES).format(entrypoint=entrypoint)
     edges = EDGE_CASES + "\n" + (RUST_EDGE_CASES if is_rust else PYTHON_EDGE_CASES)
+
     parts = [
-        f"Solve this programming problem in {'Rust' if is_rust else 'Python'}.",
-        "", rules,
-        "", edges,
-        "", "PROBLEM:", statement.strip(),
+        "<output>",
+        OUTPUT_CONTRACT.format(language="Rust" if is_rust else "Python"),
+        "</output>", "",
+        f'<problem language="{"rust" if is_rust else "python"}" '
+        f'entrypoint="{entrypoint}">',
+        statement.strip(),
+        "</problem>", "",
     ]
     rendered = _render_examples(language, examples)
     if rendered:
         parts += [
-            "",
-            "PUBLIC EXAMPLES — these are a floor, not the specification. Your "
-            "code must reproduce them exactly AND survive the cases above:",
+            "<examples note=\"PUBLIC EXAMPLES — a floor, not the specification. "
+            "Your code must reproduce these exactly AND survive the cases below.\">",
             rendered,
+            "</examples>", "",
         ]
+    parts += [
+        "<contract>", rules, "</contract>", "",
+        "<method>", edges, "", SELF_CHECK, "</method>",
+    ]
     return "\n".join(parts)
 
 
