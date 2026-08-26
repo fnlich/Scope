@@ -380,6 +380,20 @@ async def _use_dead_tab(pool: BrowserFleet) -> None:
         LeaseOnly(), max_attempts=1, safety_margin_s=0, max_budget_s=30,
         second_opinion=False,   # this is about tab replacement, not two models
     ).solve_task(DIGITS, timeout_s=30)
+    await _settle(pool)
+
+
+async def _settle(pool: BrowserFleet) -> None:
+    """Wait for the fleet's background replacements to land.
+
+    `release()` deliberately does not wait for one (it runs in the solver's
+    `finally`, past the deadline). Production has an event loop that keeps
+    running afterwards; a test that ends at `asyncio.run` does not, so the wait
+    has to be explicit here or these assertions would be measuring scheduling
+    luck rather than the fleet.
+    """
+    while pool._pending:
+        await asyncio.gather(*list(pool._pending), return_exceptions=True)
 
 
 @SITES
@@ -4230,3 +4244,434 @@ def test_a_hostile_problem_id_cannot_place_the_record_outside_the_archive(tmp_pa
         assert written is not None and written.parent == tmp_path, (
             f"{hostile!r} escaped to {written}"
         )
+
+
+# --- nothing may outlive the deadline it was given ----------------------- #
+# Playwright auto-waits 30 SECONDS on a locator unless told otherwise, and
+# `set_default_timeout` is never called anywhere in this miner. Measured here
+# against a node that was resolved and then removed -- the ordinary shape of a
+# chat page still settling after an answer:
+#
+#     button.inner_text()   raised after 30.0s
+#     node.inner_text()     raised after 30.0s
+#     code.text_content()   raised after 30.0s
+#
+# `_submit` has been bounded against that since it was written. The rest of
+# `send` was not, and the tail is the dangerous half: it runs AFTER the read
+# loop has hit the deadline, so every second it spends is a second the solve
+# has already promised away. `handle_request` wraps the whole solve in an
+# `asyncio.wait_for` and answers 504 -- nothing at all -- rather than late, so
+# an unbounded tail does not deliver the answer slowly. It destroys it.
+
+
+def _answered_page(code="def pong():\n    return 'pong'"):
+    """A page that renders one finished answer as soon as send is clicked."""
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [_Node(code=[code])])
+    return page
+
+
+def _forever(*_a, **_kw):
+    async def hang():
+        await asyncio.sleep(3600)
+
+    return hang()
+
+
+def test_a_wedged_copy_control_cannot_spend_the_answer_it_was_checking(monkeypatch):
+    """The copy phase runs past the deadline to improve an answer already in
+    hand. Unbounded it can wait 30s per button on a page that is mid-rerender,
+    and the answer it was polishing is thrown away by the deadline above it."""
+    from solvers import browser_pool
+
+    monkeypatch.setattr(_Tab, "_copy_phase", _forever)
+    page = _answered_page()
+    tab = _tab(page, _site(copy=("#copy",)))
+    started = time.monotonic()
+    reply = asyncio.run(tab.send("solve it", 1.0))
+    spent = time.monotonic() - started
+    assert spent < browser_pool.COPY_PHASE_TIMEOUT_S + 4.0, f"tail ran {spent:.1f}s"
+    assert "return 'pong'" in reply, f"scraped answer lost to the copy phase: {reply!r}"
+
+
+def test_a_wedged_stream_check_cannot_spend_the_answer_it_was_checking(monkeypatch):
+    """Same hazard, second phase. The stream is a cross-check on an answer the
+    page already gave; failing to finish it must cost the check, not the
+    answer."""
+    from solvers import browser_pool
+
+    monkeypatch.setattr(_Tab, "_reconcile_stream", _forever)
+    page = _answered_page()
+    tab = _tab(page, _site(stream=True))
+    started = time.monotonic()
+    reply = asyncio.run(tab.send("solve it", 1.0))
+    spent = time.monotonic() - started
+    assert spent < browser_pool.STREAM_PHASE_TIMEOUT_S + 4.0, f"tail ran {spent:.1f}s"
+    assert "return 'pong'" in reply, f"answer lost to the stream check: {reply!r}"
+
+
+def test_a_wedged_post_mortem_cannot_be_the_slowest_thing_in_the_solve(capsys, monkeypatch):
+    """`_explain_empty` exists to explain a zero. It is a LOG LINE. Unbounded it
+    can outlast everything that produced the zero -- and it was not even inside
+    a try, so a raise from its final `inner_text` propagated out of `send`."""
+    from solvers import browser_pool
+
+    monkeypatch.setattr(_Tab, "_explain_empty", _forever)
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    started = time.monotonic()
+    reply = asyncio.run(_tab(page, _site()).send("solve it", 1.0))
+    spent = time.monotonic() - started
+    assert reply == ""
+    assert spent < browser_pool.POSTMORTEM_TIMEOUT_S + 4.0, f"post-mortem ran {spent:.1f}s"
+    assert "did not answer in time" in capsys.readouterr().out
+
+
+def test_the_whole_tail_fits_inside_the_solvers_safety_margin():
+    """Arithmetic, not behaviour, and it is the assumption the three bounds
+    above are chosen against: they run after the budget is gone, so their sum
+    has to fit in what VerifyingSolver held back -- with room left for the last
+    grade and the tab close."""
+    from solvers import browser_pool
+
+    tail = (
+        browser_pool.COPY_PHASE_TIMEOUT_S
+        + browser_pool.STREAM_PHASE_TIMEOUT_S
+        + browser_pool.POSTMORTEM_TIMEOUT_S
+    )
+    assert tail < 15.0, f"the tail ({tail}s) can outlast the default safety margin"
+
+
+def test_a_wedged_snapshot_cannot_eat_the_budget_before_a_prompt_is_even_sent():
+    """`_fingerprint` ends in a `get_attribute` on the last message, which is
+    the 30s auto-wait again -- and it ran OUTSIDE the submit bound. A page that
+    re-renders as the prompt goes out could burn the whole read budget before a
+    single poll, on a conversation that would have answered."""
+
+    class _Wedged(_FakePage):
+        def locator(self, selector):
+            if selector == "#assistant":
+                return _Loc(self, selector, [_Slow()])
+            return super().locator(selector)
+
+    class _Slow(_Node):
+        def __init__(self):
+            super().__init__()
+
+        async def get_attribute(self, name):
+            await asyncio.sleep(3600)
+
+    page = _Wedged({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    site = _site(message_id_attr="data-id")
+    tab = _tab(page, site)
+    started = time.monotonic()
+    reply = asyncio.run(tab.send("solve it", 1.0))
+    spent = time.monotonic() - started
+    # The submit budget floors at 5s; anything beyond that is the unbounded read.
+    assert spent < 12.0, f"the snapshot ran {spent:.1f}s"
+    assert reply == "" and tab.alive is False, "a wedged page must retire the tab"
+
+
+def test_open_turn_still_snapshots_before_it_submits():
+    """Bounding the snapshot moved it into a helper. The ORDER is the thing that
+    must survive: a floor taken after the prompt can already have this answer's
+    own stream record under it, and the reply would be rebuilt from its own
+    prompt."""
+    page = _answered_page()
+    tab = _tab(page, _site())
+    order: list[str] = []
+    tab._fingerprint = lambda: _record(order, "fingerprint", (0, None))
+    tab._stream_seq = lambda: _record(order, "stream_seq", 7)
+    tab._submit = lambda text, ui_ms: _record(order, "submit", None)
+    before = asyncio.run(tab._open_turn("hello", 1000))
+    assert order == ["fingerprint", "stream_seq", "submit"], order
+    assert before == (0, None) and tab._stream_before == 7
+
+
+async def _record(log: list, name: str, value):
+    log.append(name)
+    return value
+
+
+# --- rebuilding capacity must not be billed to the solve that lost it ----- #
+# `release()` runs from the solver's `finally`, after the answer is in hand and
+# after the budget is spent. Building a tab means a new page, a navigation and
+# a wait for the composer -- `ready_timeout_ms` alone is 60 SECONDS -- and the
+# deadline above it is an `asyncio.wait_for` in `handle_request` that answers
+# 504 rather than late. Awaited there, the replacement would destroy the very
+# answer whose failure asked for it, and it is exactly the failing solves, the
+# ones with the least budget left, that reach this path.
+
+
+def _slow_pool(delay: float = 3600.0, site=None) -> BrowserFleet:
+    """A fleet whose `_spawn` takes as long as a real signed-in page can."""
+    site = site or chatgpt_site()
+    pool = _fleet(site)
+    pool._size = 1
+
+    async def spawn(context, browser, label):
+        await asyncio.sleep(delay)
+        tab = _Tab(pool, _DeadPage(), context, f"{label}-new", site=browser.site)
+        pool._tabs.append(tab)
+        return tab
+
+    pool._spawn = spawn
+    return pool
+
+
+def test_replacing_a_dead_tab_does_not_hold_up_the_answer():
+    pool = _slow_pool()
+
+    async def go():
+        dead = _Tab(pool, _DeadPage(), object(), "dead#1", chatgpt_site())
+        dead.alive, dead.leased = False, True
+        pool._tabs.append(dead)
+        started = time.monotonic()
+        await pool.release(dead)
+        spent = time.monotonic() - started
+        pending = list(pool._pending)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        return spent, pending
+
+    spent, pending = asyncio.run(go())
+    assert spent < 1.0, f"release() waited {spent:.1f}s for the new tab to load"
+    assert pending, "the replacement was dropped instead of being handed off"
+    assert pool._lost == 1 and pool._size == 0, "book-keeping is not deferred"
+
+
+def test_a_replacement_still_lands_in_the_fleet_once_it_finishes_loading():
+    """Deferring it must not mean losing it: capacity has to come back, or the
+    fleet bleeds a tab on every failure until nothing is left."""
+    pool = _slow_pool(delay=0.01)
+
+    async def go():
+        dead = _Tab(pool, _DeadPage(), object(), "dead#1", chatgpt_site())
+        dead.alive, dead.leased = False, True
+        pool._tabs.append(dead)
+        await pool.release(dead)
+        await _settle(pool)
+
+    asyncio.run(go())
+    assert pool._free.qsize() == 1, "the replacement never reached the free queue"
+    assert pool._size == 1, f"capacity not restored: {pool._size}"
+
+
+def test_shutdown_does_not_leave_a_half_built_tab_open_in_your_browser():
+    """A replacement in flight during shutdown is a page this fleet opened,
+    signed in, that nothing else knows about — `_teardown` sweeps `_tabs`, and
+    the new tab is not in it until `_spawn` returns."""
+    pool = _slow_pool(delay=3600.0)
+    pool._pw = SimpleNamespace(stop=lambda: _done(None))
+
+    async def go():
+        dead = _Tab(pool, _DeadPage(), object(), "dead#1", chatgpt_site())
+        dead.alive, dead.leased = False, True
+        pool._tabs.append(dead)
+        await pool.release(dead)
+        spawn = next(iter(pool._pending), None)
+        assert spawn is not None, "nothing was spawned to cancel"
+        started = time.monotonic()
+        await asyncio.wait_for(pool.aclose(), timeout=10)
+        # Read the state HERE, inside the loop. Asserting after `asyncio.run`
+        # returns proves nothing: its own shutdown cancels whatever is left and
+        # the done-callback empties `_pending`, so a teardown that ignored the
+        # replacement entirely would look identical from outside.
+        return time.monotonic() - started, spawn.done(), list(pool._pending)
+
+    spent, finished, leftover = asyncio.run(go())
+    assert spent < 5.0, f"shutdown waited {spent:.1f}s on a replacement"
+    assert finished, "the replacement was still loading when the fleet went away"
+    assert leftover == [], f"a replacement outlived the fleet: {leftover}"
+    assert pool._tabs == [] and pool._size == 0
+
+
+def test_a_replacement_that_finishes_after_shutdown_is_closed_not_leaked():
+    """The other half of the race: the spawn completes before the cancellation
+    reaches it. `_teardown` has already swept `_tabs`, so this tab would stay
+    open in the operator's browser forever."""
+    pool = _fleet(chatgpt_site())
+    pool._size = 1
+    built: list = []
+
+    async def spawn(context, browser, label):
+        pool._closing = True          # shutdown ran while this was loading
+        tab = _Tab(pool, _FakePage({}), context, f"{label}-new", site=browser.site)
+        pool._tabs.append(tab)
+        built.append(tab)
+        return tab
+
+    pool._spawn = spawn
+
+    async def go():
+        dead = _Tab(pool, _DeadPage(), object(), "dead#1", chatgpt_site())
+        dead.alive, dead.leased = False, True
+        pool._tabs.append(dead)
+        await pool.release(dead)
+        await _settle(pool)
+
+    asyncio.run(go())
+    assert built and built[0]._page.closed, "the late replacement was left open"
+    assert pool._free.qsize() == 0, "a page that was just closed was queued as free"
+
+
+# --- grading is blocking work wearing an async coat ---------------------- #
+# `compile_defect` shells out to rustc and `_Grader.check` runs the validator's
+# own executor -- each a `subprocess.run` of seconds, and for the Docker backend
+# of a container start. Called straight from a coroutine they stop the event
+# loop dead, and the loop is not one solve's alone: the miner answers several
+# validators at once (`solve_slots` is a semaphore), and the deadline that
+# decides whether a solve is PAID is itself an `asyncio.wait_for` -- which
+# cannot fire on a loop that is not running.
+
+
+def test_grading_does_not_stop_the_world_for_every_other_solve():
+    """Measured before the fix, a 3s subprocess beside a 1.0s deadline:
+
+        the other solve's 1.0s deadline fired after  3.05s
+
+    Every concurrent solve is pushed past its cutoff by one Rust compile, and
+    each of those answers 504 with no answer at all."""
+    from solvers.verify import Candidate
+
+    solver = _solver([RIGHT])
+    solver._grade = lambda reply, task, left=None: time.sleep(1.0) or Candidate(
+        code="x = 1", raw=reply
+    )
+    late: list[float] = []
+
+    async def other_solve():
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(asyncio.sleep(30), timeout=0.2)
+        except asyncio.TimeoutError:
+            late.append(time.monotonic() - started)
+
+    async def go():
+        return await asyncio.gather(
+            other_solve(), solver._graded("reply", DIGITS, 30.0)
+        )
+
+    _, candidate = asyncio.run(go())
+    assert candidate.code == "x = 1", "the grade itself was lost"
+    assert late and late[0] < 0.6, (
+        f"a concurrent solve's 0.2s deadline fired after {late[0]:.2f}s — "
+        f"the event loop was blocked by grading"
+    )
+
+
+def test_a_grade_that_explodes_still_yields_the_answer_it_was_checking():
+    """Off-loop or not, the check is subordinate to the answer: a candidate that
+    cannot be graded is still a candidate, and an ungraded answer can pass the
+    hidden suite where nothing at all cannot."""
+    solver = _solver([RIGHT])
+
+    def boom(reply, task, left=None):
+        raise RuntimeError("executor gone")
+
+    solver._grade = boom
+    candidate = asyncio.run(solver._graded(RIGHT, DIGITS, 30.0))
+    assert "def g(n)" in candidate.code, f"answer lost with the grade: {candidate.code!r}"
+
+
+def test_the_executor_cache_is_built_once_even_under_concurrent_grades():
+    """Now reached from worker threads, and concurrently. Two threads missing
+    the cache together would each construct an executor — for the Docker backend
+    that is a container's worth of startup thrown away, on the one code path
+    whose entire reason for caching is that Docker startup is slow."""
+    import threading
+    from solvers.verify import _Grader
+
+    grader = _Grader()
+    built: list[int] = []
+    start = threading.Barrier(4)
+
+    def make(settings, language):
+        built.append(1)
+        time.sleep(0.05)          # widen the window a real construction would have
+        return object()
+
+    import rlvr.execution.executor as ex_mod
+    original = ex_mod.get_executor
+    ex_mod.get_executor = make
+    try:
+        seen: list = []
+
+        def worker():
+            start.wait()
+            seen.append(grader.executor("python"))
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        ex_mod.get_executor = original
+
+    assert len(built) == 1, f"built the executor {len(built)} times"
+    assert len(set(map(id, seen))) == 1, "different threads got different executors"
+
+
+def test_a_compile_check_cannot_outlive_the_answer_it_is_checking():
+    """`COMPILE_TIMEOUT_S` defaults to 25s — a hang guard sized for a compiler,
+    not for a deadline. The solver's whole safety margin is 15s, and overrunning
+    it does not deliver the answer late, it discards it."""
+    from solvers import rust_compile
+
+    seen: dict = {}
+
+    class _Done:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd, **kw):
+        seen.update(kw)
+        return _Done()
+
+    original_run, original_path = rust_compile.subprocess.run, rust_compile.rustc_path
+    rust_compile.subprocess.run = fake_run
+    rust_compile.rustc_path = lambda: "/usr/bin/rustc"
+    try:
+        rust_compile.compile_defect("fn main() {}", 3.0)
+        assert seen["timeout"] == 3.0, f"budget ignored: {seen['timeout']}"
+        rust_compile.compile_defect("fn main() {}", -5.0)
+        assert seen["timeout"] == 1.0, "a spent budget must still allow one try"
+        rust_compile.compile_defect("fn main() {}", 9_999.0)
+        assert seen["timeout"] == rust_compile.COMPILE_TIMEOUT_S, "the hang guard was raised"
+        rust_compile.compile_defect("fn main() {}")
+        assert seen["timeout"] == rust_compile.COMPILE_TIMEOUT_S, "no budget, no change"
+    finally:
+        rust_compile.subprocess.run = original_run
+        rust_compile.rustc_path = original_path
+
+
+def test_the_compiler_lookup_is_safe_to_race():
+    """`rustc_path` caches in module globals and is now called from worker
+    threads. `_looked` is read OUTSIDE the lock, so setting it before the lookup
+    finishes would let a second thread see True and take `_rustc` — still None —
+    as the answer, silently skipping the compile check on that solve."""
+    from solvers import rust_compile
+
+    saved = (rust_compile._rustc, rust_compile._looked)
+    rust_compile._rustc, rust_compile._looked = None, False
+    observed: list[bool] = []
+
+    def slow_which(_name):
+        observed.append(rust_compile._looked)
+        return "/usr/bin/rustc"
+
+    original = rust_compile.shutil.which
+    rust_compile.shutil.which = slow_which
+    try:
+        assert rust_compile.rustc_path() == "/usr/bin/rustc"
+        assert observed == [False], (
+            "`_looked` was already True while the lookup was still running — "
+            "a racing thread would have read `_rustc` as None"
+        )
+        assert rust_compile._looked is True
+        rust_compile.rustc_path()
+        assert observed == [False], "the second call did not use the cache"
+    finally:
+        rust_compile.shutil.which = original
+        rust_compile._rustc, rust_compile._looked = saved

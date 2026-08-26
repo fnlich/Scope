@@ -48,7 +48,6 @@ require_linux("The custom miner")
 
 import asyncio  # noqa: E402
 import signal  # noqa: E402
-import os  # noqa: E402
 from typing import Any  # noqa: E402
 
 from custom_miner import CustomMiner  # noqa: E402

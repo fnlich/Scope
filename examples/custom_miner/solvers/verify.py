@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
@@ -132,6 +133,12 @@ class _Grader:
     def __init__(self) -> None:
         self._cache: dict[str, Any] = {}
         self._settings = self._build_settings()
+        # Built from worker threads now (see `_graded`), and concurrently: the
+        # miner serves several solves at once. Two threads missing the cache
+        # together would each construct an executor, and for the Docker backend
+        # that is a container's worth of startup thrown away -- on the one code
+        # path whose entire reason for caching is that Docker startup is slow.
+        self._lock = threading.Lock()
 
     @staticmethod
     def _build_settings():
@@ -142,21 +149,28 @@ class _Grader:
         return Settings(_env_file=None, executor=kind, per_test_timeout_s=VERIFY_TIMEOUT_S)
 
     def executor(self, language: str):
-        if language in self._cache:
-            return self._cache[language]
-        from rlvr.execution.executor import get_executor
+        cached = self._cache.get(language)
+        if cached is not None:
+            return cached
+        with self._lock:
+            cached = self._cache.get(language)
+            if cached is not None:
+                return cached
+            from rlvr.execution.executor import get_executor
 
-        settings = self._settings
-        if language == "rust" and settings.executor != "docker":
-            # Rust needs rustc in the pinned image; there is no subprocess path.
-            from rlvr.config import Settings
+            settings = self._settings
+            if language == "rust" and settings.executor != "docker":
+                # Rust needs rustc in the pinned image; no subprocess path.
+                from rlvr.config import Settings
 
-            settings = Settings(
-                _env_file=None, executor="docker", per_test_timeout_s=VERIFY_TIMEOUT_S
-            )
-        executor = get_executor(settings, language=language)
-        self._cache[language] = executor
-        return executor
+                settings = Settings(
+                    _env_file=None,
+                    executor="docker",
+                    per_test_timeout_s=VERIFY_TIMEOUT_S,
+                )
+            executor = get_executor(settings, language=language)
+            self._cache[language] = executor
+            return executor
 
     def check(
         self, code: str, language: str, entrypoint: str, examples: list[dict[str, Any]]
@@ -366,7 +380,9 @@ class VerifyingSolver:
                 )
 
                 reply = await conversation.send(prompt, slice_s)
-                candidate = self._grade(reply, task)
+                candidate = await self._graded(
+                    reply, task, budget - (time.monotonic() - started)
+                )
                 if best is None or candidate.score > best.score:
                     best = candidate
                 if candidate.verified:
@@ -394,6 +410,42 @@ class VerifyingSolver:
                     pass
         return best, provider
 
+    async def _graded(self, reply: str, task, left: float) -> Candidate:
+        """`_grade`, run OFF the event loop.
+
+        Grading is blocking work wearing an async coat: `compile_defect` shells
+        out to rustc and `_Grader.check` runs the validator's own executor,
+        each a `subprocess.run` of seconds -- and for the Docker backend, of a
+        container start. Called straight from a coroutine it stops the event
+        loop dead, and the loop is not this solve's alone.
+
+        Measured, a 3s subprocess called from inside a coroutine, beside a
+        second task holding a 1.0 second deadline:
+
+            the other solve's 1.0s deadline fired after  3.05s
+
+        The miner answers several validators at once (`solve_slots` is a
+        semaphore, not a mutex), so that other task is another live solve. Worse,
+        the deadline that decides whether a solve is PAID is itself an
+        `asyncio.wait_for` in `handle_request` -- and a timer cannot fire on a
+        loop that is not running. One Rust compile could therefore push every
+        other in-flight solve past its cutoff, and each of those answers 504
+        with no answer at all, however finished the answer already was.
+
+        `to_thread` costs nothing here: the calling coroutine is going to wait
+        for this result either way. What it buys is that everything ELSE keeps
+        running while it waits.
+        """
+        try:
+            return await asyncio.to_thread(self._grade, reply, task, left)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - never lose the answer to the check
+            print(f"[verify] grading unavailable: {type(exc).__name__}: {exc}")
+            return Candidate(
+                code=extract_code(reply, task.entrypoint, task.language), raw=reply
+            )
+
     def _note(self, winner: Optional[str], asked: list[str]) -> None:
         """Per-provider tally, so a model that has started failing is visible."""
         for name in asked:
@@ -403,7 +455,7 @@ class VerifyingSolver:
             self._by_provider[winner]["verified"] += 1
 
     # ---------------------------------------------------------------------- #
-    def _grade(self, reply: str, task) -> Candidate:
+    def _grade(self, reply: str, task, left: Optional[float] = None) -> Candidate:
         code = extract_code(reply, task.entrypoint, task.language)
         candidate = Candidate(code=code, raw=reply)
         defect = (
@@ -417,7 +469,10 @@ class VerifyingSolver:
             # which is the only check a Rust answer gets at all when no public
             # examples shipped -- and on the run this was written for, none
             # ever did. Returns None when there is no local toolchain.
-            defect = compile_defect(code)
+            #
+            # `left` caps it: a compile is allowed to be slow, but not slower
+            # than the answer it is checking is worth. See `compile_defect`.
+            defect = compile_defect(code, left)
         if defect is not None:
             # Structurally unusable: report it without paying for execution.
             candidate.defect = defect
