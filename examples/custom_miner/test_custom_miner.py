@@ -44,7 +44,7 @@ from solvers.browser_pool import (  # noqa: E402
 )
 from solvers.chatgpt_web import chatgpt_site  # noqa: E402
 from solvers.claude_web import claude_site  # noqa: E402
-from solvers.prompts import NO_CODE, extract_code  # noqa: E402
+from solvers.prompts import NO_CODE, extract_code, python_defect  # noqa: E402
 from solvers.verify import Answer, VerifyingSolver  # noqa: E402
 
 from rlvr.config import Settings  # noqa: E402
@@ -99,6 +99,25 @@ def _solver(replies, **kw):
     kw.setdefault("safety_margin_s", 0)
     kw.setdefault("max_budget_s", 120)
     return VerifyingSolver(_Backend(replies), **kw)
+
+
+@pytest.fixture(autouse=True)
+def _never_archive_into_the_operators_corpus(tmp_path, monkeypatch):
+    """Point the solution archive at a scratch directory for EVERY test.
+
+    Autouse and unconditional, because the alternative was measured rather than
+    imagined. Two tests here drive the real `/solve` path through a TestClient,
+    and `CustomMiner.solve` archives every answer it produces — so running the
+    suite wrote its own canned fixtures into `solutions/` beside answers a live
+    miner had produced for real validators. Deleting the two files and running
+    just those two tests put them straight back: 43 files, then 45.
+
+    That corpus is evidence. It is what an operator reads to find out what their
+    miner actually submitted, and a test that quietly adds rows to it makes that
+    evidence untrustworthy in a way nobody would think to check. Per-test opt-in
+    would have left the same hole open for the next test somebody writes.
+    """
+    monkeypatch.setenv("SOLVER_SOLUTION_DIR", str(tmp_path / "solutions"))
 
 
 # --------------------------------------------------------------------------- #
@@ -2797,7 +2816,7 @@ def test_the_prompts_claim_about_silent_overflow_is_true_of_this_grader():
     if rustc is None:
         pytest.skip("no rustc on this host")
     from rlvr.policy import RELEASE_POLICY
-    from solvers.prompts import RUST_EDGE_CASES
+    from solvers.prompts import RUST_ENVIRONMENT
 
     work = Path(tempfile.mkdtemp())
     src = work / "ov.rs"
@@ -2826,7 +2845,7 @@ def test_the_prompts_claim_about_silent_overflow_is_true_of_this_grader():
         f"i32 overflow produced {ran.stdout.strip()!r}; the prompt tells the "
         f"model it produces -294967296"
     )
-    assert "-294967296" in RUST_EDGE_CASES, "the prompt stopped quoting the value"
+    assert "-294967296" in RUST_ENVIRONMENT, "the prompt stopped quoting the value"
 
 
 def test_the_prompts_claims_about_answer_comparison_are_true():
@@ -2835,15 +2854,15 @@ def test_the_prompts_claims_about_answer_comparison_are_true():
     boolean answer, the other stops it wasting a repair round converting a
     perfectly acceptable tuple — and both are somebody else's code."""
     from rlvr.execution.compare import values_equal
-    from solvers.prompts import PYTHON_EDGE_CASES
+    from solvers.prompts import PYTHON_ENVIRONMENT
 
-    assert "`True` is not `1`" in PYTHON_EDGE_CASES
+    assert "`True` is not `1`" in PYTHON_ENVIRONMENT
     assert not values_equal(True, 1), "the prompt's bool claim is now false"
 
-    assert "tuple with equal contents do compare equal" in PYTHON_EDGE_CASES
+    assert "tuple with equal contents do compare equal" in PYTHON_ENVIRONMENT
     assert values_equal([1, 2], (1, 2)), "the prompt's list/tuple claim is false"
 
-    assert "two integers must match exactly" in PYTHON_EDGE_CASES
+    assert "two integers must match exactly" in PYTHON_ENVIRONMENT
     assert not values_equal(1_000_000, 1_000_001), (
         "a float tolerance is accepting wrong integers; the prompt says it cannot"
     )
@@ -2853,47 +2872,101 @@ def test_the_prompt_quotes_the_real_per_test_timeout():
     """A budget the model is told about has to be the budget it gets. Quoting a
     generous one invites an algorithm that does not fit."""
     from rlvr.config import Settings
-    from solvers.prompts import PYTHON_EDGE_CASES, RUST_EDGE_CASES
+    from solvers.prompts import PYTHON_ENVIRONMENT, RUST_ENVIRONMENT
 
     seconds = Settings.model_fields["per_test_timeout_s"].default
     assert seconds == 5.0, (
         f"the per-test timeout is now {seconds}s; both prompts still say 5"
     )
-    assert "5 seconds" in PYTHON_EDGE_CASES and "5 seconds" in RUST_EDGE_CASES
+    assert "5 seconds" in PYTHON_ENVIRONMENT and "5 seconds" in RUST_ENVIRONMENT
 
 
-def test_the_examples_are_framed_as_a_floor_and_come_after_the_checklist():
-    """The examples are the friendliest thing in the message and the easiest to
-    over-fit to. Read first, they become the specification and the checklist
-    reads as an afterthought; read last, they are a lower bound."""
+def test_the_examples_are_framed_as_a_floor_not_the_specification():
+    """The examples now sit WITH the problem rather than after the checklists,
+    and the reversal is deliberate.
+
+    They used to come last so the checklist would be read first. That bought
+    one thing and cost another: instructions about how to solve something are
+    unreadable before you know what it is, and the task was buried under two
+    kilobytes of advice. The label does the anti-over-fitting work on its own —
+    it says in the same breath that these are a floor and that the cases below
+    still apply — so the task can be where a task belongs.
+    """
     from solvers.prompts import build_initial_prompt
 
     prompt = build_initial_prompt(
         "python", "Do a thing.", "solve",
         [{"args": [[1]], "kwargs": {}, "expected": 1}],
     )
-    assert prompt.index("Edge cases are where") < prompt.index("PUBLIC EXAMPLES"), (
-        "the examples are read before the checklist"
-    )
     assert "a floor, not the specification" in prompt
+    assert "survive the cases below" in prompt, "the label does not point forward"
+    assert prompt.index("<problem") < prompt.index("<examples"), (
+        "the examples are separated from the problem they belong to"
+    )
 
 
-def test_the_prompt_asks_for_code_with_nothing_explaining_it():
-    """The grader imports the source and calls it. Nothing ever reads a comment
-    or a docstring, and every one of them is output the model spends before the
-    answer is finished — on a subnet that tiebreaks on latency, that is the only
-    thing they cost. Both languages are told, and neither is asked to narrate
-    its own edge-case reasoning back in a comment."""
+def test_how_to_answer_comes_last_where_it_is_most_likely_to_be_obeyed():
+    """Everything that shapes HOW to answer sits closest to where generation
+    begins. The problem and its examples come first, because that is the thing
+    being reasoned about; the method comes last, because that is the thing being
+    obeyed."""
     from solvers.prompts import build_initial_prompt
 
-    for language, entry in (("python", "solve"), ("rust", "main")):
+    for language, entry in (("rust", "main"), ("python", "solve")):
         prompt = build_initial_prompt(language, "Do a thing.", entry, [])
-        assert "Write no comments and no docstrings" in prompt, (
-            f"the {language} prompt never says to leave the code unexplained"
-        )
-        assert "comment at the top" not in prompt, (
-            f"the {language} prompt still asks for an explanatory comment"
-        )
+        assert prompt.index("<problem") < prompt.index("<method>")
+        assert prompt.index("<contract>") < prompt.index("<method>")
+        assert prompt.rstrip().endswith("</method>"), prompt[-80:]
+
+
+def test_the_output_contract_holds_the_first_word_and_the_nudge_the_last():
+    """The only instruction whose failure costs the ENTIRE answer rather than
+    degrading it, so it gets both ends and nothing competes for either."""
+    from solvers.prompts import build_initial_prompt
+
+    for site, language, entry in ((claude_site(), "rust", "main"),
+                                  (chatgpt_site(), "python", "solve")):
+        prompt = build_initial_prompt(language, "Do a thing.", entry, [])
+        assert prompt.startswith("<output>"), prompt[:40]
+        assert "ONE fenced" in prompt.split("</output>")[0]
+        # ...and the site's nudge, appended after everything, repeats it.
+        assert site.nudge.startswith("START your reply with the code block")
+
+
+def test_the_section_that_asks_for_a_check_does_not_say_before_you_answer():
+    """The phrase itself is what caused the narration. A model told to do
+    something "before you answer" writes it down, at length, and only then
+    starts the program — so the section is not named that either."""
+    from solvers.prompts import build_initial_prompt
+
+    prompt = build_initial_prompt("rust", "Do a thing.", "main", [])
+    assert "before_you_answer" not in prompt, "the tag name reintroduces the phrase"
+    assert "Write the program FIRST" in prompt
+    assert "silently" in prompt
+
+
+def test_the_self_check_names_the_bugs_that_actually_reached_the_grader():
+    """Read off 43 real submissions. Ten were the model's own bugs and EIGHT of
+    those were visible on a careful re-read of the program itself — a helper
+    called but never written, a `[-1]` on a list the program's own parser can
+    empty, a sentinel of 255 used to index five buckets, an id used where a
+    position was meant, a condition already guaranteed by the arm it sat in.
+
+    Generic advice does not reach any of that. Each line below is one of them.
+    """
+    from solvers.prompts import SELF_CHECK, build_initial_prompt
+
+    for phrase in (
+        "you also wrote",          # helper called but never defined
+        "index is in range",       # sentinel-as-index, id-as-position
+        "branch is reachable",     # dead arm, arm that discards its result
+        "empty case",              # [-1] on a list its own code can empty
+        "rebuild ALL of it",       # refresh that forgets one field
+        "that branch can undo",    # counter committed before the wrong path
+    ):
+        assert phrase in SELF_CHECK, f"the self-check dropped {phrase!r}"
+    for language, entry in (("rust", "main"), ("python", "solve")):
+        assert SELF_CHECK in build_initial_prompt(language, "Do a thing.", entry, [])
 
 
 def test_a_repair_round_is_sent_back_through_the_checklist():
@@ -3169,3 +3242,849 @@ def test_a_disk_that_cannot_be_written_does_not_cost_the_solve(tmp_path, capsys)
     # ...and it does not say so again on every subsequent solve.
     _solved_by(_solver_returning("fn main() {}"), _request("p2"), blocked)
     assert "could not write solutions" not in capsys.readouterr().out
+
+
+# --- a tool call is not an answer ----------------------------------------- #
+# When a model reaches for its tools, a chat UI paints every tool call as a
+# `pre code` block — the same markup an answer gets. So "read only code blocks"
+# is not enough on its own: the blocks have to be asked whether they are
+# plausibly source in the target language before one becomes a submission.
+
+TOOL_JSON = (
+    '{"command": "mkdir -p /home/claude/sol && cat > /home/claude/sol/main.rs '
+    '<< \'RUST_EOF\'\\nuse std::io;\\nfn main() {\\n    println!(\\"draft\\");\\n}'
+    '\\nRUST_EOF\\necho written"}'
+)
+TOOL_SHELL = (
+    "cat > /home/claude/sol/main.rs << 'RUST_EOF'\n"
+    "use std::io;\n"
+    "fn main() {\n"
+    '    println!("draft");\n'
+    "}\n"
+    "RUST_EOF\n"
+    "echo written"
+)
+REAL_RUST = 'use std::io;\nfn main() {\n    println!("42");\n}'
+
+
+def _blocks(*bodies):
+    return "\n".join(f"```\n{b}\n```" for b in bodies)
+
+
+def test_a_tool_call_is_not_a_rust_program():
+    """`"fn main" in code` was the whole test, and a tool call passes it: the
+    program is quoted INSIDE a shell heredoc, inside JSON. Submitted, that is a
+    compile error nobody could trace back to a tool call."""
+    from solvers.prompts import rust_defect
+
+    for name, block in (("JSON", TOOL_JSON), ("shell", TOOL_SHELL)):
+        defect = rust_defect(block)
+        assert defect is not None, f"a {name} tool call passed as a program"
+        assert "does not look like a Rust program" in defect, defect
+        assert "does not define" not in defect, (
+            "called it a program with a missing main; it was never a program"
+        )
+    assert rust_defect(REAL_RUST) is None
+    # ...and a real file that opens with an attribute rather than `use` or `fn`.
+    assert rust_defect("#![allow(unused)]\nfn main() {}") is None
+
+
+def test_a_program_that_only_mentions_fn_main_in_a_string_has_no_main():
+    """The opener check catches a tool call; this catches the subtler one it
+    cannot. A genuine Rust file that merely QUOTES `fn main` — in a string, a
+    macro, a `write!` template — opens like Rust and passes every structural
+    test except the one that asks where `fn main` actually is. Submitted, it is
+    a link error, which costs a compile to discover instead of a search."""
+    from solvers.prompts import rust_defect
+
+    quoted = 'use std::io;\nfn helper() { let s = "fn main() {}"; }'
+    assert rust_defect(quoted) == "the program does not define `fn main()`", rust_defect(quoted)
+
+    for real in (
+        "fn main() {}",
+        "    fn main() {}",
+        "pub fn main() {}",
+        "use std::io;\nfn main () {\n}",
+        "async fn main() {}",
+    ):
+        assert rust_defect(real) is None, f"rejected a real program: {real!r}"
+
+
+def test_the_answer_wins_even_when_tool_calls_come_after_it():
+    """The case that produced this. The model wrote the program, then went on
+    running things — so the LAST code block in the message is a tool call, and
+    "the last gradeable block" picked the one that merely mentioned `fn main`."""
+    assert extract_code(_blocks(TOOL_JSON, REAL_RUST, TOOL_SHELL), "main", "rust") == REAL_RUST
+    assert extract_code(_blocks(REAL_RUST, TOOL_JSON, TOOL_SHELL), "main", "rust") == REAL_RUST
+
+
+def test_a_reply_of_nothing_but_tool_calls_submits_nothing():
+    """Submitting one is a guaranteed zero AND archives a shell command as "the
+    solution". Nothing arrived is both true and actionable."""
+    from solvers.prompts import rust_defect
+
+    got = extract_code(_blocks(TOOL_JSON, TOOL_SHELL), "main", "rust")
+    assert got == "", f"submitted a tool call: {got[:60]!r}"
+    assert rust_defect(got) == NO_CODE
+
+
+def test_a_broken_program_is_still_an_attempt_and_is_kept():
+    """The line this draws. A program with a fixable flaw — no entrypoint, a
+    syntax error, a line the deadline cut in half — IS an attempt at an answer,
+    and both the grader and the repair round need to see it. Only things that
+    were never attempts get dropped."""
+    missing_main = "use std::io;\nfn helper() -> i64 { 1 }"
+    assert extract_code(_blocks(missing_main), "main", "rust") == missing_main
+
+    truncated_py = "import sys\ndef solve(xs):\n    return sorted(xs"
+    assert extract_code(_blocks(truncated_py), "solve") == truncated_py
+
+    # Python opens with arbitrary statements, so a constant first line is fine.
+    constant_first = "MOD = 10**9 + 7\ndef solve(xs):\n    return len(xs) % MOD"
+    assert extract_code(_blocks(constant_first), "solve") == constant_first
+
+
+def test_python_tool_calls_are_dropped_too():
+    """Python has no closed top-level grammar, so it cannot use Rust's
+    allowlist of openers — but the handful of things a tool call starts with
+    can still be named."""
+    from solvers.prompts import plausible_source
+
+    assert not plausible_source("python3 /home/claude/sol/sim.py")
+    assert not plausible_source("cat > sim.py << 'EOF'\ndef solve(): pass\nEOF")
+    assert not plausible_source(TOOL_JSON)
+    assert plausible_source("def solve(xs):\n    return xs")
+    assert plausible_source("MOD = 10**9 + 7")
+
+
+def test_both_backends_ask_the_model_not_to_reach_for_its_tools():
+    """The root cause, and the only fix that costs nothing: the model used its
+    tools because nothing said not to. There is no toolchain behind a chat UI —
+    the session that produced this tried `apt-get install rustc` — so every tool
+    call is time the answer does not get."""
+    for site in (claude_site(), chatgpt_site()):
+        nudge = site.nudge.lower()
+        assert "compile" in nudge and "test anything" in nudge, site.nudge
+
+
+def test_the_wire_does_not_mistake_tool_arguments_for_the_answer():
+    """The stream had the same bug, from the other direction. A model asking a
+    tool to do something streams the request as `partial_json`, and "the field
+    appended to most" is then the tool call: a shell command with a draft
+    program quoted inside it. Measured before the fix — a 5,442 byte tool call
+    beat the 54 byte answer beside it purely on volume."""
+    playwright, chrome = _chromium_or_skip()
+    answer = 'Here it is:\n\n```rust\nfn main() { println!("42"); }\n```'
+    tool = json.dumps({"command": "cat > main.rs << 'EOF'\n"
+                                  + ("fn main() { /* draft */ }\n" * 200) + "EOF"})
+    events = [
+        'data: {"type":"message_start","message":{"id":"m","role":"assistant"}}',
+        'data: {"type":"content_block_start","index":0,"content_block":'
+        '{"type":"tool_use","id":"t1","name":"bash","input":{}}}',
+    ]
+    for i in range(0, len(tool), 30):
+        events.append("data: " + json.dumps({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": tool[i:i + 30]}}))
+    events.append('data: {"type":"content_block_stop","index":0}')
+    for i in range(0, len(answer), 8):
+        events.append("data: " + json.dumps({
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "text_delta", "text": answer[i:i + 8]}}))
+    body = "\n\n".join(events) + "\n\n"
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(playwright, chrome, [body])(p)
+            await page.evaluate("async () => { await (await fetch('/sse')).text(); }")
+            await asyncio.sleep(0.2)
+            out = await page.evaluate(_STREAM_READ, 0)
+            await browser.close()
+            return out
+
+    got = asyncio.run(go())
+    assert got == answer, f"the wire took {len(tool)} bytes of tool call: {(got or '')[:80]!r}"
+
+
+# --- the miner must never submit its own prompt --------------------------- #
+# It did. Twice, to real validators, archived as Rust programs ending in the
+# words "Do not use canvas". `_echoes_prompt` was written to stop exactly this
+# and was applied in exactly one place — inside `_poll`, guarding the scrape.
+# The copy control and the network stream both went around it.
+
+OUR_PROMPT = (
+    "Solve this programming problem in Rust.\n\nRules — the grader is automated "
+    "and unforgiving:\n- Write ONE complete program with `fn main()`.\n\n"
+    "PROBLEM:\nDo a thing.\n\nReply directly in the chat with one ordinary "
+    "fenced code block. Do not use canvas."
+)
+
+
+def _text_stream(text):
+    """A Claude-shaped SSE body carrying `text` as the assistant's message."""
+    events = ['data: {"type":"message_start","message":{"id":"m","role":"assistant"}}']
+    for i in range(0, len(text), 20):
+        events.append("data: " + json.dumps({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": text[i:i + 20]}}))
+    return "\n\n".join(events) + "\n\n"
+
+
+# A page that renders nothing readable but does stream. The wire is then the
+# only source with anything in it, which is the situation the rescue exists for.
+SILENT_STREAMING_PAGE = (
+    '<!doctype html><meta charset="utf-8">'
+    '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    '<div id="host"></div><script>'
+    "document.getElementById('send').onclick = () => {"
+    "  fetch('/sse').then(r => r.text()).then(() => {"
+    "    const d = document.createElement('div');"
+    "    d.setAttribute('data-message-author-role', 'assistant');"
+    "    document.getElementById('host').appendChild(d); }); };</script>"
+)
+
+
+def _send_against_stream(body):
+    playwright, chrome = _chromium_or_skip()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(
+                playwright, chrome, [body], page_html=SILENT_STREAMING_PAGE)(p)
+            reply = await _tab(page, _wire_site()).send(OUR_PROMPT, 6.0)
+            await browser.close()
+            return reply
+
+    return asyncio.run(go())
+
+
+def test_the_wire_never_hands_back_the_miners_own_prompt(capsys):
+    """The production failure, end to end.
+
+    A chat stream carries the CONVERSATION, not just the reply, so the prompt
+    that was just sent can be the largest block of text in it. With the page
+    unreadable and the wire holding no fenced code, the rescue branch returned
+    that raw text — and a validator received this file's own instructions as a
+    Rust program. Twice.
+    """
+    reply = _send_against_stream(_text_stream(OUR_PROMPT))
+    assert reply == "", f"submitted the miner's own prompt: {reply[:80]!r}"
+    logged = capsys.readouterr().out
+    assert "no code block in it either" in logged, logged
+
+
+def test_the_wire_does_not_claim_a_rescue_it_did_not_make(capsys):
+    """The old message said "recovered no code block(s) ... The answer below
+    came off the wire" — announcing a rescue in the same breath as admitting
+    there was nothing to rescue. Worse, returning that text made `best`
+    non-empty, which SILENCED the post-mortem that would have said what the
+    page actually contained."""
+    _send_against_stream(_text_stream("I need more detail before I can answer."))
+    logged = capsys.readouterr().out
+    assert "The answer below came off the wire" not in logged, (
+        f"still claiming a rescue with nothing recovered: {logged!r}"
+    )
+    assert "captured NOTHING from this reply" in logged, (
+        f"the post-mortem was suppressed: {logged!r}"
+    )
+
+
+def test_a_real_answer_on_the_wire_is_still_rescued(capsys):
+    """The guard must not cost the thing the wire is there for."""
+    answer = 'Here it is:\n\n```rust\nfn main() { println!("42"); }\n```'
+    reply = _send_against_stream(_text_stream(answer))
+    assert "fn main" in reply, f"lost a genuine wire answer: {reply!r}"
+    assert "came off the wire" in capsys.readouterr().out
+
+
+def test_the_copy_control_cannot_smuggle_the_prompt_past_the_guard(capsys):
+    """The other unguarded route. `_copied_blocks` presses a control and takes
+    what it is handed, with no echo check anywhere on that path — so a selector
+    that has drifted onto the user's own turn submits the prompt from a source
+    the scrape guard never sees."""
+    playwright, chrome = _chromium_or_skip()
+
+    def page_for(src):
+        return (
+            '<!doctype html><meta charset="utf-8">'
+            '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+            '<div id="host"></div><script>const SRC = ' + json.dumps(src) + ';'
+            "document.getElementById('send').onclick = () => {"
+            "  const w=document.createElement('div');"
+            "  w.setAttribute('data-message-author-role','assistant');"
+            "  const pre=document.createElement('pre'), c=document.createElement('code');"
+            "  c.textContent=SRC; pre.appendChild(c); w.appendChild(pre);"
+            "  const b=document.createElement('button'); b.setAttribute('aria-label','Copy');"
+            "  b.onclick=()=>navigator.clipboard.writeText(SRC); w.appendChild(b);"
+            "  document.getElementById('host').appendChild(w); };</script>"
+        )
+
+    async def go(src):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.route("**/x", lambda r: asyncio.ensure_future(r.fulfill(
+                status=200, content_type="text/html", body=page_for(src))))
+            await page.goto("https://example.test/x")
+            site = _wire_site(copy=('button[aria-label="Copy"]',), stream=False)
+            reply = await _tab(page, site).send(OUR_PROMPT, 6.0)
+            await browser.close()
+            return reply
+
+    assert asyncio.run(go(OUR_PROMPT)) == "", "the copy control smuggled the prompt through"
+    assert "OWN PROMPT" in capsys.readouterr().out
+
+    # ...and a real program handed over by the same control still gets through.
+    real = 'use std::io;\nfn main() { println!("42"); }'
+    assert "fn main" in asyncio.run(go(real)), "the guard ate a genuine answer"
+
+
+def test_the_suite_never_archives_into_the_operators_corpus(tmp_path):
+    """Measured, not imagined: two tests here drive the real `/solve` path
+    through a TestClient, and `CustomMiner.solve` archives everything it
+    produces — so running the suite wrote its own fixtures into `solutions/`
+    beside answers a live miner had produced for real validators. Deleting the
+    two files and re-running just those tests put them straight back."""
+    from solution_archive import DEFAULT_DIR, archive_dir
+
+    where = archive_dir()
+    assert where is not None
+    assert where != Path(DEFAULT_DIR), (
+        "a test is pointed at the real solutions directory; the autouse fixture "
+        "is not in force"
+    )
+    assert "pytest" in str(where) or str(tmp_path.parent) in str(where), where
+
+
+# --- Rust gets a compiler, not a grep ------------------------------------- #
+# Python's structural check PARSES the source. Rust's greps it for `fn main`.
+# That asymmetry is why every answer this miner has destroyed in transit was a
+# Rust one: the model's reasoning, a tool call, and the miner's own prompt all
+# contain the characters `fn main`, and all three were submitted as programs.
+
+
+def _rustc_or_skip():
+    from solvers.rust_compile import rustc_path
+
+    if rustc_path() is None:
+        pytest.skip("no rustc on this host")
+
+
+BUILDS = 'use std::io::{self, Read};\nfn main() {\n    let mut s = String::new();\n    io::stdin().read_to_string(&mut s).unwrap();\n    println!("{}", s.trim().len());\n}\n'
+
+
+@pytest.mark.parametrize(
+    "name, code",
+    [
+        ("prompt echo", OUR_PROMPT),
+        ("tool call", '{"command": "cat > main.rs << \'EOF\'\\nfn main() {}\\nEOF"}'),
+        ("truncated mid-token", "use std::io;\nfn main() {\n    let x = 1;\n    le"),
+        ("undefined function", "fn main() {\n    let _ = missing_helper(1);\n}"),
+        ("borrow error", "fn main() {\n    let mut v = vec![1];\n    let r = &v[0];\n    v.push(2);\n    println!(\"{}\", r);\n}"),
+    ],
+)
+def test_the_rust_gate_rejects_what_will_not_build(name, code):
+    """Replayed against the real archive, this rejected exactly the six Rust
+    submissions that did not build and passed all twelve that did. Three of the
+    six would otherwise have reached a validator as programs; the other three
+    become a repair round instead of a certain zero."""
+    _rustc_or_skip()
+    from solvers.rust_compile import compile_defect
+
+    defect = compile_defect(code)
+    assert defect is not None, f"a {name} was accepted as a Rust program"
+    assert defect.startswith("it does not compile:"), defect
+
+
+def test_the_rust_gate_passes_a_program_that_builds():
+    """The expensive half of being wrong. A gate that rejects real answers is
+    worse than no gate: this one has to be silent on anything that compiles."""
+    _rustc_or_skip()
+    from solvers.rust_compile import compile_defect
+
+    assert compile_defect(BUILDS) is None
+
+
+def test_the_first_error_is_reported_not_the_first_warning():
+    """The exact shape that makes this necessary, found by looking rather than
+    guessing: rustc reports most errors before warnings, but a MISSING `main`
+    comes from a very late pass, so an unused import is printed first.
+
+        warning: unused import: `std::collections::HashMap`
+        ...
+        error[E0601]: `main` function not found in crate `candidate`
+
+    That is the worst possible case to get wrong. "No main function" is the one
+    defect this miner most needs to report, and handing back the head of stderr
+    instead sends the repair round off to delete an import while the program
+    still has no entry point.
+    """
+    _rustc_or_skip()
+    from solvers.rust_compile import compile_defect
+
+    warning_first = "use std::collections::HashMap;\nfn helper() {}\n"
+    defect = compile_defect(warning_first)
+    assert defect is not None, "a program with no `main` was accepted"
+    assert "main" in defect and "E0601" in defect, (
+        f"reported the warning instead of the error: {defect}"
+    )
+    assert "unused import" not in defect, defect
+
+
+def test_no_local_toolchain_means_no_opinion(monkeypatch):
+    """Silence must mean the same thing as success. A miner that stops
+    submitting answers because a toolchain went missing has turned a missing
+    convenience into an outage."""
+    import solvers.rust_compile as rc
+
+    monkeypatch.setattr(rc, "_looked", False)
+    monkeypatch.setattr(rc, "_rustc", None)
+    monkeypatch.setattr(rc.shutil, "which", lambda _: None)
+    assert rc.rustc_path() is None
+    assert rc.compile_defect("this is not rust at all") is None
+
+    # ...and the operator can switch it off even where a compiler exists.
+    monkeypatch.setattr(rc, "_looked", False)
+    monkeypatch.setenv("SOLVER_RUST_COMPILE", "0")
+    assert rc.rustc_path() is None
+
+
+def test_the_gate_asks_the_same_question_the_validator_will():
+    """Flags read from RELEASE_POLICY rather than copied, so a change to the
+    validator's toolchain cannot leave this quietly asking something else."""
+    import inspect
+
+    from rlvr.policy import RELEASE_POLICY
+    from solvers import rust_compile
+
+    source = inspect.getsource(rust_compile.compile_defect)
+    assert "RELEASE_POLICY.rustc_flags" in source
+    assert "RELEASE_POLICY.rust_edition" in source
+    assert RELEASE_POLICY.rustc_flags == ("-C", "opt-level=2"), RELEASE_POLICY.rustc_flags
+
+
+def test_a_compile_failure_becomes_a_defect_the_repair_round_can_use():
+    """End to end: it has to reach `_grade` and come out as a DEFECT, because
+    that is what turns a dead solve into another round. With no public examples
+    — every task on the run this was written for — a defect is the only thing
+    that can make the loop ask again at all."""
+    _rustc_or_skip()
+    from solvers.prompts import build_repair_prompt
+    from solvers.verify import VerifyingSolver
+
+    solver = _solver([])
+    task = SimpleNamespace(
+        language="rust", entrypoint="main", statement="do a thing", public_examples=[],
+    )
+    candidate = solver._grade("```rust\nfn main() { nope(); }\n```", task)
+
+    assert candidate.defect is not None, "a program that cannot build was taken as-is"
+    assert "does not compile" in candidate.defect
+    assert candidate.code.strip(), "threw the answer away instead of repairing it"
+
+    repair = build_repair_prompt([], "rust", "main", defect=candidate.defect)
+    assert "could not run your previous reply" in repair
+    assert "cannot find function" in repair, repair[:200]
+
+
+# --- a Python answer can be cut off and still parse ----------------------- #
+# `ast.parse` is Python's version of grepping for `fn main`: perfectly happy
+# with source that was truncated, because a reply cut at a statement boundary
+# is still a valid module. Two archived answers ended deep inside a loop with
+# no return after them. Both parsed. Both were submitted. Both answered None on
+# every hidden test, and nothing anywhere noticed.
+
+
+def test_a_truncated_python_answer_is_caught_even_though_it_parses():
+    """The shape that got through, taken from the archive: the function ends
+    on a `while` sixteen columns deep, with no return after it."""
+    cut_off = (
+        "def plan_workflow(jobs):\n"
+        "    ready = []\n"
+        "    cand = set(jobs)\n"
+        "    while cand:\n"
+        "        allowed = cand & set(ready)\n"
+        "        if not allowed:\n"
+        "            break"
+    )
+    import ast
+
+    ast.parse(cut_off)  # it really does parse — that is the whole problem
+    defect = python_defect(cut_off, "plan_workflow")
+    assert defect is not None, "a truncated answer was taken as finished"
+    assert "without returning" in defect and "while" in defect, defect
+
+
+def test_a_function_that_ends_on_a_return_is_left_alone():
+    """Replayed against the archive this flagged 2 of 25 and passed the other
+    23. A check that fires on real answers is worse than no check."""
+    for good in (
+        "def solve(xs):\n    return sorted(xs)",
+        "def solve(xs):\n    if not xs:\n        return []\n    return sorted(xs)",
+        "def solve(xs):\n    try:\n        return xs[0]\n    except IndexError:\n        return None",
+        "def solve(xs):\n    with open('/dev/null') as f:\n        return len(xs)",
+        "def solve(xs):\n    raise ValueError('no')",
+        "def solve(xs):\n    while True:\n        return xs",
+    ):
+        assert python_defect(good, "solve") is None, f"rejected a finished function:\n{good}"
+
+
+def test_falling_off_the_end_is_a_defect_even_when_the_model_meant_it():
+    """Not only a truncation detector. The grader compares RETURN VALUES, so a
+    function that runs off its own end answers None — which is wrong for almost
+    every task. Rust gets this from its compiler for free; Python did not get
+    it at all."""
+    meant_it = (
+        "def solve(xs):\n"
+        "    for x in xs:\n"
+        "        if x > 0:\n"
+        "            return x\n"
+    )
+    defect = python_defect(meant_it, "solve")
+    assert defect is not None, "an empty list would answer None and nothing said so"
+    assert "answers None" in defect, defect
+
+    # An `if` with no `else` is the same hole and the commonest shape of it —
+    # it is precisely the n = 0 case the prompt spends six lines asking about.
+    no_else = "def solve(xs):\n    if xs:\n        return max(xs)\n"
+    assert python_defect(no_else, "solve") is not None, (
+        "an unguarded `if` at the end answers None for the empty input"
+    )
+    # ...but an if/else where BOTH branches return is finished.
+    both = "def solve(xs):\n    if xs:\n        return max(xs)\n    else:\n        return 0\n"
+    assert python_defect(both, "solve") is None
+
+
+def test_the_conservative_direction_is_the_cheap_one():
+    """A `for` loop that obviously always returns is still flagged, and that is
+    deliberate: being wrong here costs one repair round, while missing a
+    truncated answer costs the whole solve. The answer is never thrown away —
+    a defective candidate still outranks an empty one."""
+    from solvers.verify import Candidate
+
+    obvious = "def solve(xs):\n    for x in [1]:\n        return x\n"
+    assert python_defect(obvious, "solve") is not None
+
+    flawed = Candidate(code=obvious, raw="", defect="falls off the end")
+    assert flawed.score > Candidate(code="", raw="").score, (
+        "a wrongly-flagged answer must still beat submitting nothing"
+    )
+
+
+# --- the stream carries the conversation, not just the reply -------------- #
+# Attributed by provider from the archive itself: the two prompt echoes end in
+# CHATGPT_NUDGE ("Do not use canvas"), and the tool call quotes `/home/claude/sol`
+# — Claude's analysis sandbox. Two different sites, two different mechanisms,
+# and the miner had been treating them as one.
+
+CHATGPT_USER_TURN = (
+    "Solve this programming problem in Rust.\n\nRules — the grader is automated\n"
+    + "- some rule about edge cases\n" * 40
+    + "\nDo not use canvas."
+)
+
+
+def _chatgpt_conversation(answer, thoughts=""):
+    """ChatGPT's real shape: a snapshot of the CONVERSATION, then deltas.
+
+    The snapshot holds the user's own turn under `author.role = "user"`, which
+    is the whole problem — it is usually far longer than the answer beside it.
+    """
+    events = []
+
+    def send(obj):
+        events.append("data: " + json.dumps(obj))
+
+    send({"v": {"message": {
+        "id": "u1", "author": {"role": "user"},
+        "content": {"content_type": "text", "parts": [CHATGPT_USER_TURN]},
+        "status": "finished"}, "conversation_id": "abc-123", "c": 0}})
+    send({"v": {"message": {
+        "id": "a1", "author": {"role": "assistant"},
+        "content": {"content_type": "text", "parts": [""]},
+        "status": "in_progress"}, "c": 1}})
+    for body, path in ((thoughts, "/message/content/thoughts/0/content"),
+                       (answer, "/message/content/parts/0")):
+        first = True
+        for i in range(0, len(body), 6):
+            if first:
+                send({"p": path, "o": "append", "v": body[i:i + 6]})
+                first = False
+            else:
+                send({"v": body[i:i + 6]})
+    events.append("data: [DONE]")
+    return "\n\n".join(events) + "\n\n"
+
+
+def _reconstruct(body):
+    playwright, chrome = _chromium_or_skip()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(playwright, chrome, [body])(p)
+            await page.evaluate("async () => { await (await fetch('/sse')).text(); }")
+            await asyncio.sleep(0.2)
+            out = await page.evaluate(_STREAM_READ, 0)
+            await browser.close()
+            return out or ""
+
+    return asyncio.run(go())
+
+
+def test_the_wire_never_takes_text_the_stream_says_the_user_wrote():
+    """The mechanism behind two real submissions, reproduced on ChatGPT's own
+    payload shape: a 1,384-character user turn beat the 41-character answer
+    beside it purely on volume, and the miner's instructions reached a validator
+    as a Rust program. Who said it decides, not how much of it there is."""
+    answer = '```rust\nfn main() { println!("42"); }\n```'
+    assert _reconstruct(_chatgpt_conversation(answer)) == answer
+
+
+def test_a_reply_with_no_answer_in_it_reconstructs_as_nothing():
+    """The production case: the model had not written anything yet, so the only
+    long text in the stream was the prompt. Nothing is the honest answer."""
+    assert _reconstruct(_chatgpt_conversation("")) == ""
+
+
+def test_bookkeeping_keys_are_tags_whatever_they_are_prefixed_with():
+    """`content_type` is as much a tag as `type`, and `conversation_id` as much
+    as `id`. Matching only the bare word left a reply with no text in it
+    reconstructing as the single word "text" — the value of `content_type`."""
+    assert "text" != _reconstruct(_chatgpt_conversation("")), (
+        "a bookkeeping value was taken as the answer"
+    )
+
+
+def test_reasoning_and_the_user_turn_lose_to_a_short_answer_together():
+    """All three kinds of text a chat stream carries, in one reply, with the
+    real answer the smallest of them."""
+    answer = '```rust\nfn main() { println!("42"); }\n```'
+    got = _reconstruct(_chatgpt_conversation(answer, thoughts="Let me reason. " * 200))
+    assert got == answer, f"took reasoning or the prompt over the answer: {got[:70]!r}"
+
+
+def test_the_log_names_which_model_produced_the_answer(capsys):
+    """Attribution after the fact was guesswork. Of 43 archived submissions
+    only three could be traced to a provider at all, and only because the
+    DAMAGE carried a fingerprint — two held ChatGPT's nudge, one quoted
+    `/home/claude/sol`. The other forty were unattributable, which made "is one
+    of these tabs doing worse than the others" unanswerable.
+
+    It has to be the model that WON, not merely the ones asked: a second
+    opinion is bought precisely when the first answer was poor, so "who was
+    asked" and "whose answer went out" are different questions.
+    """
+    # Two providers, and the FIRST one wins: its answer passes the examples, so
+    # no second opinion is bought. Crediting "whoever was asked last" would
+    # coincide with the truth here only by accident, which is why the second
+    # case below asks two and still expects the first to be named.
+    class _TwoModels:
+        def __init__(self, script):
+            self._script, self.seen = script, []
+
+        async def open(self, avoid=None):
+            name, replies = self._script[len(self.seen)]
+            self.seen.append(name)
+            return _Chat(replies, name)
+
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    task = SolveTask(
+        problem_id="p", language="python", statement=DIGITS.statement,
+        entrypoint="g", deadline_s=60.0,
+        public_examples=[{"args": [12345], "kwargs": {}, "expected": 15}],
+    )
+
+    # chatgpt answers correctly and is never followed up.
+    backend = _TwoModels([("chatgpt", [RIGHT])])
+    asyncio.run(VerifyingSolver(backend, safety_margin_s=0, max_budget_s=120)
+                .solve_task(task, 60.0))
+    logged = capsys.readouterr().out
+    assert "provider=chatgpt" in logged, f"the log cannot say who answered: {logged!r}"
+
+    # ...and when the first model fails and the second is asked but does WORSE,
+    # the credit must stay with the answer that actually went out.
+    backend = _TwoModels([("chatgpt", [WRONG, WRONG, WRONG]), ("claude", ["no code here"])])
+    asyncio.run(VerifyingSolver(backend, safety_margin_s=0, max_budget_s=120)
+                .solve_task(task, 60.0))
+    logged = capsys.readouterr().out
+    assert backend.seen == ["chatgpt", "claude"], backend.seen
+    assert "provider=chatgpt" in logged, (
+        f"credited the last model ASKED rather than the one whose answer was "
+        f"submitted: {logged!r}"
+    )
+
+
+# --- prose before the code costs time, not correctness -------------------- #
+# Reported from a live Claude tab: long explanations arriving before the
+# program. The extractor was never the problem — it handles a preamble fine.
+# The clock is: the first attempt had 135 seconds of a 225 second budget, and
+# prose spent before the code is time the code does not get.
+
+
+def test_a_preamble_before_the_code_is_extracted_correctly():
+    """Worth pinning so the fix is aimed at the right thing. A model that
+    explains itself first has still answered, and nothing downstream should
+    care — including when it appends an example block afterwards, which is the
+    shape that WOULD break a reader that took the last block blindly."""
+    reply = (
+        "I'll solve this step by step. The values reach 10^18 so i64 is needed\n"
+        "throughout, and n = 0 must answer 0 rather than divide by a length.\n\n"
+        "Here is the complete program:\n\n"
+        "```rust\nuse std::io::{self, Read};\nfn main() {\n"
+        '    let mut s = String::new();\n'
+        "    io::stdin().read_to_string(&mut s).unwrap();\n"
+        '    println!("{}", s.trim().len());\n}\n```\n\n'
+        "Example run:\n\n```\n3\n1 2 3\n```\n"
+    )
+    code = extract_code(reply, "main", "rust")
+    assert code.startswith("use std::io"), f"a preamble broke extraction: {code[:60]!r}"
+    from solvers.prompts import rust_defect
+
+    assert rust_defect(code) is None
+
+
+def test_the_checklist_asks_for_the_program_first_not_a_walkthrough():
+    """The order of one sentence, and it cost solves. It used to read "walk
+    your solution through every one of these BEFORE YOU ANSWER" — and a model
+    does what it is told, so it narrated the walkthrough at length and only
+    then started the program. Written the other way round the artifact exists
+    first, so a reply cut short loses the checking pass rather than the answer.
+    """
+    from solvers.prompts import EDGE_CASES, METHOD, build_initial_prompt
+
+    # The instruction lives in METHOD now — `<edge_cases>` is a list of input
+    # shapes and says nothing about when to write anything.
+    assert "Write the program FIRST" in METHOD, METHOD[:120]
+    assert "silently" in METHOD
+    for text in (METHOD, EDGE_CASES):
+        assert "before you answer" not in text.lower(), (
+            "the prompt still asks the model to narrate before answering"
+        )
+    for language, entry in (("rust", "main"), ("python", "solve")):
+        prompt = build_initial_prompt(language, "Do a thing.", entry, [])
+        # ...inside <method>, which comes last on purpose — see
+        # test_how_to_answer_comes_last_where_it_is_most_likely_to_be_obeyed.
+        assert "Write the program FIRST" in prompt.split("<method>")[1]
+
+
+def test_both_nudges_use_the_last_word_to_demand_code_first():
+    """The nudge is appended after everything else, so it is the last thing the
+    model reads before it starts generating. That slot is worth the strongest
+    version of the one instruction that decides whether the answer arrives."""
+    for site in (claude_site(), chatgpt_site()):
+        assert site.nudge.startswith("START your reply with the code block"), site.nudge[:70]
+        assert "may not arrive at all" in site.nudge
+
+
+def test_the_first_attempt_gets_the_budget_when_no_repair_can_happen():
+    """Reserving 40% of the budget for repair rounds is well spent when public
+    examples exist and a repair is likely. With none shipped — every task on the
+    run this was written for — a structurally fine first answer ends the loop,
+    and the reserve is simply discarded. Measured: a tab spent its whole 135s
+    slice while 90s of a 225s budget went unused, on the one attempt that had
+    to succeed."""
+    import inspect
+
+    from solvers.verify import VerifyingSolver
+
+    source = inspect.getsource(VerifyingSolver._attempt)
+    assert "first_share = 0.6 if task.public_examples else 0.85" in source, source[:200]
+
+    budget = 225.0
+    with_examples = budget * 0.6
+    without = budget * 0.85
+    assert without > with_examples
+    assert without > 135.1, (
+        "the first attempt still gets less than the slice that was running out"
+    )
+
+
+def test_the_method_is_a_numbered_procedure_ending_in_send_the_code():
+    """Ordering is what this prompt has had to fight hardest. Told to check
+    "before you answer", models narrated the check and ran out of time before
+    the program existed. A numbered list leaves no room to read the steps in a
+    different order, and the last step is the one that must be last."""
+    from solvers.prompts import METHOD, build_initial_prompt
+
+    steps = [line for line in METHOD.splitlines() if line[:2] in
+             ("1.", "2.", "3.", "4.", "5.", "6.")]
+    assert len(steps) == 6, steps
+    assert "Write the program FIRST" in steps[1], steps[1]
+    assert "Send the code and nothing else" in steps[5], steps[5]
+    assert "silently" in METHOD
+    assert METHOD in build_initial_prompt("rust", "Do a thing.", "main", [])
+
+
+def test_the_examples_decide_when_the_statement_is_ambiguous():
+    """The examples are the only disambiguation a solver is given — the README
+    says so and nothing in the prompt used to. Without the rule the model has
+    to guess which of its readings the author meant."""
+    from solvers.prompts import build_initial_prompt
+
+    for language, entry in (("rust", "main"), ("python", "solve")):
+        # Normalised, because the prompt is hard-wrapped: the phrase under test
+        # spans a line break and an indent, and asserting on the raw text would
+        # fail on formatting rather than on meaning.
+        prompt = " ".join(
+            build_initial_prompt(language, "Do a thing.", entry, []).split()
+        )
+        assert "the examples decide" in prompt, "no disambiguation rule"
+        assert "the code is wrong, not the example" in prompt
+
+
+def test_both_contracts_say_there_is_no_partial_credit():
+    """It changes the risk calculus. A model that thinks a near-miss scores
+    something will reach for the clever implementation; one that knows a single
+    wrong hidden case scores zero will not."""
+    from solvers.prompts import build_initial_prompt
+
+    for language, entry in (("rust", "main"), ("python", "solve")):
+        prompt = build_initial_prompt(language, "Do a thing.", entry, [])
+        assert "no partial credit" in prompt
+        assert "prefer the safe implementation" in prompt
+
+
+def test_each_language_is_warned_that_hash_order_is_not_stable():
+    """Measured rather than assumed, and it is the kind that hides: four runs of
+    `list({'alpha','beta','gamma'})` gave four different orders because
+    PYTHONHASHSEED is random per process, while a set of small ints gave the
+    same order every time. A solution tested with integers looks stable and is
+    not. Rust randomises HashMap/HashSet iteration for the same reason."""
+    from solvers.prompts import PYTHON_ENVIRONMENT, RUST_ENVIRONMENT
+
+    assert "PYTHONHASHSEED" in PYTHON_ENVIRONMENT
+    assert "Sort before returning" in PYTHON_ENVIRONMENT
+    assert "HashMap" in RUST_ENVIRONMENT and "BTreeMap" in RUST_ENVIRONMENT
+
+    # ...and the claim itself is true of this interpreter.
+    import subprocess
+    import sys
+
+    orders = {
+        subprocess.run([sys.executable, "-c",
+                        "print(list({'alpha','beta','gamma','delta','epsilon'}))"],
+                       capture_output=True, text=True).stdout
+        for _ in range(8)
+    }
+    assert len(orders) > 1, (
+        "string set order was stable across 8 processes; the prompt's claim "
+        "about PYTHONHASHSEED no longer holds on this interpreter"
+    )
+
+
+def test_the_environment_facts_are_not_filed_as_edge_cases():
+    """They were, and it was a category error: `<edge_cases>` is about the
+    INPUT, `<contract>` is about the machine. Silent overflow and a five-second
+    limit are facts about how the grader runs the code, not shapes of data, and
+    reading them in a list of "try n = 0" made both lists harder to act on."""
+    from solvers.prompts import EDGE_CASES, build_initial_prompt
+
+    for banned in ("OVERFLOW", "5 seconds", "recursion", "PYTHONHASHSEED"):
+        assert banned not in EDGE_CASES, f"{banned!r} is not an edge case"
+
+    prompt = build_initial_prompt("rust", "Do a thing.", "main", [])
+    contract = prompt.split("<contract>")[1].split("</contract>")[0]
+    assert "OVERFLOW IS SILENT" in contract
+    assert "5 seconds" in contract

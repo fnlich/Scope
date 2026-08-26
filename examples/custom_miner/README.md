@@ -129,6 +129,59 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 - **Never raise.** On any failure return empty `code` — a zero is survivable, a
   crash loop is not. `custom_miner.py` already wraps your solver this way.
 
+### The prompt is one delimited document, and the order is the argument
+
+```
+<output>       one fenced block, nothing else            ← first
+<problem>      the statement
+<examples>     labelled a floor, not the specification
+<contract>     what is TRUE: how it is run, compared, and
+               what the environment does silently
+<method>       what to DO: a numbered procedure           ← last
+  <edge_cases>  shapes of input that break a solution
+  <self_check>  reading the program back against itself
+```
+…then the site's nudge, appended after everything, repeats the output rule.
+
+The output contract holds **both ends**. It is the only instruction whose
+failure costs the entire answer rather than degrading it, so it gets primacy and
+recency and nothing else competes for either. The problem comes next, because
+instructions about how to solve something are unreadable before you know what it
+is. Everything shaping *how* to answer comes last, closest to where generation
+begins — and the section is called `<method>`, not `<before_you_answer>`, because
+that phrase is exactly what used to make models narrate a walkthrough instead of
+writing the program.
+
+`<contract>` and `<method>` answer different questions — what is *true* versus
+what to *do* — and four items used to be filed under the wrong one. Silent
+overflow, the recursion limit, the five-second budget and hash ordering are
+facts about the machine, not shapes of input, and reading them in a list that
+began "try n = 0" made both lists harder to act on.
+
+`<method>` is a numbered procedure rather than advice, because ordering is what
+this prompt has fought hardest:
+
+```
+1. Read the problem, then the examples. Where the statement is ambiguous,
+   the examples decide.
+2. Write the program FIRST, complete and runnable.
+3. Trace every example by hand. If one disagrees, the code is wrong.
+4. Put it through the edge cases.
+5. Read the program back against itself.
+6. Send the code and nothing else.
+```
+
+Three facts were missing that change decisions rather than decorate them.
+**There is no partial credit** — a program wrong on one hidden case scores what
+no answer scores, which is the difference between reaching for the clever
+implementation and the safe one. **The examples decide** when the statement is
+ambiguous; they are the only disambiguation a solver is given, and nothing said
+so. And **hash order is not stable across processes**: measured, four runs of
+`list({'alpha','beta','gamma'})` gave four different orders because
+`PYTHONHASHSEED` is random per process, while a set of small ints gave the same
+order every time — so a solution tested with integers looks stable and is not.
+Rust randomises `HashMap`/`HashSet` iteration for the same reason.
+
 ### The hidden suite is where the score is, so the prompt is written for it
 
 The public examples are the friendly ones. Grading is on the **complete hidden
@@ -142,6 +195,17 @@ edge cases", which every model agrees to and none acts on:
     BOTH ENDS        first and last, empty range, inclusive vs exclusive
     EXTREME VALUES   0, 1, -1, negatives, the largest magnitude allowed
     DEGENERATE       all equal, all duplicates, sorted, reverse sorted
+
+The checklist opens by saying **write the program first, then check it** — and
+that order cost solves before it was fixed. It used to read *"walk your solution
+through every one of these before you answer"*, and a model does what it is told:
+it narrated the walkthrough at length and only then started the program.
+Reported from a live Claude tab. The reason it matters is not style — the first
+attempt gets a fixed slice of the budget, and prose spent before the code is time
+the code does not get. Written this way the artifact exists first, so a reply cut
+short loses the checking pass rather than the whole answer. The nudge, which is
+appended last and so is the final thing the model reads, says the same thing in
+its strongest form: start the reply with the code block.
 
 The examples are rendered *after* that list and labelled a floor rather than the
 specification, because read first they become the spec and the checklist reads
@@ -171,6 +235,29 @@ they are not the same failure:
   at: `True` is not `1`, two integers must match exactly, a dict must have
   exactly the expected keys — and a list and a tuple *are* interchangeable, so
   no repair round need be spent converting one.
+
+### Then the program is read back against itself
+
+Read off 43 answers a live miner submitted: ten were the model's own bugs, and
+**eight of those ten were visible on a careful re-read of the program itself** —
+no test, no execution, no cleverness required.
+
+| what shipped | what a re-read would have caught |
+| --- | --- |
+| `failed_any(&output)` | called, never written |
+| `constrained[-1]` | on a list its own parser returns empty |
+| `reason.push(255)` then indexed | a sentinel used as a position, into 5 buckets |
+| `id = cmd_idx` | an id used where a push-order position was meant |
+| `if s.len() != 11` inside `10 =>` | already guaranteed false, so the arm is dead |
+| rebuild of `fcnt/first/last/rcnt` | forgot `size`, so every rank descent ran on 1 |
+| `pc[jid] = pos + 1` | committed before a branch that must not commit it |
+
+That is not a hard-problem failure. It is a re-reading failure — the model had
+everything it needed and did not look again. So `<method>` ends by asking it to,
+once, against a list of exactly those things. Generic advice reaches none of
+them; naming them is the whole point.
+
+The check is explicitly silent — it happens in reasoning, never in the reply.
 
 Both are told the real per-test budget (5 seconds), because a budget quoted
 generously invites an algorithm that does not fit.
@@ -596,6 +683,82 @@ A message with no code and a selector matching an empty wrapper both arrive as
 an empty read and need opposite fixes — the first is the model's doing, the
 second is yours — so they are named apart.
 
+### A tool call is not an answer either
+
+This one is Claude's — the archived file quotes `/home/claude/sol`, its analysis
+sandbox. Reading only code blocks is not enough on its own, because **when a
+model reaches for its tools, the chat UI paints every tool call as a code block
+too**
+— the same `pre code` markup an answer gets. There is no toolchain behind a chat
+window (one session tried `apt-get install rustc`), so those calls achieve
+nothing, and the model can end a turn having written its program only *inside*
+one:
+
+```
+{"command": "cat > main.rs << 'RUST_EOF'\nuse std::io;\nfn main() { … }\nRUST_EOF"}
+```
+
+That used to pass every test the miner had. `rust_defect` was `"fn main" in
+code`, and the block does mention `fn main` — quoted inside a shell heredoc,
+inside JSON. It was picked as the answer, submitted, and archived as the
+solution, on a solve where the model had answered correctly further up the
+message.
+
+Three things changed:
+
+- **`fn main` must begin a line.** Inside an escaped string it only ever appears
+  mid-line, after a literal `\n`. This also catches a genuine Rust file that
+  merely *quotes* `fn main` in a string or a macro, which used to pass and then
+  fail to link.
+- **A block must be plausibly source before it can be submitted.** Rust's top
+  level is a closed grammar — a file can only open with an item, an attribute or
+  a comment — so an allowlist of openers is exact and a shell command fails at
+  its first character. Python's top level is arbitrary statements, so no
+  allowlist can be written that does not reject real code (`MOD = 10**9 + 7` is
+  a fine first line); there the short list of things a *tool call* opens with is
+  named instead.
+- **Both prompts ask the model not to use its tools at all** — the root cause,
+  and the only fix that costs nothing.
+
+The line this draws matters: a program with a fixable flaw — no entrypoint, a
+syntax error, a line the deadline cut in half — **is** an attempt at an answer,
+and both the grader and the repair round still get to see it. Only things that
+were never attempts are dropped, and a reply of nothing but tool calls reports
+that nothing arrived.
+
+The network stream had the same bug from the other direction. A model asking a
+tool to do something streams the request as `partial_json`, and "the field
+appended to most" was then the tool call rather than the reply — measured, a
+5,442-byte tool call beat the 54-byte answer beside it on volume alone. Tool
+arguments are excluded by name now, like reasoning.
+
+### The miner must never submit its own prompt
+
+It did. Twice, to real validators, archived as Rust programs ending in the
+words "Do not use canvas".
+
+`_echoes_prompt` was written to stop exactly that, and it was applied in
+exactly one place: inside `_poll`, guarding the scrape. Every other route to a
+submission — the copy control, the network stream — went around it.
+
+**Both came off ChatGPT tabs**, and the mechanism is ChatGPT's specifically. Its
+response opens with a snapshot of the *conversation*, which holds the user's own
+turn under `author.role = "user"` — and "the field appended to most" is then the
+PROMPT whenever the answer is shorter, which it usually is. Reproduced on that
+payload shape: a 1,384-character user turn beat the 41-character answer beside
+it. So the reconstruction now discards anything the stream attributes to
+someone other than the model. Who said it decides, not how much of it there is.
+
+Two things changed. The rescue only claims a rescue when it actually has code
+blocks, and returns nothing otherwise — the old message announced a recovery
+in the same breath as admitting there was nothing to recover, and worse, made
+the result non-empty and so silenced the post-mortem that would have explained
+the page. And a final guard sits at the one exit `send()` has, so every route
+is covered rather than one. It tests *containment* rather than the prefix test
+the scrape guard uses, because by that stage the text has been through fencing,
+a copy control or a wire reconstruction and the prompt need not be at the front
+any more.
+
 ### When nothing is captured at all, the tab says why
 
 `the reply contained no code` is what the grader reports afterwards, and it
@@ -673,6 +836,88 @@ itself once and the answer still goes out, because a miner that dies on a full
 disk has turned a lost point into a lost session. `problem_id` arrives over the
 network and is used to build a path, so it is sanitised as hostile input: it can
 only ever name a file directly inside the archive directory.
+
+### A Python answer can be cut off and still parse
+
+`ast.parse` is Python's version of grepping for `fn main`. It is perfectly
+happy with source that was **truncated**, because a reply cut at a statement
+boundary is still a valid module. Two archived answers ended deep inside a loop
+with no return after them — one sixteen columns in, on a bare `break`. Both
+parsed. Both were submitted. Both answered `None` on every hidden test, and
+nothing anywhere noticed.
+
+So the entrypoint is now asked the question a compiler asks a Rust function:
+**can control reach the end of the body without returning?** Replayed against
+25 real archived answers this flagged exactly those two and passed the other
+twenty-three.
+
+It is not only a truncation detector. The grader compares *return values*, so a
+function that runs off its own end answers `None` — which is wrong for almost
+every task, and is exactly the `n = 0` case the edge-case checklist spends six
+lines asking about:
+
+```python
+def solve(xs):
+    if xs:
+        return max(xs)      # ← answers None for the empty list
+```
+
+The analysis is conservative in the cheap direction. A `for` loop is never
+treated as guaranteeing a return even when it obviously does, because being
+wrong here costs one repair round while missing a truncated answer costs the
+whole solve — and a flagged answer is still submitted if the repair produces
+nothing better.
+
+### Rust answers are compiled before they are sent
+
+Python's structural check PARSES the source — `ast.parse` rejects prose, a
+shell command, a truncated line, anything that is not a program. Rust's greps
+it for `fn main`. That asymmetry is why **every answer this miner has destroyed
+in transit was a Rust one**: a model's reasoning, a tool call, and the miner's
+own prompt all contain the characters `fn main`, and all three have been
+submitted as programs.
+
+So when a local `rustc` is available, the candidate is built with the
+validator's own flags (read from `RELEASE_POLICY`, not copied) before it is
+sent. Replayed against a real archive of 45 submissions — 18 of them Rust —
+this rejected exactly the six that would not build and passed all twelve that
+would:
+
+```
+REJECT  it does not compile: error: unknown start of token: \u{2014}      (prompt echo)
+REJECT  it does not compile: error: unknown start of token: \u{2014}      (prompt echo)
+REJECT  it does not compile: error: expected item, found `{`             (tool call)
+REJECT  it does not compile: error: this file contains an unclosed delimiter   (truncated)
+REJECT  it does not compile: error[E0425]: cannot find function `failed_any`   (model bug)
+REJECT  it does not compile: error[E0503]: cannot use `head` ...               (model bug)
+```
+
+Three of those would otherwise have reached a validator as programs. The other
+three become a repair round instead of a certain zero.
+
+It matters most when there is nothing else. With no public examples shipped —
+which was every task on the run this was written for — the grader never runs at
+all, so this is the *only* check a Rust answer gets before submission.
+
+A local toolchain can differ from the pinned one, and the failure mode of that
+is deliberately cheap: a wrong defect costs a repair round, never the answer,
+because a defective non-empty candidate outranks an empty one and is still what
+gets submitted if the repair produces nothing better. No compiler means no
+opinion — silence has to mean the same thing as success, or a missing toolchain
+becomes an outage. `SOLVER_RUST_COMPILE=0` turns it off. The candidate is
+compiled, never run.
+
+### The first attempt gets the budget when no repair can happen
+
+The solve budget was split 60/40 — the larger share to the first attempt, the
+rest held back for repair rounds. That is well spent when public examples exist
+and a repair is likely. With **none shipped**, a structurally sound first answer
+ends the loop immediately and the reserve is simply discarded: measured, a tab
+spent its whole 135-second slice while the remaining 90 seconds of a 225-second
+budget went unused, on the one attempt that had to succeed.
+
+The share now depends on whether a repair is even possible — 85% to the first
+attempt when nothing can be graded against, which turns 135 seconds into 191.
 
 ## Self-verification: the part that earns the money
 

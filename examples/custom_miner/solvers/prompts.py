@@ -91,9 +91,17 @@ def sanitize_code(text: str) -> str:
     return _LANG_LABEL_RE.sub("", text, count=1)
 
 
+# Stated first, and again last by the site's nudge. It is the only instruction
+# whose failure costs the whole answer rather than degrading it, so it gets both
+# the primacy and the recency slot and nothing else competes for either.
+OUTPUT_CONTRACT = """\
+Reply with ONE fenced {language} code block and nothing else. No preamble, no
+explanation before it or after it. Only the code inside the fence is ever read."""
+
 PYTHON_RULES = """\
-Rules — the grader is automated and unforgiving:
-- Reply with ONLY ONE Python code block and nothing else outside it.
+- There is no partial credit. A program wrong on ONE hidden case scores
+  exactly what no answer at all scores, so prefer the safe implementation
+  over the clever one every time.
 - Define exactly one top-level function named `{entrypoint}`. It is called
   directly as `{entrypoint}(*args, **kwargs)`.
 - RETURN the answer. Do not print it, do not read stdin, do not call input().
@@ -104,8 +112,9 @@ Rules — the grader is automated and unforgiving:
 - Do not include tests, example calls, or `if __name__ == "__main__"`."""
 
 RUST_RULES = """\
-Rules — the grader is automated and unforgiving:
-- Reply with ONLY ONE Rust code block and nothing else outside it.
+- There is no partial credit. A program wrong on ONE hidden case scores
+  exactly what no answer at all scores, so prefer the safe implementation
+  over the clever one every time.
 - Write ONE complete program with `fn main()`, compiled as a single file with
   `rustc --edition=2021 -C opt-level=2`. No Cargo, no crates, std only.
 - READ the input from stdin and WRITE only the requested answer to stdout.
@@ -120,9 +129,37 @@ Rules — the grader is automated and unforgiving:
 # summarised as "handle edge cases", which every model agrees to and none acts
 # on. Each line is a case that has a right answer the statement implies and a
 # wrong answer a plausible implementation produces.
+#
+# The ORDER of the first sentence is the expensive part. It used to read "walk
+# your solution through every one of these before you answer", and a model does
+# what it is told: it narrated the walkthrough, at length, and only then began
+# the program. Reported from a live tab, and the reason it costs a solve is not
+# style -- the first attempt has about 135 seconds of a 225 second budget, and
+# prose spent before the code is time the code does not get. Written the other
+# way round the artifact exists first, so a reply cut short loses the checking
+# pass rather than the whole answer.
+# An ordered procedure, not advice. Ordering is the thing this prompt has had to
+# fight hardest: told to check "before you answer", models narrated the check and
+# ran out of time before the program existed. A numbered list leaves no room to
+# read the steps in a different order, and step 6 is the one that must be last.
+METHOD = """\
+Work in this order:
+1. Read the problem, then the examples. Where the statement is ambiguous, the
+   examples decide — they are the only disambiguation you are given.
+2. Write the program FIRST, complete and runnable.
+3. Trace every example by hand through the code you wrote. If one disagrees,
+   the code is wrong, not the example.
+4. Put the code through the edge cases below and fix what breaks.
+5. Read the program back against itself, using the self-check below.
+6. Send the code and nothing else.
+
+Steps 1 to 5 happen silently, in your reasoning. None of that work appears in
+the reply."""
+
 EDGE_CASES = """\
-Edge cases are where this is won or lost. Walk your solution through every one
-of these before you answer, and fix what breaks:
+The hidden tests are adversarial; the examples are not. Each line below is a
+case with a right answer the statement implies and a wrong answer a plausible
+implementation produces:
 - NOTHING: an empty list, an empty string, n = 0. Work out what the statement
   says the answer is, then make sure your code reaches it instead of crashing
   or dividing by a length of zero.
@@ -143,11 +180,16 @@ of these before you answer, and fix what breaks:
 # Two of these are facts about THIS grader, not general advice, and both cost a
 # solve when guessed at: the comparison is structural and strict about bools,
 # and each test is on a five-second clock.
-PYTHON_EDGE_CASES = """\
+PYTHON_ENVIRONMENT = """\
 - Python integers never overflow, but the default recursion limit is 1000, so a
   recursive answer dies at n = 10^4 with RecursionError. Write it iteratively,
   or raise the limit yourself at the top of the file.
 - Each test gets about 5 seconds. O(n^2) over n = 10^5 does not fit.
+- Iterating a `set` or `dict` of STRINGS gives a different order in every
+  process — `PYTHONHASHSEED` is random by default. Measured: four runs of
+  `list({'alpha','beta','gamma'})` gave four different orders, while a set of
+  small ints gave the same order every time. So a solution tested with integers
+  looks stable and is not. Sort before returning anything order-sensitive.
 - Return the exact shape the examples show. The comparison is structural:
   `True` is not `1`, so a boolean answer must be a real bool; a dict must have
   exactly the expected keys; two integers must match exactly. (A list and a
@@ -159,7 +201,7 @@ PYTHON_EDGE_CASES = """\
 # at opt-level=2, so the arithmetic wraps and the program exits 0 with a
 # plausible wrong number. There is no panic, no message, and nothing in the
 # failure that points at the cause.
-RUST_EDGE_CASES = """\
+RUST_ENVIRONMENT = """\
 - INTEGER OVERFLOW IS SILENT HERE. The grader compiles with `-C opt-level=2`,
   which turns overflow checks OFF: `i32` arithmetic wraps around and the
   program exits normally with a wrong answer instead of panicking. Two `i32`
@@ -169,8 +211,43 @@ RUST_EDGE_CASES = """\
 - Read to EOF. Tolerate trailing newlines, blank lines and repeated spaces, and
   do not assume a fixed number of lines unless the statement fixes it.
 - Deep recursion overflows the stack. Prefer iteration for n up to 10^5.
+- `HashMap` and `HashSet` iteration order is unspecified and differs run to run.
+  Use `BTreeMap`/`BTreeSet`, or sort, before emitting anything order-sensitive.
 - Each test gets about 5 seconds, so lock stdout once and wrap it in a
   BufWriter rather than printing in a loop."""
+
+
+# Read off 43 answers a live miner submitted. Ten were the model's own bugs, and
+# EIGHT of those ten were visible on a careful re-read of the program itself --
+# no test, no execution, no cleverness required. A helper called but never
+# written. A `[-1]` on a list the program's own parser can empty. A sentinel of
+# 255 pushed into a list and later used to index five buckets. An id used where
+# a position was meant. A condition already guaranteed by the match arm it sat
+# in, so the arm was dead. An index of 16 into a length-16 string.
+#
+# None of that is a hard-problem failure. It is a re-reading failure, and it is
+# the one kind of mistake a prompt can actually reach: the model has everything
+# it needs to catch these and simply does not look again. So it is asked to,
+# once, against a list of exactly the things that have gone wrong.
+SELF_CHECK = """\
+Read the program back against itself and answer each of these about it. Every
+line is a bug that has reached this grader inside a program that looked
+finished:
+- Every function you CALL, you also wrote. A helper you meant to add and did not
+  is a compile error sitting in a file that otherwise looks complete.
+- Every index is in range. Watch for two numberings of the same objects — an id
+  used where a position is meant — and for a sentinel value that later reaches a
+  subscript.
+- Every branch is reachable and every branch produces its answer. A condition
+  already guaranteed by the arm it sits in is dead code; an arm that computes a
+  value and then discards it emits nothing at all.
+- Every `[0]`, `[-1]`, `.pop()`, `.first()`, `.last()` has an answer for the
+  empty case — including the empty case your OWN code can produce.
+- When you rebuild derived state, you rebuild ALL of it. A refresh that updates
+  four fields and forgets the fifth leaves the fifth silently stale.
+- State you commit before a branch, that branch can undo. A counter advanced and
+  not rewound on the path that should not have advanced it is a wrong answer
+  that shows up under one ordering and not another."""
 
 
 def _render_examples(language: str, examples: list[dict[str, Any]]) -> str:
@@ -200,28 +277,46 @@ def build_initial_prompt(
 ) -> str:
     """The one prompt that has to carry the whole contract.
 
-    The examples come LAST on purpose. They are the friendliest thing in the
-    message and the easiest to over-fit to, so the edge-case checklist is read
-    first and the examples arrive already framed as a lower bound rather than
-    as the specification.
+    Laid out in delimited sections, and the order is the argument. The output
+    contract goes FIRST because it is the only instruction whose failure costs
+    the entire answer rather than degrading it; the site's nudge repeats it last,
+    so it holds both the primacy and the recency slot. The problem and its
+    examples come next, because instructions about how to solve something are
+    unreadable before you know what it is. Everything that shapes HOW to answer
+    comes last, closest to where generation begins.
+
+    The examples are labelled a floor rather than the specification. They are the
+    friendliest thing in the message and the easiest to over-fit to, and the
+    label is what stops them being read as the whole job.
     """
     is_rust = language == "rust"
     rules = (RUST_RULES if is_rust else PYTHON_RULES).format(entrypoint=entrypoint)
-    edges = EDGE_CASES + "\n" + (RUST_EDGE_CASES if is_rust else PYTHON_EDGE_CASES)
+    environment = RUST_ENVIRONMENT if is_rust else PYTHON_ENVIRONMENT
+
     parts = [
-        f"Solve this programming problem in {'Rust' if is_rust else 'Python'}.",
-        "", rules,
-        "", edges,
-        "", "PROBLEM:", statement.strip(),
+        "<output>",
+        OUTPUT_CONTRACT.format(language="Rust" if is_rust else "Python"),
+        "</output>", "",
+        f'<problem language="{"rust" if is_rust else "python"}" '
+        f'entrypoint="{entrypoint}">',
+        statement.strip(),
+        "</problem>", "",
     ]
     rendered = _render_examples(language, examples)
     if rendered:
         parts += [
-            "",
-            "PUBLIC EXAMPLES — these are a floor, not the specification. Your "
-            "code must reproduce them exactly AND survive the cases above:",
+            "<examples note=\"PUBLIC EXAMPLES — a floor, not the specification. "
+            "Your code must reproduce these exactly AND survive the cases below.\">",
             rendered,
+            "</examples>", "",
         ]
+    parts += [
+        "<contract>", rules, "", environment, "</contract>", "",
+        "<method>", METHOD, "",
+        "<edge_cases>", EDGE_CASES, "</edge_cases>", "",
+        "<self_check>", SELF_CHECK, "</self_check>",
+        "</method>",
+    ]
     return "\n".join(parts)
 
 
@@ -336,14 +431,101 @@ def extract_code(
             )
             if defect is None:
                 return block
-    # Nothing clean: the last block is still the best guess, and the defect it
-    # reports is what the repair round needs to hear.
-    return blocks[-1]
+    # Nothing clean. Fall back only as far as something that is plausibly
+    # source: a broken program is still an attempt, and the defect it reports
+    # is what the repair round needs to hear, but a tool call is not an attempt
+    # at all. Handing one over submits a guaranteed zero AND archives it as
+    # "the solution", which is how a tool call came to be saved as a Rust
+    # program on a solve where the model had answered correctly.
+    for block in reversed(blocks):
+        if plausible_source(block, language):
+            return block
+    return ""
 
 
 # Said by both defect checks, and recognised by `build_repair_prompt`, because
 # "nothing arrived" needs a different conversation from "what arrived is wrong".
 NO_CODE = "the reply contained no code"
+
+
+# A code block a chat UI paints is not necessarily an ANSWER. When a model
+# reaches for its tools, every tool call is painted as a `pre code` block too,
+# and the reader cannot tell one from the other -- so the question "is this
+# plausibly source in the target language" has to be asked before a block is
+# allowed to become a submission.
+#
+# The two languages need different tests, and the asymmetry is real rather than
+# laziness. Rust's top level is a CLOSED grammar: a file can only begin with an
+# item, an attribute or a comment, so an allowlist of openers is exact and a
+# shell command or a JSON object fails at its first character. Python's top
+# level is arbitrary statements -- a perfectly good answer may open with
+# `MOD = 10**9 + 7` -- so no allowlist can be written that does not reject real
+# code. What CAN be named there is the short list of things a tool call opens
+# with.
+_SHELL_OPENER_RE = re.compile(
+    r"^[ \t]*(?:[$#>]\s|cat|cd|mkdir|echo|ls|rm|cp|mv|touch|chmod|export|sudo"
+    r"|apt|apt-get|yum|brew|pip3?|python3?|rustc|cargo|npm|yarn|git|curl|wget"
+    r"|bash|sh|zsh|make|which|pytest|node)\b"
+)
+
+
+def plausible_source(code: str, language: str = "python") -> bool:
+    """Could this block be source at all, before asking whether it is correct?
+
+    Deliberately not the same question as `*_defect`. A program with a fixable
+    flaw -- no entrypoint, a syntax error, a truncated line -- IS an attempt at
+    an answer, and it is worth submitting and worth showing the repair round.
+    A tool call is not an attempt at anything: submitting it guarantees a zero
+    and tells the model nothing it can act on.
+    """
+    first = next((line for line in code.splitlines() if line.strip()), "")
+    if not first:
+        return False
+    if language == "rust":
+        return bool(_RUST_OPENER_RE.match(first))
+    if first.lstrip()[:1] in "{[":
+        return False  # a JSON payload, not a program
+    return not _SHELL_OPENER_RE.match(first)
+
+
+def _always_returns(body: list) -> bool:
+    """Does this statement list guarantee a `return` or a `raise`?
+
+    The question a compiler asks about a Rust function and nothing asks about a
+    Python one. Only the LAST statement matters: anything before it can be
+    skipped, so only the tail decides whether control can fall off the end.
+
+    Conservative in the direction that costs least. A `for` loop is never
+    treated as guaranteeing a return even when it obviously does, because the
+    price of being wrong here is one repair round, while the price of missing a
+    truncated answer is the whole solve.
+    """
+    if not body:
+        return False
+    last = body[-1]
+    if isinstance(last, (ast.Return, ast.Raise)):
+        return True
+    if isinstance(last, ast.If):
+        return (
+            bool(last.orelse)
+            and _always_returns(last.body)
+            and _always_returns(last.orelse)
+        )
+    if isinstance(last, (ast.With, ast.AsyncWith)):
+        return _always_returns(last.body)
+    if isinstance(last, ast.Try):
+        if last.finalbody and _always_returns(last.finalbody):
+            return True
+        head = _always_returns(last.orelse) if last.orelse else _always_returns(last.body)
+        return head and all(_always_returns(h.body) for h in last.handlers)
+    if isinstance(last, ast.While):
+        # `while True:` with no way out never falls through to the end.
+        if isinstance(last.test, ast.Constant) and last.test.value is True:
+            return not any(isinstance(n, ast.Break) for n in ast.walk(last))
+        return False
+    if isinstance(last, ast.Match):
+        return bool(last.cases) and all(_always_returns(c.body) for c in last.cases)
+    return False
 
 
 def python_defect(code: str, entrypoint: str) -> Optional[str]:
@@ -370,6 +552,26 @@ def python_defect(code: str, entrypoint: str) -> Optional[str]:
             )
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == entrypoint:
+            if not _always_returns(node.body):
+                # `ast.parse` is Python's version of grepping for `fn main`: it
+                # is happy with source that was CUT OFF, because a reply
+                # truncated at a statement boundary is still a valid module.
+                # Measured on 25 real archived answers, two ended deep inside a
+                # loop with no return after it -- both parsed, both were
+                # submitted, both returned None on every hidden test, and
+                # nothing anywhere noticed. This flagged exactly those two and
+                # none of the other twenty-three.
+                #
+                # It is also a real defect when the model meant it: a grader
+                # compares RETURN VALUES, so a function that falls off its own
+                # end answers None. Rust gets this from the compiler for free.
+                ending = type(node.body[-1]).__name__.lower()
+                return (
+                    f"`{entrypoint}` can reach the end of its body without "
+                    f"returning, so it answers None — the body ends on a "
+                    f"`{ending}` rather than a return, which is what a reply "
+                    f"cut off mid-answer looks like"
+                )
             return None
     # An assignment such as `f = lambda x: ...` is also callable, so accept it.
     for node in tree.body:
@@ -380,10 +582,53 @@ def python_defect(code: str, entrypoint: str) -> Optional[str]:
     return f"the code does not define a top-level function named `{entrypoint}`"
 
 
+# `fn main` at the START of a line. Inside an escaped string -- a tool call's
+# JSON arguments, say -- it only ever appears mid-line, after a literal `\n`.
+_RUST_MAIN_RE = re.compile(
+    r"^[ \t]*(?:pub\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?"
+    r"fn\s+main\s*\(",
+    re.MULTILINE,
+)
+# What a single-file Rust program can begin with. Everything a chat UI renders
+# as a code block that ISN'T a program -- a shell command, a JSON payload, a
+# diff -- begins with something else, and this is the cheapest way to tell them
+# apart that does not need a compiler.
+_RUST_OPENER_RE = re.compile(
+    r"^[ \t]*(?:#!|#\[|//|/\*|use\b|fn\b|pub\b|mod\b|struct\b|enum\b|impl\b"
+    r"|trait\b|const\b|static\b|type\b|unsafe\b|extern\b|async\b|macro_rules!)"
+)
+
+
 def rust_defect(code: str) -> Optional[str]:
-    """Cheap structural check before paying for a compile."""
+    """Cheap structural check before paying for a compile.
+
+    Both tests here are stricter than they look, and they are stricter because
+    of what a chat UI renders as a code block. When a model reaches for its
+    tools, every tool call is painted as a `pre code` block too -- the reader
+    cannot tell one from an answer, and it should not have to. A block holding
+    `{"command": "cat > main.rs << 'EOF'\nfn main() ..."}` used to pass, because
+    the old test was `"fn main" in code`: it merely MENTIONS `fn main`, inside
+    a quoted shell string, inside JSON. Submitted, it is a guaranteed zero, and
+    the grader's only complaint would have been a compile error nobody could
+    trace back to a tool call.
+
+    So: `fn main` must begin a line, which it never does inside an escaped
+    string, and the file must begin the way a Rust file begins. A shell command
+    or a JSON object fails the second test at its first character.
+
+    The order of the two matters. Telling a model "your program does not define
+    `fn main()`" about something that was never a program is the contradiction
+    `build_repair_prompt` exists to avoid, so a block that is not Rust at all
+    says exactly that instead.
+    """
     if not code.strip():
         return NO_CODE
-    if "fn main" not in code:
+    first = next((line for line in code.splitlines() if line.strip()), "")
+    if not _RUST_OPENER_RE.match(first):
+        return (
+            f"this does not look like a Rust program — it begins with "
+            f"{first.strip()[:48]!r}"
+        )
+    if not _RUST_MAIN_RE.search(code):
         return "the program does not define `fn main()`"
     return None

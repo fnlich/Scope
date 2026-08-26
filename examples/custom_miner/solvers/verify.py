@@ -44,6 +44,7 @@ from .prompts import (
     python_defect,
     rust_defect,
 )
+from .rust_compile import compile_defect
 
 # Per-example wall clock when checking our own candidate. Kept small: this is
 # a smoke test against tiny public examples, not the real grading run.
@@ -257,6 +258,14 @@ class VerifyingSolver:
         # payment rides on that. Asking the other model is a fresh chance at the
         # full amount, and with a fleet there is usually an idle tab to ask on.
         asked: list[str] = []
+        # WHICH model produced the answer that wins, not merely which were
+        # asked. Attribution after the fact was otherwise guesswork: of 43
+        # archived submissions only three could be traced to a provider at all,
+        # and only because the damage itself carried a fingerprint -- two held
+        # ChatGPT's nudge, one quoted `/home/claude/sol`. The other forty were
+        # unattributable, which made "is one of these tabs doing worse than the
+        # others" an unanswerable question.
+        won_with: Optional[str] = None
         passes = 2 if self._second_opinion else 1
         for attempt_no in range(passes):
             remaining = budget - (time.monotonic() - started)
@@ -272,6 +281,7 @@ class VerifyingSolver:
                 asked.append(provider)
             if candidate is not None and candidate.score > best.score:
                 best = candidate
+                won_with = provider
             if best.verified:
                 break
             if not task.public_examples:
@@ -307,6 +317,7 @@ class VerifyingSolver:
         elapsed = time.monotonic() - started
         print(
             f"[verify] {task.language} entrypoint={task.entrypoint} "
+            f"provider={won_with or 'none'} "
             f"examples={best.passed}/{best.total} verified={best.verified} "
             f"{elapsed:.1f}s/{budget:.0f}s"
         )
@@ -340,7 +351,19 @@ class VerifyingSolver:
                 if left < 12.0:
                     break  # not enough left to be worth another round trip
                 # Give the first attempt the larger share; repairs are cheaper.
-                slice_s = left if attempt == self._max_attempts else left * 0.6
+                #
+                # How much larger depends on whether a repair can even happen.
+                # With public examples a repair is likely, and reserving 40% for
+                # it is well spent. With NONE -- every task on the run this was
+                # written for -- the only repair possible is defect-driven, and
+                # a first answer that is structurally fine ends the loop right
+                # there. Measured: a Claude tab spent its whole 135 second slice
+                # and the remaining 90 seconds of a 225 second budget went
+                # unused, on the one attempt that had to succeed.
+                first_share = 0.6 if task.public_examples else 0.85
+                slice_s = (
+                    left if attempt == self._max_attempts else left * first_share
+                )
 
                 reply = await conversation.send(prompt, slice_s)
                 candidate = self._grade(reply, task)
@@ -388,6 +411,13 @@ class VerifyingSolver:
             if task.language == "rust"
             else python_defect(code, task.entrypoint)
         )
+        if defect is None and task.language == "rust":
+            # Python's check PARSED that code; Rust's only grepped it for
+            # `fn main`. Ask the compiler the same question the validator will,
+            # which is the only check a Rust answer gets at all when no public
+            # examples shipped -- and on the run this was written for, none
+            # ever did. Returns None when there is no local toolchain.
+            defect = compile_defect(code)
         if defect is not None:
             # Structurally unusable: report it without paying for execution.
             candidate.defect = defect

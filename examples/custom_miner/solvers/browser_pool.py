@@ -228,6 +228,11 @@ _STREAM_INSTALL = f"({_STREAM_HOOK})()"
 #     thinking as `/delta/thinking` and ChatGPT under `/message/content/
 #     thoughts/...`, and a long reasoning block dwarfs the answer. Submitting
 #     the model's rough work is a failure this miner has already had once.
+#   * tool arguments. A model that reaches for its tools streams what it is
+#     asking them to do as `/delta/partial_json`, and that is not an answer --
+#     it is a shell command with a program quoted inside it. Measured: a 5,442
+#     byte tool call beat the 54 byte answer beside it on volume alone, and the
+#     wire handed back `{"command": "cat > main.rs << 'EOF' ..."}`.
 #   * enums. `/delta/type` repeats "text_delta" on every event and can outweigh
 #     a short program. A handful of distinct values across many events is a
 #     tag, not prose.
@@ -238,8 +243,20 @@ _STREAM_INSTALL = f"({_STREAM_HOOK})()"
 _STREAM_READ = r"""(since) => {
   var recs = (window.__honeStreams || []).filter(function (r) { return r.seq > since; });
   if (!recs.length) return null;
-  var NOISE = /think|thought|reason|scratch|signature|citation|websearch|tool_use/i;
-  var TAG = /(^|\/)(id|role|type|model|status|name|kind|stop_reason|created|uuid|parent|slug|index|version|mime|lang|language)$/i;
+  var NOISE = /think|thought|reason|scratch|signature|citation|websearch|tool|input_json|partial_json/i;
+  // Bookkeeping keys, with an optional prefix: `content_type` and
+  // `conversation_id` are as much tags as `type` and `id`, and matching only
+  // the bare word let `content_type` become the answer -- measured, a reply
+  // with no text in it reconstructed as the single word "text".
+  var TAG = /(^|\/)([a-z]+_)*(id|role|type|model|status|name|kind|reason|created|uuid|parent|slug|index|version|mime|lang|language)$/i;
+  // Text this stream attributes to somebody other than the model. A chat
+  // response carries the CONVERSATION, not just the reply: ChatGPT opens with
+  // a snapshot holding the user's own turn under `author.role = "user"`, and
+  // "the field appended to most" is then the PROMPT whenever the answer is
+  // shorter than it -- which it usually is. Measured on ChatGPT's real payload
+  // shape: a 1,384 character user turn beat the 41 character answer beside it,
+  // and two validators were sent this miner's own instructions as Rust.
+  var NOT_THE_MODEL = /\/role=(user|system|tool)\b/i;
   var leaves = function (node, path, out) {
     if (node === null || typeof node === 'undefined') return out;
     if (typeof node === 'string') { out.push([path, node]); return out; }
@@ -277,6 +294,7 @@ _STREAM_READ = r"""(since) => {
         var sig = marks.sort().join('|');
         if (sig) { sticky[path] = sig; } else { sig = sticky[path] || ''; }
         if (NOISE.test(path) || NOISE.test(sig)) continue;
+        if (NOT_THE_MODEL.test(sig)) continue;
         var key = path + '\u0000' + sig;
         var e = buckets[key];
         if (!e) { e = buckets[key] = { text: '', count: 0, distinct: Object.create(null), seen: 0 }; }
@@ -851,6 +869,18 @@ class _Tab:
                 )
         if self.alive and self.site.stream:
             best = await self._reconcile_stream(before, best, page_blocks)
+        if best and self._is_our_own_prompt(best):
+            # Last line of defence, at the ONE exit, because everything above
+            # it can produce a submission and only one of them was guarded.
+            self._warned_echo = True
+            print(
+                f"[{self.site.name}] WARN: tab {self.label} was about to submit the "
+                f"miner's OWN PROMPT as the answer, and did not. Run `python -m "
+                f"solvers.doctor {self.site.name}` — either "
+                f"{self.site.env_prefix}_ASSISTANT is matching your own message, or "
+                f"this tab is reconstructing the conversation rather than the reply."
+            )
+            best = ""
         if not best and self.alive:
             await self._explain_empty(before)
         return best
@@ -902,15 +932,29 @@ class _Tab:
                 page_blocks = []
         if not page_blocks and not best:
             # The page gave us nothing. This is the case the whole path exists
-            # for, so take the stream even unfenced: a model that answered
-            # without a fence still answered, and `extract_code` can salvage a
-            # bare program where an empty string can never be salvaged.
+            # for -- but only when the wire actually holds an answer.
+            if not blocks:
+                # It does not. Returning the raw text anyway was worse than
+                # returning nothing in three separate ways, all of them
+                # measured: it announced a rescue that had not happened, it
+                # made `best` non-empty and so SILENCED the post-mortem that
+                # would have said what the page contained, and the value was
+                # thrown away at extraction regardless. Worst of all it could
+                # be the miner's own prompt -- a chat stream carries the
+                # conversation, not just the reply -- and two prompts reached
+                # a validator as Rust programs that way.
+                print(
+                    f"[{self.site.name}] tab {self.label} read nothing from the page, "
+                    f"and the network stream had no code block in it either "
+                    f"({len(streamed)} chars captured). Nothing to submit."
+                )
+                return ""
             print(
                 f"[{self.site.name}] tab {self.label} read NOTHING from the page and "
-                f"recovered {len(blocks) or 'no'} code block(s) from the network "
-                f"stream instead. The answer below came off the wire, not the DOM."
+                f"recovered {len(blocks)} code block(s) from the network stream "
+                f"instead. The answer below came off the wire, not the DOM."
             )
-            return "\n".join(self._fence(b) for b in blocks) if blocks else streamed
+            return "\n".join(self._fence(b) for b in blocks)
         if blocks and page_blocks and not self._warned_stream_diff:
             gap = self._first_difference(page_blocks, blocks, "the page", "the wire")
             if gap:
@@ -1123,6 +1167,26 @@ class _Tab:
                 f"{self.site.name}` and set {self.site.env_prefix}_ASSISTANT."
             )
         return True
+
+    def _is_our_own_prompt(self, text: str) -> bool:
+        """Would this submission be the miner's own prompt handed back?
+
+        `_echoes_prompt` already asks a version of this, and it is applied in
+        exactly one place: the scrape path, inside `_poll`. Every other route
+        to a submission -- the copy control, the network stream -- went around
+        it, and the stream took that route twice in production. Two validators
+        were sent this file's own instruction text, ending in the words "Do not
+        use canvas", as a Rust program.
+
+        The test here is containment, not the prefix test `_echoes_prompt`
+        uses, and the difference is the point. By this stage the text has been
+        through fencing, a copy control or a wire reconstruction, so the prompt
+        need not be at the front any more. Containment is safe because what is
+        searched for is the head of a prompt this miner generated -- "Solve
+        this programming problem in ..." -- which appears in no answer to it.
+        """
+        head = " ".join(self._sent.split())[:80]
+        return bool(head) and head in " ".join(text.split())
 
     async def _explain_empty(self, before: tuple[int, Optional[str]]) -> None:
         """Say why nothing was captured, while the page is still there to ask.
