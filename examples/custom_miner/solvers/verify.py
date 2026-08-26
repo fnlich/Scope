@@ -298,19 +298,32 @@ class VerifyingSolver:
                 won_with = provider
             if best.verified:
                 break
-            if not task.public_examples:
+            # Nothing RAN, whether or not anything was shipped to run. The
+            # distinction used to be `not task.public_examples`, and that missed
+            # the commoner case by far: examples shipped, and the executor could
+            # not run them. Measured on a live miner with no Docker daemon, all
+            # three Rust challenges asked a SECOND model -- a full extra solve
+            # each, 55 to 108 seconds and a second conversation off the account
+            # quota -- and then submitted the first model's answer anyway,
+            # because two ungradeable candidates tie at `score` and `>` loses a
+            # tie. Twice the time and twice the quota for no information at all.
+            if best.total == 0:
                 if not self._warned_ungradeable:
                     self._warned_ungradeable = True
-                    print(
-                        "[verify] no public examples shipped with this task, so "
-                        "nothing can be graded locally: no repair rounds, and "
-                        "verified=False however good the answer is. Once per run."
+                    why = (
+                        "no public examples shipped with this task"
+                        if not task.public_examples
+                        else "the public examples could not be run here"
                     )
-                # Nothing can rank two ungradeable answers apart -- `score` ties
-                # at (0, has_code) -- so a second opinion is only ever worth
-                # buying when this one came back EMPTY. Then it is worth a lot:
-                # an empty answer scores zero, and the other model is the only
-                # remaining chance at the whole payment.
+                    print(
+                        f"[verify] {why}, so nothing can be graded locally: no "
+                        f"repair rounds, no second opinion once an answer is in "
+                        f"hand, and verified=False however good it is. Once per run."
+                    )
+                # A second opinion is only ever worth buying when this one came
+                # back EMPTY. Then it is worth a lot: an empty answer scores
+                # zero, and the other model is the only remaining chance at the
+                # whole payment.
                 if best.code.strip():
                     break
             if attempt_no + 1 < passes:

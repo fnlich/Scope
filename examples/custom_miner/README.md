@@ -1288,11 +1288,55 @@ it says so.
 | `Chrome did not open a CDP port on 9222 within 20s` | on Ubuntu, usually the snap Chromium being unable to read `~/.hone-miner/` — see step 2. Otherwise the port is taken: `curl http://127.0.0.1:9222/json/version`. |
 | the roster says `1 claude` when you configured two | the `.env` was not found, or `CHATGPT_CDP` is misspelled. With nothing set the roster falls back to one Claude browser on 9222, which looks like a working config. |
 
-Two things worth installing later, neither needed to get this far. `rustc`
-(`sudo apt install -y rustc`) lets the miner reject a Rust answer that will not
-build instead of submitting it — on a run with no public examples that is the
-only check a Rust answer gets. Docker lets it actually run Rust against the
-examples.
+### Rust needs Docker, and it is worth having
+
+Three of the five sample challenges are Rust, and Rust verification runs in the
+validator's pinned container — there is no subprocess path for it. Without a
+Docker daemon those three can only report whether the answer compiles, and
+`--challenge all` ends with three `????` rows instead of three verdicts.
+
+```bash
+# Docker Engine from Docker's own repository, not the distro's docker.io
+sudo apt update
+sudo apt install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+     -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+
+# Run it without sudo — the miner shells out to `docker` as your user
+sudo usermod -aG docker "$USER"
+newgrp docker            # or log out and back in
+
+docker run --rm hello-world
+```
+
+On Debian, replace `ubuntu` with `debian` in both URLs. The group change is not
+optional: the executor runs `docker info` as the user the miner runs as, and a
+daemon it cannot reach is reported exactly like a daemon that is not running.
+
+Then build the Rust sandbox image the validator uses:
+
+```bash
+cd /path/to/hone-subnet
+./scripts/build_rust_sandbox.sh          # or ./setup_validator.sh for everything
+```
+
+And a local compiler, which is a separate thing and cheap:
+
+```bash
+sudo apt install -y rustc
+```
+
+`rustc` is not a substitute for Docker — it cannot run the cases — but it lets
+the miner reject an answer that will not build instead of submitting it. On a
+run where no public examples ship, that is the **only** check a Rust answer
+gets before it goes to a validator.
 
 Only after all of this is a hotkey worth registering.
 

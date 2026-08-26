@@ -5631,3 +5631,96 @@ def test_the_fleet_is_opened_once_for_a_whole_batch():
         )
     )
     assert closes == [1], f"the fleet was closed {len(closes)} times, not once"
+
+
+def test_an_ungradeable_answer_does_not_buy_a_second_opinion(capsys):
+    """Measured on a live miner with no Docker daemon: all three Rust
+    challenges asked a SECOND model — a full extra solve each, 55 to 108
+    seconds and a second conversation off the account quota — and then
+    submitted the FIRST model's answer anyway, because two ungradeable
+    candidates tie at `score` and `>` loses a tie.
+
+    The old condition was `not task.public_examples`, which missed this
+    entirely: the examples were shipped, they just could not be run."""
+    asked: list[str] = []
+
+    class _Backend:
+        async def open(self, avoid=None):
+            asked.append(avoid or "first")
+            return _Chat([RIGHT], provider=f"m{len(asked)}")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(_Backend(), max_attempts=1, safety_margin_s=0,
+                             max_budget_s=60, second_opinion=True)
+
+    def unavailable(*a, **kw):
+        raise RuntimeError("DockerExecutor requires the 'docker' CLI on PATH")
+
+    solver._grader.check = unavailable
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=60))
+    out = capsys.readouterr().out
+    assert answer.code.strip(), "the answer itself was lost"
+    assert len(asked) == 1, f"asked {len(asked)} models for an ungradeable task"
+    assert "could not be run here" in out, out
+
+
+def test_an_empty_ungradeable_answer_still_buys_a_second_opinion():
+    """The other half. An empty answer scores zero, so the other model is the
+    only remaining chance at the whole payment — that trade is still worth it
+    when nothing can be graded."""
+    asked: list[str] = []
+
+    class _Backend:
+        async def open(self, avoid=None):
+            asked.append(avoid or "first")
+            # First model says nothing; the second answers.
+            return _Chat([RIGHT] if len(asked) > 1 else ["I cannot help."],
+                         provider=f"m{len(asked)}")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(_Backend(), max_attempts=1, safety_margin_s=0,
+                             max_budget_s=60, second_opinion=True)
+    solver._grader.check = lambda *a, **kw: (_ for _ in ()).throw(
+        RuntimeError("no docker")
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=60))
+    assert len(asked) == 2, "an empty answer must still get a second chance"
+    assert "def g(n)" in answer.code, answer.code
+
+
+def test_a_gradeable_failure_still_buys_a_second_opinion():
+    """Only 'nothing ran' skips it. An answer that ran and failed some examples
+    IS rankable, so the other model is worth asking."""
+    asked: list[str] = []
+
+    class _Backend:
+        async def open(self, avoid=None):
+            asked.append(avoid or "first")
+            return _Chat([WRONG], provider=f"m{len(asked)}")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(_Backend(), max_attempts=1, safety_margin_s=0,
+                             max_budget_s=60, second_opinion=True)
+    asyncio.run(solver.solve_task(DIGITS, timeout_s=60))
+    assert len(asked) == 2, "a rankable failure should still ask the other model"
+
+
+def test_the_archive_line_names_a_directory_you_can_find(tmp_path, monkeypatch, capsys):
+    """`SOLVER_SOLUTION_DIR` defaults to the relative "solutions", so the line
+    read "archived under solutions/" and left the reader to work out which
+    directory that was relative to — and the repository has a `solutions/` at
+    its root as well as the one this creates beside the miner. An operator went
+    looking in the wrong one."""
+    from solvers import rehearse
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SOLVER_SOLUTION_DIR", "solutions")
+    factory, _ = _rehearsal_solver(RIGHT_RUN)
+    asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=factory))
+    out = capsys.readouterr().out
+    line = next(l for l in out.splitlines() if "archived under" in l)
+    assert str(tmp_path / "solutions") in line, line
+    assert (tmp_path / "solutions" / "rehearsal-python-1.py").is_file()
