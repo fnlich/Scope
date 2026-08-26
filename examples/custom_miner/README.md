@@ -644,6 +644,36 @@ Three hazards are handled in code rather than left to the selectors:
 
 The same doctor works for ChatGPT: `python -m solvers.doctor chatgpt`.
 
+## Every solve leaves a file
+
+A browser-backed miner is hard to look at after the fact. The reply that
+produced a zero is gone the moment the tab starts its next conversation, the log
+says how the solve ended but not what was submitted, and the validator keeps the
+only other copy. So each answer is written to disk, named for the problem:
+
+```
+solutions/
+  bd41f0e2-….rs        the Rust source that was sent
+  7c9a1b04-….py        the Python source that was sent
+  3f88d5aa-….rs        0 bytes — this problem was seen and answered with silence
+```
+
+The empty ones are the point. Absence would be ambiguous — never dispatched,
+crashed before the solver ran, or answered with nothing — and those need
+different fixes; a zero-byte file says which it was. A solver that *raises*
+leaves one too, since that path never reaches the solver's own return.
+
+The content is taken from the payload rather than from the variable that fed it,
+so the file is the submission and not something that resembles it. The extension
+follows the task's language.
+
+`SOLVER_SOLUTION_DIR` moves the directory; setting it to nothing turns archiving
+off. Nothing here can cost you a solve — a disk that cannot be written explains
+itself once and the answer still goes out, because a miner that dies on a full
+disk has turned a lost point into a lost session. `problem_id` arrives over the
+network and is used to build a path, so it is sanitised as hostile input: it can
+only ever name a file directly inside the archive directory.
+
 ## Self-verification: the part that earns the money
 
 Scoring is accuracy-or-nothing, and models routinely produce *nearly* right

@@ -48,6 +48,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from preflight import require_linux  # noqa: E402
+from solution_archive import save_solution  # noqa: E402
 
 # Checked HERE, above the imports below, and not inside run_custom_miner(): on
 # Windows `pip install '.[chain]'` has already failed, so `import rlvr` would
@@ -229,9 +230,16 @@ class CustomMiner(DemoMiner):
             print(f"[custom-miner] solve failed: {type(exc).__name__}: {exc}")
             code, raw = "", "<solver failed>"
         # problem_id MUST equal the request's, or the validator rejects the reply.
-        return fit_response(
+        payload = fit_response(
             SolutionPayload(problem_id=request.problem_id, code=code, raw_response=raw)
         )
+        # Keep a copy of what actually went out -- taken from the payload, not
+        # from `code`, so the file is the submission rather than something that
+        # resembles it. Every solve leaves one, including the ones that produced
+        # nothing: an empty file records that this problem was seen and answered
+        # with silence, which needs a different fix from never having seen it.
+        save_solution(request.problem_id, request.language, payload.code)
+        return payload
 
     async def aclose(self) -> None:
         await self._solver.aclose()
