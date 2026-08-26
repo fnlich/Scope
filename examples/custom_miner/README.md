@@ -555,6 +555,47 @@ Because that is a heuristic over a private format, it does **not** simply win:
     happened to it.
 ```
 
+### Only a code block counts as an answer
+
+The reader returns the message's code blocks or nothing. It never returns the
+prose, and that is a statement about what this miner is for: it only ever wants
+a code block, so a message without one is not an answer it can use.
+
+The upside is not tidiness. **claude.ai renders extended thinking inside the
+element the assistant selector matches**, and the thinking arrives long before
+any code does — so for the whole first stretch of an answer, the message on
+screen is reasoning and nothing else. Reading the message text turned that into
+"here is your program": measured on a real solve, 13,200 characters of the model
+working through the problem were submitted as Rust, the grader replied `the
+program does not define fn main()`, and the repair round told the model to fix a
+program it had never sent. Twice, until the budget ran out.
+
+ChatGPT keeps its reasoning *outside* the matched element, so the identical
+moment there read as empty and was reported as empty. One DOM difference, two
+completely different diagnoses for the same situation — which is why the ChatGPT
+failure looked like a capture bug and the Claude one looked like a code bug.
+Reading only code blocks makes the site's markup stop mattering.
+
+The same rule applies once more at extraction. A reply with no fence anywhere is
+kept only if it is *gradeable* — a model that ignores the formatting and types
+the program bare has still answered — and is otherwise reported as nothing
+arriving, which is true. Punctuation does not decide; the same defect check that
+picks between fenced blocks does.
+
+What is given up is the chance to SEE what a code-free reply said, and that is
+exactly the thing that makes a silent failure take days. So the post-mortem
+quotes it:
+
+```
+[claude] tab claude#1 captured NOTHING from this reply: the message has no code
+block in it. It says: 'I need more detail about the framing rules before I can
+answer.' This is what surfaces later as "the reply contained no code".
+```
+
+A message with no code and a selector matching an empty wrapper both arrive as
+an empty read and need opposite fixes — the first is the model's doing, the
+second is yours — so they are named apart.
+
 ### When nothing is captured at all, the tab says why
 
 `the reply contained no code` is what the grader reports afterwards, and it
@@ -602,6 +643,36 @@ Three hazards are handled in code rather than left to the selectors:
   a freshly-loaded idle page at startup, and any that matches is dropped.
 
 The same doctor works for ChatGPT: `python -m solvers.doctor chatgpt`.
+
+## Every solve leaves a file
+
+A browser-backed miner is hard to look at after the fact. The reply that
+produced a zero is gone the moment the tab starts its next conversation, the log
+says how the solve ended but not what was submitted, and the validator keeps the
+only other copy. So each answer is written to disk, named for the problem:
+
+```
+solutions/
+  bd41f0e2-….rs        the Rust source that was sent
+  7c9a1b04-….py        the Python source that was sent
+  3f88d5aa-….rs        0 bytes — this problem was seen and answered with silence
+```
+
+The empty ones are the point. Absence would be ambiguous — never dispatched,
+crashed before the solver ran, or answered with nothing — and those need
+different fixes; a zero-byte file says which it was. A solver that *raises*
+leaves one too, since that path never reaches the solver's own return.
+
+The content is taken from the payload rather than from the variable that fed it,
+so the file is the submission and not something that resembles it. The extension
+follows the task's language.
+
+`SOLVER_SOLUTION_DIR` moves the directory; setting it to nothing turns archiving
+off. Nothing here can cost you a solve — a disk that cannot be written explains
+itself once and the answer still goes out, because a miner that dies on a full
+disk has turned a lost point into a lost session. `problem_id` arrives over the
+network and is used to build a path, so it is sanitised as hostile input: it can
+only ever name a file directly inside the archive directory.
 
 ## Self-verification: the part that earns the money
 

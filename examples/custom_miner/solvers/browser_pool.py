@@ -1164,10 +1164,22 @@ class _Tab:
         elif busy:
             why = "the answer was still being written when the budget ran out"
         else:
-            why = (
-                f"the answer rendered but read as empty — {self.site.env_prefix}_ASSISTANT "
-                f"may be matching a wrapper rather than the message"
-            )
+            # Distinguish "there is a message and it simply has no code in it"
+            # from "the selector matched a container with no text". They look
+            # identical from `best == ""` and they need opposite fixes -- the
+            # first is the model's doing, the second is ours.
+            spoken = " ".join((await self._whole(reply)).split())
+            if spoken:
+                why = (
+                    f"the message has no code block in it. It says: "
+                    f"{spoken[:160]!r}{'...' if len(spoken) > 160 else ''}"
+                )
+            else:
+                why = (
+                    f"the answer rendered but read as empty — "
+                    f"{self.site.env_prefix}_ASSISTANT may be matching a wrapper "
+                    f"rather than the message"
+                )
         print(
             f"[{self.site.name}] tab {self.label} captured NOTHING from this reply: "
             f"{why}. This is what surfaces later as \"the reply contained no code\"."
@@ -1341,7 +1353,7 @@ class _Tab:
 
     @staticmethod
     async def _read(reply) -> Optional[str]:
-        """The reply's code blocks, re-fenced, or the message text.
+        """The reply's code blocks, re-fenced, or None. Never the prose.
 
         Every block, not a guess at which one matters. Taking only the last
         used to submit the "example usage" snippet whenever a model appended
@@ -1349,12 +1361,29 @@ class _Tab:
         whole solve was spent to report that `solve` was never defined.
         Choosing between them needs the entrypoint, which belongs to the task
         rather than the tab, so hand them all over and let the caller pick.
+
+        Returning None rather than the message text is the important half, and
+        it is a statement about what this miner is for: it only ever wants a
+        code block, so prose is never an answer and handing it back has no
+        upside at all. It has a large downside. claude.ai renders extended
+        thinking INSIDE the element the assistant selector matches, and that
+        thinking arrives long before any code does -- so for the whole first
+        stretch of an answer, the message on screen is reasoning and nothing
+        else. Falling back to `inner_text` turned that into "here is your
+        program": measured on a real solve, 13,200 characters of the model
+        working through the problem were submitted as Rust, the grader replied
+        "the program does not define `fn main()`", and the repair round told
+        the model to fix a program it had never sent. Twice.
+
+        Reading nothing is the honest answer to "has it written the code yet",
+        and it is what the ChatGPT tabs have always done -- ChatGPT keeps its
+        reasoning outside the matched element, so the same situation there read
+        as empty and was reported as empty. This makes the two sites agree.
+        What the message actually says is not lost: `_explain_empty` quotes it
+        when a send comes back with nothing.
         """
         blocks = await _Tab._dom_blocks(reply)
-        if blocks:
-            return "\n".join(_Tab._fence(b) for b in blocks)
-        text = (await reply.inner_text()).strip()
-        return text or None
+        return "\n".join(_Tab._fence(b) for b in blocks) if blocks else None
 
     @staticmethod
     async def _dom_blocks(reply) -> list[str]:

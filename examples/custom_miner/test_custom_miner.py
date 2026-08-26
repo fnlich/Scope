@@ -17,6 +17,7 @@ to get wrong in production:
 from __future__ import annotations
 
 import json
+import os
 import asyncio
 import shutil
 import subprocess
@@ -1432,16 +1433,25 @@ def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():
 def test_a_partial_answer_survives_a_deadline_that_lands_mid_stream():
     """The commonest timeout there is: the model is still typing when the budget
     runs out. Returning "" there throws away a gradeable answer and hands the
-    repair round nothing to work with."""
+    repair round nothing to work with.
+
+    Half a CODE BLOCK, not half a message. What survives a deadline is whatever
+    the model had written into the block, because that is the only thing this
+    miner can submit -- a half-finished program still defines the entrypoint
+    often enough to be worth grading, and the repair round has something
+    concrete to work from. Prose caught mid-stream is not a partial answer; see
+    `_read`.
+    """
     page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
 
     def stream(_):
-        page.dom["#assistant"] = [_Node(text="half an answer")]
+        page.dom["#assistant"] = [_Node(code=["def solve(xs):\n    total = 0"])]
         page.dom["#stop"] = [_Node()]        # still generating, and stays that way
 
     page.on_click = stream
     site = _site(busy=("#stop",))
-    assert asyncio.run(_tab(page, site).send("solve it", 1.5)) == "half an answer"
+    got = asyncio.run(_tab(page, site).send("solve it", 1.5))
+    assert "total = 0" in got, f"threw away the half-written program: {got!r}"
 
 
 def test_send_honours_its_deadline_including_the_time_spent_submitting():
@@ -2901,3 +2911,261 @@ def test_a_repair_round_is_sent_back_through_the_checklist():
         assert "edge-case checklist" not in repair, (
             f"answered a delivery failure with logic advice: {defect!r}"
         )
+
+
+# --- a message that is all reasoning is not an answer --------------------- #
+# claude.ai renders extended thinking INSIDE the element the assistant selector
+# matches, and the thinking arrives long before any code does. ChatGPT keeps its
+# reasoning outside the matched element, so the same situation there read as
+# empty and was honestly reported as empty. That single DOM difference is why
+# one site failed with "the reply contained no code" and the other with "the
+# program does not define `fn main()`" — the same moment, two symptoms.
+
+
+def test_a_message_that_is_all_reasoning_is_not_read_as_the_answer():
+    """Measured on a real solve: 13,200 characters of the model working through
+    the problem were submitted as Rust. The grader answered "the program does
+    not define `fn main()`", and the repair round told the model to fix a
+    program it had never sent. Twice, before the budget ran out."""
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    thinking = "Let me carefully work through this problem. " * 300
+
+    def answers(_):
+        # A finished turn, as far as any selector can tell: nothing is
+        # streaming, nothing is busy. There is simply no code in it yet.
+        page.dom["#assistant"] = [_Node(text=thinking)]
+
+    page.on_click = answers
+    got = asyncio.run(_tab(page, _site()).send("solve it", 1.5))
+    assert got == "", f"submitted {len(got)} characters of reasoning as code: {got[:80]!r}"
+
+
+def test_reasoning_is_reported_as_nothing_arrived_not_as_a_broken_program():
+    """The two are different conversations, and giving the wrong one costs the
+    round. "Your program has no fn main()" is a contradiction when no program
+    was sent: the model rewrites logic that was never the problem. "Nothing
+    reached me as code" is the one that gets a code block back."""
+    from solvers.prompts import build_repair_prompt, rust_defect
+
+    prose = (
+        "Let me carefully work through this problem.\n"
+        "We have a stream of bytes described by a DAG of nodes.\n"
+        "State during processing: the current pending record length."
+    )
+    defect = rust_defect(extract_code(prose, "main", "rust"))
+    assert defect == NO_CODE, f"reasoning was diagnosed as {defect!r}"
+
+    repair = build_repair_prompt([], "rust", "main", defect=defect)
+    assert "did not reach me as code" in repair, repair[:120]
+    assert "does not define" not in repair, (
+        "still telling the model to fix a program it never sent"
+    )
+
+
+def test_a_program_sent_without_a_fence_is_still_an_answer():
+    """The other half of the same rule. A model that ignores the formatting and
+    types the program bare has still answered, and dropping that would trade one
+    silent failure for another. Gradeability decides, not punctuation."""
+    bare_rust = 'use std::io;\nfn main() { println!("1"); }'
+    assert extract_code(bare_rust, "main", "rust") == bare_rust
+
+    bare_py = "def pong():\n    return 'pong'"
+    assert extract_code(bare_py, "pong") == bare_py
+
+    # ...and something that merely looks like code but cannot be graded is not
+    # rescued by this: it is still nothing arriving.
+    assert extract_code("I would start by sorting xs, then return xs[0].", "pong") == ""
+
+
+def test_a_reply_with_no_code_block_says_what_it_said_instead(capsys):
+    """What is given up by never submitting prose is the chance to SEE it, and
+    that is the thing that makes a silent failure take days. A message with no
+    code and a selector matching an empty wrapper both arrive as `best == ""`
+    and need opposite fixes, so the post-mortem quotes the message."""
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+
+    def answers(_):
+        page.dom["#assistant"] = [
+            _Node(text="I need more detail about the framing rules before I can answer.")
+        ]
+
+    page.on_click = answers
+    asyncio.run(_tab(page, _site()).send("solve it", 1.5))
+    logged = capsys.readouterr().out
+    assert "no code block in it" in logged, logged
+    assert "I need more detail" in logged, f"did not quote the message: {logged!r}"
+
+
+def test_claude_and_chatgpt_now_fail_the_same_way_on_a_thinking_message():
+    """The bug was never in either model. It was that Claude's reasoning lands
+    inside the matched element and ChatGPT's does not, so the identical moment
+    produced two different diagnoses. Reading only code blocks makes the site's
+    markup stop mattering."""
+    thinking = "Working through the constraints. " * 50
+    results = {}
+    for name, dom in (
+        # Claude: the thinking is inside the message.
+        ("claude", [_Node(text=thinking)]),
+        # ChatGPT: it is somewhere the selector cannot see.
+        ("chatgpt", [_Node(text="")]),
+    ):
+        page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+        page.on_click = lambda _, d=dom, p=None: None
+        page.dom["#assistant"] = dom
+        results[name] = asyncio.run(_tab(page, _site()).send("solve it", 1.0))
+    assert results["claude"] == results["chatgpt"] == "", results
+
+
+# --- every solve leaves a file ------------------------------------------- #
+# A browser-backed miner is hard to look at afterwards: the reply that produced
+# a zero is gone the moment the tab starts its next conversation, and the
+# validator keeps the only other copy of what was sent.
+
+
+def _request(problem_id, language="rust"):
+    from rlvr.protocol import TaskRequest
+
+    return TaskRequest(
+        problem_id=problem_id, language=language, statement="do a thing",
+        entrypoint="main" if language == "rust" else "solve",
+    )
+
+
+def _solved_by(solver, request, directory):
+    """Drive the REAL solve path, including its own failure handling.
+
+    Called unbound against a stub rather than through a constructed miner:
+    `solve` touches nothing but `self._solver`, and building a DemoMiner would
+    drag in settings, a client and an axon to test six lines of file writing.
+    """
+    from custom_miner import CustomMiner
+
+    previous = os.environ.get("SOLVER_SOLUTION_DIR")
+    os.environ["SOLVER_SOLUTION_DIR"] = str(directory)
+    try:
+        return asyncio.run(CustomMiner.solve(SimpleNamespace(_solver=solver), request, 5.0))
+    finally:
+        if previous is None:
+            os.environ.pop("SOLVER_SOLUTION_DIR", None)
+        else:
+            os.environ["SOLVER_SOLUTION_DIR"] = previous
+
+
+def _solver_returning(code):
+    from custom_miner import SolveResult
+
+    class _S:
+        async def solve_task(self, task, timeout_s):
+            return SolveResult(code=code, raw_response="transcript")
+
+    return _S()
+
+
+def test_the_answer_that_was_sent_is_the_answer_on_disk(tmp_path):
+    """Written from the PAYLOAD, not from the variable that fed it. The file is
+    only worth having if it is the submission rather than something that
+    resembles it — anything that rewrites `code` on the way out would otherwise
+    leave a copy that quietly disagrees with what was graded."""
+    program = 'use std::io;\nfn main() { println!("1"); }\n'
+    payload = _solved_by(_solver_returning(program), _request("prob-1"), tmp_path)
+    written = tmp_path / "prob-1.rs"
+    assert written.exists(), sorted(p.name for p in tmp_path.iterdir())
+    assert written.read_text() == payload.code == program
+
+
+def test_the_language_picks_the_extension(tmp_path):
+    _solved_by(_solver_returning("def solve():\n    return 1\n"),
+               _request("py-task", "python"), tmp_path)
+    _solved_by(_solver_returning("fn main() {}"), _request("rs-task", "rust"), tmp_path)
+    assert (tmp_path / "py-task.py").exists()
+    assert (tmp_path / "rs-task.rs").exists()
+
+
+@pytest.mark.parametrize(
+    "kind, code",
+    [("empty", ""), ("blank", "   \n\n  ")],
+)
+def test_a_solve_that_produced_nothing_still_leaves_an_empty_file(kind, code, tmp_path):
+    """The deliberate part. Absence would be ambiguous — never dispatched,
+    crashed before the solver ran, or answered with silence — and those need
+    different fixes. A zero-byte file says which one it was.
+
+    Whitespace-only counts as nothing: a few blank lines on disk read as an
+    answer at a glance and to anything measuring size."""
+    _solved_by(_solver_returning(code), _request(f"{kind}-task"), tmp_path)
+    written = tmp_path / f"{kind}-task.rs"
+    assert written.exists(), f"a silent solve left no record at all ({kind})"
+    assert written.stat().st_size == 0, (
+        f"wrote {written.stat().st_size} bytes for an answer that was empty"
+    )
+
+
+def test_a_solver_that_raises_still_leaves_a_file(tmp_path):
+    """The path most likely to be the one you need afterwards, and the one that
+    never reaches the solver's own return statement."""
+
+    class _Dies:
+        async def solve_task(self, task, timeout_s):
+            raise RuntimeError("the tab died")
+
+    payload = _solved_by(_Dies(), _request("boom"), tmp_path)
+    assert payload.code == "", "a crashed solve must submit nothing"
+    written = tmp_path / "boom.rs"
+    assert written.exists() and written.stat().st_size == 0
+
+
+def test_a_problem_id_cannot_write_outside_the_archive(tmp_path):
+    """`problem_id` arrives over the network and is used to build a path, so it
+    is sanitised as hostile input rather than trusted as an identifier."""
+    from solution_archive import save_solution
+
+    for hostile in ("../../etc/passwd", "..\\..\\windows\\system32", "/abs/olute",
+                    "..", ".", "", "  ", "._-"):
+        written = save_solution(hostile, "python", "x = 1", tmp_path)
+        assert written is not None, hostile
+        assert tmp_path in written.parents, f"{hostile!r} escaped to {written}"
+        assert written.parent == tmp_path, f"{hostile!r} nested to {written}"
+    assert not (tmp_path / "etc").exists(), "created a directory from a path segment"
+
+
+def test_a_very_long_problem_id_still_produces_a_usable_name(tmp_path):
+    """Filesystems cap a single name at 255 bytes; an id is capped at 256."""
+    from solution_archive import save_solution
+
+    written = save_solution("z" * 256, "rust", "fn main(){}", tmp_path)
+    assert written is not None and written.exists()
+    assert len(written.name) < 255, len(written.name)
+
+
+def test_archiving_can_be_switched_off(tmp_path):
+    """It writes to disk on every solve, so there has to be a way to stop it."""
+    from solution_archive import archive_dir, save_solution
+
+    previous = os.environ.get("SOLVER_SOLUTION_DIR")
+    os.environ["SOLVER_SOLUTION_DIR"] = ""
+    try:
+        assert archive_dir() is None
+        assert save_solution("p", "python", "x = 1") is None
+    finally:
+        if previous is None:
+            os.environ.pop("SOLVER_SOLUTION_DIR", None)
+        else:
+            os.environ["SOLVER_SOLUTION_DIR"] = previous
+
+
+def test_a_disk_that_cannot_be_written_does_not_cost_the_solve(tmp_path, capsys):
+    """A miner that dies because a disk filled up has turned a lost point into a
+    lost session. The answer still goes out; the failure is explained once."""
+    import solution_archive
+
+    blocked = tmp_path / "wall"
+    blocked.write_text("I am a file, not a directory")
+
+    solution_archive._warned = False
+    payload = _solved_by(_solver_returning("fn main() {}"), _request("p1"), blocked)
+    assert payload.code == "fn main() {}", "a failed archive swallowed the answer"
+    assert "could not write solutions" in capsys.readouterr().out
+
+    # ...and it does not say so again on every subsequent solve.
+    _solved_by(_solver_returning("fn main() {}"), _request("p2"), blocked)
+    assert "could not write solutions" not in capsys.readouterr().out
