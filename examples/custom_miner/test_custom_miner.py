@@ -5724,3 +5724,86 @@ def test_the_archive_line_names_a_directory_you_can_find(tmp_path, monkeypatch, 
     line = next(l for l in out.splitlines() if "archived under" in l)
     assert str(tmp_path / "solutions") in line, line
     assert (tmp_path / "solutions" / "rehearsal-python-1.py").is_file()
+
+
+def test_a_failing_case_is_named_and_says_whether_it_was_held_back(capsys):
+    """A wall of arguments has to be decoded before the reader knows which of
+    three behaviours broke. And "(held back)" is the fact worth having in front
+    of them: a model that fails a case it was SHOWN has ignored its own worked
+    example, one that fails a case it never saw has simply never exercised that
+    path. Opposite diagnoses, and the arguments alone say neither."""
+    from solvers import rehearse
+
+    # Rejects everything: fails all three, two of them shown.
+    rejects = ("```python\ndef extent_journal(chunk_size, address_limit, "
+               "large_threshold, events):\n    return [('rejected',) for _ in events]\n```")
+    factory, _ = _rehearsal_solver(rejects)
+    asyncio.run(
+        rehearse.run(
+            _rehearsal_args(challenge=["extent-journal"], examples=2, timeout=30.0),
+            solver_factory=factory,
+        )
+    )
+    out = capsys.readouterr().out
+    assert "case 1 'claim lookup and release'" in out, out
+    assert "(held back)" not in out.split("case 3")[0], "a shown case was labelled held back"
+
+
+def test_only_the_cases_beyond_the_shown_ones_are_marked_held_back():
+    from solvers import rehearse
+    from solvers.verify import _Grader
+
+    seen: dict = {}
+    original = _Grader.check
+
+    def spy(self, code, language, entrypoint, examples, names=None):
+        seen["names"] = names
+        return original(self, code, language, entrypoint, examples, names)
+
+    _Grader.check = spy
+    try:
+        problem = rehearse._from_challenges(["extent-journal"], 2, 60.0)[0]
+        payload = SimpleNamespace(code="def extent_journal(*a):\n    return []")
+        rehearse._verdict(payload, problem.request, problem.tests,
+                          problem.case_names, len(problem.request.public_examples))
+    finally:
+        _Grader.check = original
+    names = seen["names"]
+    assert len(names) == 3, names
+    assert "(held back)" not in names[0] and "(held back)" not in names[1], names
+    assert names[2].endswith("(held back)"), names[2]
+
+
+def test_grading_without_names_is_unchanged():
+    """The repair prompt does not want them: the model is being shown concrete
+    inputs and outputs, and an authored title is noise there."""
+    from solvers.verify import _Grader
+
+    passed, total, failures = _Grader().check(
+        "def g(n):\n    return 0", "python", "g",
+        [{"args": [12345], "kwargs": {}, "expected": 15}],
+    )
+    assert (passed, total) == (0, 1)
+    assert failures and not failures[0].startswith("case "), failures[0]
+
+
+def test_a_docker_daemon_you_cannot_reach_is_told_how_to_reach_it():
+    """"permission denied ... /var/run/docker.sock" is not a broken install and
+    not a stopped daemon — it is a running daemon the miner's user is not in
+    the group for. The raw error names the socket and never names the group, so
+    an operator reads it as "Docker is broken" and reinstalls Docker."""
+    from solvers import rehearse
+
+    denied = rehearse._executor_hint(RuntimeError(
+        "DockerExecutor could not contact the Docker daemon ('docker info' rc=1: "
+        "permission denied while trying to connect to the docker API at "
+        "unix:///var/run/docker.sock)"
+    ))
+    assert "usermod -aG docker" in denied and "newgrp docker" in denied, denied
+
+    missing = rehearse._executor_hint(RuntimeError(
+        "DockerExecutor requires the 'docker' CLI on PATH, but it was not found."
+    ))
+    assert "not installed" in missing, missing
+
+    assert rehearse._executor_hint(RuntimeError("the grader exploded")) == ""

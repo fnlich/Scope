@@ -42,7 +42,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional, Sequence
 
 if __package__ in (None, ""):  # `python solvers/rehearse.py` as well as `-m`
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -74,6 +74,11 @@ class Problem(NamedTuple):
     tests: list[TestCase]
     origin: str
     tests_are: str
+    # The authored name of each case, when the source has them. `TestCase`
+    # drops it -- it is not part of the wire contract -- and without it a
+    # failure is a wall of arguments the reader has to decode to find out which
+    # of three situations broke. The sample challenges name every case.
+    case_names: tuple[str, ...] = ()
 
 
 def _from_sample(name: str) -> Problem:
@@ -119,6 +124,7 @@ def _from_challenges(which: Optional[list[str]], shown: Optional[int],
              f"all {len(challenge.cases)} public case(s), every one of which the "
              f"model was shown — so this grade cannot fail; use --examples to hold "
              f"some back"),
+            tuple(str(case.get("name", "")) for case in challenge.cases),
         ))
     return problems
 
@@ -247,7 +253,10 @@ async def _answer(miner, request: TaskRequest, timeout_s: float):
 SCORED, FAILED, UNKNOWN = "SCORES", "DOES NOT SCORE", "COULD NOT BE CHECKED"
 
 
-def _verdict(payload, request: TaskRequest, tests: list[TestCase]) -> tuple[str, str]:
+def _verdict(
+    payload, request: TaskRequest, tests: list[TestCase],
+    case_names: Sequence[str] = (), shown: int = 0,
+) -> tuple[str, str]:
     """Would this have scored? Run it through the validator's own executor.
 
     The miner never learns this, and that is exactly why a rehearsal should say
@@ -282,12 +291,46 @@ def _verdict(payload, request: TaskRequest, tests: list[TestCase]) -> tuple[str,
         passed, total, failures = _Grader().check(
             code, request.language, request.entrypoint,
             [t.model_dump(mode="json") for t in tests],
+            names=[
+                # "(held back)" is the fact worth having in front of the reader.
+                # A model that fails a case it was SHOWN has ignored its own
+                # worked example; one that fails a case it was not shown has
+                # simply never exercised that path -- opposite diagnoses.
+                f"{name}{'' if index < shown else ' (held back)'}"
+                for index, name in enumerate(case_names)
+            ] or None,
         )
     except Exception as exc:  # noqa: BLE001 - a missing toolchain is not a verdict
-        return UNKNOWN, f"{builds}the tests could not be run here — {_one_line(exc)}"
+        return UNKNOWN, (
+            f"{builds}the tests could not be run here — {_one_line(exc)}"
+            f"{_executor_hint(exc)}"
+        )
     if passed == total:
         return SCORED, f"passed all {total} test(s)"
     return FAILED, f"passed {passed}/{total} — {'; '.join(failures[:2])}"
+
+
+def _executor_hint(exc: Exception) -> str:
+    """The fix, when the failure has exactly one.
+
+    "permission denied ... /var/run/docker.sock" is not a broken install and
+    not a stopped daemon -- it is a running daemon the miner's user is not in
+    the group for, and it is the single commonest way a Rust rehearsal comes
+    back unchecked. The raw error names the socket and never names the group,
+    so an operator reads it as "Docker is broken" and reinstalls Docker.
+    """
+    text = str(exc).lower()
+    if "permission denied" in text and "docker.sock" in text:
+        return (
+            "\n           The daemon is UP and your user cannot reach it. Fix:\n"
+            "               sudo usermod -aG docker \"$USER\"\n"
+            "               newgrp docker      # or log out and back in\n"
+            "               docker run --rm hello-world"
+        )
+    if "docker" in text and ("not found" in text or "no such file" in text):
+        return ("\n           Docker is not installed. See the README's "
+                "\"Rust needs Docker\" section.")
+    return ""
 
 
 def _rustc_available() -> bool:
@@ -459,7 +502,9 @@ async def _rehearse_one(miner, problem: Problem, settings, args) -> tuple[str, s
               f"({request.problem_id}.{'rs' if request.language == 'rust' else 'py'}, "
               f"and the exchange beside it)")
 
-    verdict, why = _verdict(payload, request, tests)
+    verdict, why = _verdict(
+        payload, request, tests, problem.case_names, len(request.public_examples)
+    )
     print(f"[rehearse] {verdict}: {why}")
     print(f"[rehearse] checked against {problem.tests_are}")
     return verdict, why
