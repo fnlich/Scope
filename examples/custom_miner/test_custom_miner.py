@@ -44,7 +44,7 @@ from solvers.browser_pool import (  # noqa: E402
 )
 from solvers.chatgpt_web import chatgpt_site  # noqa: E402
 from solvers.claude_web import claude_site  # noqa: E402
-from solvers.prompts import NO_CODE, extract_code  # noqa: E402
+from solvers.prompts import NO_CODE, extract_code, python_defect  # noqa: E402
 from solvers.verify import Answer, VerifyingSolver  # noqa: E402
 
 from rlvr.config import Settings  # noqa: E402
@@ -99,6 +99,25 @@ def _solver(replies, **kw):
     kw.setdefault("safety_margin_s", 0)
     kw.setdefault("max_budget_s", 120)
     return VerifyingSolver(_Backend(replies), **kw)
+
+
+@pytest.fixture(autouse=True)
+def _never_archive_into_the_operators_corpus(tmp_path, monkeypatch):
+    """Point the solution archive at a scratch directory for EVERY test.
+
+    Autouse and unconditional, because the alternative was measured rather than
+    imagined. Two tests here drive the real `/solve` path through a TestClient,
+    and `CustomMiner.solve` archives every answer it produces — so running the
+    suite wrote its own canned fixtures into `solutions/` beside answers a live
+    miner had produced for real validators. Deleting the two files and running
+    just those two tests put them straight back: 43 files, then 45.
+
+    That corpus is evidence. It is what an operator reads to find out what their
+    miner actually submitted, and a test that quietly adds rows to it makes that
+    evidence untrustworthy in a way nobody would think to check. Per-test opt-in
+    would have left the same hole open for the next test somebody writes.
+    """
+    monkeypatch.setenv("SOLVER_SOLUTION_DIR", str(tmp_path / "solutions"))
 
 
 # --------------------------------------------------------------------------- #
@@ -3331,3 +3350,368 @@ def test_the_wire_does_not_mistake_tool_arguments_for_the_answer():
 
     got = asyncio.run(go())
     assert got == answer, f"the wire took {len(tool)} bytes of tool call: {(got or '')[:80]!r}"
+
+
+# --- the miner must never submit its own prompt --------------------------- #
+# It did. Twice, to real validators, archived as Rust programs ending in the
+# words "Do not use canvas". `_echoes_prompt` was written to stop exactly this
+# and was applied in exactly one place — inside `_poll`, guarding the scrape.
+# The copy control and the network stream both went around it.
+
+OUR_PROMPT = (
+    "Solve this programming problem in Rust.\n\nRules — the grader is automated "
+    "and unforgiving:\n- Write ONE complete program with `fn main()`.\n\n"
+    "PROBLEM:\nDo a thing.\n\nReply directly in the chat with one ordinary "
+    "fenced code block. Do not use canvas."
+)
+
+
+def _text_stream(text):
+    """A Claude-shaped SSE body carrying `text` as the assistant's message."""
+    events = ['data: {"type":"message_start","message":{"id":"m","role":"assistant"}}']
+    for i in range(0, len(text), 20):
+        events.append("data: " + json.dumps({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": text[i:i + 20]}}))
+    return "\n\n".join(events) + "\n\n"
+
+
+# A page that renders nothing readable but does stream. The wire is then the
+# only source with anything in it, which is the situation the rescue exists for.
+SILENT_STREAMING_PAGE = (
+    '<!doctype html><meta charset="utf-8">'
+    '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    '<div id="host"></div><script>'
+    "document.getElementById('send').onclick = () => {"
+    "  fetch('/sse').then(r => r.text()).then(() => {"
+    "    const d = document.createElement('div');"
+    "    d.setAttribute('data-message-author-role', 'assistant');"
+    "    document.getElementById('host').appendChild(d); }); };</script>"
+)
+
+
+def _send_against_stream(body):
+    playwright, chrome = _chromium_or_skip()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(
+                playwright, chrome, [body], page_html=SILENT_STREAMING_PAGE)(p)
+            reply = await _tab(page, _wire_site()).send(OUR_PROMPT, 6.0)
+            await browser.close()
+            return reply
+
+    return asyncio.run(go())
+
+
+def test_the_wire_never_hands_back_the_miners_own_prompt(capsys):
+    """The production failure, end to end.
+
+    A chat stream carries the CONVERSATION, not just the reply, so the prompt
+    that was just sent can be the largest block of text in it. With the page
+    unreadable and the wire holding no fenced code, the rescue branch returned
+    that raw text — and a validator received this file's own instructions as a
+    Rust program. Twice.
+    """
+    reply = _send_against_stream(_text_stream(OUR_PROMPT))
+    assert reply == "", f"submitted the miner's own prompt: {reply[:80]!r}"
+    logged = capsys.readouterr().out
+    assert "no code block in it either" in logged, logged
+
+
+def test_the_wire_does_not_claim_a_rescue_it_did_not_make(capsys):
+    """The old message said "recovered no code block(s) ... The answer below
+    came off the wire" — announcing a rescue in the same breath as admitting
+    there was nothing to rescue. Worse, returning that text made `best`
+    non-empty, which SILENCED the post-mortem that would have said what the
+    page actually contained."""
+    _send_against_stream(_text_stream("I need more detail before I can answer."))
+    logged = capsys.readouterr().out
+    assert "The answer below came off the wire" not in logged, (
+        f"still claiming a rescue with nothing recovered: {logged!r}"
+    )
+    assert "captured NOTHING from this reply" in logged, (
+        f"the post-mortem was suppressed: {logged!r}"
+    )
+
+
+def test_a_real_answer_on_the_wire_is_still_rescued(capsys):
+    """The guard must not cost the thing the wire is there for."""
+    answer = 'Here it is:\n\n```rust\nfn main() { println!("42"); }\n```'
+    reply = _send_against_stream(_text_stream(answer))
+    assert "fn main" in reply, f"lost a genuine wire answer: {reply!r}"
+    assert "came off the wire" in capsys.readouterr().out
+
+
+def test_the_copy_control_cannot_smuggle_the_prompt_past_the_guard(capsys):
+    """The other unguarded route. `_copied_blocks` presses a control and takes
+    what it is handed, with no echo check anywhere on that path — so a selector
+    that has drifted onto the user's own turn submits the prompt from a source
+    the scrape guard never sees."""
+    playwright, chrome = _chromium_or_skip()
+
+    def page_for(src):
+        return (
+            '<!doctype html><meta charset="utf-8">'
+            '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+            '<div id="host"></div><script>const SRC = ' + json.dumps(src) + ';'
+            "document.getElementById('send').onclick = () => {"
+            "  const w=document.createElement('div');"
+            "  w.setAttribute('data-message-author-role','assistant');"
+            "  const pre=document.createElement('pre'), c=document.createElement('code');"
+            "  c.textContent=SRC; pre.appendChild(c); w.appendChild(pre);"
+            "  const b=document.createElement('button'); b.setAttribute('aria-label','Copy');"
+            "  b.onclick=()=>navigator.clipboard.writeText(SRC); w.appendChild(b);"
+            "  document.getElementById('host').appendChild(w); };</script>"
+        )
+
+    async def go(src):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.route("**/x", lambda r: asyncio.ensure_future(r.fulfill(
+                status=200, content_type="text/html", body=page_for(src))))
+            await page.goto("https://example.test/x")
+            site = _wire_site(copy=('button[aria-label="Copy"]',), stream=False)
+            reply = await _tab(page, site).send(OUR_PROMPT, 6.0)
+            await browser.close()
+            return reply
+
+    assert asyncio.run(go(OUR_PROMPT)) == "", "the copy control smuggled the prompt through"
+    assert "OWN PROMPT" in capsys.readouterr().out
+
+    # ...and a real program handed over by the same control still gets through.
+    real = 'use std::io;\nfn main() { println!("42"); }'
+    assert "fn main" in asyncio.run(go(real)), "the guard ate a genuine answer"
+
+
+def test_the_suite_never_archives_into_the_operators_corpus(tmp_path):
+    """Measured, not imagined: two tests here drive the real `/solve` path
+    through a TestClient, and `CustomMiner.solve` archives everything it
+    produces — so running the suite wrote its own fixtures into `solutions/`
+    beside answers a live miner had produced for real validators. Deleting the
+    two files and re-running just those tests put them straight back."""
+    from solution_archive import DEFAULT_DIR, archive_dir
+
+    where = archive_dir()
+    assert where is not None
+    assert where != Path(DEFAULT_DIR), (
+        "a test is pointed at the real solutions directory; the autouse fixture "
+        "is not in force"
+    )
+    assert "pytest" in str(where) or str(tmp_path.parent) in str(where), where
+
+
+# --- Rust gets a compiler, not a grep ------------------------------------- #
+# Python's structural check PARSES the source. Rust's greps it for `fn main`.
+# That asymmetry is why every answer this miner has destroyed in transit was a
+# Rust one: the model's reasoning, a tool call, and the miner's own prompt all
+# contain the characters `fn main`, and all three were submitted as programs.
+
+
+def _rustc_or_skip():
+    from solvers.rust_compile import rustc_path
+
+    if rustc_path() is None:
+        pytest.skip("no rustc on this host")
+
+
+BUILDS = 'use std::io::{self, Read};\nfn main() {\n    let mut s = String::new();\n    io::stdin().read_to_string(&mut s).unwrap();\n    println!("{}", s.trim().len());\n}\n'
+
+
+@pytest.mark.parametrize(
+    "name, code",
+    [
+        ("prompt echo", OUR_PROMPT),
+        ("tool call", '{"command": "cat > main.rs << \'EOF\'\\nfn main() {}\\nEOF"}'),
+        ("truncated mid-token", "use std::io;\nfn main() {\n    let x = 1;\n    le"),
+        ("undefined function", "fn main() {\n    let _ = missing_helper(1);\n}"),
+        ("borrow error", "fn main() {\n    let mut v = vec![1];\n    let r = &v[0];\n    v.push(2);\n    println!(\"{}\", r);\n}"),
+    ],
+)
+def test_the_rust_gate_rejects_what_will_not_build(name, code):
+    """Replayed against the real archive, this rejected exactly the six Rust
+    submissions that did not build and passed all twelve that did. Three of the
+    six would otherwise have reached a validator as programs; the other three
+    become a repair round instead of a certain zero."""
+    _rustc_or_skip()
+    from solvers.rust_compile import compile_defect
+
+    defect = compile_defect(code)
+    assert defect is not None, f"a {name} was accepted as a Rust program"
+    assert defect.startswith("it does not compile:"), defect
+
+
+def test_the_rust_gate_passes_a_program_that_builds():
+    """The expensive half of being wrong. A gate that rejects real answers is
+    worse than no gate: this one has to be silent on anything that compiles."""
+    _rustc_or_skip()
+    from solvers.rust_compile import compile_defect
+
+    assert compile_defect(BUILDS) is None
+
+
+def test_the_first_error_is_reported_not_the_first_warning():
+    """The exact shape that makes this necessary, found by looking rather than
+    guessing: rustc reports most errors before warnings, but a MISSING `main`
+    comes from a very late pass, so an unused import is printed first.
+
+        warning: unused import: `std::collections::HashMap`
+        ...
+        error[E0601]: `main` function not found in crate `candidate`
+
+    That is the worst possible case to get wrong. "No main function" is the one
+    defect this miner most needs to report, and handing back the head of stderr
+    instead sends the repair round off to delete an import while the program
+    still has no entry point.
+    """
+    _rustc_or_skip()
+    from solvers.rust_compile import compile_defect
+
+    warning_first = "use std::collections::HashMap;\nfn helper() {}\n"
+    defect = compile_defect(warning_first)
+    assert defect is not None, "a program with no `main` was accepted"
+    assert "main" in defect and "E0601" in defect, (
+        f"reported the warning instead of the error: {defect}"
+    )
+    assert "unused import" not in defect, defect
+
+
+def test_no_local_toolchain_means_no_opinion(monkeypatch):
+    """Silence must mean the same thing as success. A miner that stops
+    submitting answers because a toolchain went missing has turned a missing
+    convenience into an outage."""
+    import solvers.rust_compile as rc
+
+    monkeypatch.setattr(rc, "_looked", False)
+    monkeypatch.setattr(rc, "_rustc", None)
+    monkeypatch.setattr(rc.shutil, "which", lambda _: None)
+    assert rc.rustc_path() is None
+    assert rc.compile_defect("this is not rust at all") is None
+
+    # ...and the operator can switch it off even where a compiler exists.
+    monkeypatch.setattr(rc, "_looked", False)
+    monkeypatch.setenv("SOLVER_RUST_COMPILE", "0")
+    assert rc.rustc_path() is None
+
+
+def test_the_gate_asks_the_same_question_the_validator_will():
+    """Flags read from RELEASE_POLICY rather than copied, so a change to the
+    validator's toolchain cannot leave this quietly asking something else."""
+    import inspect
+
+    from rlvr.policy import RELEASE_POLICY
+    from solvers import rust_compile
+
+    source = inspect.getsource(rust_compile.compile_defect)
+    assert "RELEASE_POLICY.rustc_flags" in source
+    assert "RELEASE_POLICY.rust_edition" in source
+    assert RELEASE_POLICY.rustc_flags == ("-C", "opt-level=2"), RELEASE_POLICY.rustc_flags
+
+
+def test_a_compile_failure_becomes_a_defect_the_repair_round_can_use():
+    """End to end: it has to reach `_grade` and come out as a DEFECT, because
+    that is what turns a dead solve into another round. With no public examples
+    — every task on the run this was written for — a defect is the only thing
+    that can make the loop ask again at all."""
+    _rustc_or_skip()
+    from solvers.prompts import build_repair_prompt
+    from solvers.verify import VerifyingSolver
+
+    solver = _solver([])
+    task = SimpleNamespace(
+        language="rust", entrypoint="main", statement="do a thing", public_examples=[],
+    )
+    candidate = solver._grade("```rust\nfn main() { nope(); }\n```", task)
+
+    assert candidate.defect is not None, "a program that cannot build was taken as-is"
+    assert "does not compile" in candidate.defect
+    assert candidate.code.strip(), "threw the answer away instead of repairing it"
+
+    repair = build_repair_prompt([], "rust", "main", defect=candidate.defect)
+    assert "could not run your previous reply" in repair
+    assert "cannot find function" in repair, repair[:200]
+
+
+# --- a Python answer can be cut off and still parse ----------------------- #
+# `ast.parse` is Python's version of grepping for `fn main`: perfectly happy
+# with source that was truncated, because a reply cut at a statement boundary
+# is still a valid module. Two archived answers ended deep inside a loop with
+# no return after them. Both parsed. Both were submitted. Both answered None on
+# every hidden test, and nothing anywhere noticed.
+
+
+def test_a_truncated_python_answer_is_caught_even_though_it_parses():
+    """The shape that got through, taken from the archive: the function ends
+    on a `while` sixteen columns deep, with no return after it."""
+    cut_off = (
+        "def plan_workflow(jobs):\n"
+        "    ready = []\n"
+        "    cand = set(jobs)\n"
+        "    while cand:\n"
+        "        allowed = cand & set(ready)\n"
+        "        if not allowed:\n"
+        "            break"
+    )
+    import ast
+
+    ast.parse(cut_off)  # it really does parse — that is the whole problem
+    defect = python_defect(cut_off, "plan_workflow")
+    assert defect is not None, "a truncated answer was taken as finished"
+    assert "without returning" in defect and "while" in defect, defect
+
+
+def test_a_function_that_ends_on_a_return_is_left_alone():
+    """Replayed against the archive this flagged 2 of 25 and passed the other
+    23. A check that fires on real answers is worse than no check."""
+    for good in (
+        "def solve(xs):\n    return sorted(xs)",
+        "def solve(xs):\n    if not xs:\n        return []\n    return sorted(xs)",
+        "def solve(xs):\n    try:\n        return xs[0]\n    except IndexError:\n        return None",
+        "def solve(xs):\n    with open('/dev/null') as f:\n        return len(xs)",
+        "def solve(xs):\n    raise ValueError('no')",
+        "def solve(xs):\n    while True:\n        return xs",
+    ):
+        assert python_defect(good, "solve") is None, f"rejected a finished function:\n{good}"
+
+
+def test_falling_off_the_end_is_a_defect_even_when_the_model_meant_it():
+    """Not only a truncation detector. The grader compares RETURN VALUES, so a
+    function that runs off its own end answers None — which is wrong for almost
+    every task. Rust gets this from its compiler for free; Python did not get
+    it at all."""
+    meant_it = (
+        "def solve(xs):\n"
+        "    for x in xs:\n"
+        "        if x > 0:\n"
+        "            return x\n"
+    )
+    defect = python_defect(meant_it, "solve")
+    assert defect is not None, "an empty list would answer None and nothing said so"
+    assert "answers None" in defect, defect
+
+    # An `if` with no `else` is the same hole and the commonest shape of it —
+    # it is precisely the n = 0 case the prompt spends six lines asking about.
+    no_else = "def solve(xs):\n    if xs:\n        return max(xs)\n"
+    assert python_defect(no_else, "solve") is not None, (
+        "an unguarded `if` at the end answers None for the empty input"
+    )
+    # ...but an if/else where BOTH branches return is finished.
+    both = "def solve(xs):\n    if xs:\n        return max(xs)\n    else:\n        return 0\n"
+    assert python_defect(both, "solve") is None
+
+
+def test_the_conservative_direction_is_the_cheap_one():
+    """A `for` loop that obviously always returns is still flagged, and that is
+    deliberate: being wrong here costs one repair round, while missing a
+    truncated answer costs the whole solve. The answer is never thrown away —
+    a defective candidate still outranks an empty one."""
+    from solvers.verify import Candidate
+
+    obvious = "def solve(xs):\n    for x in [1]:\n        return x\n"
+    assert python_defect(obvious, "solve") is not None
+
+    flawed = Candidate(code=obvious, raw="", defect="falls off the end")
+    assert flawed.score > Candidate(code="", raw="").score, (
+        "a wrongly-flagged answer must still beat submitting nothing"
+    )

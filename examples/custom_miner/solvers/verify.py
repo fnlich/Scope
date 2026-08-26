@@ -44,6 +44,7 @@ from .prompts import (
     python_defect,
     rust_defect,
 )
+from .rust_compile import compile_defect
 
 # Per-example wall clock when checking our own candidate. Kept small: this is
 # a smoke test against tiny public examples, not the real grading run.
@@ -388,6 +389,13 @@ class VerifyingSolver:
             if task.language == "rust"
             else python_defect(code, task.entrypoint)
         )
+        if defect is None and task.language == "rust":
+            # Python's check PARSED that code; Rust's only grepped it for
+            # `fn main`. Ask the compiler the same question the validator will,
+            # which is the only check a Rust answer gets at all when no public
+            # examples shipped -- and on the run this was written for, none
+            # ever did. Returns None when there is no local toolchain.
+            defect = compile_defect(code)
         if defect is not None:
             # Structurally unusable: report it without paying for execution.
             candidate.defect = defect

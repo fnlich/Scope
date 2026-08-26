@@ -643,6 +643,28 @@ appended to most" was then the tool call rather than the reply — measured, a
 5,442-byte tool call beat the 54-byte answer beside it on volume alone. Tool
 arguments are excluded by name now, like reasoning.
 
+### The miner must never submit its own prompt
+
+It did. Twice, to real validators, archived as Rust programs ending in the
+words "Do not use canvas".
+
+`_echoes_prompt` was written to stop exactly that, and it was applied in
+exactly one place: inside `_poll`, guarding the scrape. Every other route to a
+submission — the copy control, the network stream — went around it. A chat
+stream carries the *conversation*, not just the reply, so when the page was
+unreadable and the wire held no fenced code, the rescue branch handed back the
+prompt as raw text.
+
+Two things changed. The rescue only claims a rescue when it actually has code
+blocks, and returns nothing otherwise — the old message announced a recovery
+in the same breath as admitting there was nothing to recover, and worse, made
+the result non-empty and so silenced the post-mortem that would have explained
+the page. And a final guard sits at the one exit `send()` has, so every route
+is covered rather than one. It tests *containment* rather than the prefix test
+the scrape guard uses, because by that stage the text has been through fencing,
+a copy control or a wire reconstruction and the prompt need not be at the front
+any more.
+
 ### When nothing is captured at all, the tab says why
 
 `the reply contained no code` is what the grader reports afterwards, and it
@@ -720,6 +742,76 @@ itself once and the answer still goes out, because a miner that dies on a full
 disk has turned a lost point into a lost session. `problem_id` arrives over the
 network and is used to build a path, so it is sanitised as hostile input: it can
 only ever name a file directly inside the archive directory.
+
+### A Python answer can be cut off and still parse
+
+`ast.parse` is Python's version of grepping for `fn main`. It is perfectly
+happy with source that was **truncated**, because a reply cut at a statement
+boundary is still a valid module. Two archived answers ended deep inside a loop
+with no return after them — one sixteen columns in, on a bare `break`. Both
+parsed. Both were submitted. Both answered `None` on every hidden test, and
+nothing anywhere noticed.
+
+So the entrypoint is now asked the question a compiler asks a Rust function:
+**can control reach the end of the body without returning?** Replayed against
+25 real archived answers this flagged exactly those two and passed the other
+twenty-three.
+
+It is not only a truncation detector. The grader compares *return values*, so a
+function that runs off its own end answers `None` — which is wrong for almost
+every task, and is exactly the `n = 0` case the edge-case checklist spends six
+lines asking about:
+
+```python
+def solve(xs):
+    if xs:
+        return max(xs)      # ← answers None for the empty list
+```
+
+The analysis is conservative in the cheap direction. A `for` loop is never
+treated as guaranteeing a return even when it obviously does, because being
+wrong here costs one repair round while missing a truncated answer costs the
+whole solve — and a flagged answer is still submitted if the repair produces
+nothing better.
+
+### Rust answers are compiled before they are sent
+
+Python's structural check PARSES the source — `ast.parse` rejects prose, a
+shell command, a truncated line, anything that is not a program. Rust's greps
+it for `fn main`. That asymmetry is why **every answer this miner has destroyed
+in transit was a Rust one**: a model's reasoning, a tool call, and the miner's
+own prompt all contain the characters `fn main`, and all three have been
+submitted as programs.
+
+So when a local `rustc` is available, the candidate is built with the
+validator's own flags (read from `RELEASE_POLICY`, not copied) before it is
+sent. Replayed against a real archive of 45 submissions — 18 of them Rust —
+this rejected exactly the six that would not build and passed all twelve that
+would:
+
+```
+REJECT  it does not compile: error: unknown start of token: \u{2014}      (prompt echo)
+REJECT  it does not compile: error: unknown start of token: \u{2014}      (prompt echo)
+REJECT  it does not compile: error: expected item, found `{`             (tool call)
+REJECT  it does not compile: error: this file contains an unclosed delimiter   (truncated)
+REJECT  it does not compile: error[E0425]: cannot find function `failed_any`   (model bug)
+REJECT  it does not compile: error[E0503]: cannot use `head` ...               (model bug)
+```
+
+Three of those would otherwise have reached a validator as programs. The other
+three become a repair round instead of a certain zero.
+
+It matters most when there is nothing else. With no public examples shipped —
+which was every task on the run this was written for — the grader never runs at
+all, so this is the *only* check a Rust answer gets before submission.
+
+A local toolchain can differ from the pinned one, and the failure mode of that
+is deliberately cheap: a wrong defect costs a repair round, never the answer,
+because a defective non-empty candidate outranks an empty one and is still what
+gets submitted if the repair produces nothing better. No compiler means no
+opinion — silence has to mean the same thing as success, or a missing toolchain
+becomes an outage. `SOLVER_RUST_COMPILE=0` turns it off. The candidate is
+compiled, never run.
 
 ## Self-verification: the part that earns the money
 

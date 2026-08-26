@@ -856,6 +856,18 @@ class _Tab:
                 )
         if self.alive and self.site.stream:
             best = await self._reconcile_stream(before, best, page_blocks)
+        if best and self._is_our_own_prompt(best):
+            # Last line of defence, at the ONE exit, because everything above
+            # it can produce a submission and only one of them was guarded.
+            self._warned_echo = True
+            print(
+                f"[{self.site.name}] WARN: tab {self.label} was about to submit the "
+                f"miner's OWN PROMPT as the answer, and did not. Run `python -m "
+                f"solvers.doctor {self.site.name}` — either "
+                f"{self.site.env_prefix}_ASSISTANT is matching your own message, or "
+                f"this tab is reconstructing the conversation rather than the reply."
+            )
+            best = ""
         if not best and self.alive:
             await self._explain_empty(before)
         return best
@@ -907,15 +919,29 @@ class _Tab:
                 page_blocks = []
         if not page_blocks and not best:
             # The page gave us nothing. This is the case the whole path exists
-            # for, so take the stream even unfenced: a model that answered
-            # without a fence still answered, and `extract_code` can salvage a
-            # bare program where an empty string can never be salvaged.
+            # for -- but only when the wire actually holds an answer.
+            if not blocks:
+                # It does not. Returning the raw text anyway was worse than
+                # returning nothing in three separate ways, all of them
+                # measured: it announced a rescue that had not happened, it
+                # made `best` non-empty and so SILENCED the post-mortem that
+                # would have said what the page contained, and the value was
+                # thrown away at extraction regardless. Worst of all it could
+                # be the miner's own prompt -- a chat stream carries the
+                # conversation, not just the reply -- and two prompts reached
+                # a validator as Rust programs that way.
+                print(
+                    f"[{self.site.name}] tab {self.label} read nothing from the page, "
+                    f"and the network stream had no code block in it either "
+                    f"({len(streamed)} chars captured). Nothing to submit."
+                )
+                return ""
             print(
                 f"[{self.site.name}] tab {self.label} read NOTHING from the page and "
-                f"recovered {len(blocks) or 'no'} code block(s) from the network "
-                f"stream instead. The answer below came off the wire, not the DOM."
+                f"recovered {len(blocks)} code block(s) from the network stream "
+                f"instead. The answer below came off the wire, not the DOM."
             )
-            return "\n".join(self._fence(b) for b in blocks) if blocks else streamed
+            return "\n".join(self._fence(b) for b in blocks)
         if blocks and page_blocks and not self._warned_stream_diff:
             gap = self._first_difference(page_blocks, blocks, "the page", "the wire")
             if gap:
@@ -1128,6 +1154,26 @@ class _Tab:
                 f"{self.site.name}` and set {self.site.env_prefix}_ASSISTANT."
             )
         return True
+
+    def _is_our_own_prompt(self, text: str) -> bool:
+        """Would this submission be the miner's own prompt handed back?
+
+        `_echoes_prompt` already asks a version of this, and it is applied in
+        exactly one place: the scrape path, inside `_poll`. Every other route
+        to a submission -- the copy control, the network stream -- went around
+        it, and the stream took that route twice in production. Two validators
+        were sent this file's own instruction text, ending in the words "Do not
+        use canvas", as a Rust program.
+
+        The test here is containment, not the prefix test `_echoes_prompt`
+        uses, and the difference is the point. By this stage the text has been
+        through fencing, a copy control or a wire reconstruction, so the prompt
+        need not be at the front any more. Containment is safe because what is
+        searched for is the head of a prompt this miner generated -- "Solve
+        this programming problem in ..." -- which appears in no answer to it.
+        """
+        head = " ".join(self._sent.split())[:80]
+        return bool(head) and head in " ".join(text.split())
 
     async def _explain_empty(self, before: tuple[int, Optional[str]]) -> None:
         """Say why nothing was captured, while the page is still there to ask.

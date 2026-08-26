@@ -393,6 +393,46 @@ def plausible_source(code: str, language: str = "python") -> bool:
     return not _SHELL_OPENER_RE.match(first)
 
 
+def _always_returns(body: list) -> bool:
+    """Does this statement list guarantee a `return` or a `raise`?
+
+    The question a compiler asks about a Rust function and nothing asks about a
+    Python one. Only the LAST statement matters: anything before it can be
+    skipped, so only the tail decides whether control can fall off the end.
+
+    Conservative in the direction that costs least. A `for` loop is never
+    treated as guaranteeing a return even when it obviously does, because the
+    price of being wrong here is one repair round, while the price of missing a
+    truncated answer is the whole solve.
+    """
+    if not body:
+        return False
+    last = body[-1]
+    if isinstance(last, (ast.Return, ast.Raise)):
+        return True
+    if isinstance(last, ast.If):
+        return (
+            bool(last.orelse)
+            and _always_returns(last.body)
+            and _always_returns(last.orelse)
+        )
+    if isinstance(last, (ast.With, ast.AsyncWith)):
+        return _always_returns(last.body)
+    if isinstance(last, ast.Try):
+        if last.finalbody and _always_returns(last.finalbody):
+            return True
+        head = _always_returns(last.orelse) if last.orelse else _always_returns(last.body)
+        return head and all(_always_returns(h.body) for h in last.handlers)
+    if isinstance(last, ast.While):
+        # `while True:` with no way out never falls through to the end.
+        if isinstance(last.test, ast.Constant) and last.test.value is True:
+            return not any(isinstance(n, ast.Break) for n in ast.walk(last))
+        return False
+    if isinstance(last, ast.Match):
+        return bool(last.cases) and all(_always_returns(c.body) for c in last.cases)
+    return False
+
+
 def python_defect(code: str, entrypoint: str) -> Optional[str]:
     """Return a reason string if the source can't possibly be graded, else None.
 
@@ -417,6 +457,26 @@ def python_defect(code: str, entrypoint: str) -> Optional[str]:
             )
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == entrypoint:
+            if not _always_returns(node.body):
+                # `ast.parse` is Python's version of grepping for `fn main`: it
+                # is happy with source that was CUT OFF, because a reply
+                # truncated at a statement boundary is still a valid module.
+                # Measured on 25 real archived answers, two ended deep inside a
+                # loop with no return after it -- both parsed, both were
+                # submitted, both returned None on every hidden test, and
+                # nothing anywhere noticed. This flagged exactly those two and
+                # none of the other twenty-three.
+                #
+                # It is also a real defect when the model meant it: a grader
+                # compares RETURN VALUES, so a function that falls off its own
+                # end answers None. Rust gets this from the compiler for free.
+                ending = type(node.body[-1]).__name__.lower()
+                return (
+                    f"`{entrypoint}` can reach the end of its body without "
+                    f"returning, so it answers None — the body ends on a "
+                    f"`{ending}` rather than a return, which is what a reply "
+                    f"cut off mid-answer looks like"
+                )
             return None
     # An assignment such as `f = lambda x: ...` is also callable, so accept it.
     for node in tree.body:
