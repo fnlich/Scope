@@ -1067,7 +1067,6 @@ def test_shutdown_is_armed_before_the_slow_attach_not_after():
     """A supervisor restarting while the miner is attaching to eight browsers
     would otherwise raise KeyboardInterrupt straight through the cleanup and
     leave the tabs already opened behind."""
-    import inspect
     from pathlib import Path
 
     serve = Path(__file__).resolve().parent.joinpath("run_miner.py").read_text()
@@ -3684,7 +3683,6 @@ def test_a_compile_failure_becomes_a_defect_the_repair_round_can_use():
     that can make the loop ask again at all."""
     _rustc_or_skip()
     from solvers.prompts import build_repair_prompt
-    from solvers.verify import VerifyingSolver
 
     solver = _solver([])
     task = SimpleNamespace(
@@ -4753,3 +4751,120 @@ def test_defines_reads_a_definition_out_of_source_too_cut_to_parse():
     assert _defines("g = lambda n: n", "g") is True
     assert _defines("fn main() {\n    let x =", "main", "rust") is True
     assert _defines("let x = 1;", "main", "rust") is False
+
+
+def test_the_examples_are_not_run_once_the_budget_is_already_gone(capsys):
+    """Each case gets VERIFY_TIMEOUT_S, in a subprocess or a container, and
+    after the last send there is nothing left to spend it from. `verified` never
+    reaches the validator — it feeds this process's cache and stats — so the
+    only thing the run could still buy is a repair round there is no time for.
+    The deadline above answers 504 rather than late, so the check would be paid
+    for with the answer it was checking."""
+    solver = _solver([RIGHT])
+    ran: list = []
+    solver._grader.check = lambda *a, **kw: ran.append(a) or (2, 2, [])
+
+    spent = solver._grade(RIGHT, DIGITS, -0.5)
+    assert ran == [], "the grader ran on a budget that was already spent"
+    assert spent.code.strip() and spent.defect is None, "the answer was lost with the check"
+    assert "unverified" in capsys.readouterr().out
+
+    # With budget left, and with none stated at all, it still runs.
+    assert solver._grade(RIGHT, DIGITS, 30.0).passed == 2
+    assert solver._grade(RIGHT, DIGITS).passed == 2
+    assert len(ran) == 2
+
+
+def test_a_win_is_not_credited_to_a_model_that_did_not_produce_it():
+    """`asked[-1]` was a proxy for the winner. A pass whose backend reports no
+    provider is absent from `asked` while still able to produce the winning
+    answer, and the credit then landed on the PREVIOUS model — in the one number
+    an operator reads to decide which account has started failing."""
+
+    class _Anonymous:
+        """First a named model that gets it wrong, then one that will not say
+        who it is and gets it right."""
+
+        def __init__(self):
+            self.opened = 0
+
+        async def open(self, avoid=None):
+            self.opened += 1
+            if self.opened == 1:
+                return _Chat([WRONG], provider="claude")
+            chat = _Chat([RIGHT])
+            del chat.provider          # reports nothing about itself
+            return chat
+
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(
+        _Anonymous(), max_attempts=1, safety_margin_s=0, max_budget_s=120
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.verified, "the second pass was supposed to win"
+    rows = solver.stats()["providers"]
+    assert rows["claude"]["asked"] == 1, rows
+    assert rows["claude"]["verified"] == 0, (
+        f"claude was credited with an answer it did not produce: {rows}"
+    )
+
+
+def test_a_winner_outside_the_asked_list_is_still_counted():
+    """`_note` used to index `_by_provider[winner]` directly, on the assumption
+    that a winner is always someone who was asked. It is one KeyError away from
+    losing a whole solve to the stats line at the end of it."""
+    solver = _solver([RIGHT])
+    solver._note("chatgpt", ["claude"])
+    rows = solver.stats()["providers"]
+    assert rows["claude"] == {"asked": 1, "verified": 0}, rows
+    assert rows["chatgpt"] == {"asked": 0, "verified": 1}, rows
+
+
+def test_an_answer_that_lands_just_after_the_deadline_is_still_submitted(capsys):
+    """`page_blocks` is fetched AFTER the read loop gave up, so a non-empty one
+    means the reply rendered in the moments between the last poll and now. The
+    rescue used to require the page to be empty before it looked anywhere, so
+    that reading was discarded: measured, `best=""` beside
+    `page_blocks=["def g(n): ..."]` returned "" — with the answer sitting in a
+    list in the function's own arguments."""
+    site = _site(stream=True)
+    tab = _tab(None, site)
+    tab._sent = "solve it"
+
+    async def nothing_on_the_wire():
+        return "prose the model emitted, with no fenced block in it"
+
+    tab._streamed_markdown = nothing_on_the_wire
+    got = asyncio.run(tab._reconcile_stream((0, None), "", ["def g(n):\n    return n"]))
+    assert "def g(n)" in got, f"threw away the page's late answer: {got!r}"
+    assert "just after it" in capsys.readouterr().out
+
+
+def test_the_wire_is_used_when_the_page_has_nothing_at_all():
+    """The other order: no page blocks, an answer on the wire."""
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "solve it"
+
+    async def wire():
+        return "here:\n\n```python\ndef g(n):\n    return n\n```\n"
+
+    tab._streamed_markdown = wire
+    got = asyncio.run(tab._reconcile_stream((0, None), "", []))
+    assert "def g(n)" in got, f"the wire rescue stopped working: {got!r}"
+
+
+def test_nothing_anywhere_still_submits_nothing(capsys):
+    """The streamed text is never handed back raw — a chat stream carries the
+    conversation, and two of the miner's own prompts reached a validator as Rust
+    programs that way."""
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "solve it"
+
+    async def prose():
+        return "I need more information about the input format."
+
+    tab._streamed_markdown = prose
+    assert asyncio.run(tab._reconcile_stream((0, None), "", [])) == ""
+    assert "Nothing to submit" in capsys.readouterr().out

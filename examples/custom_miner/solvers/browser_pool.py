@@ -1018,31 +1018,48 @@ class _Tab:
                 raise
             except Exception:  # noqa: BLE001 - nothing to compare against, then
                 page_blocks = []
-        if not page_blocks and not best:
-            # The page gave us nothing. This is the case the whole path exists
-            # for -- but only when the wire actually holds an answer.
-            if not blocks:
-                # It does not. Returning the raw text anyway was worse than
-                # returning nothing in three separate ways, all of them
-                # measured: it announced a rescue that had not happened, it
-                # made `best` non-empty and so SILENCED the post-mortem that
-                # would have said what the page contained, and the value was
-                # thrown away at extraction regardless. Worst of all it could
-                # be the miner's own prompt -- a chat stream carries the
-                # conversation, not just the reply -- and two prompts reached
-                # a validator as Rust programs that way.
+        if not best:
+            # The read loop finished holding nothing. Everything read since is
+            # strictly better than the empty string, and the ONLY question left
+            # is which of the two later readings to take.
+            #
+            # The page first, when it has one. `page_blocks` here was fetched
+            # after the deadline -- so a non-empty one means the answer landed
+            # in the moments between the last poll and now, which is common
+            # enough to be the ordinary shape of a near-miss. Requiring the page
+            # to be empty before looking anywhere threw that away: measured,
+            # `best=""` beside `page_blocks=["def g(n): ..."]` returned "", with
+            # the answer sitting in a list in this function's own arguments.
+            if page_blocks:
                 print(
-                    f"[{self.site.name}] tab {self.label} read nothing from the page, "
-                    f"and the network stream had no code block in it either "
-                    f"({len(streamed)} chars captured). Nothing to submit."
+                    f"[{self.site.name}] tab {self.label} read nothing before its "
+                    f"deadline, and found {len(page_blocks)} code block(s) on the "
+                    f"page just after it. Submitting those rather than nothing."
                 )
-                return ""
+                return "\n".join(self._fence(b) for b in page_blocks)
+            # Then the wire. This is the case the whole path exists for -- but
+            # only when the wire actually holds an answer.
+            if blocks:
+                print(
+                    f"[{self.site.name}] tab {self.label} read NOTHING from the page "
+                    f"and recovered {len(blocks)} code block(s) from the network "
+                    f"stream instead. The answer below came off the wire, not the DOM."
+                )
+                return "\n".join(self._fence(b) for b in blocks)
+            # Neither. Returning the raw streamed text anyway was worse than
+            # returning nothing in three separate ways, all of them measured: it
+            # announced a rescue that had not happened, it made `best` non-empty
+            # and so SILENCED the post-mortem that would have said what the page
+            # contained, and the value was thrown away at extraction regardless.
+            # Worst of all it could be the miner's own prompt -- a chat stream
+            # carries the conversation, not just the reply -- and two prompts
+            # reached a validator as Rust programs that way.
             print(
-                f"[{self.site.name}] tab {self.label} read NOTHING from the page and "
-                f"recovered {len(blocks)} code block(s) from the network stream "
-                f"instead. The answer below came off the wire, not the DOM."
+                f"[{self.site.name}] tab {self.label} read nothing from the page, "
+                f"and the network stream had no code block in it either "
+                f"({len(streamed)} chars captured). Nothing to submit."
             )
-            return "\n".join(self._fence(b) for b in blocks)
+            return ""
         if blocks and page_blocks and not self._warned_stream_diff:
             gap = self._first_difference(page_blocks, blocks, "the page", "the wire")
             if gap:

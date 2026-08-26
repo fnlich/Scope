@@ -316,7 +316,14 @@ class VerifyingSolver:
             if attempt_no + 1 < passes:
                 print(f"[verify] {provider or 'first'} did not verify; asking another model")
         if asked:
-            self._note(asked[-1] if best.verified else None, asked)
+            # `won_with`, not `asked[-1]`. They usually coincide -- a verified
+            # answer ends the loop, so the winner is normally the last one asked
+            # -- but "usually" is not what a tally is for. A pass whose backend
+            # never reported a provider is absent from `asked` while still able
+            # to produce the winning answer, and the credit then lands on the
+            # PREVIOUS model. This is the number an operator reads to decide
+            # which account has started failing; it should say who actually won.
+            self._note(won_with if best.verified else None, asked)
 
         if best.verified:
             self._counts["verified"] += 1
@@ -452,7 +459,8 @@ class VerifyingSolver:
             row = self._by_provider.setdefault(name, {"asked": 0, "verified": 0})
             row["asked"] += 1
         if winner:
-            self._by_provider[winner]["verified"] += 1
+            row = self._by_provider.setdefault(winner, {"asked": 0, "verified": 0})
+            row["verified"] += 1
 
     # ---------------------------------------------------------------------- #
     def _grade(self, reply: str, task, left: Optional[float] = None) -> Candidate:
@@ -480,6 +488,21 @@ class VerifyingSolver:
             return candidate
         if not task.public_examples:
             return candidate  # nothing to verify against; take it as-is
+        if left is not None and left <= 0:
+            # The budget is gone, so running the examples buys nothing that can
+            # still be acted on: there is no time for a repair round, and
+            # `verified` never reaches the validator -- it feeds this process's
+            # cache and its stats and nothing else. It is not free, either:
+            # every case gets VERIFY_TIMEOUT_S, in a subprocess or a container,
+            # and the deadline above is an `asyncio.wait_for` that answers 504
+            # rather than late. The check would be paid for with the answer it
+            # was checking. The structural checks above already ran; they cost
+            # microseconds and are what ranks this candidate.
+            print(
+                "[verify] out of budget before the examples could be run; "
+                "submitting the answer unverified"
+            )
+            return candidate
         try:
             passed, total, failures = self._grader.check(
                 code, task.language, task.entrypoint, task.public_examples
