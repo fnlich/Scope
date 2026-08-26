@@ -555,6 +555,47 @@ Because that is a heuristic over a private format, it does **not** simply win:
     happened to it.
 ```
 
+### Only a code block counts as an answer
+
+The reader returns the message's code blocks or nothing. It never returns the
+prose, and that is a statement about what this miner is for: it only ever wants
+a code block, so a message without one is not an answer it can use.
+
+The upside is not tidiness. **claude.ai renders extended thinking inside the
+element the assistant selector matches**, and the thinking arrives long before
+any code does — so for the whole first stretch of an answer, the message on
+screen is reasoning and nothing else. Reading the message text turned that into
+"here is your program": measured on a real solve, 13,200 characters of the model
+working through the problem were submitted as Rust, the grader replied `the
+program does not define fn main()`, and the repair round told the model to fix a
+program it had never sent. Twice, until the budget ran out.
+
+ChatGPT keeps its reasoning *outside* the matched element, so the identical
+moment there read as empty and was reported as empty. One DOM difference, two
+completely different diagnoses for the same situation — which is why the ChatGPT
+failure looked like a capture bug and the Claude one looked like a code bug.
+Reading only code blocks makes the site's markup stop mattering.
+
+The same rule applies once more at extraction. A reply with no fence anywhere is
+kept only if it is *gradeable* — a model that ignores the formatting and types
+the program bare has still answered — and is otherwise reported as nothing
+arriving, which is true. Punctuation does not decide; the same defect check that
+picks between fenced blocks does.
+
+What is given up is the chance to SEE what a code-free reply said, and that is
+exactly the thing that makes a silent failure take days. So the post-mortem
+quotes it:
+
+```
+[claude] tab claude#1 captured NOTHING from this reply: the message has no code
+block in it. It says: 'I need more detail about the framing rules before I can
+answer.' This is what surfaces later as "the reply contained no code".
+```
+
+A message with no code and a selector matching an empty wrapper both arrive as
+an empty read and need opposite fixes — the first is the model's doing, the
+second is yours — so they are named apart.
+
 ### When nothing is captured at all, the tab says why
 
 `the reply contained no code` is what the grader reports afterwards, and it

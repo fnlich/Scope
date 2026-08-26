@@ -297,7 +297,30 @@ def extract_code(
     reply = _OPEN_THINK_RE.sub("", _THINK_RE.sub("", reply))
     matches = [m.group(2) for m in _FENCE_RE.finditer(reply)]
     if not matches:
-        return reply.strip()
+        # No fence anywhere. That is usually a reply that is ALL prose -- a
+        # refusal, a clarifying question, or a model's reasoning scraped before
+        # it wrote anything -- and handing prose back as `code` is not a
+        # harmless guess. It parses as "a program with a defect", so the caller
+        # reports "the program does not define `fn main()`" about a program
+        # that was never sent, and the repair round asks the model to fix
+        # logic instead of telling it that nothing arrived. That has cost whole
+        # solves: two rounds spent rewriting an algorithm over a reply that had
+        # no code in it at all.
+        #
+        # But an unfenced reply is not always prose: a model that ignores the
+        # formatting rule and types the program bare has still answered, and
+        # dropping that would trade one silent failure for another. The
+        # existing notion of "gradeable" settles it -- the same defect check
+        # used to choose between fenced blocks below. Code passes and is kept;
+        # prose fails and is reported as nothing arrived, which is true.
+        bare = reply.strip()
+        if not bare or entrypoint is None:
+            return bare
+        defect = (
+            rust_defect(bare) if language == "rust"
+            else python_defect(bare, entrypoint)
+        )
+        return bare if defect is None else ""
     blocks = [b for b in (sanitize_code(m).strip() for m in matches) if b]
     if not blocks:
         return ""

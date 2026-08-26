@@ -1432,16 +1432,25 @@ def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():
 def test_a_partial_answer_survives_a_deadline_that_lands_mid_stream():
     """The commonest timeout there is: the model is still typing when the budget
     runs out. Returning "" there throws away a gradeable answer and hands the
-    repair round nothing to work with."""
+    repair round nothing to work with.
+
+    Half a CODE BLOCK, not half a message. What survives a deadline is whatever
+    the model had written into the block, because that is the only thing this
+    miner can submit -- a half-finished program still defines the entrypoint
+    often enough to be worth grading, and the repair round has something
+    concrete to work from. Prose caught mid-stream is not a partial answer; see
+    `_read`.
+    """
     page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
 
     def stream(_):
-        page.dom["#assistant"] = [_Node(text="half an answer")]
+        page.dom["#assistant"] = [_Node(code=["def solve(xs):\n    total = 0"])]
         page.dom["#stop"] = [_Node()]        # still generating, and stays that way
 
     page.on_click = stream
     site = _site(busy=("#stop",))
-    assert asyncio.run(_tab(page, site).send("solve it", 1.5)) == "half an answer"
+    got = asyncio.run(_tab(page, site).send("solve it", 1.5))
+    assert "total = 0" in got, f"threw away the half-written program: {got!r}"
 
 
 def test_send_honours_its_deadline_including_the_time_spent_submitting():
@@ -2901,3 +2910,106 @@ def test_a_repair_round_is_sent_back_through_the_checklist():
         assert "edge-case checklist" not in repair, (
             f"answered a delivery failure with logic advice: {defect!r}"
         )
+
+
+# --- a message that is all reasoning is not an answer --------------------- #
+# claude.ai renders extended thinking INSIDE the element the assistant selector
+# matches, and the thinking arrives long before any code does. ChatGPT keeps its
+# reasoning outside the matched element, so the same situation there read as
+# empty and was honestly reported as empty. That single DOM difference is why
+# one site failed with "the reply contained no code" and the other with "the
+# program does not define `fn main()`" — the same moment, two symptoms.
+
+
+def test_a_message_that_is_all_reasoning_is_not_read_as_the_answer():
+    """Measured on a real solve: 13,200 characters of the model working through
+    the problem were submitted as Rust. The grader answered "the program does
+    not define `fn main()`", and the repair round told the model to fix a
+    program it had never sent. Twice, before the budget ran out."""
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    thinking = "Let me carefully work through this problem. " * 300
+
+    def answers(_):
+        # A finished turn, as far as any selector can tell: nothing is
+        # streaming, nothing is busy. There is simply no code in it yet.
+        page.dom["#assistant"] = [_Node(text=thinking)]
+
+    page.on_click = answers
+    got = asyncio.run(_tab(page, _site()).send("solve it", 1.5))
+    assert got == "", f"submitted {len(got)} characters of reasoning as code: {got[:80]!r}"
+
+
+def test_reasoning_is_reported_as_nothing_arrived_not_as_a_broken_program():
+    """The two are different conversations, and giving the wrong one costs the
+    round. "Your program has no fn main()" is a contradiction when no program
+    was sent: the model rewrites logic that was never the problem. "Nothing
+    reached me as code" is the one that gets a code block back."""
+    from solvers.prompts import build_repair_prompt, rust_defect
+
+    prose = (
+        "Let me carefully work through this problem.\n"
+        "We have a stream of bytes described by a DAG of nodes.\n"
+        "State during processing: the current pending record length."
+    )
+    defect = rust_defect(extract_code(prose, "main", "rust"))
+    assert defect == NO_CODE, f"reasoning was diagnosed as {defect!r}"
+
+    repair = build_repair_prompt([], "rust", "main", defect=defect)
+    assert "did not reach me as code" in repair, repair[:120]
+    assert "does not define" not in repair, (
+        "still telling the model to fix a program it never sent"
+    )
+
+
+def test_a_program_sent_without_a_fence_is_still_an_answer():
+    """The other half of the same rule. A model that ignores the formatting and
+    types the program bare has still answered, and dropping that would trade one
+    silent failure for another. Gradeability decides, not punctuation."""
+    bare_rust = 'use std::io;\nfn main() { println!("1"); }'
+    assert extract_code(bare_rust, "main", "rust") == bare_rust
+
+    bare_py = "def pong():\n    return 'pong'"
+    assert extract_code(bare_py, "pong") == bare_py
+
+    # ...and something that merely looks like code but cannot be graded is not
+    # rescued by this: it is still nothing arriving.
+    assert extract_code("I would start by sorting xs, then return xs[0].", "pong") == ""
+
+
+def test_a_reply_with_no_code_block_says_what_it_said_instead(capsys):
+    """What is given up by never submitting prose is the chance to SEE it, and
+    that is the thing that makes a silent failure take days. A message with no
+    code and a selector matching an empty wrapper both arrive as `best == ""`
+    and need opposite fixes, so the post-mortem quotes the message."""
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+
+    def answers(_):
+        page.dom["#assistant"] = [
+            _Node(text="I need more detail about the framing rules before I can answer.")
+        ]
+
+    page.on_click = answers
+    asyncio.run(_tab(page, _site()).send("solve it", 1.5))
+    logged = capsys.readouterr().out
+    assert "no code block in it" in logged, logged
+    assert "I need more detail" in logged, f"did not quote the message: {logged!r}"
+
+
+def test_claude_and_chatgpt_now_fail_the_same_way_on_a_thinking_message():
+    """The bug was never in either model. It was that Claude's reasoning lands
+    inside the matched element and ChatGPT's does not, so the identical moment
+    produced two different diagnoses. Reading only code blocks makes the site's
+    markup stop mattering."""
+    thinking = "Working through the constraints. " * 50
+    results = {}
+    for name, dom in (
+        # Claude: the thinking is inside the message.
+        ("claude", [_Node(text=thinking)]),
+        # ChatGPT: it is somewhere the selector cannot see.
+        ("chatgpt", [_Node(text="")]),
+    ):
+        page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+        page.on_click = lambda _, d=dom, p=None: None
+        page.dom["#assistant"] = dom
+        results[name] = asyncio.run(_tab(page, _site()).send("solve it", 1.0))
+    assert results["claude"] == results["chatgpt"] == "", results
