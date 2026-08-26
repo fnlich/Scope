@@ -32,8 +32,14 @@ from .config import selectors
 # Selectors, unchanged from the automation script, but each is now the first
 # candidate in an overridable list — see browser_pool's module docstring.
 COMPOSER = "#prompt-textarea"
-SEND_BUTTON = '[data-testid="send-button"]'
-STOP_BUTTON = '[data-testid="stop-button"]'
+# Both spellings, newest first: a live page was found using `chat-input-send`
+# where this had only ever known `send-button`. The aria-label fallback had been
+# quietly carrying the submit ever since, which is exactly the kind of drift
+# `python -m solvers.doctor chatgpt` exists to make visible.
+SEND_BUTTON = '[data-testid="chat-input-send"]'
+SEND_BUTTON_LEGACY = '[data-testid="send-button"]'
+STOP_BUTTON = '[data-testid="chat-input-stop"]'
+STOP_BUTTON_LEGACY = '[data-testid="stop-button"]'
 ASSISTANT_MSG = '[data-message-author-role="assistant"]'
 
 # Same hazard as Claude's artifacts panel, different name: a long program is
@@ -52,8 +58,14 @@ def chatgpt_site() -> Site:
         env_prefix="CHATGPT",
         url=os.environ.get("CHATGPT_URL", "https://chatgpt.com/"),
         composer=selectors("CHATGPT_COMPOSER", (COMPOSER, 'div[contenteditable="true"]')),
-        send=selectors("CHATGPT_SEND_BUTTON", (SEND_BUTTON, 'button[aria-label*="Send"]')),
-        busy=selectors("CHATGPT_STOP_BUTTON", (STOP_BUTTON, 'button[aria-label*="Stop"]')),
+        send=selectors(
+            "CHATGPT_SEND_BUTTON",
+            (SEND_BUTTON, SEND_BUTTON_LEGACY, 'button[aria-label*="Send"]'),
+        ),
+        busy=selectors(
+            "CHATGPT_STOP_BUTTON",
+            (STOP_BUTTON, STOP_BUTTON_LEGACY, 'button[aria-label*="Stop"]'),
+        ),
         assistant=selectors("CHATGPT_ASSISTANT", (ASSISTANT_MSG,)),
         # An in-app new chat rather than a reload; see `_Tab.start`. A miss here
         # only costs speed, since the reset falls back to loading `url`.

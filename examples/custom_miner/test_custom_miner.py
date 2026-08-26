@@ -1370,6 +1370,44 @@ def test_two_answers_to_one_prompt_do_not_flip_between_polls():
     assert "return 'A'" in seen.pop(), "did not commit to the branch it saw first"
 
 
+def test_a_reply_whose_id_changes_mid_stream_is_still_read():
+    """Latching the reply by id has to have a way back, and did not.
+
+    A chat UI paints a streaming message with a provisional id and can swap it
+    for the server's once the message is confirmed. The id latch searched for a
+    key that no longer existed and returned None -- and kept returning None for
+    the rest of the send, because nothing ever re-latched. If the swap happened
+    before the first readable frame (it does: the message is painted empty and
+    filled afterwards) then `best` was never set either, so `send` returned ""
+    and a complete, correct answer was reported as "the reply contained no
+    code". Seen live on ChatGPT three attempts running.
+    """
+    ANSWER = "def pong():\n    return 'pong'"
+
+    class _Swapping(_Node):
+        """One assistant message: painted empty, re-identified, then filled."""
+
+        def __init__(self):
+            super().__init__(attrs={"data-message-id": "provisional"})
+            self._polls = 0
+
+        def locator(self, selector):
+            self._code = [ANSWER] if self._polls else []   # fills after the swap
+            return super().locator(selector)
+
+        async def inner_text(self):
+            self._polls += 1
+            self._attrs["data-message-id"] = "server-assigned"
+            return self._text
+
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [_Swapping()])
+    site = _site(message_id_attr="data-message-id")
+    reply = asyncio.run(_tab(page, site).send("solve it", 2.0))
+
+    assert extract_code(reply, "pong") == ANSWER, f"lost the answer to an id swap: {reply!r}"
+
+
 def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():
     """claude.ai has no per-message id, so the reply is 'an assistant message
     that was not there before we pressed send'. Sound only because every task

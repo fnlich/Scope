@@ -602,6 +602,17 @@ class _Tab:
                 node = messages.nth(i)
                 if await node.get_attribute(self.site.message_id_attr) == self._reply_key:
                     return node
+            # The id we latched is gone, and that is NOT proof the answer is.
+            # A chat UI re-renders a streaming message and can swap the id it
+            # first painted for the one the server assigns. Returning None here
+            # returned it for the REST OF THE SEND: the read never recovered,
+            # `best` stayed empty, and a perfectly good answer was reported as
+            # "the reply contained no code". So fall back to the position the
+            # reply was latched at and adopt whatever id it wears now.
+            if self._reply_index is not None and count > self._reply_index:
+                fresh = messages.nth(self._reply_index)
+                self._reply_key = await fresh.get_attribute(self.site.message_id_attr)
+                return fresh
             return None
         if self._reply_index is not None:
             return messages.nth(self._reply_index) if count > self._reply_index else None
@@ -616,12 +627,13 @@ class _Tab:
                     f"the rest."
                 )
             fresh = messages.nth(count_before)
+            # Position is recorded even when an id is available -- it is the id
+            # latch's only way back if the id changes under it.
+            self._reply_index = count_before
             # Prefer an id: two branches keep their ids whatever order they are
             # painted in, so the read cannot drift from one answer to the other.
             if self.site.message_id_attr:
                 self._reply_key = await fresh.get_attribute(self.site.message_id_attr)
-            if self._reply_key is None:
-                self._reply_index = count_before
             return fresh
         # Some sites replace the last message rather than appending one, so a
         # changed id still means a new reply even when the count did not move.
@@ -630,6 +642,7 @@ class _Tab:
             mid = await last.get_attribute(self.site.message_id_attr)
             if mid is not None and mid != id_before:
                 self._reply_key = mid
+                self._reply_index = count - 1
                 return last
         return None
 
