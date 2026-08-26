@@ -1050,7 +1050,7 @@ to pick it up again.
 
 ## Testing your setup
 
-Four layers, cheapest first, each isolating a different failure:
+Five layers, cheapest first, each isolating a different failure:
 
 ```bash
 # from the repo root
@@ -1059,11 +1059,13 @@ python -m pytest examples/custom_miner    # 1. code only — no browser, no chai
 # from examples/custom_miner
 cd examples/custom_miner
 python -m solvers.doctor claude --probe   # 2. the browser's sign-in + selectors
-python scripts/try_solver.py              # 3. a real solve, end to end, no wallet
-                                          # 4. testnet, then finney
+python scripts/try_solver.py              # 3. a real solve, no wallet, no miner
+python -m solvers.rehearse                # 4. the whole miner, as a validator
+                                          #    meets it — archived and graded
+                                          # 5. testnet, then finney
 ```
 
-Layer 1 runs from the repo root; layers 2 and 3 run from `examples/custom_miner`
+Layer 1 runs from the repo root; layers 2 to 4 run from `examples/custom_miner`
 — they are a package and a sibling script. Use `python -m pytest`, not bare
 `pytest`: the bare binary silently falls through to a system install if the
 `dev` extra is missing.
@@ -1085,6 +1087,62 @@ cd examples/custom_miner
 python scripts/try_solver.py --statement "Return n factorial." \
     --entrypoint fact --example '{"args": [5], "expected": 120}'
 ```
+
+### Layer 4: rehearsing the whole miner
+
+`python -m solvers.rehearse` answers a question layer 3 deliberately cannot.
+`try_solver.py` tests the SOLVER — it never imports `custom_miner`, which is
+what makes a failure there unambiguous. The rehearsal tests the MINER: the
+request is signed and goes through `CustomMiner`'s own HTTP handler, so it
+exercises the signature check, the concurrency slot, the deadline that answers
+504 rather than late, `fit_response`'s byte cap and the solution archive — the
+same objects, in the same order, that a validator's request meets. It
+reimplements none of it, on purpose: a rehearsal that solved the problem its
+own way would agree with the miner right up until the day they diverged.
+
+Two other things it does that nothing else here does.
+
+It writes the answer to `solutions/` through the miner's own `save_solution`,
+so a rehearsal leaves the same evidence a live solve does — the code, the
+request and the reply beside it, and a zero-byte file when the answer was
+silence.
+
+And it grades against a suite the model never saw. Every other check in this
+repository compares an answer to the public examples, which the model was shown
+and which it can pass while still scoring zero. The built-in samples keep cases
+back — the empty list, `i64` where a model reaches for `i32` — so the run can
+end with the thing you actually want to know:
+
+```
+[verify] python entrypoint=longest_run provider=claude examples=2/2 verified=True
+[rehearse] DOES NOT SCORE: passed 7/8 — longest_run(*[[]], **{}) returned 1, expected 0
+[rehearse] checked against the full suite, including cases the model never saw
+```
+
+That is a miner whose own verification is satisfied and whose answer is worth
+nothing, which is not a state any other layer can show you.
+
+Three sources, and the exit code says which of three things happened —
+`0` correct, `1` answered and wrong, `2` nothing could be concluded (no Docker
+for Rust, say), so a shell script can tell a broken miner from a machine that
+cannot grade:
+
+```bash
+python -m solvers.rehearse                       # a built-in sample
+python -m solvers.rehearse --sample rust
+python -m solvers.rehearse --from solutions/<id>.json   # replay a real request
+python -m solvers.rehearse --lease               # a real challenge
+```
+
+`--from` takes what `save_exchange` writes, so the natural thing to hand it is
+the archived record of a solve that went wrong — the same problem, the same
+prompt, this time with you watching. It can only check against the public
+examples, because the hidden suite was never in the request, and it says so.
+
+`--lease` wants what a VALIDATOR wants: a registered wallet and
+`PROBLEM_SERVER_URL`. Leasing is the validator's side of the protocol, and it
+consumes a real challenge — which is why nothing reaches for it unless you name
+it.
 
 ## Tests
 

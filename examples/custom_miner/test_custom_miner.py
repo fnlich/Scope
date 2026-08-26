@@ -5072,3 +5072,304 @@ def test_a_star_import_is_never_itself_carried():
 
     assert _import_bindings("from collections import *") == {}
     assert _import_bindings("import math\nfrom os import *") == {}
+
+
+# --------------------------------------------------------------------------- #
+# The local rehearsal: one real problem, solved through the miner's own code.
+#
+# What is under test here is mostly that it does NOT reimplement the miner. A
+# rehearsal that solved the problem its own way would agree with the miner
+# right up until the day they diverged, and would then report success about
+# code nobody runs. So these pin the path: the request is signed, it goes
+# through `handle_request`, the answer comes back through `fit_response`, and
+# the archive is written by `save_solution` — the same objects a validator's
+# request meets.
+# --------------------------------------------------------------------------- #
+def _rehearsal_args(**kw):
+    import argparse
+
+    base = dict(sample="python", source_file=None, lease=False,
+                insecure=False, statement=False, show=0)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def _rehearsal_solver(reply, provider="claude"):
+    """A backend that answers with `reply`, so the rehearsal needs no browser."""
+    class _Chat:
+        def __init__(self):
+            self.provider = provider
+            self.asked: list[str] = []
+
+        async def send(self, text, timeout_s):
+            self.asked.append(text)
+            return reply
+
+        async def close(self): pass
+
+    class _Backend:
+        def __init__(self): self.chats: list[_Chat] = []
+        async def open(self, avoid=None):
+            chat = _Chat()
+            self.chats.append(chat)
+            return chat
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    backend = _Backend()
+
+    def factory():
+        return VerifyingSolver(backend, max_attempts=1, safety_margin_s=0,
+                               max_budget_s=60, second_opinion=False)
+
+    return factory, backend
+
+
+RIGHT_RUN = """Here you go.
+
+```python
+def longest_run(values):
+    best = 0
+    run = 0
+    previous = object()
+    for value in values:
+        run = run + 1 if run and value == previous else 1
+        previous = value
+        best = max(best, run)
+    return best
+```
+"""
+
+
+def test_the_rehearsal_solves_a_real_problem_and_says_it_would_score(tmp_path, capsys):
+    from solvers import rehearse
+
+    factory, backend = _rehearsal_solver(RIGHT_RUN)
+    code = asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=factory))
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "SCORES: passed all" in out, out
+    # The MINER'S prompt reached the model, not one the rehearsal invented.
+    assert backend.chats and "longest run" in backend.chats[0].asked[0]
+    assert "<output>" in backend.chats[0].asked[0], "not the miner's own prompt"
+
+
+def test_the_rehearsal_writes_the_solution_to_a_file(tmp_path, monkeypatch, capsys):
+    """The archive is written by the miner's own `save_solution`, so a rehearsal
+    leaves the same evidence a live solve does — including the empty file that
+    records an answer of silence."""
+    from solvers import rehearse
+
+    monkeypatch.setenv("SOLVER_SOLUTION_DIR", str(tmp_path))
+    factory, _ = _rehearsal_solver(RIGHT_RUN)
+    asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=factory))
+    written = sorted(p.name for p in tmp_path.iterdir())
+    assert written == ["rehearsal-python-1.json", "rehearsal-python-1.py"], written
+    assert "def longest_run" in (tmp_path / "rehearsal-python-1.py").read_text()
+    record = json.loads((tmp_path / "rehearsal-python-1.json").read_text())
+    assert record["request"]["entrypoint"] == "longest_run"
+    assert "def longest_run" in record["response"]["code"]
+
+
+def test_a_rehearsal_that_answers_with_prose_leaves_an_empty_file(tmp_path, monkeypatch, capsys):
+    from solvers import rehearse
+
+    monkeypatch.setenv("SOLVER_SOLUTION_DIR", str(tmp_path))
+    factory, _ = _rehearsal_solver("Could you clarify whether the list can nest?")
+    code = asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=factory))
+    out = capsys.readouterr().out
+    assert code == 1 and "DOES NOT SCORE: nothing was submitted" in out, out
+    assert (tmp_path / "rehearsal-python-1.py").read_text() == ""
+
+
+def test_the_hidden_cases_catch_an_answer_that_passed_every_example(tmp_path, capsys):
+    """The reason the samples carry a hidden suite at all. This answer passes
+    both public examples, so the miner's own local check reports `verified=True`
+    — and it is still a zero, because the statement promises something about the
+    empty list that no example shows. That gap is invisible to every check the
+    miner has, and it is the commonest shape of a wrong answer."""
+    from solvers import rehearse
+
+    skimmed = (
+        "```python\n"
+        "def longest_run(values):\n"
+        "    best = 1\n"
+        "    run = 1\n"
+        "    for i in range(1, len(values)):\n"
+        "        run = run + 1 if values[i] == values[i - 1] else 1\n"
+        "        best = max(best, run)\n"
+        "    return best\n"
+        "```"
+    )
+    factory, _ = _rehearsal_solver(skimmed)
+    code = asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=factory))
+    out = capsys.readouterr().out
+    assert "verified=True" in out, "the miner's own check should have been happy"
+    assert code == 1, out
+    assert "DOES NOT SCORE: passed 7/8" in out, out
+    assert "longest_run(*[[]]" in out, "it should name the case that failed"
+
+
+def test_the_rehearsal_replays_an_archived_request(tmp_path, monkeypatch, capsys):
+    """`--from` takes what `save_exchange` writes, so the natural thing to hand
+    it is the record of a solve that went wrong."""
+    from solvers import rehearse
+    from solution_archive import save_exchange
+
+    monkeypatch.setenv("SOLVER_SOLUTION_DIR", str(tmp_path))
+    request = TaskRequest(
+        problem_id="replayed-1", language="python", statement=DIGITS.statement,
+        entrypoint="g", public_examples=[TestCase(args=[12345], kwargs={}, expected=15)],
+    )
+    record = save_exchange("replayed-1", request.model_dump(mode="json"),
+                           {"problem_id": "replayed-1", "code": "", "raw_response": ""},
+                           tmp_path)
+    factory, backend = _rehearsal_solver(RIGHT)
+    code = asyncio.run(
+        rehearse.run(_rehearsal_args(source_file=str(record)), solver_factory=factory)
+    )
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "problem replayed-1" in out and "SCORES" in out, out
+    # An archive has no hidden suite in it, and saying so is the point.
+    assert "only the public examples" in out, out
+
+
+def test_replaying_a_bare_task_request_works_too():
+    """A validator's own logs hold the request without the answer beside it."""
+    from solvers import rehearse
+
+    path = Path(tempfile.mkdtemp()) / "bare.json"
+    path.write_text(TaskRequest(
+        problem_id="bare-1", language="python", statement="Return n.",
+        entrypoint="g",
+    ).model_dump_json())
+    problem = rehearse._from_file(str(path))
+    assert problem.request.problem_id == "bare-1"
+    assert "only the public examples" in problem.tests_are
+
+
+def test_an_archive_with_extra_fields_is_not_a_validation_error():
+    """`TaskRequest` forbids extras, and an archived record has more in it than
+    a request. A confusing pydantic error is a poor way to say so."""
+    from solvers import rehearse
+
+    path = Path(tempfile.mkdtemp()) / "fat.json"
+    path.write_text(json.dumps({
+        "problem_id": "fat-1",
+        "request": {
+            "problem_id": "fat-1", "language": "python", "statement": "Return n.",
+            "entrypoint": "g", "public_examples": [], "deadline_s": 90.0,
+            "challenge_id": "not part of a TaskRequest", "leased_at": 1.0,
+        },
+        "response": {"code": "", "raw_response": ""},
+    }))
+    problem = rehearse._from_file(str(path))
+    assert problem.request.problem_id == "fat-1" and problem.request.deadline_s == 90.0
+
+
+def test_a_rust_answer_that_will_not_build_is_a_failure_not_an_unknown(capsys):
+    """A missing Docker daemon means the tests cannot run, which is an unknown.
+    A program that will not COMPILE is not an unknown — it is a zero, and
+    reporting it as unknown hides the most definite failure there is behind a
+    note about the operator's docker socket."""
+    _rustc_or_skip()
+    from solvers import rehearse
+
+    broken = '```rust\nfn main() {\n    let x: i32 = "not a number";\n    println!("{}", x)\n}\n```'
+    factory, _ = _rehearsal_solver(broken)
+    code = asyncio.run(rehearse.run(_rehearsal_args(sample="rust"), solver_factory=factory))
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "DOES NOT SCORE" in out and "does not compile" in out, out
+
+
+def test_an_unknown_sample_names_the_ones_that_exist():
+    from solvers import rehearse
+
+    with pytest.raises(SystemExit) as raised:
+        rehearse._from_sample("cobol")
+    assert "python" in str(raised.value) and "rust" in str(raised.value)
+
+
+def test_every_sample_is_a_valid_request_whose_examples_are_a_strict_subset():
+    """The samples only mean something if the hidden suite really is hidden:
+    "passed the examples" and "would have scored" have to be able to differ."""
+    from solvers.samples import SAMPLES
+
+    for name, sample in SAMPLES.items():
+        request = sample.request()
+        assert request.entrypoint and request.statement.strip(), name
+        assert request.public_examples, f"{name} shows the model nothing"
+        assert len(sample.hidden_tests()) > len(request.public_examples), (
+            f"{name} has no hidden cases, so it cannot tell a skimmed answer apart"
+        )
+
+
+def test_the_rehearsal_goes_through_the_signed_handler_not_a_shortcut(monkeypatch, capsys):
+    """The load-bearing claim of the whole tool. Calling `solve()` directly
+    would be simpler and would look identical on a good day — and would stop
+    testing the signature check, the replay cache, the concurrency slot and the
+    deadline that answers 504 rather than late. Proven by breaking the
+    signature: only a path that actually verifies it can reject this."""
+    from solvers import rehearse
+
+    monkeypatch.setattr(
+        rehearse, "sign_message",
+        lambda *a, **kw: {"Epistula-Version": "2", "Epistula-Signed-By": "nobody"},
+    )
+    factory, _ = _rehearsal_solver(RIGHT_RUN)
+    code = asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=factory))
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "answered 401" in out, f"the signature was never checked: {out}"
+
+
+def test_the_rehearsal_closes_the_fleet_even_when_the_solve_explodes():
+    """It opens real browser tabs. Leaving them behind on a failure would be a
+    tab per run, in the operator's own signed-in Chrome."""
+    from solvers import rehearse
+
+    closed: list[bool] = []
+
+    class _Exploding:
+        async def solve_task(self, task, timeout_s):
+            raise RuntimeError("the fleet fell over")
+        async def aclose(self):
+            closed.append(True)
+        def stats(self):
+            return {"tabs": 1}
+
+    code = asyncio.run(
+        rehearse.run(_rehearsal_args(), solver_factory=lambda: _Exploding())
+    )
+    assert closed == [True], "the fleet was left open"
+    # A solve that raises is caught by the miner, which answers with silence.
+    assert code == 1
+
+
+def test_no_browser_is_reported_as_unchecked_not_as_a_wrong_answer(capsys):
+    """An operator who has not started Chrome yet is the likeliest person ever
+    to run this. The fleet already says what is wrong and how to fix it; a
+    traceback on top of that buries the one line worth reading, and calling it
+    a failed answer would blame the miner for a browser that is not running."""
+    from solvers import rehearse
+
+    class _NoFleet:
+        async def solve_task(self, task, timeout_s):
+            raise AssertionError("should never get as far as solving")
+        async def aclose(self): pass
+        def stats(self): return {"tabs": 0}
+        async def start(self):
+            raise RuntimeError("No usable tabs. Wanted: claude@http://127.0.0.1:9222")
+
+    class _Solver(_NoFleet):
+        _backend = None
+
+    solver = _Solver()
+    solver._backend = solver          # `warm_up` reaches for `_backend.start`
+    code = asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=lambda: solver))
+    out = capsys.readouterr().out
+    assert code == 2, f"a missing browser is not a wrong answer: {out}"
+    assert "COULD NOT BE CHECKED: no browser" in out, out
+    assert "No usable tabs" in out, "the fleet's own advice was swallowed"
