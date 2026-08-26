@@ -280,6 +280,18 @@ def _verdict(
         defect = _compile_defect_if_possible(code)
         if defect is not None:
             return FAILED, defect
+        absent = _rust_sandbox_missing()
+        if absent is not None:
+            return UNKNOWN, (
+                f"the Rust sandbox image has not been pulled on this machine, "
+                f"so the cases were not run.\n           Fix:\n"
+                f"               docker pull {absent}\n"
+                f"           Do NOT let the grader pull it: that happens inside "
+                f"its own ~80s budget\n           (compile 60s + cases + slack), "
+                f"and a first pull of a Rust image is several\n           hundred "
+                f"megabytes -- over budget it fails every case and reads as a "
+                f"WRONG ANSWER."
+            )
         if _rustc_available():
             # Worth carrying into the message below. Without a Docker daemon
             # "could not be run here" is all an operator would learn from a
@@ -331,6 +343,49 @@ def _executor_hint(exc: Exception) -> str:
         return ("\n           Docker is not installed. See the README's "
                 "\"Rust needs Docker\" section.")
     return ""
+
+
+def _rust_sandbox_missing() -> Optional[str]:
+    """The pinned sandbox image, if this machine has not pulled it yet.
+
+    Returns None when it is present, when Docker cannot be asked at all, and on
+    any answer other than a clear "no such image" -- claiming an absent image on
+    an ambiguous error would mislabel a real failure as a missing download.
+
+    Worth its own check because of what happens without one. `docker run` pulls
+    a missing image, and that pull runs INSIDE the executor's own bounded
+    subprocess: the Rust compile timeout plus the per-case timeout plus slack,
+    about eighty seconds for three cases. A first pull of a Rust image is
+    several hundred megabytes. Over that budget the run is killed, every case
+    comes back failed, and an unfinished download is reported as a wrong
+    answer -- the one thing a tool built to say "would this have scored" must
+    never get backwards.
+
+    `scripts/build_rust_sandbox.sh` does not help here and says so on its last
+    line: it builds a LOCAL tag, while the executor runs a digest-pinned
+    reference from `RELEASE_POLICY` that nothing overrides.
+    """
+    import shutil
+    import subprocess
+
+    from rlvr.policy import RELEASE_POLICY
+
+    docker = shutil.which("docker")
+    if docker is None:
+        return None  # a missing Docker is the executor's story to tell
+    image = RELEASE_POLICY.rust_image
+    try:
+        done = subprocess.run(
+            [docker, "image", "inspect", image],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception:  # noqa: BLE001 - an unanswerable Docker is not a verdict
+        return None
+    if done.returncode == 0:
+        return None
+    if "no such image" in (done.stderr or "").lower():
+        return image
+    return None
 
 
 def _rustc_available() -> bool:

@@ -5807,3 +5807,59 @@ def test_a_docker_daemon_you_cannot_reach_is_told_how_to_reach_it():
     assert "not installed" in missing, missing
 
     assert rehearse._executor_hint(RuntimeError("the grader exploded")) == ""
+
+
+def test_an_unpulled_rust_image_is_not_reported_as_a_wrong_answer(monkeypatch):
+    """`docker run` pulls a missing image, and that pull happens INSIDE the
+    executor's own ~80s budget (compile 60s + cases + slack). A first pull of a
+    Rust image is several hundred megabytes; over budget the run is killed,
+    every case comes back failed, and an unfinished download is reported as
+    `passed 0/3` — a wrong answer. That is the one thing a tool built to say
+    "would this have scored" must never get backwards."""
+    from solvers import rehearse
+    from rlvr.policy import RELEASE_POLICY
+
+    monkeypatch.setattr(rehearse, "_compile_defect_if_possible", lambda code: None)
+    monkeypatch.setattr(
+        rehearse, "_rust_sandbox_missing", lambda: RELEASE_POLICY.rust_image
+    )
+    request = TaskRequest(
+        problem_id="r", language="rust", statement="Do it.", entrypoint="main",
+    )
+    verdict, why = rehearse._verdict(
+        SimpleNamespace(code="fn main() {}"), request,
+        [TestCase(args=["1\n"], kwargs={}, expected="1\n")],
+    )
+    assert verdict == rehearse.UNKNOWN, (verdict, why)
+    assert "docker pull" in why and RELEASE_POLICY.rust_image in why, why
+
+
+def test_the_image_check_only_speaks_when_docker_actually_said_no_such_image(monkeypatch):
+    """An ambiguous Docker error must not be relabelled as a missing download:
+    the operator would go and pull an image they already have, twice, while the
+    real failure went unreported."""
+    from solvers import rehearse
+    import subprocess
+
+    monkeypatch.setattr(rehearse.shutil if hasattr(rehearse, "shutil") else __import__("shutil"),
+                        "which", lambda name: "/usr/bin/docker", raising=False)
+
+    def answering(returncode, stderr):
+        def run(cmd, **kw):
+            return SimpleNamespace(returncode=returncode, stderr=stderr, stdout="")
+        return run
+
+    monkeypatch.setattr(subprocess, "run", answering(1, "Error: No such image: ghcr.io/x@sha256:y"))
+    assert rehearse._rust_sandbox_missing() is not None
+
+    monkeypatch.setattr(subprocess, "run", answering(0, ""))
+    assert rehearse._rust_sandbox_missing() is None
+
+    monkeypatch.setattr(subprocess, "run", answering(1, "permission denied on /var/run/docker.sock"))
+    assert rehearse._rust_sandbox_missing() is None, "an ambiguous error was called a missing image"
+
+    def explode(cmd, **kw):
+        raise OSError("docker vanished")
+
+    monkeypatch.setattr(subprocess, "run", explode)
+    assert rehearse._rust_sandbox_missing() is None
