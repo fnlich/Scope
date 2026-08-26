@@ -228,6 +228,11 @@ _STREAM_INSTALL = f"({_STREAM_HOOK})()"
 #     thinking as `/delta/thinking` and ChatGPT under `/message/content/
 #     thoughts/...`, and a long reasoning block dwarfs the answer. Submitting
 #     the model's rough work is a failure this miner has already had once.
+#   * tool arguments. A model that reaches for its tools streams what it is
+#     asking them to do as `/delta/partial_json`, and that is not an answer --
+#     it is a shell command with a program quoted inside it. Measured: a 5,442
+#     byte tool call beat the 54 byte answer beside it on volume alone, and the
+#     wire handed back `{"command": "cat > main.rs << 'EOF' ..."}`.
 #   * enums. `/delta/type` repeats "text_delta" on every event and can outweigh
 #     a short program. A handful of distinct values across many events is a
 #     tag, not prose.
@@ -238,7 +243,7 @@ _STREAM_INSTALL = f"({_STREAM_HOOK})()"
 _STREAM_READ = r"""(since) => {
   var recs = (window.__honeStreams || []).filter(function (r) { return r.seq > since; });
   if (!recs.length) return null;
-  var NOISE = /think|thought|reason|scratch|signature|citation|websearch|tool_use/i;
+  var NOISE = /think|thought|reason|scratch|signature|citation|websearch|tool|input_json|partial_json/i;
   var TAG = /(^|\/)(id|role|type|model|status|name|kind|stop_reason|created|uuid|parent|slug|index|version|mime|lang|language)$/i;
   var leaves = function (node, path, out) {
     if (node === null || typeof node === 'undefined') return out;

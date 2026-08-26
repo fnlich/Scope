@@ -3169,3 +3169,165 @@ def test_a_disk_that_cannot_be_written_does_not_cost_the_solve(tmp_path, capsys)
     # ...and it does not say so again on every subsequent solve.
     _solved_by(_solver_returning("fn main() {}"), _request("p2"), blocked)
     assert "could not write solutions" not in capsys.readouterr().out
+
+
+# --- a tool call is not an answer ----------------------------------------- #
+# When a model reaches for its tools, a chat UI paints every tool call as a
+# `pre code` block — the same markup an answer gets. So "read only code blocks"
+# is not enough on its own: the blocks have to be asked whether they are
+# plausibly source in the target language before one becomes a submission.
+
+TOOL_JSON = (
+    '{"command": "mkdir -p /home/claude/sol && cat > /home/claude/sol/main.rs '
+    '<< \'RUST_EOF\'\\nuse std::io;\\nfn main() {\\n    println!(\\"draft\\");\\n}'
+    '\\nRUST_EOF\\necho written"}'
+)
+TOOL_SHELL = (
+    "cat > /home/claude/sol/main.rs << 'RUST_EOF'\n"
+    "use std::io;\n"
+    "fn main() {\n"
+    '    println!("draft");\n'
+    "}\n"
+    "RUST_EOF\n"
+    "echo written"
+)
+REAL_RUST = 'use std::io;\nfn main() {\n    println!("42");\n}'
+
+
+def _blocks(*bodies):
+    return "\n".join(f"```\n{b}\n```" for b in bodies)
+
+
+def test_a_tool_call_is_not_a_rust_program():
+    """`"fn main" in code` was the whole test, and a tool call passes it: the
+    program is quoted INSIDE a shell heredoc, inside JSON. Submitted, that is a
+    compile error nobody could trace back to a tool call."""
+    from solvers.prompts import rust_defect
+
+    for name, block in (("JSON", TOOL_JSON), ("shell", TOOL_SHELL)):
+        defect = rust_defect(block)
+        assert defect is not None, f"a {name} tool call passed as a program"
+        assert "does not look like a Rust program" in defect, defect
+        assert "does not define" not in defect, (
+            "called it a program with a missing main; it was never a program"
+        )
+    assert rust_defect(REAL_RUST) is None
+    # ...and a real file that opens with an attribute rather than `use` or `fn`.
+    assert rust_defect("#![allow(unused)]\nfn main() {}") is None
+
+
+def test_a_program_that_only_mentions_fn_main_in_a_string_has_no_main():
+    """The opener check catches a tool call; this catches the subtler one it
+    cannot. A genuine Rust file that merely QUOTES `fn main` — in a string, a
+    macro, a `write!` template — opens like Rust and passes every structural
+    test except the one that asks where `fn main` actually is. Submitted, it is
+    a link error, which costs a compile to discover instead of a search."""
+    from solvers.prompts import rust_defect
+
+    quoted = 'use std::io;\nfn helper() { let s = "fn main() {}"; }'
+    assert rust_defect(quoted) == "the program does not define `fn main()`", rust_defect(quoted)
+
+    for real in (
+        "fn main() {}",
+        "    fn main() {}",
+        "pub fn main() {}",
+        "use std::io;\nfn main () {\n}",
+        "async fn main() {}",
+    ):
+        assert rust_defect(real) is None, f"rejected a real program: {real!r}"
+
+
+def test_the_answer_wins_even_when_tool_calls_come_after_it():
+    """The case that produced this. The model wrote the program, then went on
+    running things — so the LAST code block in the message is a tool call, and
+    "the last gradeable block" picked the one that merely mentioned `fn main`."""
+    assert extract_code(_blocks(TOOL_JSON, REAL_RUST, TOOL_SHELL), "main", "rust") == REAL_RUST
+    assert extract_code(_blocks(REAL_RUST, TOOL_JSON, TOOL_SHELL), "main", "rust") == REAL_RUST
+
+
+def test_a_reply_of_nothing_but_tool_calls_submits_nothing():
+    """Submitting one is a guaranteed zero AND archives a shell command as "the
+    solution". Nothing arrived is both true and actionable."""
+    from solvers.prompts import rust_defect
+
+    got = extract_code(_blocks(TOOL_JSON, TOOL_SHELL), "main", "rust")
+    assert got == "", f"submitted a tool call: {got[:60]!r}"
+    assert rust_defect(got) == NO_CODE
+
+
+def test_a_broken_program_is_still_an_attempt_and_is_kept():
+    """The line this draws. A program with a fixable flaw — no entrypoint, a
+    syntax error, a line the deadline cut in half — IS an attempt at an answer,
+    and both the grader and the repair round need to see it. Only things that
+    were never attempts get dropped."""
+    missing_main = "use std::io;\nfn helper() -> i64 { 1 }"
+    assert extract_code(_blocks(missing_main), "main", "rust") == missing_main
+
+    truncated_py = "import sys\ndef solve(xs):\n    return sorted(xs"
+    assert extract_code(_blocks(truncated_py), "solve") == truncated_py
+
+    # Python opens with arbitrary statements, so a constant first line is fine.
+    constant_first = "MOD = 10**9 + 7\ndef solve(xs):\n    return len(xs) % MOD"
+    assert extract_code(_blocks(constant_first), "solve") == constant_first
+
+
+def test_python_tool_calls_are_dropped_too():
+    """Python has no closed top-level grammar, so it cannot use Rust's
+    allowlist of openers — but the handful of things a tool call starts with
+    can still be named."""
+    from solvers.prompts import plausible_source
+
+    assert not plausible_source("python3 /home/claude/sol/sim.py")
+    assert not plausible_source("cat > sim.py << 'EOF'\ndef solve(): pass\nEOF")
+    assert not plausible_source(TOOL_JSON)
+    assert plausible_source("def solve(xs):\n    return xs")
+    assert plausible_source("MOD = 10**9 + 7")
+
+
+def test_both_backends_ask_the_model_not_to_reach_for_its_tools():
+    """The root cause, and the only fix that costs nothing: the model used its
+    tools because nothing said not to. There is no toolchain behind a chat UI —
+    the session that produced this tried `apt-get install rustc` — so every tool
+    call is time the answer does not get."""
+    for site in (claude_site(), chatgpt_site()):
+        nudge = site.nudge.lower()
+        assert "compile" in nudge and "test anything" in nudge, site.nudge
+
+
+def test_the_wire_does_not_mistake_tool_arguments_for_the_answer():
+    """The stream had the same bug, from the other direction. A model asking a
+    tool to do something streams the request as `partial_json`, and "the field
+    appended to most" is then the tool call: a shell command with a draft
+    program quoted inside it. Measured before the fix — a 5,442 byte tool call
+    beat the 54 byte answer beside it purely on volume."""
+    playwright, chrome = _chromium_or_skip()
+    answer = 'Here it is:\n\n```rust\nfn main() { println!("42"); }\n```'
+    tool = json.dumps({"command": "cat > main.rs << 'EOF'\n"
+                                  + ("fn main() { /* draft */ }\n" * 200) + "EOF"})
+    events = [
+        'data: {"type":"message_start","message":{"id":"m","role":"assistant"}}',
+        'data: {"type":"content_block_start","index":0,"content_block":'
+        '{"type":"tool_use","id":"t1","name":"bash","input":{}}}',
+    ]
+    for i in range(0, len(tool), 30):
+        events.append("data: " + json.dumps({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": tool[i:i + 30]}}))
+    events.append('data: {"type":"content_block_stop","index":0}')
+    for i in range(0, len(answer), 8):
+        events.append("data: " + json.dumps({
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "text_delta", "text": answer[i:i + 8]}}))
+    body = "\n\n".join(events) + "\n\n"
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(playwright, chrome, [body])(p)
+            await page.evaluate("async () => { await (await fetch('/sse')).text(); }")
+            await asyncio.sleep(0.2)
+            out = await page.evaluate(_STREAM_READ, 0)
+            await browser.close()
+            return out
+
+    got = asyncio.run(go())
+    assert got == answer, f"the wire took {len(tool)} bytes of tool call: {(got or '')[:80]!r}"

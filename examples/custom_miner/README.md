@@ -596,6 +596,53 @@ A message with no code and a selector matching an empty wrapper both arrive as
 an empty read and need opposite fixes — the first is the model's doing, the
 second is yours — so they are named apart.
 
+### A tool call is not an answer either
+
+Reading only code blocks is not enough on its own, because **when a model
+reaches for its tools, the chat UI paints every tool call as a code block too**
+— the same `pre code` markup an answer gets. There is no toolchain behind a chat
+window (one session tried `apt-get install rustc`), so those calls achieve
+nothing, and the model can end a turn having written its program only *inside*
+one:
+
+```
+{"command": "cat > main.rs << 'RUST_EOF'\nuse std::io;\nfn main() { … }\nRUST_EOF"}
+```
+
+That used to pass every test the miner had. `rust_defect` was `"fn main" in
+code`, and the block does mention `fn main` — quoted inside a shell heredoc,
+inside JSON. It was picked as the answer, submitted, and archived as the
+solution, on a solve where the model had answered correctly further up the
+message.
+
+Three things changed:
+
+- **`fn main` must begin a line.** Inside an escaped string it only ever appears
+  mid-line, after a literal `\n`. This also catches a genuine Rust file that
+  merely *quotes* `fn main` in a string or a macro, which used to pass and then
+  fail to link.
+- **A block must be plausibly source before it can be submitted.** Rust's top
+  level is a closed grammar — a file can only open with an item, an attribute or
+  a comment — so an allowlist of openers is exact and a shell command fails at
+  its first character. Python's top level is arbitrary statements, so no
+  allowlist can be written that does not reject real code (`MOD = 10**9 + 7` is
+  a fine first line); there the short list of things a *tool call* opens with is
+  named instead.
+- **Both prompts ask the model not to use its tools at all** — the root cause,
+  and the only fix that costs nothing.
+
+The line this draws matters: a program with a fixable flaw — no entrypoint, a
+syntax error, a line the deadline cut in half — **is** an attempt at an answer,
+and both the grader and the repair round still get to see it. Only things that
+were never attempts are dropped, and a reply of nothing but tool calls reports
+that nothing arrived.
+
+The network stream had the same bug from the other direction. A model asking a
+tool to do something streams the request as `partial_json`, and "the field
+appended to most" was then the tool call rather than the reply — measured, a
+5,442-byte tool call beat the 54-byte answer beside it on volume alone. Tool
+arguments are excluded by name now, like reasoning.
+
 ### When nothing is captured at all, the tab says why
 
 `the reply contained no code` is what the grader reports afterwards, and it

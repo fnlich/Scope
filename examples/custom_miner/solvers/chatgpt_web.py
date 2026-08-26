@@ -48,7 +48,9 @@ ASSISTANT_MSG = '[data-message-author-role="assistant"]'
 # no code, which costs a whole solve to discover.
 NUDGE = (
     "Reply directly in the chat with one ordinary fenced code block, however "
-    "long the program is. Do not use canvas."
+    "long the program is. Do not use canvas. Do not run code and do not try to "
+    "compile or test anything — there is no toolchain here and every tool "
+    "call is time the answer does not get."
 )
 
 

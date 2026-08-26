@@ -336,14 +336,61 @@ def extract_code(
             )
             if defect is None:
                 return block
-    # Nothing clean: the last block is still the best guess, and the defect it
-    # reports is what the repair round needs to hear.
-    return blocks[-1]
+    # Nothing clean. Fall back only as far as something that is plausibly
+    # source: a broken program is still an attempt, and the defect it reports
+    # is what the repair round needs to hear, but a tool call is not an attempt
+    # at all. Handing one over submits a guaranteed zero AND archives it as
+    # "the solution", which is how a tool call came to be saved as a Rust
+    # program on a solve where the model had answered correctly.
+    for block in reversed(blocks):
+        if plausible_source(block, language):
+            return block
+    return ""
 
 
 # Said by both defect checks, and recognised by `build_repair_prompt`, because
 # "nothing arrived" needs a different conversation from "what arrived is wrong".
 NO_CODE = "the reply contained no code"
+
+
+# A code block a chat UI paints is not necessarily an ANSWER. When a model
+# reaches for its tools, every tool call is painted as a `pre code` block too,
+# and the reader cannot tell one from the other -- so the question "is this
+# plausibly source in the target language" has to be asked before a block is
+# allowed to become a submission.
+#
+# The two languages need different tests, and the asymmetry is real rather than
+# laziness. Rust's top level is a CLOSED grammar: a file can only begin with an
+# item, an attribute or a comment, so an allowlist of openers is exact and a
+# shell command or a JSON object fails at its first character. Python's top
+# level is arbitrary statements -- a perfectly good answer may open with
+# `MOD = 10**9 + 7` -- so no allowlist can be written that does not reject real
+# code. What CAN be named there is the short list of things a tool call opens
+# with.
+_SHELL_OPENER_RE = re.compile(
+    r"^[ \t]*(?:[$#>]\s|cat|cd|mkdir|echo|ls|rm|cp|mv|touch|chmod|export|sudo"
+    r"|apt|apt-get|yum|brew|pip3?|python3?|rustc|cargo|npm|yarn|git|curl|wget"
+    r"|bash|sh|zsh|make|which|pytest|node)\b"
+)
+
+
+def plausible_source(code: str, language: str = "python") -> bool:
+    """Could this block be source at all, before asking whether it is correct?
+
+    Deliberately not the same question as `*_defect`. A program with a fixable
+    flaw -- no entrypoint, a syntax error, a truncated line -- IS an attempt at
+    an answer, and it is worth submitting and worth showing the repair round.
+    A tool call is not an attempt at anything: submitting it guarantees a zero
+    and tells the model nothing it can act on.
+    """
+    first = next((line for line in code.splitlines() if line.strip()), "")
+    if not first:
+        return False
+    if language == "rust":
+        return bool(_RUST_OPENER_RE.match(first))
+    if first.lstrip()[:1] in "{[":
+        return False  # a JSON payload, not a program
+    return not _SHELL_OPENER_RE.match(first)
 
 
 def python_defect(code: str, entrypoint: str) -> Optional[str]:
@@ -380,10 +427,53 @@ def python_defect(code: str, entrypoint: str) -> Optional[str]:
     return f"the code does not define a top-level function named `{entrypoint}`"
 
 
+# `fn main` at the START of a line. Inside an escaped string -- a tool call's
+# JSON arguments, say -- it only ever appears mid-line, after a literal `\n`.
+_RUST_MAIN_RE = re.compile(
+    r"^[ \t]*(?:pub\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?"
+    r"fn\s+main\s*\(",
+    re.MULTILINE,
+)
+# What a single-file Rust program can begin with. Everything a chat UI renders
+# as a code block that ISN'T a program -- a shell command, a JSON payload, a
+# diff -- begins with something else, and this is the cheapest way to tell them
+# apart that does not need a compiler.
+_RUST_OPENER_RE = re.compile(
+    r"^[ \t]*(?:#!|#\[|//|/\*|use\b|fn\b|pub\b|mod\b|struct\b|enum\b|impl\b"
+    r"|trait\b|const\b|static\b|type\b|unsafe\b|extern\b|async\b|macro_rules!)"
+)
+
+
 def rust_defect(code: str) -> Optional[str]:
-    """Cheap structural check before paying for a compile."""
+    """Cheap structural check before paying for a compile.
+
+    Both tests here are stricter than they look, and they are stricter because
+    of what a chat UI renders as a code block. When a model reaches for its
+    tools, every tool call is painted as a `pre code` block too -- the reader
+    cannot tell one from an answer, and it should not have to. A block holding
+    `{"command": "cat > main.rs << 'EOF'\nfn main() ..."}` used to pass, because
+    the old test was `"fn main" in code`: it merely MENTIONS `fn main`, inside
+    a quoted shell string, inside JSON. Submitted, it is a guaranteed zero, and
+    the grader's only complaint would have been a compile error nobody could
+    trace back to a tool call.
+
+    So: `fn main` must begin a line, which it never does inside an escaped
+    string, and the file must begin the way a Rust file begins. A shell command
+    or a JSON object fails the second test at its first character.
+
+    The order of the two matters. Telling a model "your program does not define
+    `fn main()`" about something that was never a program is the contradiction
+    `build_repair_prompt` exists to avoid, so a block that is not Rust at all
+    says exactly that instead.
+    """
     if not code.strip():
         return NO_CODE
-    if "fn main" not in code:
+    first = next((line for line in code.splitlines() if line.strip()), "")
+    if not _RUST_OPENER_RE.match(first):
+        return (
+            f"this does not look like a Rust program — it begins with "
+            f"{first.strip()[:48]!r}"
+        )
+    if not _RUST_MAIN_RE.search(code):
         return "the program does not define `fn main()`"
     return None

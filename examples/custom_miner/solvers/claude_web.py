@@ -60,7 +60,9 @@ from .config import selectors
 # sentence is cheaper than trying to scrape the panel.
 NUDGE = (
     "Reply directly in the chat with one ordinary fenced code block, however "
-    "long the program is. Do not create an artifact."
+    "long the program is. Do not create an artifact. Do not use the analysis "
+    "tool and do not try to compile, run or test anything — there is no "
+    "toolchain here and every tool call is time the answer does not get."
 )
 
 
