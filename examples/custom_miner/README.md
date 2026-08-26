@@ -598,8 +598,10 @@ second is yours — so they are named apart.
 
 ### A tool call is not an answer either
 
-Reading only code blocks is not enough on its own, because **when a model
-reaches for its tools, the chat UI paints every tool call as a code block too**
+This one is Claude's — the archived file quotes `/home/claude/sol`, its analysis
+sandbox. Reading only code blocks is not enough on its own, because **when a
+model reaches for its tools, the chat UI paints every tool call as a code block
+too**
 — the same `pre code` markup an answer gets. There is no toolchain behind a chat
 window (one session tried `apt-get install rustc`), so those calls achieve
 nothing, and the model can end a turn having written its program only *inside*
@@ -650,10 +652,15 @@ words "Do not use canvas".
 
 `_echoes_prompt` was written to stop exactly that, and it was applied in
 exactly one place: inside `_poll`, guarding the scrape. Every other route to a
-submission — the copy control, the network stream — went around it. A chat
-stream carries the *conversation*, not just the reply, so when the page was
-unreadable and the wire held no fenced code, the rescue branch handed back the
-prompt as raw text.
+submission — the copy control, the network stream — went around it.
+
+**Both came off ChatGPT tabs**, and the mechanism is ChatGPT's specifically. Its
+response opens with a snapshot of the *conversation*, which holds the user's own
+turn under `author.role = "user"` — and "the field appended to most" is then the
+PROMPT whenever the answer is shorter, which it usually is. Reproduced on that
+payload shape: a 1,384-character user turn beat the 41-character answer beside
+it. So the reconstruction now discards anything the stream attributes to
+someone other than the model. Who said it decides, not how much of it there is.
 
 Two things changed. The rescue only claims a rescue when it actually has code
 blocks, and returns nothing otherwise — the old message announced a recovery

@@ -244,7 +244,19 @@ _STREAM_READ = r"""(since) => {
   var recs = (window.__honeStreams || []).filter(function (r) { return r.seq > since; });
   if (!recs.length) return null;
   var NOISE = /think|thought|reason|scratch|signature|citation|websearch|tool|input_json|partial_json/i;
-  var TAG = /(^|\/)(id|role|type|model|status|name|kind|stop_reason|created|uuid|parent|slug|index|version|mime|lang|language)$/i;
+  // Bookkeeping keys, with an optional prefix: `content_type` and
+  // `conversation_id` are as much tags as `type` and `id`, and matching only
+  // the bare word let `content_type` become the answer -- measured, a reply
+  // with no text in it reconstructed as the single word "text".
+  var TAG = /(^|\/)([a-z]+_)*(id|role|type|model|status|name|kind|reason|created|uuid|parent|slug|index|version|mime|lang|language)$/i;
+  // Text this stream attributes to somebody other than the model. A chat
+  // response carries the CONVERSATION, not just the reply: ChatGPT opens with
+  // a snapshot holding the user's own turn under `author.role = "user"`, and
+  // "the field appended to most" is then the PROMPT whenever the answer is
+  // shorter than it -- which it usually is. Measured on ChatGPT's real payload
+  // shape: a 1,384 character user turn beat the 41 character answer beside it,
+  // and two validators were sent this miner's own instructions as Rust.
+  var NOT_THE_MODEL = /\/role=(user|system|tool)\b/i;
   var leaves = function (node, path, out) {
     if (node === null || typeof node === 'undefined') return out;
     if (typeof node === 'string') { out.push([path, node]); return out; }
@@ -282,6 +294,7 @@ _STREAM_READ = r"""(since) => {
         var sig = marks.sort().join('|');
         if (sig) { sticky[path] = sig; } else { sig = sticky[path] || ''; }
         if (NOISE.test(path) || NOISE.test(sig)) continue;
+        if (NOT_THE_MODEL.test(sig)) continue;
         var key = path + '\u0000' + sig;
         var e = buckets[key];
         if (!e) { e = buckets[key] = { text: '', count: 0, distinct: Object.create(null), seen: 0 }; }

@@ -3715,3 +3715,95 @@ def test_the_conservative_direction_is_the_cheap_one():
     assert flawed.score > Candidate(code="", raw="").score, (
         "a wrongly-flagged answer must still beat submitting nothing"
     )
+
+
+# --- the stream carries the conversation, not just the reply -------------- #
+# Attributed by provider from the archive itself: the two prompt echoes end in
+# CHATGPT_NUDGE ("Do not use canvas"), and the tool call quotes `/home/claude/sol`
+# — Claude's analysis sandbox. Two different sites, two different mechanisms,
+# and the miner had been treating them as one.
+
+CHATGPT_USER_TURN = (
+    "Solve this programming problem in Rust.\n\nRules — the grader is automated\n"
+    + "- some rule about edge cases\n" * 40
+    + "\nDo not use canvas."
+)
+
+
+def _chatgpt_conversation(answer, thoughts=""):
+    """ChatGPT's real shape: a snapshot of the CONVERSATION, then deltas.
+
+    The snapshot holds the user's own turn under `author.role = "user"`, which
+    is the whole problem — it is usually far longer than the answer beside it.
+    """
+    events = []
+
+    def send(obj):
+        events.append("data: " + json.dumps(obj))
+
+    send({"v": {"message": {
+        "id": "u1", "author": {"role": "user"},
+        "content": {"content_type": "text", "parts": [CHATGPT_USER_TURN]},
+        "status": "finished"}, "conversation_id": "abc-123", "c": 0}})
+    send({"v": {"message": {
+        "id": "a1", "author": {"role": "assistant"},
+        "content": {"content_type": "text", "parts": [""]},
+        "status": "in_progress"}, "c": 1}})
+    for body, path in ((thoughts, "/message/content/thoughts/0/content"),
+                       (answer, "/message/content/parts/0")):
+        first = True
+        for i in range(0, len(body), 6):
+            if first:
+                send({"p": path, "o": "append", "v": body[i:i + 6]})
+                first = False
+            else:
+                send({"v": body[i:i + 6]})
+    events.append("data: [DONE]")
+    return "\n\n".join(events) + "\n\n"
+
+
+def _reconstruct(body):
+    playwright, chrome = _chromium_or_skip()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(playwright, chrome, [body])(p)
+            await page.evaluate("async () => { await (await fetch('/sse')).text(); }")
+            await asyncio.sleep(0.2)
+            out = await page.evaluate(_STREAM_READ, 0)
+            await browser.close()
+            return out or ""
+
+    return asyncio.run(go())
+
+
+def test_the_wire_never_takes_text_the_stream_says_the_user_wrote():
+    """The mechanism behind two real submissions, reproduced on ChatGPT's own
+    payload shape: a 1,384-character user turn beat the 41-character answer
+    beside it purely on volume, and the miner's instructions reached a validator
+    as a Rust program. Who said it decides, not how much of it there is."""
+    answer = '```rust\nfn main() { println!("42"); }\n```'
+    assert _reconstruct(_chatgpt_conversation(answer)) == answer
+
+
+def test_a_reply_with_no_answer_in_it_reconstructs_as_nothing():
+    """The production case: the model had not written anything yet, so the only
+    long text in the stream was the prompt. Nothing is the honest answer."""
+    assert _reconstruct(_chatgpt_conversation("")) == ""
+
+
+def test_bookkeeping_keys_are_tags_whatever_they_are_prefixed_with():
+    """`content_type` is as much a tag as `type`, and `conversation_id` as much
+    as `id`. Matching only the bare word left a reply with no text in it
+    reconstructing as the single word "text" — the value of `content_type`."""
+    assert "text" != _reconstruct(_chatgpt_conversation("")), (
+        "a bookkeeping value was taken as the answer"
+    )
+
+
+def test_reasoning_and_the_user_turn_lose_to_a_short_answer_together():
+    """All three kinds of text a chat stream carries, in one reply, with the
+    real answer the smallest of them."""
+    answer = '```rust\nfn main() { println!("42"); }\n```'
+    got = _reconstruct(_chatgpt_conversation(answer, thoughts="Let me reason. " * 200))
+    assert got == answer, f"took reasoning or the prompt over the answer: {got[:70]!r}"
