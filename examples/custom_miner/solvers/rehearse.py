@@ -349,7 +349,13 @@ async def run(
 
     code = payload.code or ""
     print(f"[rehearse] submitted {len(code)} chars of {request.language}")
-    if code.strip() and args.show > 0:
+    # Two questions, not one. Whether there IS an answer and whether it is
+    # being printed are unrelated, and folding them into one branch made
+    # `--show 0` announce "the answer was EMPTY" directly beneath "submitted
+    # 197 chars of python".
+    if not code.strip():
+        print("[rehearse] the answer was EMPTY. The lines above this one say why.")
+    elif args.show > 0:
         lines = code.splitlines()
         print("    ----- what a validator would grade -----")
         for line in lines[: args.show]:
@@ -357,8 +363,6 @@ async def run(
         if len(lines) > args.show:
             print(f"    | ... {len(lines) - args.show} more line(s)")
         print("    ----------------------------------------")
-    else:
-        print("[rehearse] the answer was EMPTY. The lines above this one say why.")
 
     from solution_archive import archive_dir
 

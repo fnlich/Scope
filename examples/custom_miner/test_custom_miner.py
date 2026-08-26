@@ -5373,3 +5373,58 @@ def test_no_browser_is_reported_as_unchecked_not_as_a_wrong_answer(capsys):
     assert code == 2, f"a missing browser is not a wrong answer: {out}"
     assert "COULD NOT BE CHECKED: no browser" in out, out
     assert "No usable tabs" in out, "the fleet's own advice was swallowed"
+
+
+def test_a_quiet_rehearsal_does_not_call_a_real_answer_empty(capsys):
+    """`--show 0` prints no code, which is not the same as there being none.
+    Folding the two into one branch put "the answer was EMPTY" directly beneath
+    "submitted 197 chars of python"."""
+    from solvers import rehearse
+
+    factory, _ = _rehearsal_solver(RIGHT_RUN)
+    asyncio.run(rehearse.run(_rehearsal_args(show=0), solver_factory=factory))
+    out = capsys.readouterr().out
+    assert "submitted" in out and "chars of python" in out, out
+    assert "EMPTY" not in out, f"a real answer was announced as empty:\n{out}"
+
+    factory, _ = _rehearsal_solver("I need a clarification before I can answer.")
+    asyncio.run(rehearse.run(_rehearsal_args(show=0), solver_factory=factory))
+    assert "the answer was EMPTY" in capsys.readouterr().out
+
+
+def test_the_doctor_explains_a_site_it_cannot_reach(capsys, monkeypatch):
+    """Measured by running the doctor behind a network that blocks the site:
+    twenty-five lines of Playwright internals ending in
+    `net::ERR_CONNECTION_RESET`, with the one useful word buried in the middle.
+    Attaching had already succeeded — that part is printed — so what failed is
+    reaching the site, and that has causes an operator can act on."""
+    import solvers.doctor as doctor
+
+    page = _FakePage({"#composer": [_Node()]})
+    page.add_init_script = lambda script: _done(None)
+
+    async def refuse(url, wait_until=None):
+        raise RuntimeError(f"net::ERR_CONNECTION_RESET at {url}")
+
+    page.goto = refuse
+    site = _site(url="https://example.invalid/new", stream=True)
+
+    class _Browser:
+        contexts = [SimpleNamespace(new_page=lambda: _done(page))]
+        async def close(self): pass
+
+    monkeypatch.setattr(doctor, "_site", lambda name: site)
+    monkeypatch.setattr(doctor, "_attach", lambda pw, s, endpoint: _done(_Browser()))
+    monkeypatch.setattr(
+        doctor, "import_playwright",
+        lambda: lambda: SimpleNamespace(
+            start=lambda: _done(SimpleNamespace(stop=lambda: _done(None)))
+        ),
+    )
+    code = asyncio.run(doctor.run("claude", "9222", False))
+    out = capsys.readouterr().out
+    assert code == 2, out
+    assert "could not open" in out and "ERR_CONNECTION_RESET" in out, out
+    assert "Traceback" not in out
+    assert "proxy or firewall" in out, "the operator was left without a next step"
+    assert page.closed, "the doctor's own tab was left open in your browser"

@@ -1048,6 +1048,139 @@ to pick it up again.
   and the pinned image; without those, grading is skipped and Rust candidates
   come back unverified.
 
+## Trying it all without a wallet, off-chain
+
+Nothing below touches the chain, and none of it needs a registered hotkey. The
+miner's signing, the metagraph check and the axon only matter once a validator
+is talking to you; every layer here runs before that, and `solvers.rehearse`
+was written so the last one does too.
+
+That is a property worth stating rather than assuming, so it is tested: the
+suite runs a rehearsal with `bittensor`, `bittensor_wallet`,
+`substrateinterface`, `fastapi` and `uvicorn` all blocked at the import hook,
+and it still solves, archives and grades. `rlvr.protocol` falls back to an HMAC
+identity when no chain stack is installed, and the rehearsal signs with that.
+
+**1. Install.** The chain extra is not among these.
+
+```bash
+cd /path/to/hone-subnet
+python -m venv .venv && . .venv/bin/activate
+pip install -e '.[miner,dev]'
+pip install playwright          # no `playwright install` — you start the browser
+```
+
+**2. Code only, no browser.** If this fails, stop here; nothing downstream can
+work.
+
+```bash
+python -m pytest examples/custom_miner
+```
+
+**3. Start a browser and sign in.** This is the step that carries the real
+risk, and it is the one nothing can do for you. The browser must be one YOU
+started: a browser launched by an automation driver announces itself as one,
+and providers refuse the sign-in.
+
+```bash
+cd examples/custom_miner
+./scripts/start_debug_browser.sh --port 9222
+```
+
+It prints a VNC command if the host is headless. Open `https://claude.ai` in
+that browser and sign in **by hand** — prefer email plus a one-time code, since
+"Continue with Google" is the sign-in most likely to be refused. Leave it
+running: the miner attaches and detaches over CDP and never closes it, so
+restarts keep your login.
+
+For ChatGPT instead, sign in to `https://chatgpt.com` and use `CHATGPT_CDP`
+below. For both, run a second browser on a second port.
+
+**4. Point the miner at it.** Only if you used a port other than 9222 — the
+default needs no configuration at all.
+
+```bash
+echo 'CLAUDE_CDP=9222' >> .env      # or CHATGPT_CDP=9223
+```
+
+**5. Check the selectors.**
+
+```bash
+python -m solvers.doctor claude --probe
+```
+
+It reports, per role, which candidate selector your page actually has, then
+sends a real prompt and shows the text it read back. `--probe` is the half that
+matters: it drives the same read path the miner uses, so what you see is what
+the miner would get.
+
+**6. Solve one task, no miner, no wallet.**
+
+```bash
+python scripts/try_solver.py
+```
+
+Three outcomes, distinct on purpose: verified (the setup is good),
+code-but-wrong (the plumbing works and the model missed — re-run before blaming
+the setup), and nothing-came-back (it names login, selector and deadline in
+likelihood order).
+
+**7. Rehearse the whole miner.**
+
+```bash
+python -m solvers.rehearse
+python -m solvers.rehearse --sample rust
+```
+
+This is the closest you get to being a miner without being one. The request is
+signed and goes through `CustomMiner`'s own HTTP handler, so it exercises the
+signature check, the concurrency slot, the deadline that answers 504 rather
+than late, `fit_response`'s byte cap and the solution archive — and it grades
+the answer against cases the model never saw. A good run ends:
+
+```
+[rehearse] SCORES: passed all 8 test(s)
+[rehearse] checked against the full suite, including cases the model never saw
+```
+
+Exit `0` correct, `1` answered and wrong, `2` nothing could be concluded.
+
+**8. Read what it wrote.**
+
+```bash
+ls solutions/
+cat solutions/rehearsal-python-1.py       # what a validator would have graded
+python -m json.tool solutions/rehearsal-python-1.json | head -40
+```
+
+The `.json` holds the request and the reply side by side. A zero-byte `.py` is
+not a bug: it is the record that the problem was seen and answered with
+silence, which needs a different fix from never having seen it.
+
+**9. Replay it whenever something goes wrong.** Once the miner has run for
+real, every solve leaves one of these, and the rehearsal takes it back:
+
+```bash
+python -m solvers.rehearse --from solutions/<problem-id>.json
+```
+
+Same problem, same prompt, this time with you watching. It can only check
+against the public examples — the hidden suite was never in the request — and
+it says so.
+
+### If a step fails
+
+| what you see | what it means |
+| --- | --- |
+| `cannot attach to http://127.0.0.1:9222` | the browser is not running, or is on another port. Check `curl http://127.0.0.1:9222/json/version`. |
+| `attached to the browser, but could not open https://claude.ai/new` | the browser is fine and the site is not reachable from it. Open the URL in that Chrome by hand; whatever it shows is the real problem. |
+| `no composer selector matched` | almost always not signed in. Sign in by hand in that browser, then re-run the doctor. |
+| `COULD NOT BE CHECKED: no browser to solve with` | same as the first row, reported by the rehearsal. |
+| `DOES NOT SCORE: passed 7/8` | the miner works. The model got the problem wrong — which is the answer the rehearsal exists to give. |
+| Rust says `COULD NOT BE CHECKED` | Rust verification needs Docker. Without it you still learn whether the answer compiles, which is most of the value. |
+
+Only after all of this is a hotkey worth registering.
+
 ## Testing your setup
 
 Five layers, cheapest first, each isolating a different failure:

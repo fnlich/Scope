@@ -216,6 +216,24 @@ async def run(name: str, cdp: str, probe: bool) -> int:
 
             if probe:
                 healthy &= await _probe(page, site, composer, kept)
+        except Exception as exc:  # noqa: BLE001 - the page never loaded
+            # Measured by running this behind a network that blocks the site:
+            # twenty-five lines of Playwright internals ending in
+            # `net::ERR_CONNECTION_RESET`, with the one useful word buried in
+            # the middle. The browser attached fine -- that part is already
+            # printed above -- so what failed is reaching the site, and that
+            # has three causes an operator can act on.
+            detail = " ".join(str(exc).split())
+            print(
+                f"\n[doctor] FAIL: attached to the browser, but could not open "
+                f"{site.url}.\n"
+                f"         {detail[:200]}\n"
+                f"         Three things do this: no network from this host, a "
+                f"proxy or firewall in front of it, or the browser being pointed "
+                f"somewhere else. Open {site.url} in that Chrome by hand -- "
+                f"whatever it shows you is the actual problem."
+            )
+            return 2
         finally:
             # Close only our tab, then disconnect. Your browser keeps running.
             try:
