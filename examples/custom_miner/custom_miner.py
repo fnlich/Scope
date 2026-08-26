@@ -48,7 +48,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from preflight import require_linux  # noqa: E402
-from solution_archive import save_solution  # noqa: E402
+from solution_archive import save_exchange, save_solution  # noqa: E402
 
 # Checked HERE, above the imports below, and not inside run_custom_miner(): on
 # Windows `pip install '.[chain]'` has already failed, so `import rlvr` would
@@ -239,6 +239,15 @@ class CustomMiner(DemoMiner):
         # nothing: an empty file records that this problem was seen and answered
         # with silence, which needs a different fix from never having seen it.
         save_solution(request.problem_id, request.language, payload.code)
+        # ...and beside it, what was ASKED and what was actually sent back. The
+        # code alone cannot answer "was that a reasonable thing to submit" --
+        # the statement, the examples and the model's own reply are the context
+        # that makes a bad answer diagnosable instead of merely visible.
+        save_exchange(
+            request.problem_id,
+            request.model_dump(mode="json"),
+            payload.model_dump(mode="json"),
+        )
         return payload
 
     async def aclose(self) -> None:

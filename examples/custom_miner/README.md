@@ -817,8 +817,11 @@ only other copy. So each answer is written to disk, named for the problem:
 ```
 solutions/
   bd41f0e2-….rs        the Rust source that was sent
+  bd41f0e2-….json      what was asked, and what was actually replied
   7c9a1b04-….py        the Python source that was sent
+  7c9a1b04-….json
   3f88d5aa-….rs        0 bytes — this problem was seen and answered with silence
+  3f88d5aa-….json      …and this says WHICH problem, and why
 ```
 
 The empty ones are the point. Absence would be ambiguous — never dispatched,
@@ -829,6 +832,34 @@ leaves one too, since that path never reaches the solver's own return.
 The content is taken from the payload rather than from the variable that fed it,
 so the file is the submission and not something that resembles it. The extension
 follows the task's language.
+
+The `.json` beside it holds the validator's **request** and the miner's
+**reply**, verbatim:
+
+```json
+{
+  "problem_id": "…",
+  "request":  { "statement": "…", "entrypoint": "main", "public_examples": [ … ],
+                "language": "rust", "deadline_s": 240.0 },
+  "response": { "code": "fn main(){ … }", "raw_response": "Here is the program:\n\n```rust\n…" }
+}
+```
+
+The code alone answers *what did we submit*. It cannot answer *was that a
+reasonable thing to submit* — the statement, the entrypoint and the examples all
+lived only in the request, and the model's actual words only in the tab. Reading
+43 archived answers made the gap concrete: half could not be judged without the
+problem they were answering, and the two most expensive bugs this miner has had
+— a tool call submitted as Rust, a prompt submitted as Rust — are unmistakable
+in `raw_response` and invisible in the code file, where each looked like a
+finished program.
+
+It sits **beside** the code rather than inside it because the code file is a
+program: something has to be able to compile it, diff it or feed it to a grader
+without stripping a header off first. Same stem, different extension, so the
+pair is obvious in a listing and trivial to join. A solve that crashed writes
+one too — the empty `.rs` says a problem was seen and answered with silence, and
+only the record says which problem, and that the solver raised.
 
 `SOLVER_SOLUTION_DIR` moves the directory; setting it to nothing turns archiving
 off. Nothing here can cost you a solve — a disk that cannot be written explains

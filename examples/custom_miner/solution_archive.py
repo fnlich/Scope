@@ -20,6 +20,7 @@ swallowed after one line of explanation.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -77,6 +78,57 @@ def save_solution(
     try:
         target.mkdir(parents=True, exist_ok=True)
         path.write_text(body, encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001 - a full disk must not cost a solve
+        global _warned
+        if not _warned:
+            _warned = True
+            print(
+                f"[custom-miner] could not write solutions to {target} "
+                f"({type(exc).__name__}: {exc}). Solving continues; set "
+                f"SOLVER_SOLUTION_DIR to a writable path, or to nothing to "
+                f"turn archiving off. Once per run."
+            )
+        return None
+    return path
+
+
+def save_exchange(
+    problem_id: str,
+    request: dict,
+    response: dict,
+    directory: Optional[str | Path] = None,
+) -> Optional[Path]:
+    """Write the validator's request and the miner's reply, side by side.
+
+    The code alone answers "what did we submit". It cannot answer "was that a
+    reasonable thing to submit", because the question is gone: the statement,
+    the entrypoint, the public examples and the deadline all lived only in the
+    request, and the model's actual reply lived only in the tab. Reading 43
+    archived answers made that gap concrete -- half of them could not be judged
+    at all without the problem they were answering, and the two most expensive
+    bugs in this miner (a tool call submitted as Rust, a prompt submitted as
+    Rust) would have been obvious in one glance at `raw_response`.
+
+    Kept beside the code rather than inside it, because the code file is a
+    program: something has to be able to compile it, diff it, or feed it to a
+    grader without stripping a header first. Same stem, different extension, so
+    the pair is obvious in a listing and trivial to join.
+
+    Takes plain dicts rather than the wire models on purpose -- this module has
+    no idea what a `TaskRequest` is and should not learn.
+    """
+    target = archive_dir() if directory is None else Path(directory)
+    if target is None:
+        return None
+    path = target / (_stem(problem_id) + ".json")
+    record = {"problem_id": problem_id, "request": request, "response": response}
+    try:
+        body = json.dumps(record, indent=2, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001 - an unserialisable field is not worth a solve
+        return None
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        path.write_text(body + "\n", encoding="utf-8")
     except OSError as exc:  # noqa: BLE001 - a full disk must not cost a solve
         global _warned
         if not _warned:
