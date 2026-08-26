@@ -437,10 +437,53 @@ def extract_code(
     # at all. Handing one over submits a guaranteed zero AND archives it as
     # "the solution", which is how a tool call came to be saved as a Rust
     # program on a solve where the model had answered correctly.
-    for block in reversed(blocks):
-        if plausible_source(block, language):
-            return block
-    return ""
+    usable = [b for b in reversed(blocks) if plausible_source(b, language)]
+    if not usable:
+        return ""
+    # Among those, prefer one that at least DEFINES what the grader is going to
+    # call. Taking the last plausible block instead was measured doing real
+    # damage: a model answers, then appends `print(g([1, 2, 3]))` as a usage
+    # example, and that demo is perfectly plausible Python. The moment the
+    # answer above it picks up any defect at all -- a genuine truncation, or a
+    # false positive from the fall-off-the-end check -- the demo becomes the
+    # last plausible block and wins. A whole correct program was replaced by its
+    # own one-line example, submitted, and archived as the solution. The demo
+    # also teaches the repair round nothing: it is told the code does not define
+    # `g`, about a block that was never trying to.
+    if entrypoint:
+        for block in usable:
+            if _defines(block, entrypoint, language):
+                return block
+    return usable[0]
+
+
+def _defines(code: str, entrypoint: str, language: str = "python") -> bool:
+    """Does this block define the thing the grader will call?
+
+    Not "is it correct" and not "is it complete". A truncated answer still
+    defines its function, and that block is precisely the one a repair round
+    needs to be shown -- which is why this is a separate question from
+    `*_defect` rather than a re-use of it.
+    """
+    if language == "rust":
+        return bool(_RUST_MAIN_RE.search(code))
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        # Cut off mid-statement, so there is no tree to ask. The definition line
+        # itself is the best evidence left, and it is the part that survives a
+        # truncation: the cut is at the END of the answer, not the start.
+        return re.search(
+            rf"^[ \t]*(?:async\s+)?def\s+{re.escape(entrypoint)}\s*\(", code, re.MULTILINE
+        ) is not None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == entrypoint:
+            return True
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == entrypoint for t in node.targets
+        ):
+            return True
+    return False
 
 
 # Said by both defect checks, and recognised by `build_repair_prompt`, because
@@ -521,10 +564,35 @@ def _always_returns(body: list) -> bool:
     if isinstance(last, ast.While):
         # `while True:` with no way out never falls through to the end.
         if isinstance(last.test, ast.Constant) and last.test.value is True:
-            return not any(isinstance(n, ast.Break) for n in ast.walk(last))
+            return not _breaks_out_of(last)
         return False
     if isinstance(last, ast.Match):
         return bool(last.cases) and all(_always_returns(c.body) for c in last.cases)
+    return False
+
+
+def _breaks_out_of(loop) -> bool:
+    """Is there a `break` bound to THIS loop, rather than to one inside it?
+
+    `ast.walk` sees every `break` in the subtree, and an inner loop's break
+    exits the inner loop -- it says nothing about whether the outer `while True`
+    can ever end. Counting those flagged a correct program as "can reach the end
+    without returning", and the consequence was not merely a wasted repair
+    round: the block was then outranked by the model's own usage example, and
+    the example was what got submitted.
+    """
+    stack: list = list(loop.body) + list(loop.orelse)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.Break):
+            return True
+        if isinstance(
+            node,
+            (ast.For, ast.AsyncFor, ast.While, ast.FunctionDef,
+             ast.AsyncFunctionDef, ast.ClassDef),
+        ):
+            continue  # a `break` in there belongs to it, not to us
+        stack.extend(ast.iter_child_nodes(node))
     return False
 
 

@@ -4675,3 +4675,81 @@ def test_the_compiler_lookup_is_safe_to_race():
     finally:
         rust_compile.shutil.which = original
         rust_compile._rustc, rust_compile._looked = saved
+
+
+# --- a usage example is not an answer ------------------------------------ #
+# Models append `print(g(5))` after the program. That demo is perfectly
+# plausible Python, so the moment the block above it picks up ANY defect --
+# a genuine truncation, or a false positive -- the demo becomes the last
+# plausible block and wins. What gets submitted is a one-liner that calls a
+# function nobody defined, and it is archived as "the solution".
+
+
+def test_a_usage_example_never_outranks_the_program_it_demonstrates():
+    """Measured: a correct program whose entrypoint ends in `while True:` was
+    replaced by its own `print(g(...))` example, submitted, and archived."""
+    answer = (
+        "def g(grid):\n"
+        "    seen = set()\n"
+        "    while True:\n"
+        "        for row in grid:\n"
+        "            if row in seen:\n"
+        "                break\n"
+        "            seen.add(row)\n"
+        "        if len(seen) == len(grid):\n"
+        "            return sorted(seen)\n"
+    )
+    reply = f"Here:\n\n```python\n{answer}```\n\nUsage:\n\n```python\nprint(g([1, 2, 3]))\n```\n"
+    got = extract_code(reply, "g")
+    assert got.strip().startswith("def g(grid)"), f"submitted the demo: {got!r}"
+
+
+def test_a_truncated_attempt_still_beats_the_demo_beneath_it():
+    """The fallback exists to hand the repair round a real attempt. A demo
+    teaches it nothing — it would be told the code does not define `g`, about a
+    block that was never trying to."""
+    cut = "def g(n):\n    total = 0\n    for d in str(n):\n        total += int(d)\n"
+    reply = f"```python\n{cut}```\n\n```python\nprint(g(5))\n```\n"
+    got = extract_code(reply, "g")
+    assert got.strip().startswith("def g(n)"), f"kept the demo instead: {got!r}"
+    assert "without returning" in (python_defect(got, "g") or ""), (
+        "the repair round would hear about the wrong block"
+    )
+
+
+def test_a_break_inside_a_nested_loop_does_not_end_the_outer_while():
+    """`ast.walk` sees every break in the subtree, and an inner loop's break
+    exits the INNER loop. Counting it marked a correct program as truncated."""
+    nested = (
+        "def g(n):\n"
+        "    while True:\n"
+        "        for d in range(n):\n"
+        "            if d > 2:\n"
+        "                break\n"
+        "        return n\n"
+    )
+    assert python_defect(nested, "g") is None, python_defect(nested, "g")
+    # ...and a break that really is bound to the `while` still counts.
+    escapes = "def g(n):\n    while True:\n        n -= 1\n        if n < 0:\n            break\n"
+    assert "without returning" in (python_defect(escapes, "g") or "")
+
+
+def test_the_fallback_still_refuses_a_block_that_is_not_source_at_all():
+    """Preferring the block that defines the entrypoint must not become a way
+    for a tool call to get in: `plausible_source` is still the gate."""
+    tool = '{"command": "cat > main.rs << \'EOF\'\\nfn main() {}"}'
+    assert extract_code(f"```\n{tool}\n```", "g") == ""
+    assert extract_code(f"```\n{tool}\n```", "main", "rust") == ""
+
+
+def test_defines_reads_a_definition_out_of_source_too_cut_to_parse():
+    """A truncation lands at the END of an answer, so the `def` line survives it.
+    Without that path a half-written program loses to any demo beside it."""
+    from solvers.prompts import _defines
+
+    assert _defines("def g(n):\n    return {", "g") is True   # unparseable
+    assert _defines("async def g(n):\n    x = [", "g") is True
+    assert _defines("def other(n):\n    return {", "g") is False
+    assert _defines("g = lambda n: n", "g") is True
+    assert _defines("fn main() {\n    let x =", "main", "rust") is True
+    assert _defines("let x = 1;", "main", "rust") is False
