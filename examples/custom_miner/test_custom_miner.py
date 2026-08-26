@@ -380,6 +380,20 @@ async def _use_dead_tab(pool: BrowserFleet) -> None:
         LeaseOnly(), max_attempts=1, safety_margin_s=0, max_budget_s=30,
         second_opinion=False,   # this is about tab replacement, not two models
     ).solve_task(DIGITS, timeout_s=30)
+    await _settle(pool)
+
+
+async def _settle(pool: BrowserFleet) -> None:
+    """Wait for the fleet's background replacements to land.
+
+    `release()` deliberately does not wait for one (it runs in the solver's
+    `finally`, past the deadline). Production has an event loop that keeps
+    running afterwards; a test that ends at `asyncio.run` does not, so the wait
+    has to be explicit here or these assertions would be measuring scheduling
+    luck rather than the fleet.
+    """
+    while pool._pending:
+        await asyncio.gather(*list(pool._pending), return_exceptions=True)
 
 
 @SITES
@@ -1053,7 +1067,6 @@ def test_shutdown_is_armed_before_the_slow_attach_not_after():
     """A supervisor restarting while the miner is attaching to eight browsers
     would otherwise raise KeyboardInterrupt straight through the cleanup and
     leave the tabs already opened behind."""
-    import inspect
     from pathlib import Path
 
     serve = Path(__file__).resolve().parent.joinpath("run_miner.py").read_text()
@@ -3670,7 +3683,6 @@ def test_a_compile_failure_becomes_a_defect_the_repair_round_can_use():
     that can make the loop ask again at all."""
     _rustc_or_skip()
     from solvers.prompts import build_repair_prompt
-    from solvers.verify import VerifyingSolver
 
     solver = _solver([])
     task = SimpleNamespace(
@@ -4230,3 +4242,1189 @@ def test_a_hostile_problem_id_cannot_place_the_record_outside_the_archive(tmp_pa
         assert written is not None and written.parent == tmp_path, (
             f"{hostile!r} escaped to {written}"
         )
+
+
+# --- nothing may outlive the deadline it was given ----------------------- #
+# Playwright auto-waits 30 SECONDS on a locator unless told otherwise, and
+# `set_default_timeout` is never called anywhere in this miner. Measured here
+# against a node that was resolved and then removed -- the ordinary shape of a
+# chat page still settling after an answer:
+#
+#     button.inner_text()   raised after 30.0s
+#     node.inner_text()     raised after 30.0s
+#     code.text_content()   raised after 30.0s
+#
+# `_submit` has been bounded against that since it was written. The rest of
+# `send` was not, and the tail is the dangerous half: it runs AFTER the read
+# loop has hit the deadline, so every second it spends is a second the solve
+# has already promised away. `handle_request` wraps the whole solve in an
+# `asyncio.wait_for` and answers 504 -- nothing at all -- rather than late, so
+# an unbounded tail does not deliver the answer slowly. It destroys it.
+
+
+def _answered_page(code="def pong():\n    return 'pong'"):
+    """A page that renders one finished answer as soon as send is clicked."""
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [_Node(code=[code])])
+    return page
+
+
+def _forever(*_a, **_kw):
+    async def hang():
+        await asyncio.sleep(3600)
+
+    return hang()
+
+
+def test_a_wedged_copy_control_cannot_spend_the_answer_it_was_checking(monkeypatch):
+    """The copy phase runs past the deadline to improve an answer already in
+    hand. Unbounded it can wait 30s per button on a page that is mid-rerender,
+    and the answer it was polishing is thrown away by the deadline above it."""
+    from solvers import browser_pool
+
+    monkeypatch.setattr(_Tab, "_copy_phase", _forever)
+    page = _answered_page()
+    tab = _tab(page, _site(copy=("#copy",)))
+    started = time.monotonic()
+    reply = asyncio.run(tab.send("solve it", 1.0))
+    spent = time.monotonic() - started
+    assert spent < browser_pool.COPY_PHASE_TIMEOUT_S + 4.0, f"tail ran {spent:.1f}s"
+    assert "return 'pong'" in reply, f"scraped answer lost to the copy phase: {reply!r}"
+
+
+def test_a_wedged_stream_check_cannot_spend_the_answer_it_was_checking(monkeypatch):
+    """Same hazard, second phase. The stream is a cross-check on an answer the
+    page already gave; failing to finish it must cost the check, not the
+    answer."""
+    from solvers import browser_pool
+
+    monkeypatch.setattr(_Tab, "_reconcile_stream", _forever)
+    page = _answered_page()
+    tab = _tab(page, _site(stream=True))
+    started = time.monotonic()
+    reply = asyncio.run(tab.send("solve it", 1.0))
+    spent = time.monotonic() - started
+    assert spent < browser_pool.STREAM_PHASE_TIMEOUT_S + 4.0, f"tail ran {spent:.1f}s"
+    assert "return 'pong'" in reply, f"answer lost to the stream check: {reply!r}"
+
+
+def test_a_wedged_post_mortem_cannot_be_the_slowest_thing_in_the_solve(capsys, monkeypatch):
+    """`_explain_empty` exists to explain a zero. It is a LOG LINE. Unbounded it
+    can outlast everything that produced the zero -- and it was not even inside
+    a try, so a raise from its final `inner_text` propagated out of `send`."""
+    from solvers import browser_pool
+
+    monkeypatch.setattr(_Tab, "_explain_empty", _forever)
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    started = time.monotonic()
+    reply = asyncio.run(_tab(page, _site()).send("solve it", 1.0))
+    spent = time.monotonic() - started
+    assert reply == ""
+    assert spent < browser_pool.POSTMORTEM_TIMEOUT_S + 4.0, f"post-mortem ran {spent:.1f}s"
+    assert "did not answer in time" in capsys.readouterr().out
+
+
+def test_the_whole_tail_fits_inside_the_solvers_safety_margin():
+    """Arithmetic, not behaviour, and it is the assumption the three bounds
+    above are chosen against: they run after the budget is gone, so their sum
+    has to fit in what VerifyingSolver held back -- with room left for the last
+    grade and the tab close."""
+    from solvers import browser_pool
+
+    tail = (
+        browser_pool.COPY_PHASE_TIMEOUT_S
+        + browser_pool.STREAM_PHASE_TIMEOUT_S
+        + browser_pool.POSTMORTEM_TIMEOUT_S
+    )
+    assert tail < 15.0, f"the tail ({tail}s) can outlast the default safety margin"
+
+
+def test_a_wedged_snapshot_cannot_eat_the_budget_before_a_prompt_is_even_sent():
+    """`_fingerprint` ends in a `get_attribute` on the last message, which is
+    the 30s auto-wait again -- and it ran OUTSIDE the submit bound. A page that
+    re-renders as the prompt goes out could burn the whole read budget before a
+    single poll, on a conversation that would have answered."""
+
+    class _Wedged(_FakePage):
+        def locator(self, selector):
+            if selector == "#assistant":
+                return _Loc(self, selector, [_Slow()])
+            return super().locator(selector)
+
+    class _Slow(_Node):
+        def __init__(self):
+            super().__init__()
+
+        async def get_attribute(self, name):
+            await asyncio.sleep(3600)
+
+    page = _Wedged({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    site = _site(message_id_attr="data-id")
+    tab = _tab(page, site)
+    started = time.monotonic()
+    reply = asyncio.run(tab.send("solve it", 1.0))
+    spent = time.monotonic() - started
+    # The submit budget floors at 5s; anything beyond that is the unbounded read.
+    assert spent < 12.0, f"the snapshot ran {spent:.1f}s"
+    assert reply == "" and tab.alive is False, "a wedged page must retire the tab"
+
+
+def test_open_turn_still_snapshots_before_it_submits():
+    """Bounding the snapshot moved it into a helper. The ORDER is the thing that
+    must survive: a floor taken after the prompt can already have this answer's
+    own stream record under it, and the reply would be rebuilt from its own
+    prompt."""
+    page = _answered_page()
+    tab = _tab(page, _site())
+    order: list[str] = []
+    tab._fingerprint = lambda: _record(order, "fingerprint", (0, None))
+    tab._stream_seq = lambda: _record(order, "stream_seq", 7)
+    tab._submit = lambda text, ui_ms: _record(order, "submit", None)
+    before = asyncio.run(tab._open_turn("hello", 1000))
+    assert order == ["fingerprint", "stream_seq", "submit"], order
+    assert before == (0, None) and tab._stream_before == 7
+
+
+async def _record(log: list, name: str, value):
+    log.append(name)
+    return value
+
+
+# --- rebuilding capacity must not be billed to the solve that lost it ----- #
+# `release()` runs from the solver's `finally`, after the answer is in hand and
+# after the budget is spent. Building a tab means a new page, a navigation and
+# a wait for the composer -- `ready_timeout_ms` alone is 60 SECONDS -- and the
+# deadline above it is an `asyncio.wait_for` in `handle_request` that answers
+# 504 rather than late. Awaited there, the replacement would destroy the very
+# answer whose failure asked for it, and it is exactly the failing solves, the
+# ones with the least budget left, that reach this path.
+
+
+def _slow_pool(delay: float = 3600.0, site=None) -> BrowserFleet:
+    """A fleet whose `_spawn` takes as long as a real signed-in page can."""
+    site = site or chatgpt_site()
+    pool = _fleet(site)
+    pool._size = 1
+
+    async def spawn(context, browser, label):
+        await asyncio.sleep(delay)
+        tab = _Tab(pool, _DeadPage(), context, f"{label}-new", site=browser.site)
+        pool._tabs.append(tab)
+        return tab
+
+    pool._spawn = spawn
+    return pool
+
+
+def test_replacing_a_dead_tab_does_not_hold_up_the_answer():
+    pool = _slow_pool()
+
+    async def go():
+        dead = _Tab(pool, _DeadPage(), object(), "dead#1", chatgpt_site())
+        dead.alive, dead.leased = False, True
+        pool._tabs.append(dead)
+        started = time.monotonic()
+        await pool.release(dead)
+        spent = time.monotonic() - started
+        pending = list(pool._pending)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        return spent, pending
+
+    spent, pending = asyncio.run(go())
+    assert spent < 1.0, f"release() waited {spent:.1f}s for the new tab to load"
+    assert pending, "the replacement was dropped instead of being handed off"
+    assert pool._lost == 1 and pool._size == 0, "book-keeping is not deferred"
+
+
+def test_a_replacement_still_lands_in_the_fleet_once_it_finishes_loading():
+    """Deferring it must not mean losing it: capacity has to come back, or the
+    fleet bleeds a tab on every failure until nothing is left."""
+    pool = _slow_pool(delay=0.01)
+
+    async def go():
+        dead = _Tab(pool, _DeadPage(), object(), "dead#1", chatgpt_site())
+        dead.alive, dead.leased = False, True
+        pool._tabs.append(dead)
+        await pool.release(dead)
+        await _settle(pool)
+
+    asyncio.run(go())
+    assert pool._free.qsize() == 1, "the replacement never reached the free queue"
+    assert pool._size == 1, f"capacity not restored: {pool._size}"
+
+
+def test_shutdown_does_not_leave_a_half_built_tab_open_in_your_browser():
+    """A replacement in flight during shutdown is a page this fleet opened,
+    signed in, that nothing else knows about — `_teardown` sweeps `_tabs`, and
+    the new tab is not in it until `_spawn` returns."""
+    pool = _slow_pool(delay=3600.0)
+    pool._pw = SimpleNamespace(stop=lambda: _done(None))
+
+    async def go():
+        dead = _Tab(pool, _DeadPage(), object(), "dead#1", chatgpt_site())
+        dead.alive, dead.leased = False, True
+        pool._tabs.append(dead)
+        await pool.release(dead)
+        spawn = next(iter(pool._pending), None)
+        assert spawn is not None, "nothing was spawned to cancel"
+        started = time.monotonic()
+        await asyncio.wait_for(pool.aclose(), timeout=10)
+        # Read the state HERE, inside the loop. Asserting after `asyncio.run`
+        # returns proves nothing: its own shutdown cancels whatever is left and
+        # the done-callback empties `_pending`, so a teardown that ignored the
+        # replacement entirely would look identical from outside.
+        return time.monotonic() - started, spawn.done(), list(pool._pending)
+
+    spent, finished, leftover = asyncio.run(go())
+    assert spent < 5.0, f"shutdown waited {spent:.1f}s on a replacement"
+    assert finished, "the replacement was still loading when the fleet went away"
+    assert leftover == [], f"a replacement outlived the fleet: {leftover}"
+    assert pool._tabs == [] and pool._size == 0
+
+
+def test_a_replacement_that_finishes_after_shutdown_is_closed_not_leaked():
+    """The other half of the race: the spawn completes before the cancellation
+    reaches it. `_teardown` has already swept `_tabs`, so this tab would stay
+    open in the operator's browser forever."""
+    pool = _fleet(chatgpt_site())
+    pool._size = 1
+    built: list = []
+
+    async def spawn(context, browser, label):
+        pool._closing = True          # shutdown ran while this was loading
+        tab = _Tab(pool, _FakePage({}), context, f"{label}-new", site=browser.site)
+        pool._tabs.append(tab)
+        built.append(tab)
+        return tab
+
+    pool._spawn = spawn
+
+    async def go():
+        dead = _Tab(pool, _DeadPage(), object(), "dead#1", chatgpt_site())
+        dead.alive, dead.leased = False, True
+        pool._tabs.append(dead)
+        await pool.release(dead)
+        await _settle(pool)
+
+    asyncio.run(go())
+    assert built and built[0]._page.closed, "the late replacement was left open"
+    assert pool._free.qsize() == 0, "a page that was just closed was queued as free"
+
+
+# --- grading is blocking work wearing an async coat ---------------------- #
+# `compile_defect` shells out to rustc and `_Grader.check` runs the validator's
+# own executor -- each a `subprocess.run` of seconds, and for the Docker backend
+# of a container start. Called straight from a coroutine they stop the event
+# loop dead, and the loop is not one solve's alone: the miner answers several
+# validators at once (`solve_slots` is a semaphore), and the deadline that
+# decides whether a solve is PAID is itself an `asyncio.wait_for` -- which
+# cannot fire on a loop that is not running.
+
+
+def test_grading_does_not_stop_the_world_for_every_other_solve():
+    """Measured before the fix, a 3s subprocess beside a 1.0s deadline:
+
+        the other solve's 1.0s deadline fired after  3.05s
+
+    Every concurrent solve is pushed past its cutoff by one Rust compile, and
+    each of those answers 504 with no answer at all."""
+    from solvers.verify import Candidate
+
+    solver = _solver([RIGHT])
+    solver._grade = lambda reply, task, left=None: time.sleep(1.0) or Candidate(
+        code="x = 1", raw=reply
+    )
+    late: list[float] = []
+
+    async def other_solve():
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(asyncio.sleep(30), timeout=0.2)
+        except asyncio.TimeoutError:
+            late.append(time.monotonic() - started)
+
+    async def go():
+        return await asyncio.gather(
+            other_solve(), solver._graded("reply", DIGITS, 30.0)
+        )
+
+    _, candidate = asyncio.run(go())
+    assert candidate.code == "x = 1", "the grade itself was lost"
+    assert late and late[0] < 0.6, (
+        f"a concurrent solve's 0.2s deadline fired after {late[0]:.2f}s — "
+        f"the event loop was blocked by grading"
+    )
+
+
+def test_a_grade_that_explodes_still_yields_the_answer_it_was_checking():
+    """Off-loop or not, the check is subordinate to the answer: a candidate that
+    cannot be graded is still a candidate, and an ungraded answer can pass the
+    hidden suite where nothing at all cannot."""
+    solver = _solver([RIGHT])
+
+    def boom(reply, task, left=None):
+        raise RuntimeError("executor gone")
+
+    solver._grade = boom
+    candidate = asyncio.run(solver._graded(RIGHT, DIGITS, 30.0))
+    assert "def g(n)" in candidate.code, f"answer lost with the grade: {candidate.code!r}"
+
+
+def test_the_executor_cache_is_built_once_even_under_concurrent_grades():
+    """Now reached from worker threads, and concurrently. Two threads missing
+    the cache together would each construct an executor — for the Docker backend
+    that is a container's worth of startup thrown away, on the one code path
+    whose entire reason for caching is that Docker startup is slow."""
+    import threading
+    from solvers.verify import _Grader
+
+    grader = _Grader()
+    built: list[int] = []
+    start = threading.Barrier(4)
+
+    def make(settings, language):
+        built.append(1)
+        time.sleep(0.05)          # widen the window a real construction would have
+        return object()
+
+    import rlvr.execution.executor as ex_mod
+    original = ex_mod.get_executor
+    ex_mod.get_executor = make
+    try:
+        seen: list = []
+
+        def worker():
+            start.wait()
+            seen.append(grader.executor("python"))
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        ex_mod.get_executor = original
+
+    assert len(built) == 1, f"built the executor {len(built)} times"
+    assert len(set(map(id, seen))) == 1, "different threads got different executors"
+
+
+def test_a_compile_check_cannot_outlive_the_answer_it_is_checking():
+    """`COMPILE_TIMEOUT_S` defaults to 25s — a hang guard sized for a compiler,
+    not for a deadline. The solver's whole safety margin is 15s, and overrunning
+    it does not deliver the answer late, it discards it."""
+    from solvers import rust_compile
+
+    seen: dict = {}
+
+    class _Done:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd, **kw):
+        seen.update(kw)
+        return _Done()
+
+    original_run, original_path = rust_compile.subprocess.run, rust_compile.rustc_path
+    rust_compile.subprocess.run = fake_run
+    rust_compile.rustc_path = lambda: "/usr/bin/rustc"
+    try:
+        rust_compile.compile_defect("fn main() {}", 3.0)
+        assert seen["timeout"] == 3.0, f"budget ignored: {seen['timeout']}"
+        rust_compile.compile_defect("fn main() {}", -5.0)
+        assert seen["timeout"] == 1.0, "a spent budget must still allow one try"
+        rust_compile.compile_defect("fn main() {}", 9_999.0)
+        assert seen["timeout"] == rust_compile.COMPILE_TIMEOUT_S, "the hang guard was raised"
+        rust_compile.compile_defect("fn main() {}")
+        assert seen["timeout"] == rust_compile.COMPILE_TIMEOUT_S, "no budget, no change"
+    finally:
+        rust_compile.subprocess.run = original_run
+        rust_compile.rustc_path = original_path
+
+
+def test_the_compiler_lookup_is_safe_to_race():
+    """`rustc_path` caches in module globals and is now called from worker
+    threads. `_looked` is read OUTSIDE the lock, so setting it before the lookup
+    finishes would let a second thread see True and take `_rustc` — still None —
+    as the answer, silently skipping the compile check on that solve."""
+    from solvers import rust_compile
+
+    saved = (rust_compile._rustc, rust_compile._looked)
+    rust_compile._rustc, rust_compile._looked = None, False
+    observed: list[bool] = []
+
+    def slow_which(_name):
+        observed.append(rust_compile._looked)
+        return "/usr/bin/rustc"
+
+    original = rust_compile.shutil.which
+    rust_compile.shutil.which = slow_which
+    try:
+        assert rust_compile.rustc_path() == "/usr/bin/rustc"
+        assert observed == [False], (
+            "`_looked` was already True while the lookup was still running — "
+            "a racing thread would have read `_rustc` as None"
+        )
+        assert rust_compile._looked is True
+        rust_compile.rustc_path()
+        assert observed == [False], "the second call did not use the cache"
+    finally:
+        rust_compile.shutil.which = original
+        rust_compile._rustc, rust_compile._looked = saved
+
+
+# --- a usage example is not an answer ------------------------------------ #
+# Models append `print(g(5))` after the program. That demo is perfectly
+# plausible Python, so the moment the block above it picks up ANY defect --
+# a genuine truncation, or a false positive -- the demo becomes the last
+# plausible block and wins. What gets submitted is a one-liner that calls a
+# function nobody defined, and it is archived as "the solution".
+
+
+def test_a_usage_example_never_outranks_the_program_it_demonstrates():
+    """Measured: a correct program whose entrypoint ends in `while True:` was
+    replaced by its own `print(g(...))` example, submitted, and archived."""
+    answer = (
+        "def g(grid):\n"
+        "    seen = set()\n"
+        "    while True:\n"
+        "        for row in grid:\n"
+        "            if row in seen:\n"
+        "                break\n"
+        "            seen.add(row)\n"
+        "        if len(seen) == len(grid):\n"
+        "            return sorted(seen)\n"
+    )
+    reply = f"Here:\n\n```python\n{answer}```\n\nUsage:\n\n```python\nprint(g([1, 2, 3]))\n```\n"
+    got = extract_code(reply, "g")
+    assert got.strip().startswith("def g(grid)"), f"submitted the demo: {got!r}"
+
+
+def test_a_truncated_attempt_still_beats_the_demo_beneath_it():
+    """The fallback exists to hand the repair round a real attempt. A demo
+    teaches it nothing — it would be told the code does not define `g`, about a
+    block that was never trying to."""
+    cut = "def g(n):\n    total = 0\n    for d in str(n):\n        total += int(d)\n"
+    reply = f"```python\n{cut}```\n\n```python\nprint(g(5))\n```\n"
+    got = extract_code(reply, "g")
+    assert got.strip().startswith("def g(n)"), f"kept the demo instead: {got!r}"
+    assert "without returning" in (python_defect(got, "g") or ""), (
+        "the repair round would hear about the wrong block"
+    )
+
+
+def test_a_break_inside_a_nested_loop_does_not_end_the_outer_while():
+    """`ast.walk` sees every break in the subtree, and an inner loop's break
+    exits the INNER loop. Counting it marked a correct program as truncated."""
+    nested = (
+        "def g(n):\n"
+        "    while True:\n"
+        "        for d in range(n):\n"
+        "            if d > 2:\n"
+        "                break\n"
+        "        return n\n"
+    )
+    assert python_defect(nested, "g") is None, python_defect(nested, "g")
+    # ...and a break that really is bound to the `while` still counts.
+    escapes = "def g(n):\n    while True:\n        n -= 1\n        if n < 0:\n            break\n"
+    assert "without returning" in (python_defect(escapes, "g") or "")
+
+
+def test_the_fallback_still_refuses_a_block_that_is_not_source_at_all():
+    """Preferring the block that defines the entrypoint must not become a way
+    for a tool call to get in: `plausible_source` is still the gate."""
+    tool = '{"command": "cat > main.rs << \'EOF\'\\nfn main() {}"}'
+    assert extract_code(f"```\n{tool}\n```", "g") == ""
+    assert extract_code(f"```\n{tool}\n```", "main", "rust") == ""
+
+
+def test_defines_reads_a_definition_out_of_source_too_cut_to_parse():
+    """A truncation lands at the END of an answer, so the `def` line survives it.
+    Without that path a half-written program loses to any demo beside it."""
+    from solvers.prompts import _defines
+
+    assert _defines("def g(n):\n    return {", "g") is True   # unparseable
+    assert _defines("async def g(n):\n    x = [", "g") is True
+    assert _defines("def other(n):\n    return {", "g") is False
+    assert _defines("g = lambda n: n", "g") is True
+    assert _defines("fn main() {\n    let x =", "main", "rust") is True
+    assert _defines("let x = 1;", "main", "rust") is False
+
+
+def test_the_examples_are_not_run_once_the_budget_is_already_gone(capsys):
+    """Each case gets VERIFY_TIMEOUT_S, in a subprocess or a container, and
+    after the last send there is nothing left to spend it from. `verified` never
+    reaches the validator — it feeds this process's cache and stats — so the
+    only thing the run could still buy is a repair round there is no time for.
+    The deadline above answers 504 rather than late, so the check would be paid
+    for with the answer it was checking."""
+    solver = _solver([RIGHT])
+    ran: list = []
+    solver._grader.check = lambda *a, **kw: ran.append(a) or (2, 2, [])
+
+    spent = solver._grade(RIGHT, DIGITS, -0.5)
+    assert ran == [], "the grader ran on a budget that was already spent"
+    assert spent.code.strip() and spent.defect is None, "the answer was lost with the check"
+    assert "unverified" in capsys.readouterr().out
+
+    # With budget left, and with none stated at all, it still runs.
+    assert solver._grade(RIGHT, DIGITS, 30.0).passed == 2
+    assert solver._grade(RIGHT, DIGITS).passed == 2
+    assert len(ran) == 2
+
+
+def test_a_win_is_not_credited_to_a_model_that_did_not_produce_it():
+    """`asked[-1]` was a proxy for the winner. A pass whose backend reports no
+    provider is absent from `asked` while still able to produce the winning
+    answer, and the credit then landed on the PREVIOUS model — in the one number
+    an operator reads to decide which account has started failing."""
+
+    class _Anonymous:
+        """First a named model that gets it wrong, then one that will not say
+        who it is and gets it right."""
+
+        def __init__(self):
+            self.opened = 0
+
+        async def open(self, avoid=None):
+            self.opened += 1
+            if self.opened == 1:
+                return _Chat([WRONG], provider="claude")
+            chat = _Chat([RIGHT])
+            del chat.provider          # reports nothing about itself
+            return chat
+
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(
+        _Anonymous(), max_attempts=1, safety_margin_s=0, max_budget_s=120
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.verified, "the second pass was supposed to win"
+    rows = solver.stats()["providers"]
+    assert rows["claude"]["asked"] == 1, rows
+    assert rows["claude"]["verified"] == 0, (
+        f"claude was credited with an answer it did not produce: {rows}"
+    )
+
+
+def test_a_winner_outside_the_asked_list_is_still_counted():
+    """`_note` used to index `_by_provider[winner]` directly, on the assumption
+    that a winner is always someone who was asked. It is one KeyError away from
+    losing a whole solve to the stats line at the end of it."""
+    solver = _solver([RIGHT])
+    solver._note("chatgpt", ["claude"])
+    rows = solver.stats()["providers"]
+    assert rows["claude"] == {"asked": 1, "verified": 0}, rows
+    assert rows["chatgpt"] == {"asked": 0, "verified": 1}, rows
+
+
+def test_an_answer_that_lands_just_after_the_deadline_is_still_submitted(capsys):
+    """`page_blocks` is fetched AFTER the read loop gave up, so a non-empty one
+    means the reply rendered in the moments between the last poll and now. The
+    rescue used to require the page to be empty before it looked anywhere, so
+    that reading was discarded: measured, `best=""` beside
+    `page_blocks=["def g(n): ..."]` returned "" — with the answer sitting in a
+    list in the function's own arguments."""
+    site = _site(stream=True)
+    tab = _tab(None, site)
+    tab._sent = "solve it"
+
+    async def nothing_on_the_wire():
+        return "prose the model emitted, with no fenced block in it"
+
+    tab._streamed_markdown = nothing_on_the_wire
+    got = asyncio.run(tab._reconcile_stream((0, None), "", ["def g(n):\n    return n"]))
+    assert "def g(n)" in got, f"threw away the page's late answer: {got!r}"
+    assert "just after it" in capsys.readouterr().out
+
+
+def test_the_wire_is_used_when_the_page_has_nothing_at_all():
+    """The other order: no page blocks, an answer on the wire."""
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "solve it"
+
+    async def wire():
+        return "here:\n\n```python\ndef g(n):\n    return n\n```\n"
+
+    tab._streamed_markdown = wire
+    got = asyncio.run(tab._reconcile_stream((0, None), "", []))
+    assert "def g(n)" in got, f"the wire rescue stopped working: {got!r}"
+
+
+def test_nothing_anywhere_still_submits_nothing(capsys):
+    """The streamed text is never handed back raw — a chat stream carries the
+    conversation, and two of the miner's own prompts reached a validator as Rust
+    programs that way."""
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "solve it"
+
+    async def prose():
+        return "I need more information about the input format."
+
+    tab._streamed_markdown = prose
+    assert asyncio.run(tab._reconcile_stream((0, None), "", [])) == ""
+    assert "Nothing to submit" in capsys.readouterr().out
+
+
+# --- one reader for fenced markdown, not two ----------------------------- #
+# `browser_pool` scanned fences line by line while `extract_code` matched them
+# with a regular expression, and the two disagreed about where a block ends.
+# Each disagreement below was measured losing a whole answer.
+
+
+def _grades(reply, entry="g", lang="python"):
+    from solvers.prompts import rust_defect
+
+    code = extract_code(reply, entry, lang)
+    defect = rust_defect(code) if lang == "rust" else python_defect(code, entry)
+    return code, defect
+
+
+def test_a_closing_fence_has_to_be_a_whole_line():
+    """`fence = "```"` inside a program is not the end of the block. The regex
+    matched its backticks anywhere and truncated the answer at that line."""
+    prog = 'def g(t):\n    fence = "```"\n    return t.count(fence)'
+    code, defect = _grades(f"Here:\n\n```python\n{prog}\n```\n")
+    assert defect is None, defect
+    assert code.strip() == prog, f"truncated at the inner fence: {code!r}"
+
+
+def test_a_reply_cut_off_mid_block_keeps_the_program_it_did_write():
+    """The commonest thing a deadline does. With no closing fence the regex
+    matched nothing, the extractor fell through to its all-prose path, and a
+    fully written program was returned as ''."""
+    code, defect = _grades(
+        "Here you go:\n\n```python\ndef g(n):\n    return sum(int(c) for c in str(n))"
+    )
+    assert defect is None, defect
+    assert code.strip().startswith("def g(n)"), f"lost the answer: {code!r}"
+    assert "Here you go" not in code, "the prose came with it"
+
+
+def test_tilde_fences_are_fences():
+    """CommonMark says so, and a model that uses them is not wrong."""
+    code, defect = _grades("~~~python\ndef g(n):\n    return len(str(n))\n~~~")
+    assert defect is None and code.strip().startswith("def g(n)"), code
+
+
+def test_a_four_backtick_fence_keeps_the_three_backticks_inside_it():
+    """Markdown's rule for a block that contains a fence. The regex's trailing
+    backtick run ate the wrong one and left a stray fence in the code."""
+    prog = 'FENCE = """\n```\n"""\n\n\ndef g(t):\n    return t.count(FENCE.strip())'
+    code, defect = _grades(f"````python\n{prog}\n````")
+    assert defect is None, defect
+    assert code.strip() == prog, f"the fence rule was not applied: {code!r}"
+    scope: dict = {}
+    exec(compile(code, "<test>", "exec"), scope)
+    assert scope["g"]("``` and ``` again") == 2
+
+
+def test_both_readers_are_now_the_same_function():
+    """The point of the change: two readers of one markdown format that
+    disagree is a bug waiting for the reply that tells them apart."""
+    from solvers import browser_pool
+    from solvers.prompts import fenced_blocks
+
+    assert browser_pool._fenced_blocks is fenced_blocks
+
+
+# --- an answer split across two blocks ----------------------------------- #
+# A model told to send ONE code block sometimes sends its imports in a block of
+# their own. Taking the block that defines the entrypoint then leaves the
+# imports behind, and the result is worse than a visibly broken answer: it
+# parses, it defines the right function, `python_defect` passes it, and every
+# hidden test fails with `NameError: name 'math' is not defined` while nothing
+# anywhere says so.
+
+
+def _runs(reply, entry="g", args=(16,)):
+    """Extract, then actually run it the way the grader will."""
+    code = extract_code(reply, entry)
+    assert python_defect(code, entry) is None, python_defect(code, entry)
+    scope: dict = {}
+    exec(compile(code, "<test>", "exec"), scope)
+    return code, scope[entry](*args)
+
+
+def test_imports_left_in_their_own_block_are_carried_to_the_answer():
+    code, value = _runs("```python\nimport math\n```\n\n"
+                        "```python\ndef g(n):\n    return math.isqrt(n)\n```")
+    assert value == 4, value
+    assert code.startswith("import math"), code
+
+
+def test_only_the_imports_the_answer_actually_needs_are_carried():
+    code, value = _runs("```python\nimport math\nimport json\n```\n\n"
+                        "```python\ndef g(n):\n    return math.isqrt(n)\n```")
+    assert value == 4 and "import json" not in code, code
+
+
+def test_a_from_import_is_carried_the_same_way():
+    code, value = _runs(
+        "```python\nfrom collections import Counter\n```\n\n"
+        "```python\ndef g(s):\n    return len(Counter(s))\n```",
+        args=("aab",),
+    )
+    assert value == 2 and "from collections import Counter" in code, code
+
+
+def test_an_import_the_answer_does_not_use_is_never_dragged_in():
+    """The dangerous direction. `import numpy` prepended to a self-contained
+    answer turns a working program into an ImportError on every hidden test."""
+    code, value = _runs("```python\nimport numpy\n```\n\n"
+                        "```python\ndef g(n):\n    return n * 2\n```", args=(3,))
+    assert value == 6 and "numpy" not in code, code
+
+
+def test_only_the_import_lines_are_taken_never_the_code_beside_them():
+    """The safety property. A header block that also RUNS something — a
+    `sys.setrecursionlimit` call, a `print` — still yields its imports, and the
+    statement that would execute at import time is left exactly where it is."""
+    code, value = _runs("```python\nprint('setting up')\nimport math\n```\n\n"
+                        "```python\ndef g(n):\n    return math.isqrt(n)\n```")
+    assert value == 4, value
+    assert "import math" in code, "the import was lost with the block around it"
+    assert "print(" not in code, f"a running statement was prepended: {code!r}"
+
+
+def test_a_block_with_no_imports_at_all_contributes_nothing():
+    code, value = _runs("```python\nprint('setting up')\n```\n\n"
+                        "```python\ndef g(n):\n    return n + 1\n```", args=(1,))
+    assert value == 2 and "print(" not in code, code
+
+
+def test_a_local_name_that_shadows_a_module_is_not_a_missing_import():
+    code, value = _runs("```python\nimport math\n```\n\n"
+                        "```python\ndef g(n):\n    math = 2\n    return n * math\n```",
+                        args=(3,))
+    assert value == 6 and "import math" not in code, code
+
+
+def test_carrying_imports_does_not_resurrect_the_usage_demo():
+    """The two rules have to hold together: take the block that defines the
+    entrypoint, and give it the imports it needs — not the demo below it."""
+    code, value = _runs("```python\nimport math\n```\n\n"
+                        "```python\ndef g(n):\n    return math.isqrt(n)\n```\n\n"
+                        "```python\nprint(g(16))\n```")
+    assert value == 4 and "print(g(" not in code, code
+
+
+def test_rust_is_left_to_its_compiler():
+    """`use` has the same shape, but a Rust answer is put through rustc, which
+    says so in a message a repair round can act on."""
+    got = extract_code("```rust\nuse std::io;\n```\n\n"
+                       "```rust\nfn main() {\n    println!(\"x\");\n}\n```", "main", "rust")
+    assert got.strip().startswith("fn main()"), got
+
+
+def test_a_fence_that_ends_a_line_of_prose_still_opens_a_block():
+    """Markdown says a fence opens a line, and a model that writes
+    `Here you go: ```python` has broken that rule — but it has still answered.
+    Requiring the line to START with the fence dropped that answer entirely:
+    no block found, so the extractor fell through to its all-prose path and
+    returned "". Caught by this suite when the reader was unified."""
+    ans = "def g(n):\n    return sum(int(c) for c in str(n))"
+    for reply in (
+        f"I will explain at length. ```python\n{ans}\n```",
+        f"Here you go: ```\n{ans}\n```",
+    ):
+        code, defect = _grades(reply)
+        assert defect is None, f"{reply[:30]!r}: {defect}"
+        assert code.strip() == ans, code
+
+
+def test_inline_backticks_in_a_sentence_do_not_open_a_block():
+    """The other side of that tolerance. A fence run mid-sentence, with prose
+    after it, would swallow the paragraph beneath — and the answer with it."""
+    ans = "def g(n):\n    return sum(int(c) for c in str(n))"
+    code, defect = _grades(f"Use ```code``` inline.\n\nThen:\n\n```python\n{ans}\n```")
+    assert defect is None and code.strip() == ans, code
+    assert extract_code("You can wrap it in ```fences``` if you like.", "g") == ""
+
+
+def test_an_indented_fence_and_a_spaced_info_string_are_still_fences():
+    ans = "def g(n):\n    return len(str(n))"
+    assert _grades(f"  ```python\n{ans}\n  ```")[1] is None
+    assert _grades(f"``` python\n{ans}\n```")[1] is None
+
+
+def test_a_star_import_does_not_hide_a_genuinely_missing_module():
+    """Treating `import *` as binding everything looked like the cautious
+    choice and cost a carry: a block holding `from collections import *` beside
+    a use of `math` reported nothing missing, the `math` split into an earlier
+    block was left behind, and every hidden test failed on NameError."""
+    code, value = _runs(
+        "```python\nimport math\n```\n\n"
+        "```python\nfrom collections import *\ndef g(n):\n    return math.isqrt(n)\n```"
+    )
+    assert value == 4, value
+    assert "import math" in code, code
+
+
+def test_a_star_import_is_never_itself_carried():
+    """The other half: `from x import *` binds names this cannot enumerate, so
+    it can never be the statement that answers a missing name."""
+    from solvers.prompts import _import_bindings
+
+    assert _import_bindings("from collections import *") == {}
+    assert _import_bindings("import math\nfrom os import *") == {}
+
+
+# --------------------------------------------------------------------------- #
+# The local rehearsal: one real problem, solved through the miner's own code.
+#
+# What is under test here is mostly that it does NOT reimplement the miner. A
+# rehearsal that solved the problem its own way would agree with the miner
+# right up until the day they diverged, and would then report success about
+# code nobody runs. So these pin the path: the request is signed, it goes
+# through `handle_request`, the answer comes back through `fit_response`, and
+# the archive is written by `save_solution` — the same objects a validator's
+# request meets.
+# --------------------------------------------------------------------------- #
+def _rehearsal_args(**kw):
+    import argparse
+
+    base = dict(sample="python", source_file=None, lease=False,
+                insecure=False, statement=False, show=0)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def _rehearsal_solver(reply, provider="claude"):
+    """A backend that answers with `reply`, so the rehearsal needs no browser."""
+    class _Chat:
+        def __init__(self):
+            self.provider = provider
+            self.asked: list[str] = []
+
+        async def send(self, text, timeout_s):
+            self.asked.append(text)
+            return reply
+
+        async def close(self): pass
+
+    class _Backend:
+        def __init__(self): self.chats: list[_Chat] = []
+        async def open(self, avoid=None):
+            chat = _Chat()
+            self.chats.append(chat)
+            return chat
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    backend = _Backend()
+
+    def factory():
+        return VerifyingSolver(backend, max_attempts=1, safety_margin_s=0,
+                               max_budget_s=60, second_opinion=False)
+
+    return factory, backend
+
+
+RIGHT_RUN = """Here you go.
+
+```python
+def longest_run(values):
+    best = 0
+    run = 0
+    previous = object()
+    for value in values:
+        run = run + 1 if run and value == previous else 1
+        previous = value
+        best = max(best, run)
+    return best
+```
+"""
+
+
+def test_the_rehearsal_solves_a_real_problem_and_says_it_would_score(tmp_path, capsys):
+    from solvers import rehearse
+
+    factory, backend = _rehearsal_solver(RIGHT_RUN)
+    code = asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=factory))
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "SCORES: passed all" in out, out
+    # The MINER'S prompt reached the model, not one the rehearsal invented.
+    assert backend.chats and "longest run" in backend.chats[0].asked[0]
+    assert "<output>" in backend.chats[0].asked[0], "not the miner's own prompt"
+
+
+def test_the_rehearsal_writes_the_solution_to_a_file(tmp_path, monkeypatch, capsys):
+    """The archive is written by the miner's own `save_solution`, so a rehearsal
+    leaves the same evidence a live solve does — including the empty file that
+    records an answer of silence."""
+    from solvers import rehearse
+
+    monkeypatch.setenv("SOLVER_SOLUTION_DIR", str(tmp_path))
+    factory, _ = _rehearsal_solver(RIGHT_RUN)
+    asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=factory))
+    written = sorted(p.name for p in tmp_path.iterdir())
+    assert written == ["rehearsal-python-1.json", "rehearsal-python-1.py"], written
+    assert "def longest_run" in (tmp_path / "rehearsal-python-1.py").read_text()
+    record = json.loads((tmp_path / "rehearsal-python-1.json").read_text())
+    assert record["request"]["entrypoint"] == "longest_run"
+    assert "def longest_run" in record["response"]["code"]
+
+
+def test_a_rehearsal_that_answers_with_prose_leaves_an_empty_file(tmp_path, monkeypatch, capsys):
+    from solvers import rehearse
+
+    monkeypatch.setenv("SOLVER_SOLUTION_DIR", str(tmp_path))
+    factory, _ = _rehearsal_solver("Could you clarify whether the list can nest?")
+    code = asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=factory))
+    out = capsys.readouterr().out
+    assert code == 1 and "DOES NOT SCORE: nothing was submitted" in out, out
+    assert (tmp_path / "rehearsal-python-1.py").read_text() == ""
+
+
+def test_the_hidden_cases_catch_an_answer_that_passed_every_example(tmp_path, capsys):
+    """The reason the samples carry a hidden suite at all. This answer passes
+    both public examples, so the miner's own local check reports `verified=True`
+    — and it is still a zero, because the statement promises something about the
+    empty list that no example shows. That gap is invisible to every check the
+    miner has, and it is the commonest shape of a wrong answer."""
+    from solvers import rehearse
+
+    skimmed = (
+        "```python\n"
+        "def longest_run(values):\n"
+        "    best = 1\n"
+        "    run = 1\n"
+        "    for i in range(1, len(values)):\n"
+        "        run = run + 1 if values[i] == values[i - 1] else 1\n"
+        "        best = max(best, run)\n"
+        "    return best\n"
+        "```"
+    )
+    factory, _ = _rehearsal_solver(skimmed)
+    code = asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=factory))
+    out = capsys.readouterr().out
+    assert "verified=True" in out, "the miner's own check should have been happy"
+    assert code == 1, out
+    assert "DOES NOT SCORE: passed 7/8" in out, out
+    assert "longest_run(*[[]]" in out, "it should name the case that failed"
+
+
+def test_the_rehearsal_replays_an_archived_request(tmp_path, monkeypatch, capsys):
+    """`--from` takes what `save_exchange` writes, so the natural thing to hand
+    it is the record of a solve that went wrong."""
+    from solvers import rehearse
+    from solution_archive import save_exchange
+
+    monkeypatch.setenv("SOLVER_SOLUTION_DIR", str(tmp_path))
+    request = TaskRequest(
+        problem_id="replayed-1", language="python", statement=DIGITS.statement,
+        entrypoint="g", public_examples=[TestCase(args=[12345], kwargs={}, expected=15)],
+    )
+    record = save_exchange("replayed-1", request.model_dump(mode="json"),
+                           {"problem_id": "replayed-1", "code": "", "raw_response": ""},
+                           tmp_path)
+    factory, backend = _rehearsal_solver(RIGHT)
+    code = asyncio.run(
+        rehearse.run(_rehearsal_args(source_file=str(record)), solver_factory=factory)
+    )
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "problem replayed-1" in out and "SCORES" in out, out
+    # An archive has no hidden suite in it, and saying so is the point.
+    assert "only the public examples" in out, out
+
+
+def test_replaying_a_bare_task_request_works_too():
+    """A validator's own logs hold the request without the answer beside it."""
+    from solvers import rehearse
+
+    path = Path(tempfile.mkdtemp()) / "bare.json"
+    path.write_text(TaskRequest(
+        problem_id="bare-1", language="python", statement="Return n.",
+        entrypoint="g",
+    ).model_dump_json())
+    problem = rehearse._from_file(str(path))
+    assert problem.request.problem_id == "bare-1"
+    assert "only the public examples" in problem.tests_are
+
+
+def test_an_archive_with_extra_fields_is_not_a_validation_error():
+    """`TaskRequest` forbids extras, and an archived record has more in it than
+    a request. A confusing pydantic error is a poor way to say so."""
+    from solvers import rehearse
+
+    path = Path(tempfile.mkdtemp()) / "fat.json"
+    path.write_text(json.dumps({
+        "problem_id": "fat-1",
+        "request": {
+            "problem_id": "fat-1", "language": "python", "statement": "Return n.",
+            "entrypoint": "g", "public_examples": [], "deadline_s": 90.0,
+            "challenge_id": "not part of a TaskRequest", "leased_at": 1.0,
+        },
+        "response": {"code": "", "raw_response": ""},
+    }))
+    problem = rehearse._from_file(str(path))
+    assert problem.request.problem_id == "fat-1" and problem.request.deadline_s == 90.0
+
+
+def test_a_rust_answer_that_will_not_build_is_a_failure_not_an_unknown(capsys):
+    """A missing Docker daemon means the tests cannot run, which is an unknown.
+    A program that will not COMPILE is not an unknown — it is a zero, and
+    reporting it as unknown hides the most definite failure there is behind a
+    note about the operator's docker socket."""
+    _rustc_or_skip()
+    from solvers import rehearse
+
+    broken = '```rust\nfn main() {\n    let x: i32 = "not a number";\n    println!("{}", x)\n}\n```'
+    factory, _ = _rehearsal_solver(broken)
+    code = asyncio.run(rehearse.run(_rehearsal_args(sample="rust"), solver_factory=factory))
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "DOES NOT SCORE" in out and "does not compile" in out, out
+
+
+def test_an_unknown_sample_names_the_ones_that_exist():
+    from solvers import rehearse
+
+    with pytest.raises(SystemExit) as raised:
+        rehearse._from_sample("cobol")
+    assert "python" in str(raised.value) and "rust" in str(raised.value)
+
+
+def test_every_sample_is_a_valid_request_whose_examples_are_a_strict_subset():
+    """The samples only mean something if the hidden suite really is hidden:
+    "passed the examples" and "would have scored" have to be able to differ."""
+    from solvers.samples import SAMPLES
+
+    for name, sample in SAMPLES.items():
+        request = sample.request()
+        assert request.entrypoint and request.statement.strip(), name
+        assert request.public_examples, f"{name} shows the model nothing"
+        assert len(sample.hidden_tests()) > len(request.public_examples), (
+            f"{name} has no hidden cases, so it cannot tell a skimmed answer apart"
+        )
+
+
+def test_the_rehearsal_goes_through_the_signed_handler_not_a_shortcut(monkeypatch, capsys):
+    """The load-bearing claim of the whole tool. Calling `solve()` directly
+    would be simpler and would look identical on a good day — and would stop
+    testing the signature check, the replay cache, the concurrency slot and the
+    deadline that answers 504 rather than late. Proven by breaking the
+    signature: only a path that actually verifies it can reject this."""
+    from solvers import rehearse
+
+    monkeypatch.setattr(
+        rehearse, "sign_message",
+        lambda *a, **kw: {"Epistula-Version": "2", "Epistula-Signed-By": "nobody"},
+    )
+    factory, _ = _rehearsal_solver(RIGHT_RUN)
+    code = asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=factory))
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "answered 401" in out, f"the signature was never checked: {out}"
+
+
+def test_the_rehearsal_closes_the_fleet_even_when_the_solve_explodes():
+    """It opens real browser tabs. Leaving them behind on a failure would be a
+    tab per run, in the operator's own signed-in Chrome."""
+    from solvers import rehearse
+
+    closed: list[bool] = []
+
+    class _Exploding:
+        async def solve_task(self, task, timeout_s):
+            raise RuntimeError("the fleet fell over")
+        async def aclose(self):
+            closed.append(True)
+        def stats(self):
+            return {"tabs": 1}
+
+    code = asyncio.run(
+        rehearse.run(_rehearsal_args(), solver_factory=lambda: _Exploding())
+    )
+    assert closed == [True], "the fleet was left open"
+    # A solve that raises is caught by the miner, which answers with silence.
+    assert code == 1
+
+
+def test_no_browser_is_reported_as_unchecked_not_as_a_wrong_answer(capsys):
+    """An operator who has not started Chrome yet is the likeliest person ever
+    to run this. The fleet already says what is wrong and how to fix it; a
+    traceback on top of that buries the one line worth reading, and calling it
+    a failed answer would blame the miner for a browser that is not running."""
+    from solvers import rehearse
+
+    class _NoFleet:
+        async def solve_task(self, task, timeout_s):
+            raise AssertionError("should never get as far as solving")
+        async def aclose(self): pass
+        def stats(self): return {"tabs": 0}
+        async def start(self):
+            raise RuntimeError("No usable tabs. Wanted: claude@http://127.0.0.1:9222")
+
+    class _Solver(_NoFleet):
+        _backend = None
+
+    solver = _Solver()
+    solver._backend = solver          # `warm_up` reaches for `_backend.start`
+    code = asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=lambda: solver))
+    out = capsys.readouterr().out
+    assert code == 2, f"a missing browser is not a wrong answer: {out}"
+    assert "COULD NOT BE CHECKED: no browser" in out, out
+    assert "No usable tabs" in out, "the fleet's own advice was swallowed"
+
+
+def test_a_quiet_rehearsal_does_not_call_a_real_answer_empty(capsys):
+    """`--show 0` prints no code, which is not the same as there being none.
+    Folding the two into one branch put "the answer was EMPTY" directly beneath
+    "submitted 197 chars of python"."""
+    from solvers import rehearse
+
+    factory, _ = _rehearsal_solver(RIGHT_RUN)
+    asyncio.run(rehearse.run(_rehearsal_args(show=0), solver_factory=factory))
+    out = capsys.readouterr().out
+    assert "submitted" in out and "chars of python" in out, out
+    assert "EMPTY" not in out, f"a real answer was announced as empty:\n{out}"
+
+    factory, _ = _rehearsal_solver("I need a clarification before I can answer.")
+    asyncio.run(rehearse.run(_rehearsal_args(show=0), solver_factory=factory))
+    assert "the answer was EMPTY" in capsys.readouterr().out
+
+
+def test_the_doctor_explains_a_site_it_cannot_reach(capsys, monkeypatch):
+    """Measured by running the doctor behind a network that blocks the site:
+    twenty-five lines of Playwright internals ending in
+    `net::ERR_CONNECTION_RESET`, with the one useful word buried in the middle.
+    Attaching had already succeeded — that part is printed — so what failed is
+    reaching the site, and that has causes an operator can act on."""
+    import solvers.doctor as doctor
+
+    page = _FakePage({"#composer": [_Node()]})
+    page.add_init_script = lambda script: _done(None)
+
+    async def refuse(url, wait_until=None):
+        raise RuntimeError(f"net::ERR_CONNECTION_RESET at {url}")
+
+    page.goto = refuse
+    site = _site(url="https://example.invalid/new", stream=True)
+
+    class _Browser:
+        contexts = [SimpleNamespace(new_page=lambda: _done(page))]
+        async def close(self): pass
+
+    monkeypatch.setattr(doctor, "_site", lambda name: site)
+    monkeypatch.setattr(doctor, "_attach", lambda pw, s, endpoint: _done(_Browser()))
+    monkeypatch.setattr(
+        doctor, "import_playwright",
+        lambda: lambda: SimpleNamespace(
+            start=lambda: _done(SimpleNamespace(stop=lambda: _done(None)))
+        ),
+    )
+    code = asyncio.run(doctor.run("claude", "9222", False))
+    out = capsys.readouterr().out
+    assert code == 2, out
+    assert "could not open" in out and "ERR_CONNECTION_RESET" in out, out
+    assert "Traceback" not in out
+    assert "proxy or firewall" in out, "the operator was left without a next step"
+    assert page.closed, "the doctor's own tab was left open in your browser"

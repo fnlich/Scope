@@ -34,6 +34,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -46,38 +47,73 @@ COMPILE_TIMEOUT_S = float(os.environ.get("SOLVER_RUST_COMPILE_TIMEOUT_S", "25"))
 
 _rustc: Optional[str] = None
 _looked = False
+# The miner grades several solves at once and this now runs in a worker thread,
+# so the "looked up once, reported once" above has to mean it. Without the lock
+# two threads both miss the cache, both shell out to `which`, and both print the
+# once-per-run advice -- the second of which is the one an operator reports as a
+# bug in the miner.
+_lookup_lock = threading.Lock()
 
 
 def rustc_path() -> Optional[str]:
     """The local compiler, or None. Looked up once and reported once."""
-    global _rustc, _looked
     if _looked:
         return _rustc
-    _looked = True
-    if os.environ.get("SOLVER_RUST_COMPILE", "1") == "0":
-        print("[verify] local Rust compile checking is off (SOLVER_RUST_COMPILE=0)")
-        return None
-    _rustc = shutil.which("rustc")
-    if _rustc is None:
-        print(
-            "[verify] no local `rustc`, so Rust answers get the structural check "
-            "only. Installing a toolchain lets the miner reject an answer that "
-            "will not build instead of submitting it. Once per run."
-        )
-    return _rustc
+    with _lookup_lock:
+        if _looked:
+            return _rustc
+        return _look_for_rustc()
 
 
-def compile_defect(code: str) -> Optional[str]:
+def _look_for_rustc() -> Optional[str]:
+    """The actual lookup. Assumes `_lookup_lock` is held.
+
+    `_looked` is set LAST, and that ordering is the whole point of the `finally`:
+    it is read OUTSIDE the lock, so a thread that sees it True must be able to
+    trust that `_rustc` already holds the answer. Setting it first would let a
+    second thread sail past the fast path and get None while the first was still
+    inside `which` -- the miner would silently skip the compile check on
+    whichever solve happened to be second.
+    """
+    global _rustc, _looked
+    try:
+        if os.environ.get("SOLVER_RUST_COMPILE", "1") == "0":
+            print("[verify] local Rust compile checking is off (SOLVER_RUST_COMPILE=0)")
+            return None
+        _rustc = shutil.which("rustc")
+        if _rustc is None:
+            print(
+                "[verify] no local `rustc`, so Rust answers get the structural check "
+                "only. Installing a toolchain lets the miner reject an answer that "
+                "will not build instead of submitting it. Once per run."
+            )
+        return _rustc
+    finally:
+        _looked = True
+
+
+def compile_defect(code: str, budget_s: Optional[float] = None) -> Optional[str]:
     """Why this source will not build, in one line, or None. Never raises.
 
     None also means "could not tell" -- no compiler, or the attempt itself went
     wrong. Silence has to mean the same thing as success here, because the
     alternative is a miner that stops submitting answers the moment a toolchain
     goes missing.
+
+    ``budget_s`` is what the SOLVE has left, and it caps the compile below
+    COMPILE_TIMEOUT_S when it is smaller. The default of 25s is a hang guard
+    sized for a compiler, not for a deadline: the solver's whole safety margin
+    is 15s, and `handle_request` wraps the solve in an `asyncio.wait_for` that
+    answers 504 -- nothing at all -- the moment it is exceeded. A compile that
+    outlives the budget therefore does not merely delay the answer, it throws
+    away an answer already in hand to report a defect nobody will read.
     """
     rustc = rustc_path()
     if rustc is None or not code.strip():
         return None
+    timeout = COMPILE_TIMEOUT_S
+    if budget_s is not None:
+        timeout = min(timeout, max(1.0, float(budget_s)))
     try:
         with tempfile.TemporaryDirectory(prefix="hone-rustc-") as work:
             source = Path(work) / "candidate.rs"
@@ -91,7 +127,7 @@ def compile_defect(code: str) -> Optional[str]:
                     str(source),
                 ],
                 capture_output=True, text=True, cwd=work,
-                timeout=COMPILE_TIMEOUT_S,
+                timeout=timeout,
             )
             if built.returncode == 0:
                 return None

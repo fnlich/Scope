@@ -62,6 +62,13 @@ from dataclasses import dataclass, replace
 from itertools import zip_longest
 from typing import Any, NamedTuple, Optional, Sequence
 
+# One scanner for fenced markdown, not two. This module used to carry its own
+# copy while the extractor in `prompts` matched fences with a regular
+# expression instead -- and the two disagreed about where a block ends, in four
+# measured ways that each cost a whole answer. Two readers of the same markdown
+# that disagree is a bug waiting for the reply that tells them apart.
+from .prompts import fenced_blocks as _fenced_blocks
+
 # The port `scripts/start_debug_browser.sh` uses unless told otherwise, and so
 # the port every backend assumes when `<PREFIX>_CDP` is not set.
 DEFAULT_CDP_PORT = 9222
@@ -84,10 +91,45 @@ NEW_CHAT_TIMEOUT_MS = 5_000
 # milliseconds, so the only thing this buys back is the entire budget.
 POLL_READ_TIMEOUT_S = 5.0
 
-# How long the last-resort copy gets, in total. Tight on purpose: it runs after
-# the read already came back empty, so it is spending time the solve has
-# notionally run out of, to turn a guaranteed zero into a possible answer.
+# How long ONE click on a copy control gets. Tight on purpose: it runs after the
+# read already came back empty, so it is spending time the solve has notionally
+# run out of, to turn a guaranteed zero into a possible answer. Per click, not
+# per send -- a reply with several code blocks is several clicks, and the whole
+# phase is bounded separately by COPY_PHASE_TIMEOUT_S.
 COPY_TIMEOUT_MS = 1_500
+
+# How long each phase AFTER the read loop gets.
+#
+# Everything past the loop runs on time the solve has notionally already spent:
+# the loop exits at the deadline, and then the copy control, the network stream
+# and the post-mortem each go back to the page. Every one of those is a
+# Playwright call, and a Playwright call auto-waits 30 SECONDS unless told
+# otherwise -- measured here against a node that was resolved and then removed,
+# which is the ordinary shape of a page still settling after an answer:
+#
+#     button.inner_text()   raised after 30.0s
+#     node.inner_text()     raised after 30.0s
+#     code.text_content()   raised after 30.0s
+#
+# Three phases, several calls apiece, and `send` can return two minutes after
+# the `timeout_s` it was given -- long after the validator stopped listening,
+# and with nothing gained, because the answer it is holding was complete before
+# any of it started. `_submit` has been bounded against exactly this since it
+# was written; the way out was not.
+#
+# Each bound degrades into the reading already in hand rather than into
+# nothing: copy falls back to what scraping saw, the stream leaves `best`
+# untouched, and the post-mortem is a log line whose absence costs no answer.
+#
+# The three together must stay inside VerifyingSolver's safety margin, which is
+# 15 seconds, and the reason is not tidiness either: `handle_request` wraps the
+# whole solve in an `asyncio.wait_for` and answers 504 -- NOTHING -- when it is
+# exceeded. Overrunning does not deliver the answer late; it throws away an
+# answer already in hand. 5 + 4 + 2 = 11 leaves the last grade and the tab
+# close the rest of it.
+COPY_PHASE_TIMEOUT_S = 5.0
+STREAM_PHASE_TIMEOUT_S = 4.0
+POSTMORTEM_TIMEOUT_S = 2.0
 
 # Installed before the copy button is clicked. It makes the page hand the code
 # to US instead of to the operating system.
@@ -477,39 +519,6 @@ async def usable_busy_selectors(page, candidates: Sequence[str], name: str) -> t
     return tuple(kept)
 
 
-def _fenced_blocks(markdown: str) -> list[str]:
-    """Every fenced block in a markdown string, in order, without its fences.
-
-    Scanned line by line rather than matched with one regular expression,
-    because the closing fence has to be at least as long as the opening one --
-    that is what lets a block that itself contains ``` be written with four
-    backticks, and a regex that ignores it truncates such an answer at the
-    inner fence. An unclosed final fence is kept: a reply cut off by a deadline
-    still has its program in it, and dropping it turns a partial answer into no
-    answer.
-    """
-    blocks: list[str] = []
-    body: Optional[list[str]] = None
-    fence = ""
-    for line in markdown.splitlines():
-        stripped = line.strip()
-        if body is None:
-            opener = re.match(r"(`{3,}|~{3,})", stripped)
-            if opener:
-                fence = opener.group(1)
-                body = []
-            continue
-        if re.fullmatch(re.escape(fence[0]) + "{%d,}" % len(fence), stripped):
-            if "\n".join(body).strip():
-                blocks.append("\n".join(body) + "\n")
-            body, fence = None, ""
-            continue
-        body.append(line)
-    if body is not None and "\n".join(body).strip():
-        blocks.append("\n".join(body) + "\n")
-    return blocks
-
-
 def _describe_char(ch: str) -> str:
     """A character a human can act on: the codepoint, not a blank space."""
     if not ch:
@@ -718,6 +727,38 @@ class _Tab:
             return
         await self._page.locator(button).first.click(timeout=ui_ms)
 
+    async def _open_turn(self, text: str, ui_ms: int) -> tuple[int, Optional[str]]:
+        """Snapshot the conversation, then put the prompt in.
+
+        One coroutine so `send` can bound the whole "getting the prompt in"
+        phase with a single `wait_for`, rather than bounding the click and
+        leaving the two reads either side of it unbounded.
+        """
+        before = await self._fingerprint()
+        # Before the prompt, not after: the response starts streaming while
+        # `_submit` is still returning, so a floor taken afterwards can already
+        # have this answer's own record under it.
+        self._stream_before = await self._stream_seq()
+        await self._submit(text, ui_ms)
+        return before
+
+    async def _copy_phase(
+        self, before: tuple[int, Optional[str]]
+    ) -> tuple[Optional[list[str]], Optional[list[str]]]:
+        """What the copy control gives, and what the DOM shows, for comparison.
+
+        Returns ``(copied, rendered)``; ``rendered`` is only read when
+        ``copied`` is non-empty, so it is not fetched otherwise. Separated from
+        `send` for the same reason as `_open_turn`: it is three Playwright
+        calls that need ONE bound around them.
+        """
+        reply = await self._new_reply(before)
+        if reply is None:
+            return None, None
+        copied = await self._copied_blocks(reply)
+        rendered = await self._dom_blocks(reply) if copied else None
+        return copied, rendered
+
     async def send(self, text: str, timeout_s: float) -> str:
         if not self.alive:
             # The pool has not recycled this tab yet. Retrying a known-dead tab
@@ -747,13 +788,15 @@ class _Tab:
         # the rest is for waiting on the answer.
         submit_budget_s = max(5.0, min(20.0, timeout_s * 0.3))
         try:
-            before = await self._fingerprint()
-            # Before the prompt, not after: the response starts streaming while
-            # `_submit` is still returning, so a floor taken afterwards can
-            # already have this answer's own record under it.
-            self._stream_before = await self._stream_seq()
-            await asyncio.wait_for(
-                self._submit(text, int(submit_budget_s * 1000)),
+            # The snapshot is inside the bound, not outside it. `_fingerprint`
+            # ends in a `get_attribute` on the last message, and that is the
+            # 30s auto-wait again: a conversation that re-renders as the
+            # prompt goes out hands back a node the site has already replaced,
+            # and the whole read budget is gone before a single poll runs --
+            # on a page that would have answered. The budget is described as
+            # the slice for getting the prompt in; this makes that true.
+            before = await asyncio.wait_for(
+                self._open_turn(text, int(submit_budget_s * 1000)),
                 timeout=submit_budget_s,
             )
         except asyncio.CancelledError:
@@ -834,17 +877,14 @@ class _Tab:
             # clicking a control on every poll would be dozens of clicks a
             # solve. Scraping decided WHEN to read; the copy control decides
             # WHAT was read, because it predates the syntax highlighter.
-            copied = rendered = None
             try:
-                reply = await self._new_reply(before)
-                if reply is not None:
-                    copied = await self._copied_blocks(reply)
-                    if copied:
-                        rendered = await self._dom_blocks(reply)
+                copied, rendered = await asyncio.wait_for(
+                    self._copy_phase(before), timeout=COPY_PHASE_TIMEOUT_S
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - fall back to what scraping saw
-                copied = None
+                copied = rendered = None
             page_blocks = copied
             if copied:
                 if rendered and not self._warned_diff:
@@ -868,7 +908,19 @@ class _Tab:
                     f"start arriving mangled — the control may have been renamed."
                 )
         if self.alive and self.site.stream:
-            best = await self._reconcile_stream(before, best, page_blocks)
+            try:
+                best = await asyncio.wait_for(
+                    self._reconcile_stream(before, best, page_blocks),
+                    timeout=STREAM_PHASE_TIMEOUT_S,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - keep the page's reading
+                print(
+                    f"[{self.site.name}] note: tab {self.label} could not finish "
+                    f"checking the answer against the network stream in "
+                    f"{STREAM_PHASE_TIMEOUT_S:.0f}s. Submitting what the page gave."
+                )
         if best and self._is_our_own_prompt(best):
             # Last line of defence, at the ONE exit, because everything above
             # it can produce a submission and only one of them was guarded.
@@ -882,7 +934,17 @@ class _Tab:
             )
             best = ""
         if not best and self.alive:
-            await self._explain_empty(before)
+            try:
+                await asyncio.wait_for(
+                    self._explain_empty(before), timeout=POSTMORTEM_TIMEOUT_S
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a diagnostic, never a failure
+                print(
+                    f"[{self.site.name}] tab {self.label} captured NOTHING from this "
+                    f"reply, and the page did not answer in time to say why."
+                )
         return best
 
     async def _reconcile_stream(
@@ -930,31 +992,48 @@ class _Tab:
                 raise
             except Exception:  # noqa: BLE001 - nothing to compare against, then
                 page_blocks = []
-        if not page_blocks and not best:
-            # The page gave us nothing. This is the case the whole path exists
-            # for -- but only when the wire actually holds an answer.
-            if not blocks:
-                # It does not. Returning the raw text anyway was worse than
-                # returning nothing in three separate ways, all of them
-                # measured: it announced a rescue that had not happened, it
-                # made `best` non-empty and so SILENCED the post-mortem that
-                # would have said what the page contained, and the value was
-                # thrown away at extraction regardless. Worst of all it could
-                # be the miner's own prompt -- a chat stream carries the
-                # conversation, not just the reply -- and two prompts reached
-                # a validator as Rust programs that way.
+        if not best:
+            # The read loop finished holding nothing. Everything read since is
+            # strictly better than the empty string, and the ONLY question left
+            # is which of the two later readings to take.
+            #
+            # The page first, when it has one. `page_blocks` here was fetched
+            # after the deadline -- so a non-empty one means the answer landed
+            # in the moments between the last poll and now, which is common
+            # enough to be the ordinary shape of a near-miss. Requiring the page
+            # to be empty before looking anywhere threw that away: measured,
+            # `best=""` beside `page_blocks=["def g(n): ..."]` returned "", with
+            # the answer sitting in a list in this function's own arguments.
+            if page_blocks:
                 print(
-                    f"[{self.site.name}] tab {self.label} read nothing from the page, "
-                    f"and the network stream had no code block in it either "
-                    f"({len(streamed)} chars captured). Nothing to submit."
+                    f"[{self.site.name}] tab {self.label} read nothing before its "
+                    f"deadline, and found {len(page_blocks)} code block(s) on the "
+                    f"page just after it. Submitting those rather than nothing."
                 )
-                return ""
+                return "\n".join(self._fence(b) for b in page_blocks)
+            # Then the wire. This is the case the whole path exists for -- but
+            # only when the wire actually holds an answer.
+            if blocks:
+                print(
+                    f"[{self.site.name}] tab {self.label} read NOTHING from the page "
+                    f"and recovered {len(blocks)} code block(s) from the network "
+                    f"stream instead. The answer below came off the wire, not the DOM."
+                )
+                return "\n".join(self._fence(b) for b in blocks)
+            # Neither. Returning the raw streamed text anyway was worse than
+            # returning nothing in three separate ways, all of them measured: it
+            # announced a rescue that had not happened, it made `best` non-empty
+            # and so SILENCED the post-mortem that would have said what the page
+            # contained, and the value was thrown away at extraction regardless.
+            # Worst of all it could be the miner's own prompt -- a chat stream
+            # carries the conversation, not just the reply -- and two prompts
+            # reached a validator as Rust programs that way.
             print(
-                f"[{self.site.name}] tab {self.label} read NOTHING from the page and "
-                f"recovered {len(blocks)} code block(s) from the network stream "
-                f"instead. The answer below came off the wire, not the DOM."
+                f"[{self.site.name}] tab {self.label} read nothing from the page, "
+                f"and the network stream had no code block in it either "
+                f"({len(streamed)} chars captured). Nothing to submit."
             )
-            return "\n".join(self._fence(b) for b in blocks)
+            return ""
         if blocks and page_blocks and not self._warned_stream_diff:
             gap = self._first_difference(page_blocks, blocks, "the page", "the wire")
             if gap:
@@ -1547,6 +1626,10 @@ class BrowserFleet:
         self._reclaimed = 0
         self._started = False
         self._closing = False
+        # Replacement spawns in flight. Tracked, not fired and forgotten: each
+        # one opens a page in YOUR browser, and one that lands after shutdown
+        # has swept `_tabs` is a signed-in tab nothing will ever close.
+        self._pending: set[Any] = set()
         # How long open() waits for a free tab before saying so. Unbounded would
         # be worse: a caller with its own deadline gets cancelled, and a caller
         # without one hangs with no explanation.
@@ -1695,6 +1778,13 @@ class BrowserFleet:
             # fails its checks below is reclaimable after an unclean exit.
             await page.evaluate(f"window.name = {TAB_MARK + '/' + site.name!r}")
             composer = await wait_for_any(page, site.composer, site.ready_timeout_ms)
+        except asyncio.CancelledError:
+            # Shutdown, almost always. Close the page on the way out: this
+            # coroutine is the only thing that knows it exists yet -- it is not
+            # in `_tabs` until the very end -- so unwinding without it leaves a
+            # tab open in the operator's browser for good.
+            await _close_quietly(page)
+            raise
         except Exception as exc:  # noqa: BLE001
             print(
                 f"[{site.name}] WARN: tab {label} never loaded {site.url} "
@@ -1781,9 +1871,11 @@ class BrowserFleet:
                     self._retire(tab)
                 raise
             except Exception as exc:  # noqa: BLE001
-                # start() already marked it dead; release() disposes and replaces
-                # it, so the second pass gets the healthy replacement rather than
-                # failing the task while a good tab sits idle.
+                # start() already marked it dead; release() disposes it and
+                # rebuilds the capacity in the background, so the second pass
+                # takes whichever tab reaches `_free` first -- another idle one
+                # straight away, or the replacement when it finishes loading --
+                # rather than failing the task while a good tab sits idle.
                 last = exc
                 await self.release(tab)
         raise last if last is not None else RuntimeError("could not lease a tab")
@@ -1888,17 +1980,44 @@ class BrowserFleet:
             return
         await tab.dispose()
         self._retire(tab)
+        # Rebuilt off to the side, NOT awaited here. Building a tab means a new
+        # page, a navigation, and a wait for the composer -- `ready_timeout_ms`
+        # alone is 60 SECONDS. This runs from the solver's `finally`, after the
+        # answer is already in hand and after the budget is spent, and the
+        # deadline above it is an `asyncio.wait_for` in `handle_request` that
+        # answers 504 rather than late. Awaited, the replacement would throw
+        # away the very answer whose failure asked for it -- and it is precisely
+        # the failing solves, the ones with the least budget left, that get
+        # here. Nothing waits on the new tab except the next lease, which waits
+        # on `_free` anyway and has its own budget to do it in.
+        self._replace_later(tab)
+
+    def _replace_later(self, tab: _Tab) -> None:
+        """Rebuild one tab's worth of capacity, out of everyone's way."""
+        if self._closing:
+            return
+        task = asyncio.ensure_future(self._replace(tab))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
+    async def _replace(self, tab: _Tab) -> None:
         browser = Browser(tab.source, tab.site)
         replacement = await self._spawn(tab.context, browser, tab.label)
-        if replacement is not None:
-            await self._free.put(replacement)
-            self._size += 1  # _retire took one off; this puts the capacity back
-            print(f"[{tab.site.name}] tab {tab.label} replaced after failure")
+        if replacement is None:
+            print(
+                f"[{tab.site.name}] WARN: tab {tab.label} retired and could not be "
+                f"replaced; {self._size} tab(s) left"
+            )
             return
-        print(
-            f"[{tab.site.name}] WARN: tab {tab.label} retired and could not be "
-            f"replaced; {self._size} tab(s) left"
-        )
+        if self._closing:
+            # Shutdown started while this was loading. `_teardown` has already
+            # swept `_tabs`, so nothing else will ever close this page.
+            self._retire(replacement)
+            await replacement.dispose()
+            return
+        await self._free.put(replacement)
+        self._size += 1  # _retire took one off; this puts the capacity back
+        print(f"[{tab.site.name}] tab {tab.label} replaced after failure")
 
     # -- reporting and shutdown --------------------------------------------- #
     def stats(self) -> dict[str, Any]:
@@ -1932,6 +2051,14 @@ class BrowserFleet:
         # releases its tab part-way through, and release() has to know not to
         # requeue a page that is about to be closed.
         self._closing = True
+        # Stop the background replacements BEFORE the sweep below. One may be
+        # mid-navigation right now, and a tab that lands after `_tabs.clear()`
+        # is a page this fleet opened, still signed in, that nothing will close.
+        for task in list(self._pending):
+            task.cancel()
+        if self._pending:
+            await asyncio.gather(*list(self._pending), return_exceptions=True)
+            self._pending.clear()
         # Drain the queue first so nothing is handed out mid-shutdown, then
         # close every tab this fleet opened — leased ones included, or they would
         # be left open in your browser.

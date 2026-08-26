@@ -56,8 +56,6 @@ from solution_archive import save_exchange, save_solution  # noqa: E402
 # whole point is to say why instead.
 require_linux("The custom miner")
 
-import asyncio  # noqa: E402
-import json  # noqa: E402
 import os  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from typing import Any, Optional, Protocol  # noqa: E402

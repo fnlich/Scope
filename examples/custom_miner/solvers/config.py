@@ -57,7 +57,7 @@ def _unquote(value: str) -> str:
     """
     value = value.strip()
     if value[:1] in ("\"", "'"):
-        quote, end = value[0], value.find(value[0], 1)
+        end = value.find(value[0], 1)
         return value[1:end] if end != -1 else value[1:]
     for marker in (" #", "\t#"):
         value = value.split(marker, 1)[0]
