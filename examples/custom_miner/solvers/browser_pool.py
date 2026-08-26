@@ -302,6 +302,7 @@ class _Tab:
         self._reply_key: Optional[str] = None
         self._warned_echo = False
         self._warned_branches = False
+        self._warned_copy = False
         self.uses = 0
         self.alive = True
         # True while this tab is known to be sitting in an EMPTY conversation.
@@ -547,22 +548,28 @@ class _Tab:
         except Exception as exc:  # noqa: BLE001 - the page died mid-read
             self.alive = False
             print(f"[{self.site.name}] tab {self.label} died while reading: {type(exc).__name__}")
-        if self.alive and "```" not in best:
-            # No fenced block came back. `_read` re-fences every `pre code` it
-            # finds, so this means the code selectors matched nothing and what
-            # `best` holds is the message's prose -- the DOM-has-moved case, and
-            # the only one worth spending the page's copy control on. Triggering
-            # on `not best` instead looks equivalent and is not: the prose
-            # fallback almost always returns something, so the copy control
-            # would never have run at all.
+        if self.alive and self.site.copy:
+            # Once per send, never per poll: the answer is finished by now, and
+            # clicking a control on every poll would be dozens of clicks a
+            # solve. Scraping decided WHEN to read; the copy control decides
+            # WHAT was read, because it predates the syntax highlighter.
             try:
                 reply = await self._new_reply(before)
-                if reply is not None:
-                    best = await self._copied_code(reply) or best
+                copied = await self._copied_code(reply) if reply is not None else None
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - a last resort may simply not work
-                pass
+            except Exception:  # noqa: BLE001 - fall back to what scraping saw
+                copied = None
+            if copied:
+                best = copied
+            elif not self._warned_copy:
+                self._warned_copy = True
+                print(
+                    f"[{self.site.name}] note: tab {self.label} could not use the "
+                    f"code block's copy control, falling back to reading the DOM. "
+                    f"Run `python -m solvers.doctor {self.site.name}` if answers "
+                    f"start arriving mangled — the control may have been renamed."
+                )
         return best
 
     async def _poll(
@@ -744,16 +751,20 @@ class _Tab:
     async def _copied_code(self, reply) -> Optional[str]:
         """The code as the PAGE would copy it, without touching the clipboard.
 
-        A last resort, and deliberately only that. Scraping `pre code` is
-        measured byte-exact on both sites today, so this earns nothing on the
-        happy path and is never run there. What it covers is the failure that
-        keeps recurring: the DOM moves, the selector stops matching, and a
-        perfectly good answer is reported as no answer at all. The copy button
-        is the site's own answer to "where is the code", so when scraping comes
-        back with nothing it is worth one click.
+        This is the preferred extractor, and the reason is not tidiness. What
+        the copy control hands over is the source the model wrote; what
+        `pre code` hands over is the source AFTER a syntax highlighter has
+        rebuilt it as DOM. Those differ, and they have differed here in
+        production: a highlighter put U+E027 -- a Private Use Area character
+        that exists in no source file -- inside a Python answer, and the solve
+        died on a character no human could see. Re-fencing, chip stripping and
+        invisible-character scrubbing are all repairs for damage that this path
+        never takes, because it reads from before the render.
 
-        Clicking is safe *here* precisely because we already have nothing: the
-        worst case is a wasted click on a reply that was unreadable anyway.
+        All-or-nothing on purpose. A reply with two blocks has two controls; if
+        only one answers, taking that one would silently drop a block and could
+        drop the answer. Returning None instead hands the whole read back to
+        scraping, which at least sees every block.
         """
         if not self.site.copy:
             return None
@@ -767,7 +778,8 @@ class _Tab:
             return None
         await self._page.evaluate(_COPY_HOOK)
         fenced: list[str] = []
-        for i in range(await buttons.count()):
+        expected = await buttons.count()
+        for i in range(expected):
             await self._page.evaluate("window.__honeCopied = null")
             try:
                 # force: the control is often transparent until hover, and
@@ -781,17 +793,9 @@ class _Tab:
                 continue
             if not block or not block.strip():
                 continue
-            longest = max((len(r) for r in re.findall(r"`+", block)), default=0)
-            fence = "`" * max(3, longest + 1)
-            fenced.append(f"{fence}\n{block}\n{fence}")
-        if not fenced:
-            return None
-        print(
-            f"[{self.site.name}] tab {self.label}: nothing matched the code "
-            f"selectors, recovered {len(fenced)} block(s) from the page's own "
-            f"copy control. Run `python -m solvers.doctor {self.site.name}` — "
-            f"the DOM has moved."
-        )
+            fenced.append(self._fence(block))
+        if len(fenced) != expected or not fenced:
+            return None  # see the docstring: all of them, or none of them
         return "\n".join(fenced)
 
     @staticmethod
@@ -807,6 +811,13 @@ class _Tab:
             return await reply.inner_text()
         except Exception:  # noqa: BLE001 - mid-navigation, or the node went away
             return ""
+
+    @staticmethod
+    def _fence(block: str) -> str:
+        """Wrap one block. Markdown's own rule: the fence must outrun any
+        backtick run inside, or a block containing ``` closes itself early."""
+        longest = max((len(r) for r in re.findall(r"`+", block)), default=0)
+        return "`" * max(3, longest + 1) + f"\n{block}\n" + "`" * max(3, longest + 1)
 
     @staticmethod
     async def _read(reply) -> Optional[str]:
@@ -838,11 +849,7 @@ class _Tab:
                 block = await code_blocks.nth(i).text_content() or ""
                 if not block.strip():
                     continue
-                # Markdown's own rule: the fence must outrun any backtick run
-                # inside, or a block containing ``` would close itself early.
-                longest = max((len(r) for r in re.findall(r"`+", block)), default=0)
-                fence = "`" * max(3, longest + 1)
-                fenced.append(f"{fence}\n{block}\n{fence}")
+                fenced.append(_Tab._fence(block))
             if fenced:
                 return "\n".join(fenced)
         text = (await reply.inner_text()).strip()

@@ -1861,30 +1861,61 @@ def test_the_copy_control_recovers_code_the_selectors_cannot_see():
     )
 
 
-def test_the_copy_control_is_left_alone_when_the_selectors_work():
-    """A last resort, not a read path: scraping is byte-exact today, and
-    clicking a button on every answer is a side effect bought for nothing."""
-    playwright, chrome = _chromium_or_skip()
-    url = _served('<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<template id="tpl"><pre><code>def pong():\n    return 1</code></pre><button aria-label="Copy" class="c">copy</button></template>\n<script>\ndocument.getElementById(\'send\').onclick = () => {\n  const d = document.createElement(\'div\');\n  d.setAttribute(\'data-message-author-role\', \'assistant\');\n  d.appendChild(document.getElementById(\'tpl\').content.cloneNode(true));\n  document.getElementById(\'host\').appendChild(d);\n  d.querySelector(\'.c\').onclick = () => navigator.clipboard.writeText(\'WRONG\');\n};\n</script>')
-    site = _site(
+def _answering_site():
+    return _site(
         composer=("#composer",), send=("#send",),
         assistant=('[data-message-author-role="assistant"]',),
         copy=('button[aria-label="Copy"]',),
     )
+
+
+def _send_in_browser(body, then=None):
+    playwright, chrome = _chromium_or_skip()
+    url = _served(body)
 
     async def go():
         async with playwright.async_playwright() as p:
             browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
             page = await (await browser.new_context()).new_page()
             await page.goto(url)
-            reply = await _tab(page, site).send("solve it", 5.0)
-            untouched = await page.evaluate("window.__honeHooked === undefined")
+            reply = await _tab(page, _answering_site()).send("solve it", 5.0)
+            extra = await page.evaluate(then) if then else None
             await browser.close()
-            return reply, untouched
+            return reply, extra
 
-    reply, untouched = asyncio.run(go())
-    assert "return 1" in extract_code(reply, "pong"), f"scraping failed: {reply!r}"
-    assert untouched, "the copy hook was installed on an answer that read fine"
+    return asyncio.run(go())
+
+
+def test_the_copy_control_is_preferred_over_the_rendered_dom():
+    """Why the copy control leads rather than backs up.
+
+    `pre code` hands over the source AFTER a syntax highlighter has rebuilt it
+    as DOM; the copy control hands over what the model actually wrote. They
+    differ, and they differed in production: a highlighter put U+E027 -- a
+    Private Use Area character present in no source file -- inside a Python
+    answer, and the solve died on a character nobody could see. Sanitising that
+    after the fact is chasing damage the copy path never takes.
+
+    Also pins the cost: one click per send, not one per poll.
+    """
+    from solvers.prompts import python_defect
+
+    reply, clicks = _send_in_browser('<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<script>\n// The source the model wrote. The copy control hands this over verbatim.\nconst SOURCE = "def pong():\\n    total = 1 + 2\\n    return total";\nwindow.__clicks = 0;\ndocument.getElementById(\'send\').onclick = () => {\n  const wrap = document.createElement(\'div\');\n  wrap.setAttribute(\'data-message-author-role\', \'assistant\');\n  const pre = document.createElement(\'pre\');\n  const code = document.createElement(\'code\');\n  // A syntax highlighter rebuilding the source as DOM, and slipping in a\n  // Private Use Area character that exists in no source file. This is the\n  // real production bug: U+E027 inside a Python answer.\n  code.textContent = SOURCE.replace("1 + 2", "1 \\uE027+ 2");\n  pre.appendChild(code);\n  wrap.appendChild(pre);\n  const btn = document.createElement(\'button\');\n  btn.setAttribute(\'aria-label\', \'Copy\');\n  btn.textContent = \'copy\';\n  btn.onclick = () => { window.__clicks++; navigator.clipboard.writeText(SOURCE); };\n  wrap.appendChild(btn);\n  document.getElementById(\'host\').appendChild(wrap);\n};\n</script>', then="window.__clicks")
+    code = extract_code(reply, "pong")
+
+    assert "\ue027" not in code, f"took the highlighter's DOM over the source: {code!r}"
+    assert python_defect(code, "pong") is None, python_defect(code, "pong")
+    scope: dict = {}
+    exec(compile(code, "<submitted>", "exec"), scope)
+    assert scope["pong"]() == 3, "the recovered source does not run"
+    assert clicks == 1, f"clicked the copy control {clicks} times, expected once per send"
+
+
+def test_a_missing_copy_control_falls_back_to_reading_the_dom():
+    """The copy control is preferred, not required: a site that never had one,
+    or renamed it, must still be read rather than reported as silent."""
+    reply, _ = _send_in_browser('<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<script>\ndocument.getElementById(\'send\').onclick = () => {\n  const wrap = document.createElement(\'div\');\n  wrap.setAttribute(\'data-message-author-role\', \'assistant\');\n  const pre = document.createElement(\'pre\');\n  const code = document.createElement(\'code\');\n  code.textContent = "def pong():\\n    return 7";\n  pre.appendChild(code);\n  wrap.appendChild(pre);\n  document.getElementById(\'host\').appendChild(wrap);   // no copy control at all\n};\n</script>')
+    assert "return 7" in extract_code(reply, "pong"), f"lost the answer: {reply!r}"
 
 
 def test_a_defect_is_not_reported_as_a_failed_run():

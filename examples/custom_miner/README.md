@@ -363,12 +363,42 @@ CLAUDE_ASSISTANT='div[data-is-streaming]'
 CLAUDE_SEND_BUTTON='button[aria-label="Send message"]'
 CLAUDE_STOP_BUTTON='button[aria-label="Stop response"]'
 CLAUDE_NEW_CHAT='a[href$="/new"]'
+CLAUDE_COPY='button[aria-label="Copy to clipboard"]'
 ```
 
-`*_NEW_CHAT` is the one role that is optional: it is how a tab starts its next
-conversation without a page load, and if nothing matches, the tab reloads
-instead — a few seconds per task, never a wrong answer. The doctor reports it
-like any other role.
+Two roles are optional. `*_NEW_CHAT` is how a tab starts its next conversation
+without a page load; if nothing matches, the tab reloads instead — a few seconds
+per task, never a wrong answer. `*_COPY` is the code block's own copy control,
+and it is how the code is normally taken (see below); if nothing matches, the
+miner reads the DOM instead and says so once. The doctor reports both like any
+other role.
+
+## The code comes from the copy control, not the DOM
+
+`pre code` gives you the source *after* a syntax highlighter has rebuilt it as
+DOM. The copy control gives you what the model actually wrote. Those differ, and
+they have differed here: a highlighter once put U+E027 — a Private Use Area
+character that appears in no source file — inside a Python answer, and the solve
+died on a character nobody could see. So the reader scrapes the DOM to decide
+*when* an answer is finished, then clicks the block's own copy control once to
+decide *what* it says.
+
+The value never reaches your clipboard. `navigator.clipboard.writeText` is
+patched inside the miner's own tabs so the string comes back to the miner and
+goes no further. That is not fastidiousness — there is one clipboard shared by
+every tab, every browser on the display, and every miner you run, and reading it
+back was measured to cross tabs:
+
+    tab A wrote 'TAB-A-CODE', tab B wrote 'TAB-B-CODE'
+    tab A read back: 'TAB-B-CODE'
+
+A pool that read the clipboard would submit another task's program whenever two
+solves overlapped, silently. The one visible consequence of the patch: while the
+miner owns a tab, that tab's copy buttons no longer write to your real clipboard.
+
+It is preferred, not required. If the control is missing or renamed, scraping
+answers instead, and a reply with two blocks whose controls only half-respond is
+handed back to scraping whole rather than losing a block.
 
 Three hazards are handled in code rather than left to the selectors:
 
