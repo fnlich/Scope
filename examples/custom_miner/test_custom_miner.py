@@ -1805,6 +1805,88 @@ def test_the_reader_returns_a_code_block_byte_for_byte():
     assert not code.lstrip().startswith("rust"), "the language chip leaked in"
 
 
+# The code block's own copy control, used as a LAST RESORT when the code
+# selectors match nothing. The copied value is intercepted inside the page:
+# reading the system clipboard back would be catastrophic here, because there
+# is one clipboard shared by every tab, every browser on the display, and every
+# miner process the operator runs. Measured, two tabs in one browser: A wrote
+# 'TAB-A-CODE', B wrote 'TAB-B-CODE', A read back 'TAB-B-CODE'. A pool reading
+# the clipboard would submit another task's program whenever two solves
+# overlapped -- silently, and with no way to tell afterwards.
+
+COPY_PROGRAM = 'def pong():\n    note = """one\ntwo"""\n    return note'
+
+
+def _chromium_or_skip():
+    chrome = Path("/opt/pw-browsers/chromium-1194/chrome-linux/chrome")
+    if not chrome.exists():
+        pytest.skip("no browser on this host")
+    return pytest.importorskip("playwright.async_api"), str(chrome)
+
+
+def _served(body: str) -> str:
+    page = Path(tempfile.mkdtemp()) / "reply.html"
+    page.write_text(body, encoding="utf-8")
+    return page.as_uri()
+
+
+def test_the_copy_control_recovers_code_the_selectors_cannot_see():
+    """The recurring failure this covers: the DOM moves, `pre code` stops
+    matching, and a complete answer is reported as no answer at all."""
+    playwright, chrome = _chromium_or_skip()
+    url = _served('<!doctype html><meta charset="utf-8">\n<div data-message-author-role="assistant">\n  <div id="src">__PROGRAM__</div>\n  <button aria-label="Copy" id="c">copy</button>\n  <button aria-label="Run code">run</button>\n</div>\n<script>\ndocument.getElementById(\'c\').onclick = () =>\n  navigator.clipboard.writeText(document.getElementById(\'src\').textContent);\n</script>'.replace("__PROGRAM__", COPY_PROGRAM))
+    site = _site(copy=('button[aria-label="Copy"]',))
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            ctx = await browser.new_context()
+            await ctx.grant_permissions(["clipboard-read", "clipboard-write"])
+            page = await ctx.new_page()
+            await page.goto(url)
+            await page.evaluate("navigator.clipboard.writeText('SENTINEL')")
+            reply = page.locator('[data-message-author-role="assistant"]').first
+            recovered = await _tab(page, site)._copied_code(reply)
+            clipboard = await page.evaluate("navigator.clipboard.readText()")
+            await browser.close()
+            return recovered, clipboard
+
+    recovered, clipboard = asyncio.run(go())
+    assert recovered is not None, "the copy control was not used"
+    assert extract_code(recovered, "pong") == COPY_PROGRAM, f"garbled: {recovered!r}"
+    assert clipboard == "SENTINEL", (
+        f"the system clipboard was written to ({clipboard!r}); it is shared by "
+        f"every tab and miner on this machine, so two overlapping solves could "
+        f"swap answers"
+    )
+
+
+def test_the_copy_control_is_left_alone_when_the_selectors_work():
+    """A last resort, not a read path: scraping is byte-exact today, and
+    clicking a button on every answer is a side effect bought for nothing."""
+    playwright, chrome = _chromium_or_skip()
+    url = _served('<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<template id="tpl"><pre><code>def pong():\n    return 1</code></pre><button aria-label="Copy" class="c">copy</button></template>\n<script>\ndocument.getElementById(\'send\').onclick = () => {\n  const d = document.createElement(\'div\');\n  d.setAttribute(\'data-message-author-role\', \'assistant\');\n  d.appendChild(document.getElementById(\'tpl\').content.cloneNode(true));\n  document.getElementById(\'host\').appendChild(d);\n  d.querySelector(\'.c\').onclick = () => navigator.clipboard.writeText(\'WRONG\');\n};\n</script>')
+    site = _site(
+        composer=("#composer",), send=("#send",),
+        assistant=('[data-message-author-role="assistant"]',),
+        copy=('button[aria-label="Copy"]',),
+    )
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            reply = await _tab(page, site).send("solve it", 5.0)
+            untouched = await page.evaluate("window.__honeHooked === undefined")
+            await browser.close()
+            return reply, untouched
+
+    reply, untouched = asyncio.run(go())
+    assert "return 1" in extract_code(reply, "pong"), f"scraping failed: {reply!r}"
+    assert untouched, "the copy hook was installed on an answer that read fine"
+
+
 def test_a_defect_is_not_reported_as_a_failed_run():
     """Defects are found BEFORE anything executes. "I ran the program against
     the examples and got: the program does not define `fn main()`" is not

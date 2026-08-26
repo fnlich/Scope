@@ -72,6 +72,43 @@ DEFAULT_CDP_PORT = 9222
 # the fast path slower than the thing it replaces.
 NEW_CHAT_TIMEOUT_MS = 5_000
 
+# How long the last-resort copy gets, in total. Tight on purpose: it runs after
+# the read already came back empty, so it is spending time the solve has
+# notionally run out of, to turn a guaranteed zero into a possible answer.
+COPY_TIMEOUT_MS = 1_500
+
+# Installed before the copy button is clicked. It makes the page hand the code
+# to US instead of to the operating system.
+#
+# Reading the system clipboard back would be the obvious way to use a copy
+# button, and it is the one thing that must not happen here: the clipboard is
+# ONE object shared by every tab, every browser on the display, and every miner
+# process the operator runs. Measured, two tabs in one browser: A wrote
+# 'TAB-A-CODE', B wrote 'TAB-B-CODE', A read back 'TAB-B-CODE'. A pool that
+# read the clipboard would submit another task's program, silently, whenever
+# two solves overlapped. Intercepting `writeText` keeps the value in the page,
+# so nothing is shared and nothing can collide -- and it also leaves the
+# operator's own clipboard alone while the miner works.
+_COPY_HOOK = """() => {
+  if (window.__honeHooked) return;
+  window.__honeHooked = true;
+  window.__honeCopied = null;
+  const c = navigator.clipboard;
+  if (!c) return;
+  c.writeText = (t) => { window.__honeCopied = String(t); return Promise.resolve(); };
+  c.write = (items) => {
+    try {
+      const item = items && items[0];
+      if (item && item.getType) {
+        return item.getType('text/plain')
+          .then((b) => b.text())
+          .then((t) => { window.__honeCopied = t; });
+      }
+    } catch (e) { /* fall through: the read below reports nothing copied */ }
+    return Promise.resolve();
+  };
+}"""
+
 
 @dataclass(frozen=True)
 class Site:
@@ -91,6 +128,10 @@ class Site:
     # a fresh conversation is had by reloading ``url`` instead, which always
     # works. So a wrong or missing candidate costs speed, never correctness.
     new_chat: tuple[str, ...] = ()
+    # The code block's own "copy" control, used ONLY as a last resort — see
+    # `_Tab._copied_code`. Must name the button that copies ONE code block, not
+    # the one that copies the whole message and not, on ChatGPT, "Run code".
+    copy: tuple[str, ...] = ()
     # Attribute that uniquely identifies a message, if the site has one.
     # ChatGPT does (``data-message-id``); without one the reply is identified
     # by position, which works because every task starts a fresh conversation.
@@ -492,7 +533,12 @@ class _Tab:
                     continue
                 mark = (text_now, whole)
                 if mark == stable:
-                    return text_now  # finished: not busy, and nothing moved
+                    # Finished: not busy, and nothing moved. Break rather than
+                    # return, so the one exit below is the only exit — a
+                    # `return` here left the fenced-block check unreachable on
+                    # every successful read, which is every read that matters.
+                    best = text_now
+                    break
                 stable = mark
         except asyncio.TimeoutError:
             pass  # out of budget mid-read; `best` still holds what we had
@@ -501,6 +547,22 @@ class _Tab:
         except Exception as exc:  # noqa: BLE001 - the page died mid-read
             self.alive = False
             print(f"[{self.site.name}] tab {self.label} died while reading: {type(exc).__name__}")
+        if self.alive and "```" not in best:
+            # No fenced block came back. `_read` re-fences every `pre code` it
+            # finds, so this means the code selectors matched nothing and what
+            # `best` holds is the message's prose -- the DOM-has-moved case, and
+            # the only one worth spending the page's copy control on. Triggering
+            # on `not best` instead looks equivalent and is not: the prose
+            # fallback almost always returns something, so the copy control
+            # would never have run at all.
+            try:
+                reply = await self._new_reply(before)
+                if reply is not None:
+                    best = await self._copied_code(reply) or best
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a last resort may simply not work
+                pass
         return best
 
     async def _poll(
@@ -678,6 +740,59 @@ class _Tab:
                 f"{self.site.name}` and set {self.site.env_prefix}_ASSISTANT."
             )
         return True
+
+    async def _copied_code(self, reply) -> Optional[str]:
+        """The code as the PAGE would copy it, without touching the clipboard.
+
+        A last resort, and deliberately only that. Scraping `pre code` is
+        measured byte-exact on both sites today, so this earns nothing on the
+        happy path and is never run there. What it covers is the failure that
+        keeps recurring: the DOM moves, the selector stops matching, and a
+        perfectly good answer is reported as no answer at all. The copy button
+        is the site's own answer to "where is the code", so when scraping comes
+        back with nothing it is worth one click.
+
+        Clicking is safe *here* precisely because we already have nothing: the
+        worst case is a wasted click on a reply that was unreadable anyway.
+        """
+        if not self.site.copy:
+            return None
+        buttons = None
+        for selector in self.site.copy:
+            found = reply.locator(selector)
+            if await found.count() > 0:
+                buttons = found
+                break
+        if buttons is None:
+            return None
+        await self._page.evaluate(_COPY_HOOK)
+        fenced: list[str] = []
+        for i in range(await buttons.count()):
+            await self._page.evaluate("window.__honeCopied = null")
+            try:
+                # force: the control is often transparent until hover, and
+                # actionability would wait for a hover that never comes.
+                await buttons.nth(i).click(timeout=COPY_TIMEOUT_MS, force=True)
+                await self._page.wait_for_function(
+                    "window.__honeCopied !== null", timeout=COPY_TIMEOUT_MS
+                )
+                block = await self._page.evaluate("window.__honeCopied")
+            except Exception:  # noqa: BLE001 - one uncooperative button, not a dead tab
+                continue
+            if not block or not block.strip():
+                continue
+            longest = max((len(r) for r in re.findall(r"`+", block)), default=0)
+            fence = "`" * max(3, longest + 1)
+            fenced.append(f"{fence}\n{block}\n{fence}")
+        if not fenced:
+            return None
+        print(
+            f"[{self.site.name}] tab {self.label}: nothing matched the code "
+            f"selectors, recovered {len(fenced)} block(s) from the page's own "
+            f"copy control. Run `python -m solvers.doctor {self.site.name}` — "
+            f"the DOM has moved."
+        )
+        return "\n".join(fenced)
 
     @staticmethod
     async def _whole(reply) -> str:

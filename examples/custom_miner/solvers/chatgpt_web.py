@@ -73,6 +73,9 @@ def chatgpt_site() -> Site:
             "CHATGPT_NEW_CHAT",
             ('[data-testid="create-new-chat-button"]', 'button[aria-label*="New chat"]'),
         ),
+        # The code block's own control. NOT "Copy response" (the whole message)
+        # and emphatically NOT "Run code". See `_Tab._copied_code`.
+        copy=selectors("CHATGPT_COPY", ('button[aria-label="Copy"]',)),
         message_id_attr="data-message-id",
         nudge=os.environ.get("CHATGPT_NUDGE", NUDGE),
         poll_s=float(os.environ.get("CHATGPT_POLL_S", "2")),

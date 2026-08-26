@@ -119,6 +119,9 @@ def claude_site() -> Site:
         # claude.ai has no per-message id attribute we can rely on, so the reply
         # is identified by position. Sound here because every task starts a
         # fresh conversation.
+        # The code block's own control. NOT the message-level "Copy", which
+        # takes the whole reply. See `_Tab._copied_code`.
+        copy=selectors("CLAUDE_COPY", ('button[aria-label="Copy to clipboard"]',)),
         message_id_attr=None,
         nudge=os.environ.get("CLAUDE_NUDGE", NUDGE),
         poll_s=float(os.environ.get("CLAUDE_POLL_S", "2")),
