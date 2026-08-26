@@ -52,6 +52,7 @@ from rlvr.types import TestCase  # noqa: E402
 
 from solvers.config import find_env_file, load_env_file  # noqa: E402
 from solvers.roster import build_solver, describe, roster, warm_up  # noqa: E402
+from solvers.challenges import load_all, names as challenge_names  # noqa: E402
 from solvers.samples import SAMPLES  # noqa: E402
 
 
@@ -86,6 +87,40 @@ def _from_sample(name: str) -> Problem:
         sample.request(), sample.hidden_tests(), "a built-in sample",
         "the full suite, including cases the model never saw",
     )
+
+
+def _from_challenges(which: Optional[list[str]], shown: Optional[int],
+                     timeout_s: float) -> list[Problem]:
+    """The sample challenges as validator requests.
+
+    Graded on ALL their cases while the model is shown only some. Showing all
+    three and grading all three is circular -- `VerifyingSolver` repairs until
+    the public examples pass, so the grade could only agree with the check
+    already made, and would report a success it was incapable of failing.
+    """
+    problems = []
+    for challenge in load_all(which):
+        examples = challenge.shown(shown)
+        held = len(challenge.cases) - len(examples)
+        problems.append(Problem(
+            TaskRequest(
+                problem_id=challenge.name,
+                language=challenge.language,
+                statement=challenge.statement,
+                entrypoint=challenge.entrypoint,
+                public_examples=[TestCase(**case) for case in examples],
+                deadline_s=timeout_s,
+            ),
+            [TestCase(**case) for case in challenge.cases],
+            "the sample challenges",
+            (f"all {len(challenge.cases)} public case(s), "
+             f"{held} of which the model was not shown"
+             if held else
+             f"all {len(challenge.cases)} public case(s), every one of which the "
+             f"model was shown — so this grade cannot fail; use --examples to hold "
+             f"some back"),
+        ))
+    return problems
 
 
 def _from_file(path: str) -> Problem:
@@ -231,10 +266,16 @@ def _verdict(payload, request: TaskRequest, tests: list[TestCase]) -> tuple[str,
     code = getattr(payload, "code", "") or ""
     if not code.strip():
         return FAILED, "nothing was submitted"
+    builds = ""
     if request.language == "rust":
         defect = _compile_defect_if_possible(code)
         if defect is not None:
             return FAILED, defect
+        if _rustc_available():
+            # Worth carrying into the message below. Without a Docker daemon
+            # "could not be run here" is all an operator would learn from a
+            # Rust rehearsal, and "it builds" is most of what they wanted.
+            builds = "it compiles locally; "
     if not tests:
         return UNKNOWN, "no tests came with this problem to check it against"
     try:
@@ -243,10 +284,16 @@ def _verdict(payload, request: TaskRequest, tests: list[TestCase]) -> tuple[str,
             [t.model_dump(mode="json") for t in tests],
         )
     except Exception as exc:  # noqa: BLE001 - a missing toolchain is not a verdict
-        return UNKNOWN, f"the tests could not be run here — {_one_line(exc)}"
+        return UNKNOWN, f"{builds}the tests could not be run here — {_one_line(exc)}"
     if passed == total:
         return SCORED, f"passed all {total} test(s)"
     return FAILED, f"passed {passed}/{total} — {'; '.join(failures[:2])}"
+
+
+def _rustc_available() -> bool:
+    from solvers.rust_compile import rustc_path
+
+    return rustc_path() is not None
 
 
 def _compile_defect_if_possible(code: str) -> Optional[str]:
@@ -292,23 +339,17 @@ async def run(
     if load_env_file(env_file):
         print(f"[rehearse] loaded {env_file}")
 
-    if args.source_file:
-        problem = _from_file(args.source_file)
+    if args.challenge:
+        which = None if args.challenge == ["all"] else args.challenge
+        problems = _from_challenges(which, args.examples, args.timeout)
+    elif args.source_file:
+        problems = [_from_file(args.source_file)]
     elif args.lease:
-        problem = await _from_lease(args.insecure)
+        problems = [await _from_lease(args.insecure)]
     else:
-        problem = _from_sample(args.sample)
-    request, tests, origin = problem.request, problem.tests, problem.origin
-
-    print(
-        f"[rehearse] {request.language} problem {request.problem_id} from {origin}\n"
-        f"[rehearse] entrypoint={request.entrypoint} "
-        f"examples={len(request.public_examples)} deadline={request.deadline_s:g}s"
-    )
-    if args.statement:
-        print("-" * 72)
-        print(request.statement.strip())
-        print("-" * 72)
+        problems = [_from_sample(args.sample)]
+    if not problems:
+        raise SystemExit("[rehearse] nothing to rehearse")
 
     from custom_miner import CustomMiner
     from rlvr.neurons.demo_miner import DemoMinerSettings
@@ -324,6 +365,7 @@ async def run(
     # address the request to and no chain to authorize the sender against. The
     # handler's own checks cover both cases and are exercised as they are.
     miner = CustomMiner(settings, solver)
+    results: list[tuple[Problem, str, str]] = []
     try:
         try:
             await warm_up(solver, settings.miner_max_concurrent_requests)
@@ -336,16 +378,55 @@ async def run(
             print(f"\n[rehearse] COULD NOT BE CHECKED: no browser to solve with.\n"
                   f"           {_one_line(exc, limit=400)}")
             return 2
-        timeout_s = min(request.deadline_s, settings.glm_request_timeout_s)
-        status, payload, spent = await _answer(miner, request, timeout_s)
+        for index, problem in enumerate(problems, 1):
+            if len(problems) > 1:
+                print(f"\n{'=' * 72}\n[rehearse] {index} of {len(problems)}: "
+                      f"{problem.request.problem_id}\n{'=' * 72}")
+            verdict, why = await _rehearse_one(miner, problem, settings, args)
+            results.append((problem, verdict, why))
     finally:
+        # The fleet is closed ONCE, after every problem. Opening browsers per
+        # challenge would spend a minute of sign-in-warm page loads five times
+        # over, and the tabs are designed to be reused -- that is what a miner
+        # does for its whole life.
         await solver.aclose()
 
+    if len(results) > 1:
+        _summarise(results)
+    # 0 everything scored, 1 something answered and was wrong, 2 nothing could
+    # be concluded -- so a rehearsal in a shell script can tell "my miner is
+    # broken" from "this machine cannot grade Rust". A mixed run reports the
+    # worst outcome in it, because a run with one wrong answer in it is not a
+    # passing run.
+    verdicts = {verdict for _, verdict, _ in results}
+    if FAILED in verdicts:
+        return 1
+    if UNKNOWN in verdicts:
+        return 2
+    return 0
+
+
+async def _rehearse_one(miner, problem: Problem, settings, args) -> tuple[str, str]:
+    """One problem, from the request going out to the verdict coming back."""
+    request, tests = problem.request, problem.tests
+    print(
+        f"[rehearse] {request.language} problem {request.problem_id} from "
+        f"{problem.origin}\n"
+        f"[rehearse] entrypoint={request.entrypoint} "
+        f"examples={len(request.public_examples)} deadline={request.deadline_s:g}s"
+    )
+    if args.statement:
+        print("-" * 72)
+        print(request.statement.strip())
+        print("-" * 72)
+
+    timeout_s = min(request.deadline_s, settings.glm_request_timeout_s)
+    status, payload, spent = await _answer(miner, request, timeout_s)
     print(f"[rehearse] the miner answered {status} in {spent:.1f}s "
           f"(its budget was {timeout_s:g}s)")
     if status != 200:
         print(f"[rehearse] FAILED: {payload}")
-        return 1
+        return FAILED, f"the miner answered {status}"
 
     code = payload.code or ""
     print(f"[rehearse] submitted {len(code)} chars of {request.language}")
@@ -368,21 +449,59 @@ async def run(
 
     where = archive_dir()
     if where is not None:
-        print(f"[rehearse] archived under {where}/ (the code, and the exchange beside it)")
+        print(f"[rehearse] archived under {where}/ "
+              f"({request.problem_id}.{'rs' if request.language == 'rust' else 'py'}, "
+              f"and the exchange beside it)")
 
     verdict, why = _verdict(payload, request, tests)
     print(f"[rehearse] {verdict}: {why}")
     print(f"[rehearse] checked against {problem.tests_are}")
-    # 0 answered and correct, 1 answered and wrong, 2 nothing could be
-    # concluded -- so a rehearsal in a shell script can tell "my miner is
-    # broken" from "this machine cannot grade Rust".
-    return {SCORED: 0, FAILED: 1}.get(verdict, 2)
+    return verdict, why
+
+
+# How wide one summary row may be. Chosen to sit inside an 80-column terminal's
+# usual two-line wrap rather than to match it exactly: the alternative is a
+# detail cut so short it names nothing.
+ROW_WIDTH = 118
+
+
+def _fit(text: str, limit: int) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
+def _summarise(results: list[tuple[Problem, str, str]]) -> None:
+    """One table at the end, because the per-problem output scrolls away.
+
+    A run over five challenges prints several hundred lines and takes long
+    enough that nobody watches it. The thing worth reading is which of them
+    scored, and it must not require scrolling back through four other answers
+    to find out.
+    """
+    width = max(len(problem.request.problem_id) for problem, _, _ in results)
+    print(f"\n{'=' * 72}\n[rehearse] summary\n{'=' * 72}")
+    for problem, verdict, why in results:
+        mark = {SCORED: "PASS", FAILED: "FAIL"}.get(verdict, "????")
+        # One line each, and the budget is the WHOLE line rather than the
+        # detail alone -- the name column is as wide as the longest challenge
+        # name, so trimming only the tail still wrapped. A failure detail runs
+        # to several hundred characters (it names the arguments, what came back
+        # and what was wanted) and five of those wrapped is not a table, it is
+        # the scrollback the table was added to replace. The full text is
+        # printed above, per problem.
+        head = (f"  {mark}  {problem.request.problem_id:<{width}}  "
+                f"{problem.request.language:<7} ")
+        print(head + _fit(why, max(24, ROW_WIDTH - len(head))))
+    scored = sum(1 for _, verdict, _ in results if verdict == SCORED)
+    print(f"\n  {scored}/{len(results)} would have scored")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m solvers.rehearse",
-        description="Solve one real problem locally, through the miner's own code.",
+        description="Solve real problems locally, through the miner's own code.",
+        epilog="Exit 0 everything scored, 1 something was wrong, 2 nothing "
+               "could be concluded.",
     )
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
@@ -396,6 +515,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     source.add_argument(
         "--lease", action="store_true",
         help="lease a real challenge from PROBLEM_SERVER_URL (consumes one)",
+    )
+    source.add_argument(
+        "--challenge", nargs="+", metavar="NAME",
+        help="one or more of the sample challenges, or `all` for every one: "
+             + (", ".join(challenge_names()) or "(none found)"),
+    )
+    parser.add_argument(
+        "--examples", type=int, default=2, metavar="N",
+        help="how many of a challenge's public cases the MODEL is shown; it is "
+             "always graded on all of them. 0 reproduces the run this miner was "
+             "built for, where no examples shipped at all (default: 2)",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=300.0, metavar="S",
+        help="deadline per challenge, as a validator would advertise it "
+             "(default: 300)",
     )
     parser.add_argument(
         "--insecure", action="store_true",

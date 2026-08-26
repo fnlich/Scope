@@ -5088,8 +5088,8 @@ def test_a_star_import_is_never_itself_carried():
 def _rehearsal_args(**kw):
     import argparse
 
-    base = dict(sample="python", source_file=None, lease=False,
-                insecure=False, statement=False, show=0)
+    base = dict(sample="python", source_file=None, lease=False, challenge=None,
+                examples=2, timeout=300.0, insecure=False, statement=False, show=0)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -5428,3 +5428,206 @@ def test_the_doctor_explains_a_site_it_cannot_reach(capsys, monkeypatch):
     assert "Traceback" not in out
     assert "proxy or firewall" in out, "the operator was left without a next step"
     assert page.closed, "the doctor's own tab was left open in your browser"
+
+
+# --------------------------------------------------------------------------- #
+# The sample challenges: the closest thing in this repository to what a
+# validator actually sends. Five real problems, two Python and three Rust, each
+# a page of prose with its edge cases stated rather than shown.
+# --------------------------------------------------------------------------- #
+def test_every_sample_challenge_loads_as_a_validator_request():
+    from solvers.challenges import load_all, names
+
+    found = names()
+    assert len(found) == 5, found
+    for challenge in load_all():
+        assert challenge.language in ("python", "rust"), challenge.name
+        assert challenge.entrypoint, challenge.name
+        assert len(challenge.statement) > 500, f"{challenge.name} statement looks empty"
+        assert challenge.cases, challenge.name
+        for case in challenge.cases:
+            assert set(case) >= {"args", "kwargs", "expected"}, case
+
+
+def test_the_model_is_shown_fewer_cases_than_it_is_graded_on():
+    """The decision that makes a challenge run mean anything. Show the model all
+    three and grade it on all three and the result is circular:
+    `VerifyingSolver` repairs until the public examples pass, so the grade can
+    only agree with the check already made — it would report a success it was
+    incapable of failing."""
+    from solvers import rehearse
+
+    problems = rehearse._from_challenges(None, 2, 300.0)
+    assert len(problems) == 5
+    for problem in problems:
+        shown = len(problem.request.public_examples)
+        graded = len(problem.tests)
+        assert shown < graded, (
+            f"{problem.request.problem_id}: shown {shown} of {graded} — "
+            f"the grade cannot fail"
+        )
+        assert "not shown" in problem.tests_are
+
+
+def test_no_examples_at_all_reproduces_the_run_this_miner_was_built_for():
+    """On that run nothing shipped public examples, so the whole repair loop was
+    dead code. It is the condition worth measuring against, not a handicap."""
+    from solvers import rehearse
+
+    for problem in rehearse._from_challenges(None, 0, 300.0):
+        assert problem.request.public_examples == []
+        assert len(problem.tests) == 3
+
+
+def test_showing_every_case_says_the_grade_cannot_fail():
+    """If someone asks for it anyway, the report has to admit what it is."""
+    from solvers import rehearse
+
+    problem = rehearse._from_challenges(["extent-journal"], 99, 300.0)[0]
+    assert len(problem.request.public_examples) == len(problem.tests)
+    assert "cannot fail" in problem.tests_are
+
+
+def test_a_challenge_name_cannot_read_outside_the_challenge_directory(tmp_path):
+    """`name` arrives from the command line and becomes a path.
+
+    The escape target has to be a REAL challenge, or the "is there a cases.json
+    there" check catches it on its own and the guard under test never runs.
+    So: one valid challenge inside the directory, an identical one just outside
+    it, and `../elsewhere` must not reach the second."""
+    from solvers.challenges import load
+
+    root = tmp_path / "challenges"
+    (root / "inside").mkdir(parents=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    manifest = json.dumps({
+        "language": "python", "entrypoint": "f",
+        "cases": [{"name": "c", "args": [], "kwargs": {}, "expected": 1}],
+    })
+    for directory in (root / "inside", outside):
+        (directory / "cases.json").write_text(manifest)
+        (directory / "PROBLEM.md").write_text("# t\n\nDo the thing.")
+
+    assert load("inside", root).entrypoint == "f", "the ordinary case broke"
+    for hostile in ("../elsewhere", "inside/../../elsewhere", ".."):
+        with pytest.raises(SystemExit):
+            load(hostile, root)
+
+
+def test_an_unknown_challenge_names_the_ones_that_exist():
+    from solvers.challenges import load
+
+    with pytest.raises(SystemExit) as raised:
+        load("no-such-challenge")
+    assert "sparse-circular-array" in str(raised.value)
+
+
+def test_challenges_run_as_a_batch_and_end_in_one_table(capsys):
+    """A run over five challenges prints several hundred lines and takes long
+    enough that nobody watches it. Which of them scored must not require
+    scrolling back through four other answers."""
+    from solvers import rehearse
+
+    factory, backend = _rehearsal_solver("```python\ndef f():\n    return 1\n```")
+    code = asyncio.run(
+        rehearse.run(
+            _rehearsal_args(challenge=["all"], examples=2, timeout=30.0),
+            solver_factory=factory,
+        )
+    )
+    out = capsys.readouterr().out
+    assert "[rehearse] summary" in out, out
+    for name in ("asset-rebuild-planner", "extent-journal", "sparse-circular-array"):
+        assert name in out, f"{name} missing from the run"
+    assert "0/5 would have scored" in out, out
+    assert code != 0
+    assert len(backend.chats) == 5, "one conversation per challenge"
+    # Every summary row on one line. A failure detail runs to several hundred
+    # characters, and five of those wrapped is the scrollback the table was
+    # added to replace.
+    table = out[out.index("[rehearse] summary"):]
+    rows = [line for line in table.splitlines() if line.startswith(("  PASS", "  FAIL", "  ????"))]
+    assert len(rows) == 5, table
+    over = [line for line in rows if len(line) > 130]
+    assert not over, f"summary row too long to be a table: {over[0][:160]}..."
+
+
+def test_the_summary_stays_a_table():
+    """A failure detail runs to several hundred characters — it names the
+    arguments, what came back and what was wanted. Five of those wrapped is the
+    scrollback the table was added to replace."""
+    from solvers import rehearse
+
+    long_why = "passed 0/3 — " + "x" * 400
+    assert len(rehearse._fit(long_why, 96)) == 96
+    assert rehearse._fit("short", 96) == "short"
+    assert rehearse._fit("a\n  b   c", 96) == "a b c"
+
+
+def test_a_mixed_batch_reports_the_worst_outcome_in_it(capsys, monkeypatch):
+    """A run with one wrong answer in it is not a passing run."""
+    from solvers import rehearse
+
+    verdicts = iter([
+        (rehearse.SCORED, "passed all 3 test(s)"),
+        (rehearse.UNKNOWN, "the tests could not be run here"),
+        (rehearse.FAILED, "passed 1/3"),
+    ])
+    monkeypatch.setattr(rehearse, "_verdict", lambda *a: next(verdicts))
+    factory, _ = _rehearsal_solver("```python\ndef f():\n    return 1\n```")
+    code = asyncio.run(
+        rehearse.run(
+            _rehearsal_args(
+                challenge=["asset-rebuild-planner", "extent-journal",
+                           "sparse-circular-array"],
+                examples=2, timeout=30.0,
+            ),
+            solver_factory=factory,
+        )
+    )
+    assert code == 1, capsys.readouterr().out
+
+    # ...and with nothing failed, an unknown still outranks a pass.
+    verdicts = iter([(rehearse.SCORED, "ok"), (rehearse.UNKNOWN, "no docker")])
+    monkeypatch.setattr(rehearse, "_verdict", lambda *a: next(verdicts))
+    factory, _ = _rehearsal_solver("```python\ndef f():\n    return 1\n```")
+    code = asyncio.run(
+        rehearse.run(
+            _rehearsal_args(
+                challenge=["asset-rebuild-planner", "extent-journal"],
+                examples=2, timeout=30.0,
+            ),
+            solver_factory=factory,
+        )
+    )
+    assert code == 2, capsys.readouterr().out
+
+
+def test_the_fleet_is_opened_once_for_a_whole_batch():
+    """Opening browsers per challenge would spend a minute of page loads five
+    times over, and the tabs are designed to be reused — that is what a miner
+    does for its whole life."""
+    from solvers import rehearse
+
+    closes: list[int] = []
+    factory, backend = _rehearsal_solver("```python\ndef f():\n    return 1\n```")
+
+    def counting_factory():
+        solver = factory()
+        original = solver.aclose
+
+        async def aclose():
+            closes.append(1)
+            await original()
+
+        solver.aclose = aclose
+        return solver
+
+    asyncio.run(
+        rehearse.run(
+            _rehearsal_args(challenge=["all"], examples=2, timeout=30.0),
+            solver_factory=counting_factory,
+        )
+    )
+    assert closes == [1], f"the fleet was closed {len(closes)} times, not once"
