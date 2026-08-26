@@ -3807,3 +3807,56 @@ def test_reasoning_and_the_user_turn_lose_to_a_short_answer_together():
     answer = '```rust\nfn main() { println!("42"); }\n```'
     got = _reconstruct(_chatgpt_conversation(answer, thoughts="Let me reason. " * 200))
     assert got == answer, f"took reasoning or the prompt over the answer: {got[:70]!r}"
+
+
+def test_the_log_names_which_model_produced_the_answer(capsys):
+    """Attribution after the fact was guesswork. Of 43 archived submissions
+    only three could be traced to a provider at all, and only because the
+    DAMAGE carried a fingerprint — two held ChatGPT's nudge, one quoted
+    `/home/claude/sol`. The other forty were unattributable, which made "is one
+    of these tabs doing worse than the others" unanswerable.
+
+    It has to be the model that WON, not merely the ones asked: a second
+    opinion is bought precisely when the first answer was poor, so "who was
+    asked" and "whose answer went out" are different questions.
+    """
+    # Two providers, and the FIRST one wins: its answer passes the examples, so
+    # no second opinion is bought. Crediting "whoever was asked last" would
+    # coincide with the truth here only by accident, which is why the second
+    # case below asks two and still expects the first to be named.
+    class _TwoModels:
+        def __init__(self, script):
+            self._script, self.seen = script, []
+
+        async def open(self, avoid=None):
+            name, replies = self._script[len(self.seen)]
+            self.seen.append(name)
+            return _Chat(replies, name)
+
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    task = SolveTask(
+        problem_id="p", language="python", statement=DIGITS.statement,
+        entrypoint="g", deadline_s=60.0,
+        public_examples=[{"args": [12345], "kwargs": {}, "expected": 15}],
+    )
+
+    # chatgpt answers correctly and is never followed up.
+    backend = _TwoModels([("chatgpt", [RIGHT])])
+    asyncio.run(VerifyingSolver(backend, safety_margin_s=0, max_budget_s=120)
+                .solve_task(task, 60.0))
+    logged = capsys.readouterr().out
+    assert "provider=chatgpt" in logged, f"the log cannot say who answered: {logged!r}"
+
+    # ...and when the first model fails and the second is asked but does WORSE,
+    # the credit must stay with the answer that actually went out.
+    backend = _TwoModels([("chatgpt", [WRONG, WRONG, WRONG]), ("claude", ["no code here"])])
+    asyncio.run(VerifyingSolver(backend, safety_margin_s=0, max_budget_s=120)
+                .solve_task(task, 60.0))
+    logged = capsys.readouterr().out
+    assert backend.seen == ["chatgpt", "claude"], backend.seen
+    assert "provider=chatgpt" in logged, (
+        f"credited the last model ASKED rather than the one whose answer was "
+        f"submitted: {logged!r}"
+    )

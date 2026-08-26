@@ -258,6 +258,14 @@ class VerifyingSolver:
         # payment rides on that. Asking the other model is a fresh chance at the
         # full amount, and with a fleet there is usually an idle tab to ask on.
         asked: list[str] = []
+        # WHICH model produced the answer that wins, not merely which were
+        # asked. Attribution after the fact was otherwise guesswork: of 43
+        # archived submissions only three could be traced to a provider at all,
+        # and only because the damage itself carried a fingerprint -- two held
+        # ChatGPT's nudge, one quoted `/home/claude/sol`. The other forty were
+        # unattributable, which made "is one of these tabs doing worse than the
+        # others" an unanswerable question.
+        won_with: Optional[str] = None
         passes = 2 if self._second_opinion else 1
         for attempt_no in range(passes):
             remaining = budget - (time.monotonic() - started)
@@ -273,6 +281,7 @@ class VerifyingSolver:
                 asked.append(provider)
             if candidate is not None and candidate.score > best.score:
                 best = candidate
+                won_with = provider
             if best.verified:
                 break
             if not task.public_examples:
@@ -308,6 +317,7 @@ class VerifyingSolver:
         elapsed = time.monotonic() - started
         print(
             f"[verify] {task.language} entrypoint={task.entrypoint} "
+            f"provider={won_with or 'none'} "
             f"examples={best.passed}/{best.total} verified={best.verified} "
             f"{elapsed:.1f}s/{budget:.0f}s"
         )
