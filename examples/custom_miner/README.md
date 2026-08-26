@@ -129,6 +129,58 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 - **Never raise.** On any failure return empty `code` — a zero is survivable, a
   crash loop is not. `custom_miner.py` already wraps your solver this way.
 
+### The hidden suite is where the score is, so the prompt is written for it
+
+The public examples are the friendly ones. Grading is on the **complete hidden
+suite**, which is written to break a solution that only handles the shape it was
+shown — so the prompt names the cases one at a time instead of saying "handle
+edge cases", which every model agrees to and none acts on:
+
+    NOTHING          empty list, empty string, n = 0
+    ONE              n = 1, one element, one character
+    TWO              where "first" and "last" stop being the same element
+    BOTH ENDS        first and last, empty range, inclusive vs exclusive
+    EXTREME VALUES   0, 1, -1, negatives, the largest magnitude allowed
+    DEGENERATE       all equal, all duplicates, sorted, reverse sorted
+
+The examples are rendered *after* that list and labelled a floor rather than the
+specification, because read first they become the spec and the checklist reads
+as an afterthought. The model is also asked for one comment at the top of its
+code stating what the program does for the empty case and for `n = 1` — writing
+it down is what turns the list from something to agree with into something to
+do. Repair rounds are sent back through the same checklist, since they share the
+conversation and a repair that fixes the failing example while breaking a
+boundary scores the same zero.
+
+Each language is then warned about its own way of losing a large number, because
+they are not the same failure:
+
+- **Rust — overflow is silent.** The validator compiles with `-C opt-level=2`,
+  and `rustc` turns overflow checks off at any opt-level above zero. `i32`
+  arithmetic wraps and the program **exits 0 with a plausible wrong number**
+  rather than panicking. Measured with the validator's own flags: two `i32`
+  values of `2_000_000_000` sum to `-294967296`. So the prompt asks for `i64` by
+  default and `i128` for products. There is no message and nothing in the
+  failure that points at the cause, which is exactly why it has to be said up
+  front.
+- **Python — integers never overflow, but recursion dies at 1000.** A recursive
+  answer fails at `n = 10^4` with `RecursionError`, so the prompt asks for
+  iteration. It also states the comparison rules that cost a solve when guessed
+  at: `True` is not `1`, two integers must match exactly, a dict must have
+  exactly the expected keys — and a list and a tuple *are* interchangeable, so
+  no repair round need be spent converting one.
+
+Both are told the real per-test budget (5 seconds), because a budget quoted
+generously invites an algorithm that does not fit.
+
+Every one of those claims is about somebody else's code, and claims like that
+rot without anyone noticing — the prompt keeps saying them long after the policy
+that made them true has moved. So each is pinned by a test: the overflow test
+compiles with `RELEASE_POLICY.rustc_flags` rather than a copy of them, the
+comparison claims are asserted against `rlvr.execution.compare.values_equal`,
+and the timeout is read from the validator's own config. Change the policy and
+the tests fail, instead of the prompt quietly starting to lie.
+
 ## How it works: you run the browsers, the miner uses them
 
 You start N browsers — six to ten is a normal fleet — each signed in **by hand**

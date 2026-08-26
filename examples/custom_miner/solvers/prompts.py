@@ -99,7 +99,6 @@ Rules — the grader is automated and unforgiving:
 - RETURN the answer. Do not print it, do not read stdin, do not call input().
   Printed output is ignored by the grader.
 - Standard library only. No pip packages, no network, no file access.
-- Handle edge cases and large inputs; hidden tests go beyond the examples.
 - Do not include tests, example calls, or `if __name__ == "__main__"`."""
 
 RUST_RULES = """\
@@ -109,9 +108,71 @@ Rules — the grader is automated and unforgiving:
   `rustc --edition=2021 -C opt-level=2`. No Cargo, no crates, std only.
 - READ the input from stdin and WRITE only the requested answer to stdout.
 - Output is compared token-by-token after splitting on ASCII whitespace, so
-  extra prose, labels or prompts make the answer wrong.
-- Handle edge cases and large inputs; hidden tests go beyond the examples.
-- Prefer fast I/O (lock stdout, use a BufWriter) — inputs can be large."""
+  extra prose, labels or prompts make the answer wrong."""
+
+# The public examples are the friendly ones. The hidden suite is where the
+# score comes from, and it is written to break a solution that only handles the
+# shape it was shown -- so the cases below are named one at a time rather than
+# summarised as "handle edge cases", which every model agrees to and none acts
+# on. Each line is a case that has a right answer the statement implies and a
+# wrong answer a plausible implementation produces.
+EDGE_CASES = """\
+Edge cases are where this is won or lost. Walk your solution through every one
+of these before you answer, and fix what breaks:
+- NOTHING: an empty list, an empty string, n = 0. Work out what the statement
+  says the answer is, then make sure your code reaches it instead of crashing
+  or dividing by a length of zero.
+- ONE: n = 1, a single element, a one-character string. Almost every
+  off-by-one bug is visible here and nowhere else.
+- TWO: the smallest case where "first" and "last" are different elements, and
+  where adjacent-pair logic stops agreeing with the general case.
+- BOTH ENDS: the first element and the last, an empty range, and an inclusive
+  bound against an exclusive one. Check the far end explicitly — a loop that is
+  right at the start and short by one at the finish passes every example.
+- EXTREME VALUES: 0, 1, -1, negative numbers, and the largest magnitude the
+  statement allows. If no bound is given, assume values up to 10^18 and n up to
+  10^5, and pick an algorithm and a type that survive both.
+- DEGENERATE SHAPE: every element equal, every element a duplicate, already
+  sorted, sorted backwards, all zeros."""
+
+# Deliberately last, AFTER the language-specific cases: it is the one line that
+# turns the list above from something to agree with into something to do, and a
+# closing instruction has to close.
+EDGE_CASES_CLOSE = """\
+Put ONE short comment at the top of your code saying what it produces for the
+empty case and for n = 1. Writing it down is what makes the check real."""
+
+# Two of these are facts about THIS grader, not general advice, and both cost a
+# solve when guessed at: the comparison is structural and strict about bools,
+# and each test is on a five-second clock.
+PYTHON_EDGE_CASES = """\
+- Python integers never overflow, but the default recursion limit is 1000, so a
+  recursive answer dies at n = 10^4 with RecursionError. Write it iteratively,
+  or raise the limit yourself at the top of the file.
+- Each test gets about 5 seconds. O(n^2) over n = 10^5 does not fit.
+- Return the exact shape the examples show. The comparison is structural:
+  `True` is not `1`, so a boolean answer must be a real bool; a dict must have
+  exactly the expected keys; two integers must match exactly. (A list and a
+  tuple with equal contents do compare equal, so that one is safe.)"""
+
+# The overflow line is the single most valuable sentence in this file, and it is
+# measured rather than assumed -- see the test that compiles it. `rustc`
+# switches overflow checks off whenever opt-level > 0, and the grader compiles
+# at opt-level=2, so the arithmetic wraps and the program exits 0 with a
+# plausible wrong number. There is no panic, no message, and nothing in the
+# failure that points at the cause.
+RUST_EDGE_CASES = """\
+- INTEGER OVERFLOW IS SILENT HERE. The grader compiles with `-C opt-level=2`,
+  which turns overflow checks OFF: `i32` arithmetic wraps around and the
+  program exits normally with a wrong answer instead of panicking. Two `i32`
+  values of 2_000_000_000 add up to -294967296. Use `i64` everywhere by
+  default, `i128` for products, and reach for `i32` only where you have proved
+  the range cannot be exceeded.
+- Read to EOF. Tolerate trailing newlines, blank lines and repeated spaces, and
+  do not assume a fixed number of lines unless the statement fixes it.
+- Deep recursion overflows the stack. Prefer iteration for n up to 10^5.
+- Each test gets about 5 seconds, so lock stdout once and wrap it in a
+  BufWriter rather than printing in a loop."""
 
 
 def _render_examples(language: str, examples: list[dict[str, Any]]) -> str:
@@ -139,13 +200,34 @@ def _render_examples(language: str, examples: list[dict[str, Any]]) -> str:
 def build_initial_prompt(
     language: str, statement: str, entrypoint: str, examples: list[dict[str, Any]]
 ) -> str:
-    rules = (RUST_RULES if language == "rust" else PYTHON_RULES).format(
-        entrypoint=entrypoint
-    )
-    parts = [f"Solve this programming problem in {'Rust' if language == 'rust' else 'Python'}.", "", rules, "", "PROBLEM:", statement.strip()]
+    """The one prompt that has to carry the whole contract.
+
+    The examples come LAST on purpose. They are the friendliest thing in the
+    message and the easiest to over-fit to, so the edge-case checklist is read
+    first and the examples arrive already framed as a lower bound rather than
+    as the specification.
+    """
+    is_rust = language == "rust"
+    rules = (RUST_RULES if is_rust else PYTHON_RULES).format(entrypoint=entrypoint)
+    edges = "\n".join((
+        EDGE_CASES,
+        RUST_EDGE_CASES if is_rust else PYTHON_EDGE_CASES,
+        EDGE_CASES_CLOSE,
+    ))
+    parts = [
+        f"Solve this programming problem in {'Rust' if is_rust else 'Python'}.",
+        "", rules,
+        "", edges,
+        "", "PROBLEM:", statement.strip(),
+    ]
     rendered = _render_examples(language, examples)
     if rendered:
-        parts += ["", "PUBLIC EXAMPLES (your code must reproduce these exactly):", rendered]
+        parts += [
+            "",
+            "PUBLIC EXAMPLES — these are a floor, not the specification. Your "
+            "code must reproduce them exactly AND survive the cases above:",
+            rendered,
+        ]
     return "\n".join(parts)
 
 
@@ -194,6 +276,10 @@ def build_repair_prompt(
         f"Your solution is WRONG. I ran {target} against the examples and got:\n"
         f"{detail}\n\n"
         "Work out why, then reply with ONLY ONE corrected code block. "
+        "Before you send it, run the fix back through the edge-case checklist "
+        "from my first message — the empty case, n = 1, both ends, and the "
+        "largest values allowed — because a repair that fixes the example and "
+        "breaks a boundary scores the same zero. "
         "Same rules as before. Do not explain outside the code block."
     )
 

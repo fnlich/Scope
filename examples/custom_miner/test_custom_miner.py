@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import asyncio
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -41,7 +43,7 @@ from solvers.browser_pool import (  # noqa: E402
 )
 from solvers.chatgpt_web import chatgpt_site  # noqa: E402
 from solvers.claude_web import claude_site  # noqa: E402
-from solvers.prompts import extract_code  # noqa: E402
+from solvers.prompts import NO_CODE, extract_code  # noqa: E402
 from solvers.verify import Answer, VerifyingSolver  # noqa: E402
 
 from rlvr.config import Settings  # noqa: E402
@@ -2725,3 +2727,159 @@ def test_a_round_that_captured_nothing_never_replaces_a_flawed_program():
     assert clean.score > flawed.score, "a repaired answer does not beat the broken one"
     assert flawed.score > nothing.score, "an empty round displaced a real program"
     assert candidate("x", passed=1).score > clean.score, "passing examples must win"
+
+
+# --- what the prompt promises about the grader must stay true ------------- #
+# The edge-case section makes specific factual claims: overflow is silent,
+# `True` is not `1`, each test gets five seconds. Claims like those rot without
+# anyone noticing — the prompt keeps saying them long after the policy that
+# made them true has moved — and a prompt that confidently states something
+# false is worse than one that says nothing, because the model acts on it.
+
+
+def test_the_edge_case_checklist_names_the_cases_rather_than_gesturing_at_them():
+    """"Handle edge cases" is a line every model agrees to and none acts on.
+    What earns its place in the prompt is a case with a right answer the
+    statement implies and a wrong answer a plausible implementation gives."""
+    from solvers.prompts import build_initial_prompt
+
+    for language, entry in (("python", "solve"), ("rust", "main")):
+        prompt = build_initial_prompt(language, "Do a thing.", entry, [])
+        for case in ("n = 0", "n = 1", "empty", "BOTH ENDS", "EXTREME VALUES",
+                     "DEGENERATE SHAPE", "-1"):
+            assert case in prompt, f"{language} prompt never mentions {case!r}"
+        assert "off-by-one" in prompt, f"{language} prompt omits the boundary case"
+
+
+def test_each_language_is_warned_about_its_own_way_of_losing_a_large_number():
+    """The large-number failure is not the same failure in both languages, and
+    telling either one the other's story wastes the only prompt there is:
+    Python cannot overflow at all, and Rust cannot grow an integer."""
+    from solvers.prompts import build_initial_prompt
+
+    rust = build_initial_prompt("rust", "Do a thing.", "main", [])
+    python = build_initial_prompt("python", "Do a thing.", "solve", [])
+
+    assert "OVERFLOW IS SILENT" in rust and "i64" in rust
+    assert "overflow" not in python.lower().replace("never overflow", ""), (
+        "told Python about an overflow it cannot have"
+    )
+    assert "recursion limit is 1000" in python
+    assert "recursion limit" not in rust, "told Rust about Python's limit"
+
+
+def test_the_prompts_claim_about_silent_overflow_is_true_of_this_grader():
+    """The most valuable sentence in the prompt, and the one most able to go
+    quietly wrong.
+
+    `rustc` disables overflow checks whenever opt-level > 0, and the validator
+    compiles at opt-level=2 — so `i32` arithmetic WRAPS and the program exits 0
+    with a plausible wrong number instead of panicking. There is no message and
+    nothing in the failure that points at the cause, which is exactly why the
+    model has to be told up front.
+
+    Compiled here with the validator's own flags rather than a copy of them, so
+    that changing `RELEASE_POLICY.rustc_flags` — adding `-C
+    debug-assertions=on`, say — fails this test instead of leaving the prompt
+    asserting something that stopped being true.
+    """
+    rustc = shutil.which("rustc")
+    if rustc is None:
+        pytest.skip("no rustc on this host")
+    from rlvr.policy import RELEASE_POLICY
+    from solvers.prompts import RUST_EDGE_CASES
+
+    work = Path(tempfile.mkdtemp())
+    src = work / "ov.rs"
+    src.write_text(
+        "fn main() {\n"
+        "    let vals: Vec<i32> = vec![2_000_000_000, 2_000_000_000];\n"
+        "    let mut t: i32 = 0;\n"
+        "    for v in &vals { t += *v; }\n"
+        "    println!(\"{}\", t);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    built = subprocess.run(
+        [rustc, f"--edition={RELEASE_POLICY.rust_edition}",
+         *RELEASE_POLICY.rustc_flags, "-o", str(work / "ov"), str(src)],
+        capture_output=True, text=True, cwd=work,
+    )
+    assert built.returncode == 0, built.stderr
+    ran = subprocess.run([str(work / "ov")], capture_output=True, text=True)
+
+    assert ran.returncode == 0, (
+        f"the overflow panicked (exit {ran.returncode}); the prompt says it is "
+        f"silent, so either the flags changed or the prompt is now wrong"
+    )
+    assert ran.stdout.strip() == "-294967296", (
+        f"i32 overflow produced {ran.stdout.strip()!r}; the prompt tells the "
+        f"model it produces -294967296"
+    )
+    assert "-294967296" in RUST_EDGE_CASES, "the prompt stopped quoting the value"
+
+
+def test_the_prompts_claims_about_answer_comparison_are_true():
+    """The Python prompt tells the model `True` is not `1` and that a list and
+    a tuple are interchangeable. Both are load-bearing — one makes it wrap a
+    boolean answer, the other stops it wasting a repair round converting a
+    perfectly acceptable tuple — and both are somebody else's code."""
+    from rlvr.execution.compare import values_equal
+    from solvers.prompts import PYTHON_EDGE_CASES
+
+    assert "`True` is not `1`" in PYTHON_EDGE_CASES
+    assert not values_equal(True, 1), "the prompt's bool claim is now false"
+
+    assert "tuple with equal contents do compare equal" in PYTHON_EDGE_CASES
+    assert values_equal([1, 2], (1, 2)), "the prompt's list/tuple claim is false"
+
+    assert "two integers must match exactly" in PYTHON_EDGE_CASES
+    assert not values_equal(1_000_000, 1_000_001), (
+        "a float tolerance is accepting wrong integers; the prompt says it cannot"
+    )
+
+
+def test_the_prompt_quotes_the_real_per_test_timeout():
+    """A budget the model is told about has to be the budget it gets. Quoting a
+    generous one invites an algorithm that does not fit."""
+    from rlvr.config import Settings
+    from solvers.prompts import PYTHON_EDGE_CASES, RUST_EDGE_CASES
+
+    seconds = Settings.model_fields["per_test_timeout_s"].default
+    assert seconds == 5.0, (
+        f"the per-test timeout is now {seconds}s; both prompts still say 5"
+    )
+    assert "5 seconds" in PYTHON_EDGE_CASES and "5 seconds" in RUST_EDGE_CASES
+
+
+def test_the_examples_are_framed_as_a_floor_and_come_after_the_checklist():
+    """The examples are the friendliest thing in the message and the easiest to
+    over-fit to. Read first, they become the specification and the checklist
+    reads as an afterthought; read last, they are a lower bound."""
+    from solvers.prompts import build_initial_prompt
+
+    prompt = build_initial_prompt(
+        "python", "Do a thing.", "solve",
+        [{"args": [[1]], "kwargs": {}, "expected": 1}],
+    )
+    assert prompt.index("Edge cases are where") < prompt.index("PUBLIC EXAMPLES"), (
+        "the examples are read before the checklist"
+    )
+    assert "a floor, not the specification" in prompt
+
+
+def test_a_repair_round_is_sent_back_through_the_checklist():
+    """Repairs go into the SAME conversation, so the checklist is still above
+    them — and a repair that fixes the failing example while breaking a
+    boundary scores the same zero as the answer it replaced."""
+    from solvers.prompts import build_repair_prompt
+
+    prompt = build_repair_prompt(["solve([]) raised IndexError"], "python", "solve")
+    assert "edge-case checklist" in prompt
+    assert "n = 1" in prompt and "largest values" in prompt
+    # ...but a DEFECT is not a logic problem, and must not be answered with it.
+    for defect in ("the program does not define fn main()", NO_CODE):
+        repair = build_repair_prompt([], "rust", "main", defect=defect)
+        assert "edge-case checklist" not in repair, (
+            f"answered a delivery failure with logic advice: {defect!r}"
+        )
