@@ -1061,60 +1061,111 @@ suite runs a rehearsal with `bittensor`, `bittensor_wallet`,
 and it still solves, archives and grades. `rlvr.protocol` falls back to an HMAC
 identity when no chain stack is installed, and the rehearsal signs with that.
 
-**1. Install.** The chain extra is not among these.
+**1. System packages.** On a machine with nothing on it:
 
 ```bash
-cd /path/to/hone-subnet
-python -m venv .venv && . .venv/bin/activate
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip git curl
+```
+
+`python3-venv` and `curl` are the two that catch people: Ubuntu ships neither
+on a minimal install, `python -m venv` fails without the first, and
+`start_debug_browser.sh` refuses to start without the second (it uses `curl` to
+tell whether the browser came up).
+
+**2. A browser.** Prefer Google Chrome's `.deb` over Ubuntu's `chromium`:
+
+```bash
+wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+sudo apt install -y ./google-chrome-stable_current_amd64.deb
+```
+
+Ubuntu's `chromium` package is a **snap**, and a strictly-confined snap cannot
+read dot-directories under `$HOME`. The profile path this script defaults to is
+`~/.hone-miner/chrome/<port>`, which is exactly that — so the browser starts,
+the CDP port never opens, and the script reports a timeout that looks like
+nothing at all went wrong. If you would rather keep the snap, give it a profile
+without the dot: `--profile ~/hone-chrome/9222`.
+
+**3. The repository.**
+
+```bash
+git clone https://github.com/fnlich/hone-subnet.git
+cd hone-subnet
+python3 -m venv .venv && . .venv/bin/activate
 pip install -e '.[miner,dev]'
 pip install playwright          # no `playwright install` — you start the browser
 ```
 
-**2. Code only, no browser.** If this fails, stop here; nothing downstream can
+The `chain` extra is deliberately not among these. Nothing below needs it.
+
+**4. Code only, no browser.** If this fails, stop here; nothing downstream can
 work.
 
 ```bash
 python -m pytest examples/custom_miner
 ```
 
-**3. Start a browser and sign in.** This is the step that carries the real
-risk, and it is the one nothing can do for you. The browser must be one YOU
-started: a browser launched by an automation driver announces itself as one,
-and providers refuse the sign-in.
+**5. Start a browser per account and sign in by hand.** This step carries the
+real risk and it is the one nothing can do for you. The browser must be one YOU
+started: a browser launched by an automation driver announces itself as one, and
+providers refuse the sign-in.
 
 ```bash
 cd examples/custom_miner
-./scripts/start_debug_browser.sh --port 9222
+./scripts/start_debug_browser.sh --port 9222     # this one becomes Claude
+./scripts/start_debug_browser.sh --port 9223     # this one becomes ChatGPT
 ```
 
-It prints a VNC command if the host is headless. Open `https://claude.ai` in
-that browser and sign in **by hand** — prefer email plus a one-time code, since
-"Continue with Google" is the sign-in most likely to be refused. Leave it
-running: the miner attaches and detaches over CDP and never closes it, so
-restarts keep your login.
+Two windows open on your desktop. In the **9222** window go to
+`https://claude.ai` and sign in; in the **9223** window go to
+`https://chatgpt.com` and sign in. Prefer email plus a one-time code —
+"Continue with Google" is the sign-in most likely to be refused.
 
-For ChatGPT instead, sign in to `https://chatgpt.com` and use `CHATGPT_CDP`
-below. For both, run a second browser on a second port.
+One account per browser, never two in one. The ports keep the profiles apart,
+which is the whole point: each browser holds one logged-in session, and the
+miner picks a tab by which provider it wants.
 
-**4. Point the miner at it.** Only if you used a port other than 9222 — the
-default needs no configuration at all.
+Leave both running. The miner attaches and detaches over CDP and never closes
+them, so restarting the miner keeps your logins. Each terminal stays busy —
+open new ones, or add `&`.
+
+**6. Tell the miner about both.** From the repository root:
 
 ```bash
-echo 'CLAUDE_CDP=9222' >> .env      # or CHATGPT_CDP=9223
+cd /path/to/hone-subnet
+cat >> .env <<'EOF'
+CLAUDE_CDP=9222
+CHATGPT_CDP=9223
+EOF
 ```
 
-**5. Check the selectors.**
+`.env` is searched for upward from wherever you run, so one file at the
+repository root serves the miner and every tool here. Confirm it took:
+
+```bash
+cd examples/custom_miner
+python -c "from solvers.roster import roster, describe; print(describe(roster()))"
+# 1 chatgpt, 1 claude
+```
+
+If that says `1 claude` only, the `.env` was not found or `CHATGPT_CDP` is
+misspelled — the roster silently uses one default browser when nothing is set.
+
+**7. Check the selectors, one provider at a time.**
 
 ```bash
 python -m solvers.doctor claude --probe
+python -m solvers.doctor chatgpt --probe
 ```
 
 It reports, per role, which candidate selector your page actually has, then
 sends a real prompt and shows the text it read back. `--probe` is the half that
 matters: it drives the same read path the miner uses, so what you see is what
-the miner would get.
+the miner would get. Run it against both, because the two sites fail
+differently and a working Claude tells you nothing about ChatGPT.
 
-**6. Solve one task, no miner, no wallet.**
+**8. Solve one task, no miner, no wallet.**
 
 ```bash
 python scripts/try_solver.py
@@ -1125,7 +1176,7 @@ code-but-wrong (the plumbing works and the model missed — re-run before blamin
 the setup), and nothing-came-back (it names login, selector and deadline in
 likelihood order).
 
-**7. Rehearse the whole miner.**
+**9. Rehearse the whole miner.**
 
 ```bash
 python -m solvers.rehearse
@@ -1145,7 +1196,12 @@ the answer against cases the model never saw. A good run ends:
 
 Exit `0` correct, `1` answered and wrong, `2` nothing could be concluded.
 
-**8. Read what it wrote.**
+With two browsers the fleet holds four tabs (two per browser) and hands the
+task to whichever is free, so consecutive rehearsals will not always use the
+same provider. The `provider=` field on the `[verify]` line says which one
+answered.
+
+**10. Read what it wrote.**
 
 ```bash
 ls solutions/
@@ -1157,7 +1213,7 @@ The `.json` holds the request and the reply side by side. A zero-byte `.py` is
 not a bug: it is the record that the problem was seen and answered with
 silence, which needs a different fix from never having seen it.
 
-**9. Replay it whenever something goes wrong.** Once the miner has run for
+**11. Replay it whenever something goes wrong.** Once the miner has run for
 real, every solve leaves one of these, and the rehearsal takes it back:
 
 ```bash
@@ -1178,6 +1234,14 @@ it says so.
 | `COULD NOT BE CHECKED: no browser to solve with` | same as the first row, reported by the rehearsal. |
 | `DOES NOT SCORE: passed 7/8` | the miner works. The model got the problem wrong — which is the answer the rehearsal exists to give. |
 | Rust says `COULD NOT BE CHECKED` | Rust verification needs Docker. Without it you still learn whether the answer compiles, which is most of the value. |
+| `Chrome did not open a CDP port on 9222 within 20s` | on Ubuntu, usually the snap Chromium being unable to read `~/.hone-miner/` — see step 2. Otherwise the port is taken: `curl http://127.0.0.1:9222/json/version`. |
+| the roster says `1 claude` when you configured two | the `.env` was not found, or `CHATGPT_CDP` is misspelled. With nothing set the roster falls back to one Claude browser on 9222, which looks like a working config. |
+
+Two things worth installing later, neither needed to get this far. `rustc`
+(`sudo apt install -y rustc`) lets the miner reject a Rust answer that will not
+build instead of submitting it — on a run with no public examples that is the
+only check a Rust answer gets. Docker lets it actually run Rust against the
+examples.
 
 Only after all of this is a hotkey worth registering.
 
