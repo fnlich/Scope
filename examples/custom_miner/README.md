@@ -129,6 +129,60 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 - **Never raise.** On any failure return empty `code` — a zero is survivable, a
   crash loop is not. `custom_miner.py` already wraps your solver this way.
 
+### The hidden suite is where the score is, so the prompt is written for it
+
+The public examples are the friendly ones. Grading is on the **complete hidden
+suite**, which is written to break a solution that only handles the shape it was
+shown — so the prompt names the cases one at a time instead of saying "handle
+edge cases", which every model agrees to and none acts on:
+
+    NOTHING          empty list, empty string, n = 0
+    ONE              n = 1, one element, one character
+    TWO              where "first" and "last" stop being the same element
+    BOTH ENDS        first and last, empty range, inclusive vs exclusive
+    EXTREME VALUES   0, 1, -1, negatives, the largest magnitude allowed
+    DEGENERATE       all equal, all duplicates, sorted, reverse sorted
+
+The examples are rendered *after* that list and labelled a floor rather than the
+specification, because read first they become the spec and the checklist reads
+as an afterthought. Repair rounds are sent back through the same checklist,
+since they share the conversation and a repair that fixes the failing example
+while breaking a boundary scores the same zero.
+
+The code itself is asked for **unexplained** — no comments, no docstrings. The
+grader imports the source and calls it; nothing ever reads a comment, so the
+only thing one costs is output the model spends before the answer is finished,
+on a subnet that tiebreaks on latency.
+
+Each language is then warned about its own way of losing a large number, because
+they are not the same failure:
+
+- **Rust — overflow is silent.** The validator compiles with `-C opt-level=2`,
+  and `rustc` turns overflow checks off at any opt-level above zero. `i32`
+  arithmetic wraps and the program **exits 0 with a plausible wrong number**
+  rather than panicking. Measured with the validator's own flags: two `i32`
+  values of `2_000_000_000` sum to `-294967296`. So the prompt asks for `i64` by
+  default and `i128` for products. There is no message and nothing in the
+  failure that points at the cause, which is exactly why it has to be said up
+  front.
+- **Python — integers never overflow, but recursion dies at 1000.** A recursive
+  answer fails at `n = 10^4` with `RecursionError`, so the prompt asks for
+  iteration. It also states the comparison rules that cost a solve when guessed
+  at: `True` is not `1`, two integers must match exactly, a dict must have
+  exactly the expected keys — and a list and a tuple *are* interchangeable, so
+  no repair round need be spent converting one.
+
+Both are told the real per-test budget (5 seconds), because a budget quoted
+generously invites an algorithm that does not fit.
+
+Every one of those claims is about somebody else's code, and claims like that
+rot without anyone noticing — the prompt keeps saying them long after the policy
+that made them true has moved. So each is pinned by a test: the overflow test
+compiles with `RELEASE_POLICY.rustc_flags` rather than a copy of them, the
+comparison claims are asserted against `rlvr.execution.compare.values_equal`,
+and the timeout is read from the validator's own config. Change the policy and
+the tests fail, instead of the prompt quietly starting to lie.
+
 ## How it works: you run the browsers, the miner uses them
 
 You start N browsers — six to ten is a normal fleet — each signed in **by hand**
@@ -363,12 +417,175 @@ CLAUDE_ASSISTANT='div[data-is-streaming]'
 CLAUDE_SEND_BUTTON='button[aria-label="Send message"]'
 CLAUDE_STOP_BUTTON='button[aria-label="Stop response"]'
 CLAUDE_NEW_CHAT='a[href$="/new"]'
+CLAUDE_COPY='button[aria-label="Copy to clipboard"]'
 ```
 
-`*_NEW_CHAT` is the one role that is optional: it is how a tab starts its next
-conversation without a page load, and if nothing matches, the tab reloads
-instead — a few seconds per task, never a wrong answer. The doctor reports it
-like any other role.
+Two roles are optional. `*_NEW_CHAT` is how a tab starts its next conversation
+without a page load; if nothing matches, the tab reloads instead — a few seconds
+per task, never a wrong answer. `*_COPY` is the code block's own copy control,
+and it is how the code is normally taken (see below); if nothing matches, the
+miner reads the DOM instead and says so once. The doctor reports both like any
+other role.
+
+Two more are not selectors at all, and both are off by default in the direction
+that cannot hurt you:
+
+```dotenv
+CLAUDE_STREAM=0          # stop reading the answer off the network entirely
+CLAUDE_STREAM_FIRST=1    # ...or trust it over what the page shows
+```
+
+## Where the answer is read from
+
+There are four places the same answer can be taken from, and they are not
+equally good. In order:
+
+| Source | What it is | Used |
+| --- | --- | --- |
+| the network stream | the markdown the model emitted, before any of it was a page | when the page reads back empty; as primary with `*_STREAM_FIRST=1` |
+| framework state | the source string the site holds per block | not reachable from outside |
+| the copy control | that state, handed back on request | **primary** |
+| the rendered DOM | `pre code`, after a syntax highlighter rebuilt it | fallback |
+
+Everything below the first line is downstream of a render. The stream is not,
+which is why it is the one source with anything left to say when the page read
+comes back empty — and an empty page read is where *every* recent `the reply
+contained no code` has come from.
+
+## The code comes from the copy control, not the DOM
+
+`pre code` gives you the source *after* a syntax highlighter has rebuilt it as
+DOM. The copy control gives you what the model actually wrote. Those differ, and
+they have differed here: a highlighter once put U+E027 — a Private Use Area
+character that appears in no source file — inside a Python answer, and the solve
+died on a character nobody could see. So the reader scrapes the DOM to decide
+*when* an answer is finished, then clicks the block's own copy control once to
+decide *what* it says.
+
+The value never reaches your clipboard. `navigator.clipboard.writeText` is
+patched inside the miner's own tabs so the string comes back to the miner and
+goes no further. That is not fastidiousness — there is one clipboard shared by
+every tab, every browser on the display, and every miner you run, and reading it
+back was measured to cross tabs:
+
+    tab A wrote 'TAB-A-CODE', tab B wrote 'TAB-B-CODE'
+    tab A read back: 'TAB-B-CODE'
+
+A pool that read the clipboard would submit another task's program whenever two
+solves overlapped, silently. The one visible consequence of the patch: while the
+miner owns a tab, that tab's copy buttons no longer write to your real clipboard.
+
+Nothing is *clicked* unless it says what it is. A selector is a guess about
+structure and can drift onto a neighbour — ChatGPT keeps "Run code" in the same
+header as "Copy", and reading an answer is worth a click where executing it is
+not. So the control's accessible name is checked first and must contain `copy`.
+On a UI in another language, set `CLAUDE_COPY_NAME` / `CHATGPT_COPY_NAME`; until
+you do, the miner reads the DOM instead, which is the safe direction to fail.
+
+It is preferred, not required. If the control is missing or renamed, scraping
+answers instead, and a reply with two blocks whose controls only half-respond is
+handed back to scraping whole rather than losing a block.
+
+### Both readings are taken, and disagreement is reported
+
+Choosing the better source is only half of it. Every extraction bug this miner
+has had was *silent* — a Private Use Area character, a leaked language chip, a
+blank line inserted at a render boundary. Each one looked exactly like the model
+writing bad code, and each cost days to find.
+
+Two independent readings of the same answer are already in hand by the time a
+send finishes, so they are compared. The copy still wins; the difference gets
+logged:
+
+```
+[claude] note: tab claude#1: what the page RENDERS and what it COPIES are not
+the same — they differ at character 14: rendered '\ue027' (U+E027), copied
+'+' (U+002B). Using the copy, which is the source before syntax highlighting.
+```
+
+It names the codepoint because that is the part you can act on. It fires once
+per tab, and only on a real difference — a warning that appears on every answer
+is one nobody reads.
+
+### The answer as it came off the wire
+
+Every tab the miner opens patches `window.fetch` before the site's own code
+runs, and keeps a copy of any streaming response body. That is the answer
+*before* the page exists.
+
+The patch is written so it cannot break a site you are signed in to: it clones
+the response rather than replacing it (a hand-built `Response` loses `url` and
+`redirected`, and a chat UI reading either breaks in a way that looks like the
+site's own bug), it returns the original object untouched on every path
+including the ones where it throws, it ignores anything that is not a streaming
+content type, and it bounds what it keeps. Verified in a browser: `url`,
+`status`, `redirected` and `bodyUsed` all unchanged, ordinary JSON requests not
+cloned at all, a fetch that should fail still failing.
+
+Reconstructing the markdown is the part nobody can do for you. Neither site
+publishes its stream format and both change theirs without notice, so nothing
+about either is hard-coded. What is relied on is structural: an SSE stream is
+many small JSON events, and the answer is the one field appended to over and
+over. Group every string leaf by its path *plus* the short strings that came
+with it, concatenate, take the biggest group — dropping reasoning by name
+(`thinking`, `thoughts`), and dropping tags, which repeat a handful of values
+across hundreds of events. Both real shapes are pinned in the tests, including
+reasoning that outweighs the answer four to one and metadata interleaved into
+the middle of it.
+
+Because that is a heuristic over a private format, it does **not** simply win:
+
+- the page read back empty → the wire is used, and says so;
+- both produced code and they agree → nothing changes;
+- both produced code and they differ → the page is used and the difference is
+  logged, with the codepoint;
+- `CLAUDE_STREAM_FIRST=1` / `CHATGPT_STREAM_FIRST=1` → the wire is used as the
+  primary. Set this once `--probe` has shown you the two agreeing on your own
+  accounts, not before.
+
+`CLAUDE_STREAM=0` / `CHATGPT_STREAM=0` turns the capture off entirely.
+`python -m solvers.doctor claude --probe` reports all of it side by side:
+
+```
+  where the answer can be read from, on this page:
+    [ok   ] network — 1 streamed response(s) seen this turn, 812 chars
+            reconstructed, 2 code block(s)
+    the page and the wire AGREE on all 2 block(s). Setting CLAUDE_STREAM_FIRST=1
+    would read this page from the wire, which is the source before any rendering
+    happened to it.
+```
+
+### When nothing is captured at all, the tab says why
+
+`the reply contained no code` is what the grader reports afterwards, and it
+describes several very different causes identically: a selector that matches
+nothing, a reply that never rendered, an answer still being written when the
+budget ran out. Only the page can tell them apart, and only at the time — so it
+is asked before the tab moves on:
+
+```
+[claude] tab claude#1 captured NOTHING from this reply: 'div[data-is-streaming]'
+matched 1 message(s) but none of them could be identified as the answer to this
+prompt. This is what surfaces later as "the reply contained no code".
+```
+
+One read is never allowed to spend the whole budget. A poll resolves a node and
+then reads it, and if the site swaps the message between those two steps the
+read waits on an element that no longer matches — which Playwright does for
+thirty seconds. Bounded only by the send's remaining time, that single poll
+spends every second the solve had left and returns nothing, while the finished
+answer sits on screen. Measured on the transition claude.ai actually makes: an
+8s send spent 7.85s inside one `inner_text()` and returned `""`. Each read now
+gets five seconds and a timed-out read is retried, not fatal; the retry
+re-resolves and costs milliseconds.
+
+One related failure is now repaired rather than reported. A site streams a
+message under one attribute and drops it when the message is finished, so the
+candidate that *found* the answer can be the one that cannot see it. The
+assistant selector is latched for the whole send — deliberately, so message
+counts stay comparable — but the latch is dropped the moment it matches
+nothing, because there is no count to corrupt at zero and the alternative is
+reading nothing while the answer sits on screen.
 
 Three hazards are handled in code rather than left to the selectors:
 

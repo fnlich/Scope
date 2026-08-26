@@ -36,7 +36,9 @@ from pathlib import Path
 
 from .browser_pool import (
     DEFAULT_CDP_PORT,
+    _STREAM_INSTALL,
     Site,
+    _fenced_blocks,
     import_playwright,
     normalize_cdp,
     usable_busy_selectors,
@@ -156,6 +158,11 @@ async def run(name: str, cdp: str, probe: bool) -> int:
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
         # Our own tab, so the doctor never disturbs one you are looking at.
         page = await context.new_page()
+        if site.stream:
+            # Same hook the miner installs, installed the same way, so --probe
+            # measures the network path this page really has rather than one
+            # the doctor arranged for itself.
+            await page.add_init_script(_STREAM_INSTALL)
         healthy = True
         try:
             print(f"[doctor] opening {site.url}")
@@ -246,6 +253,7 @@ async def _probe(page, site: Site, composer: str, busy) -> bool:
         _Solo(), page, None, "probe", replace(site, busy=busy), composer=composer
     )
     reply = await tab.send(PROBE, 120.0)
+    await _report_sources(tab, site)
     if not reply.strip():
         print("[doctor] !! the probe read nothing back. The assistant selector or the")
         print("            still-generating selector is wrong for this page.")
@@ -304,6 +312,63 @@ async def _probe(page, site: Site, composer: str, busy) -> bool:
         print("         here — re-run if you want that covered.")
     await _report_reset(tab)
     return True
+
+
+async def _report_sources(tab, site: Site) -> None:
+    """Show what each of the three readings of that answer produced.
+
+    This is the only place the network path can be checked, and it has to be
+    checked HERE rather than reasoned about: the wire formats are private and
+    undocumented, so whether the reconstruction is right on YOUR account, today,
+    is a measurement nobody can make on your behalf. The miner will not take
+    the wire over the page until it is told to, and this is what tells you
+    whether telling it to is safe.
+    """
+    if not site.stream:
+        print(f"\n  network stream: off ({site.env_prefix}_STREAM=0)")
+        return
+    print("\n  where the answer can be read from, on this page:")
+    try:
+        armed = bool(await tab._page.evaluate("!!window.__honeStreamHooked"))
+        seen = int(await tab._page.evaluate("(window.__honeStreams || []).length") or 0)
+    except Exception as exc:  # noqa: BLE001
+        print(f"    the page could not be asked about the network hook ({exc!r})")
+        return
+    if not armed:
+        print("    [none ] network — the capture never installed on this page")
+        return
+    streamed = await tab._streamed_markdown()
+    blocks = _fenced_blocks(streamed) if streamed else []
+    print(f"    [{'ok   ' if streamed else 'none '}] network — "
+          f"{seen} streamed response(s) seen this turn, "
+          f"{len(streamed) if streamed else 0} chars reconstructed, "
+          f"{len(blocks)} code block(s)")
+    if streamed and not blocks:
+        print("           it captured text but found no fenced block in it. Either the")
+        print("           model answered without fences, or the reconstruction picked")
+        print("           the wrong field. The first 200 characters it found:")
+        print(f"           {streamed[:200]!r}")
+    try:
+        reply_node = await tab._new_reply(await tab._fingerprint())
+    except Exception:  # noqa: BLE001
+        reply_node = None
+    if not blocks:
+        return
+    dom = []
+    if reply_node is not None:
+        try:
+            dom = await tab._dom_blocks(reply_node)
+        except Exception:  # noqa: BLE001
+            dom = []
+    gap = tab._first_difference(dom, blocks, "the page", "the wire") if dom else None
+    if gap is None and dom:
+        print(f"    the page and the wire AGREE on all {len(dom)} block(s). Setting")
+        print(f"    {site.env_prefix}_STREAM_FIRST=1 would read this page from the wire,")
+        print("    which is the source before any rendering happened to it.")
+    elif dom:
+        print(f"    !! the page and the wire DISAGREE — {gap}")
+        print("       Leave STREAM_FIRST off and look at which one is right; the wire")
+        print("       is used regardless whenever the page reads back empty.")
 
 
 async def _report_reset(tab) -> None:

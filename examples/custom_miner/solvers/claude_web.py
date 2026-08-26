@@ -59,8 +59,8 @@ from .config import selectors
 # artifacts panel, which lives outside the message the reader scrapes. One
 # sentence is cheaper than trying to scrape the panel.
 NUDGE = (
-    "Reply directly in the chat with one ordinary fenced code block. "
-    "Do not create an artifact."
+    "Reply directly in the chat with one ordinary fenced code block, however "
+    "long the program is. Do not create an artifact."
 )
 
 
@@ -119,6 +119,15 @@ def claude_site() -> Site:
         # claude.ai has no per-message id attribute we can rely on, so the reply
         # is identified by position. Sound here because every task starts a
         # fresh conversation.
+        # The code block's own control. NOT the message-level "Copy", which
+        # takes the whole reply. See `_Tab._copied_code`.
+        copy=selectors("CLAUDE_COPY", ('button[aria-label="Copy to clipboard"]',)),
+        copy_name=os.environ.get("CLAUDE_COPY_NAME", "copy").casefold(),
+        # The answer as it came off the wire, ahead of every render.
+        # `CLAUDE_STREAM=0` turns the capture off entirely;
+        # `CLAUDE_STREAM_FIRST=1` promotes it over what the page shows.
+        stream=os.environ.get("CLAUDE_STREAM", "1") != "0",
+        stream_first=os.environ.get("CLAUDE_STREAM_FIRST", "0") == "1",
         message_id_attr=None,
         nudge=os.environ.get("CLAUDE_NUDGE", NUDGE),
         poll_s=float(os.environ.get("CLAUDE_POLL_S", "2")),

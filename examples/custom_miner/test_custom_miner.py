@@ -16,8 +16,12 @@ to get wrong in production:
 
 from __future__ import annotations
 
+import json
 import asyncio
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,12 +35,15 @@ from solvers.browser_pool import (  # noqa: E402
     Browser,
     BrowserFleet,
     Site,
+    _STREAM_INSTALL,
+    _STREAM_READ,
     _Tab,
+    _fenced_blocks,
     usable_busy_selectors,
 )
 from solvers.chatgpt_web import chatgpt_site  # noqa: E402
 from solvers.claude_web import claude_site  # noqa: E402
-from solvers.prompts import extract_code  # noqa: E402
+from solvers.prompts import NO_CODE, extract_code  # noqa: E402
 from solvers.verify import Answer, VerifyingSolver  # noqa: E402
 
 from rlvr.config import Settings  # noqa: E402
@@ -493,6 +500,10 @@ class _Node:
         return _Loc(None, selector, inner)
 
     async def inner_text(self):
+        return self._text
+
+    async def text_content(self):
+        """`_read` asks code blocks for this; see the note there on why."""
         return self._text
 
     async def get_attribute(self, name):
@@ -1365,6 +1376,44 @@ def test_two_answers_to_one_prompt_do_not_flip_between_polls():
     assert "return 'A'" in seen.pop(), "did not commit to the branch it saw first"
 
 
+def test_a_reply_whose_id_changes_mid_stream_is_still_read():
+    """Latching the reply by id has to have a way back, and did not.
+
+    A chat UI paints a streaming message with a provisional id and can swap it
+    for the server's once the message is confirmed. The id latch searched for a
+    key that no longer existed and returned None -- and kept returning None for
+    the rest of the send, because nothing ever re-latched. If the swap happened
+    before the first readable frame (it does: the message is painted empty and
+    filled afterwards) then `best` was never set either, so `send` returned ""
+    and a complete, correct answer was reported as "the reply contained no
+    code". Seen live on ChatGPT three attempts running.
+    """
+    ANSWER = "def pong():\n    return 'pong'"
+
+    class _Swapping(_Node):
+        """One assistant message: painted empty, re-identified, then filled."""
+
+        def __init__(self):
+            super().__init__(attrs={"data-message-id": "provisional"})
+            self._polls = 0
+
+        def locator(self, selector):
+            self._code = [ANSWER] if self._polls else []   # fills after the swap
+            return super().locator(selector)
+
+        async def inner_text(self):
+            self._polls += 1
+            self._attrs["data-message-id"] = "server-assigned"
+            return self._text
+
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [_Swapping()])
+    site = _site(message_id_attr="data-message-id")
+    reply = asyncio.run(_tab(page, site).send("solve it", 2.0))
+
+    assert extract_code(reply, "pong") == ANSWER, f"lost the answer to an id swap: {reply!r}"
+
+
 def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():
     """claude.ai has no per-message id, so the reply is 'an assistant message
     that was not there before we pressed send'. Sound only because every task
@@ -1590,6 +1639,478 @@ def test_clean_code_is_left_exactly_alone():
     assert extract_code(source) == source
 
 
+def test_a_delivery_failure_is_not_reported_as_a_wrong_answer():
+    """The repair round is the second and last chance at a task, and it used to
+    be spent on a contradiction. When nothing arrived, the miner said "I ran the
+    program against the examples and got: the reply contained no code" — nothing
+    was run, there was nothing to run. A model told its program failed the
+    examples rewrites the program, which was never the problem, and the rewrite
+    goes to the same place the first one did.
+
+    Seen live on a Rust task: two complete, plausible programs, both reported as
+    no code, both repaired against evidence that did not exist.
+    """
+    from solvers.prompts import NO_CODE, build_repair_prompt
+
+    prompt = build_repair_prompt([], "rust", "main", defect=NO_CODE)
+    assert "did not reach me as code" in prompt
+    assert "artifact" in prompt and "canvas" in prompt
+    assert "I ran" not in prompt, "still claims to have run something"
+    assert "WRONG" not in prompt, "still blames the answer for a delivery fault"
+
+
+def test_a_real_failure_still_quotes_the_evidence():
+    """The other branch must keep working: when code DID arrive and failed, the
+    concrete counter-example is what makes the repair loop converge."""
+    from solvers.prompts import build_repair_prompt
+
+    prompt = build_repair_prompt(["g(*[12345]) returned 14, expected 15"], "python", "g")
+    assert "returned 14, expected 15" in prompt
+    assert "I ran `g` against the examples" in prompt
+
+
+# --- a model that reasons before it answers ------------------------------- #
+# Reasoning quotes code, and quoted code is not an answer. Three separate
+# things had to hold for a fragment out of the model's rough work to reach the
+# grader, and each of these pins one of them: the read must not stop in the gap
+# between the reasoning and the answer, the extractor must not treat reasoning
+# as a candidate, and a defect must be reported as one rather than as a failed
+# run. Live symptom on a Rust task, three attempts running: "no code", then
+# "does not define fn main()", then "no code" again.
+
+
+def test_a_pause_between_the_reasoning_and_the_answer_is_not_the_answer():
+    """`_read` keeps a message's code blocks and drops its prose. So while the
+    model writes the sentence that introduces its real answer, the read does not
+    move at all -- two identical polls, which is exactly what "finished" used to
+    mean. The reasoning's fragment is returned, `fn main` is missing from it,
+    and the repair round is spent on a program that was never the answer.
+
+    The busy selector normally covers this, but it is per-site, overridable and
+    dropped at startup when it matches an idle page, so the completion test has
+    to hold without one. There is none here on purpose.
+    """
+    from solvers.prompts import rust_defect
+
+    FRAGMENT = "struct SegTree { n: usize }"          # quoted mid-reasoning
+    ANSWER = 'fn main() {\n    println!("42");\n}'    # written much later
+    intro = "Let me think. A segment tree works."
+    frames = [
+        ([FRAGMENT], "Let me think."),
+        ([FRAGMENT], intro),                          # code identical, prose grew
+        ([FRAGMENT], intro + " Here it is:"),         # and again
+        ([FRAGMENT, ANSWER], intro + " Here it is:"), # the answer finally lands
+        ([FRAGMENT, ANSWER], intro + " Here it is:"), # settled
+    ]
+
+    class _StreamNode(_Node):
+        """One assistant message that advances a frame each time it is polled."""
+
+        def __init__(self):
+            super().__init__()
+            self._i = 0
+
+        def _frame(self):
+            return frames[min(self._i, len(frames) - 1)]
+
+        def locator(self, selector):
+            self._code = list(self._frame()[0])
+            return super().locator(selector)
+
+        async def inner_text(self):
+            text = self._frame()[1]
+            self._i += 1     # `_whole` reads this last, so one poll is one frame
+            return text
+
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [_StreamNode()])
+    reply = asyncio.run(_tab(page, _site(busy=())).send("solve it", 5.0))
+
+    code = extract_code(reply, "main", "rust")
+    assert rust_defect(code) is None, f"stopped reading mid-reasoning: {reply!r}"
+    assert "println!" in code, "handed over the fragment instead of the answer"
+
+
+def test_code_quoted_while_thinking_is_not_a_candidate_answer():
+    """Some replies carry the reasoning as literal `<think>` text, and the
+    reasoning quotes code. Every fragment in it looks like a candidate to a
+    fence scanner -- and one of them is the LAST block whenever the answer did
+    not arrive, so rough work goes to the grader looking like a solution.
+
+    An opener with no closer is the same problem with no bottom: there is no
+    answer after it, and "nothing arrived" is the only honest thing to report.
+    It is also the more useful one, because it is the branch of the repair
+    prompt that asks for the code again instead of blaming the logic.
+    """
+    from solvers.prompts import NO_CODE, rust_defect
+
+    reply = (
+        "<think>\nA segment tree, maybe:\n"
+        "```rust\nstruct SegTree { n: usize }\n```\n"
+        "no, too slow.\n</think>\n"
+        'Here it is:\n```rust\nfn main() { println!("42"); }\n```'
+    )
+    code = extract_code(reply, "main", "rust")
+    assert rust_defect(code) is None and "println!" in code
+    assert "SegTree" not in code, "mined the model's own reasoning for an answer"
+
+    cut = reply.split("</think>")[0]        # the read landed mid-thought
+    assert rust_defect(extract_code(cut, "main", "rust")) == NO_CODE
+
+
+def test_the_reader_returns_a_code_block_byte_for_byte():
+    """Only a real browser can answer this, so this one uses one.
+
+    claude.ai splits a <code> into `data-code-line-group` blocks. `innerText`
+    puts a line break at every block boundary, so a 15-line program comes back
+    as 17 -- measured, on the DOM of a real answer. Rust shrugs at a stray blank
+    line. A Python multi-line string literal does not, and nothing anywhere
+    reports the corruption: the code parses, defines the entrypoint, passes
+    every check, and disagrees with a hidden test about the contents of a
+    string. textContent is the raw text, and each line already carries its own
+    newline, so it round-trips exactly.
+    """
+    chrome = Path("/opt/pw-browsers/chromium-1194/chrome-linux/chrome")
+    if not chrome.exists():
+        pytest.skip("no browser on this host")
+    playwright = pytest.importorskip("playwright.async_api")
+
+    source = "\n".join(
+        ['fn main() {', '    let s = "line one', 'line two";', '    println!("{}", s);', '}']
+    )
+    # The real shape: per-line spans, chunked into display:block line groups.
+    lines = source.split("\n")
+    groups = "".join(
+        '<span class="block" data-code-line-group="">'
+        + "".join(f"<span>{ln}\n</span>" for ln in lines[i : i + 2])
+        + "</span>"
+        for i in range(0, len(lines), 2)
+    )
+    html = (
+        '<!doctype html><meta charset="utf-8"><style>.block{display:block}'
+        "code{white-space:pre}</style>"
+        '<div data-is-streaming="false"><div class="p-3.5">rust</div>'
+        f'<pre><code class="language-rust">{groups}</code></pre></div>'
+    )
+    page_file = Path(tempfile.mkdtemp()) / "reply.html"
+    page_file.write_text(html, encoding="utf-8")
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(
+                executable_path=str(chrome), args=["--no-sandbox"]
+            )
+            page = await (await browser.new_context()).new_page()
+            await page.goto(page_file.as_uri())
+            read = await _Tab._read(page.locator("div[data-is-streaming]").first)
+            await browser.close()
+            return read
+
+    code = extract_code(asyncio.run(go()), "main", "rust")
+    assert code == source, f"the reader did not return the block verbatim:\n{code!r}"
+    assert not code.lstrip().startswith("rust"), "the language chip leaked in"
+
+
+# The code block's own copy control, used as a LAST RESORT when the code
+# selectors match nothing. The copied value is intercepted inside the page:
+# reading the system clipboard back would be catastrophic here, because there
+# is one clipboard shared by every tab, every browser on the display, and every
+# miner process the operator runs. Measured, two tabs in one browser: A wrote
+# 'TAB-A-CODE', B wrote 'TAB-B-CODE', A read back 'TAB-B-CODE'. A pool reading
+# the clipboard would submit another task's program whenever two solves
+# overlapped -- silently, and with no way to tell afterwards.
+
+COPY_PROGRAM = 'def pong():\n    note = """one\ntwo"""\n    return note'
+
+
+def _chromium_or_skip():
+    chrome = Path("/opt/pw-browsers/chromium-1194/chrome-linux/chrome")
+    if not chrome.exists():
+        pytest.skip("no browser on this host")
+    return pytest.importorskip("playwright.async_api"), str(chrome)
+
+
+def _served(body: str) -> str:
+    page = Path(tempfile.mkdtemp()) / "reply.html"
+    page.write_text(body, encoding="utf-8")
+    return page.as_uri()
+
+
+def test_the_copy_control_recovers_code_the_selectors_cannot_see():
+    """The recurring failure this covers: the DOM moves, `pre code` stops
+    matching, and a complete answer is reported as no answer at all."""
+    playwright, chrome = _chromium_or_skip()
+    url = _served('<!doctype html><meta charset="utf-8">\n<div data-message-author-role="assistant">\n  <div id="src">__PROGRAM__</div>\n  <button aria-label="Copy" id="c">copy</button>\n  <button aria-label="Run code">run</button>\n</div>\n<script>\ndocument.getElementById(\'c\').onclick = () =>\n  navigator.clipboard.writeText(document.getElementById(\'src\').textContent);\n</script>'.replace("__PROGRAM__", COPY_PROGRAM))
+    site = _site(copy=('button[aria-label="Copy"]',))
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            ctx = await browser.new_context()
+            await ctx.grant_permissions(["clipboard-read", "clipboard-write"])
+            page = await ctx.new_page()
+            await page.goto(url)
+            await page.evaluate("navigator.clipboard.writeText('SENTINEL')")
+            reply = page.locator('[data-message-author-role="assistant"]').first
+            recovered = await _tab(page, site)._copied_code(reply)
+            clipboard = await page.evaluate("navigator.clipboard.readText()")
+            await browser.close()
+            return recovered, clipboard
+
+    recovered, clipboard = asyncio.run(go())
+    assert recovered is not None, "the copy control was not used"
+    assert extract_code(recovered, "pong") == COPY_PROGRAM, f"garbled: {recovered!r}"
+    assert clipboard == "SENTINEL", (
+        f"the system clipboard was written to ({clipboard!r}); it is shared by "
+        f"every tab and miner on this machine, so two overlapping solves could "
+        f"swap answers"
+    )
+
+
+def _answering_site():
+    return _site(
+        composer=("#composer",), send=("#send",),
+        assistant=('[data-message-author-role="assistant"]',),
+        copy=('button[aria-label="Copy"]',),
+    )
+
+
+def _send_in_browser(body, then=None):
+    playwright, chrome = _chromium_or_skip()
+    url = _served(body)
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            reply = await _tab(page, _answering_site()).send("solve it", 5.0)
+            extra = await page.evaluate(then) if then else None
+            await browser.close()
+            return reply, extra
+
+    return asyncio.run(go())
+
+
+def test_the_copy_control_is_preferred_over_the_rendered_dom(capsys):
+    """Why the copy control leads rather than backs up.
+
+    `pre code` hands over the source AFTER a syntax highlighter has rebuilt it
+    as DOM; the copy control hands over what the model actually wrote. They
+    differ, and they differed in production: a highlighter put U+E027 -- a
+    Private Use Area character present in no source file -- inside a Python
+    answer, and the solve died on a character nobody could see. Sanitising that
+    after the fact is chasing damage the copy path never takes.
+
+    Also pins the cost: one click per send, not one per poll.
+    """
+    from solvers.prompts import python_defect
+
+    reply, clicks = _send_in_browser('<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<script>\n// The source the model wrote. The copy control hands this over verbatim.\nconst SOURCE = "def pong():\\n    total = 1 + 2\\n    return total";\nwindow.__clicks = 0;\ndocument.getElementById(\'send\').onclick = () => {\n  const wrap = document.createElement(\'div\');\n  wrap.setAttribute(\'data-message-author-role\', \'assistant\');\n  const pre = document.createElement(\'pre\');\n  const code = document.createElement(\'code\');\n  // A syntax highlighter rebuilding the source as DOM, and slipping in a\n  // Private Use Area character that exists in no source file. This is the\n  // real production bug: U+E027 inside a Python answer.\n  code.textContent = SOURCE.replace("1 + 2", "1 \\uE027+ 2");\n  pre.appendChild(code);\n  wrap.appendChild(pre);\n  const btn = document.createElement(\'button\');\n  btn.setAttribute(\'aria-label\', \'Copy\');\n  btn.textContent = \'copy\';\n  btn.onclick = () => { window.__clicks++; navigator.clipboard.writeText(SOURCE); };\n  wrap.appendChild(btn);\n  document.getElementById(\'host\').appendChild(wrap);\n};\n</script>', then="window.__clicks")
+    code = extract_code(reply, "pong")
+
+    assert "\ue027" not in code, f"took the highlighter's DOM over the source: {code!r}"
+    assert python_defect(code, "pong") is None, python_defect(code, "pong")
+    scope: dict = {}
+    exec(compile(code, "<submitted>", "exec"), scope)
+    assert scope["pong"]() == 3, "the recovered source does not run"
+    assert clicks == 1, f"clicked the copy control {clicks} times, expected once per send"
+
+    # Preferring the copy silently would leave the next render bug as invisible
+    # as the last three were. Two readings are already in hand, so say when they
+    # disagree, and name the character a human can act on.
+    logged = capsys.readouterr().out
+    assert "RENDERS and what it COPIES are not the same" in logged, (
+        f"took the copy but never said the page rendered something else: {logged!r}"
+    )
+    assert "U+E027" in logged, f"did not name the offending codepoint: {logged!r}"
+
+
+def test_agreeing_readings_are_not_reported_as_a_problem(capsys):
+    """The warning has to mean something. If it fires on every answer, nobody
+    reads it, and the one time it matters it is lost in the noise."""
+    body = '<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<script>\nconst SOURCE = "def pong():\\n    return 5";\ndocument.getElementById(\'send\').onclick = () => {\n  const wrap = document.createElement(\'div\');\n  wrap.setAttribute(\'data-message-author-role\', \'assistant\');\n  const pre = document.createElement(\'pre\');\n  const code = document.createElement(\'code\');\n  code.textContent = SOURCE;                       // render and source agree\n  pre.appendChild(code);\n  wrap.appendChild(pre);\n  const btn = document.createElement(\'button\');\n  btn.setAttribute(\'aria-label\', \'Copy\');\n  btn.onclick = () => navigator.clipboard.writeText(SOURCE);\n  wrap.appendChild(btn);\n  document.getElementById(\'host\').appendChild(wrap);\n};\n</script>'
+    reply, _ = _send_in_browser(body)
+    assert "return 5" in extract_code(reply, "pong"), f"lost the answer: {reply!r}"
+    assert "not the same" not in capsys.readouterr().out, "cried wolf on a clean read"
+
+
+def test_a_missing_copy_control_falls_back_to_reading_the_dom():
+    """The copy control is preferred, not required: a site that never had one,
+    or renamed it, must still be read rather than reported as silent."""
+    reply, _ = _send_in_browser('<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<script>\ndocument.getElementById(\'send\').onclick = () => {\n  const wrap = document.createElement(\'div\');\n  wrap.setAttribute(\'data-message-author-role\', \'assistant\');\n  const pre = document.createElement(\'pre\');\n  const code = document.createElement(\'code\');\n  code.textContent = "def pong():\\n    return 7";\n  pre.appendChild(code);\n  wrap.appendChild(pre);\n  document.getElementById(\'host\').appendChild(wrap);   // no copy control at all\n};\n</script>')
+    assert "return 7" in extract_code(reply, "pong"), f"lost the answer: {reply!r}"
+
+
+def test_a_control_that_does_not_call_itself_copy_is_never_pressed():
+    """A selector is a guess about structure and can drift onto a neighbour.
+    ChatGPT keeps "Run code" in the same header as "Copy": reading the answer is
+    worth a click, executing it is not. So the control's own name is checked
+    before anything is pressed, and a mismatch falls back to scraping."""
+    playwright, chrome = _chromium_or_skip()
+    url = _served('<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<script>\nwindow.__ran = false;\ndocument.getElementById(\'send\').onclick = () => {\n  const wrap = document.createElement(\'div\');\n  wrap.setAttribute(\'data-message-author-role\', \'assistant\');\n  const pre = document.createElement(\'pre\');\n  const code = document.createElement(\'code\');\n  code.textContent = "def pong():\\n    return 9";\n  pre.appendChild(code);\n  wrap.appendChild(pre);\n  // The selector has drifted onto the neighbour ChatGPT keeps in the same\n  // header. Pressing this would execute the answer instead of reading it.\n  const btn = document.createElement(\'button\');\n  btn.setAttribute(\'data-role\', \'copyish\');\n  btn.setAttribute(\'aria-label\', \'Run code\');\n  btn.onclick = () => { window.__ran = true; };\n  wrap.appendChild(btn);\n  document.getElementById(\'host\').appendChild(wrap);\n};\n</script>')
+    site = _site(
+        composer=("#composer",), send=("#send",),
+        assistant=('[data-message-author-role="assistant"]',),
+        copy=('button[data-role="copyish"]',),   # matches, but it is not Copy
+    )
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            reply = await _tab(page, site).send("solve it", 5.0)
+            ran = await page.evaluate("window.__ran")
+            await browser.close()
+            return reply, ran
+
+    reply, ran = asyncio.run(go())
+    assert not ran, "pressed a control labelled 'Run code'"
+    assert "return 9" in extract_code(reply, "pong"), f"lost the answer: {reply!r}"
+
+
+def test_an_assistant_selector_that_dies_mid_answer_is_re_resolved(capsys):
+    """Captured nothing, and the answer was on screen the whole time.
+
+    Sites stream a message under one attribute and drop it when the message is
+    done. The candidate that found the message is then the one that cannot see
+    it, and a latch held for the whole send reads nothing for the rest of it --
+    which surfaces, much later and much less usefully, as "the reply contained
+    no code".
+
+    The transition is driven from here rather than a page timer: Chromium
+    throttles timers in background pages, and every tab this miner owns is a
+    background page.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served('<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<script>\ndocument.getElementById(\'send\').onclick = () => {\n  const d = document.createElement(\'div\');\n  d.setAttribute(\'data-is-streaming\', \'true\');   // painted, still empty\n  document.getElementById(\'host\').appendChild(d);\n};\n</script>')
+    site = _site(
+        composer=("#composer",), send=("#send",),
+        assistant=("div[data-is-streaming]", "div.done-msg"),
+    )
+    finish = """() => {
+        const d = document.querySelector('[data-is-streaming]');
+        d.removeAttribute('data-is-streaming');
+        d.className = 'done-msg';
+        const pre = document.createElement('pre');
+        const code = document.createElement('code');
+        code.textContent = 'def pong():\\n    return 4';
+        pre.appendChild(code);
+        d.appendChild(pre);
+    }"""
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            sending = asyncio.create_task(tab.send("solve it", 8.0))
+            # Wait for the latch itself, not for a length of time: a fixed
+            # sleep encodes a guess about how fast this machine is, and this
+            # suite runs a browser per test. The latch going non-None IS the
+            # state under test — the streaming candidate has won.
+            deadline = time.monotonic() + 5
+            while tab._assistant is None and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            assert tab._assistant == "div[data-is-streaming]", tab._assistant
+            await page.evaluate(finish)   # ...which now matches nothing
+            reply = await sending
+            await browser.close()
+            return reply
+
+    reply = asyncio.run(go())
+    assert "return 4" in extract_code(reply, "pong"), f"captured nothing: {reply!r}"
+    assert "stopped matching mid-answer" in capsys.readouterr().out, "re-resolved silently"
+
+
+def test_capturing_nothing_says_why_while_the_page_can_still_be_asked(capsys):
+    """"The reply contained no code" describes a selector that matches nothing,
+    a reply that never rendered and an answer still streaming, identically. The
+    page can tell them apart in four queries, and only at the time."""
+    playwright, chrome = _chromium_or_skip()
+    url = _served('<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<script>\ndocument.getElementById(\'send\').onclick = () => {\n  const d = document.createElement(\'div\');\n  d.className = \'renamed-by-the-site\';     // nothing the miner knows about\n  d.textContent = \'def pong(): return 1\';\n  document.getElementById(\'host\').appendChild(d);\n};\n</script>')
+    site = _site(
+        composer=("#composer",), send=("#send",),
+        assistant=('[data-message-author-role="assistant"]',),
+    )
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            reply = await _tab(page, site).send("solve it", 3.0)
+            await browser.close()
+            return reply
+
+    assert asyncio.run(go()) == "", "expected an empty capture for this page"
+    logged = capsys.readouterr().out
+    assert "captured NOTHING" in logged, f"stayed silent about an empty read: {logged!r}"
+    assert "no assistant selector matched" in logged, f"did not name the cause: {logged!r}"
+    assert "_ASSISTANT" in logged, f"did not name the fix: {logged!r}"
+
+
+def test_a_defect_is_not_reported_as_a_failed_run():
+    """Defects are found BEFORE anything executes. "I ran the program against
+    the examples and got: the program does not define `fn main()`" is not
+    evidence, it is a contradiction -- and a model told its logic failed will
+    rewrite the logic, which was never the problem."""
+    from solvers.prompts import build_repair_prompt
+
+    prompt = build_repair_prompt(
+        [], "rust", "main", defect="the program does not define `fn main()`"
+    )
+    assert "does not define `fn main()`" in prompt
+    assert "could not run" in prompt
+    assert "I ran" not in prompt, "still claims to have executed it"
+    assert "WRONG" not in prompt, "still blames logic that never ran"
+
+
+def test_the_repair_round_hears_about_the_defect_not_about_the_examples():
+    """The wiring, not the wording: `_grade` returns a defect OR failures, never
+    both, and merging them into one list of "problems" was what put a defect
+    under the "I ran it" heading in the first place."""
+    prompts: list[str] = []
+
+    class _Recording(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            return await super().send(text, timeout_s)
+
+    class _Backend2(_Backend):
+        async def open(self, avoid=None):
+            return _Recording(self._replies, self._provider)
+
+    task = SolveTask(
+        problem_id="defect", language="rust", statement="Print 42.",
+        entrypoint="main", public_examples=[], deadline_s=120.0,
+    )
+    solver = VerifyingSolver(
+        # First reply is a helper with no `fn main`; second is a real program.
+        _Backend2(["```rust\nfn helper() {}\n```",
+                   '```rust\nfn main() { println!("42"); }\n```']),
+        safety_margin_s=0, max_budget_s=120,
+    )
+    answer = asyncio.run(solver.solve_task(task, 120.0))
+
+    assert "println!" in answer.code, "never got past the defect"
+    assert len(prompts) == 2, f"expected one repair round, got {len(prompts)}"
+    assert "could not run" in prompts[1] and "fn main" in prompts[1]
+    assert "against the examples" not in prompts[1]
+
+
+def test_both_providers_are_told_to_keep_long_code_in_the_chat():
+    """A long program is exactly when a model moves the answer into a side panel
+    the reader cannot see, so both nudges have to say so — and say it about
+    length, which is the trigger."""
+    assert "however long" in claude_site().nudge
+    assert "artifact" in claude_site().nudge
+    assert "however long" in chatgpt_site().nudge
+    assert "canvas" in chatgpt_site().nudge
+
+
 def test_the_claude_prompt_asks_for_an_inline_code_block():
     """Long code can land in the artifacts panel, outside the message the
     reader scrapes. One sentence is cheaper than scraping the panel."""
@@ -1691,3 +2212,692 @@ def test_a_browser_backend_is_started_before_serving_not_on_first_request():
     assert started == [True]
     # An API backend has nothing to warm up and must not be a problem.
     asyncio.run(warm_up(_solver([RIGHT]), 1))
+
+
+# --- the answer as it came off the wire ---------------------------------- #
+# The source above every other one this reader has: the markdown the model
+# emitted, captured before the page turned any of it into DOM. `pre code` is
+# that source after a syntax highlighter rebuilt it; even the copy control is
+# the framework's own copy of a block it has already parsed. The wire is also
+# the only source with anything left to say when the page read comes back
+# empty, which is the failure that keeps arriving as "the reply contained no
+# code" — a selector that stopped matching, an id swapped mid-stream, a render
+# this tab cannot see.
+
+
+def test_a_block_that_contains_a_fence_is_not_cut_at_the_inner_one():
+    """Markdown's own rule: the closing fence must be at least as long as the
+    opening one. A parser that stops at the first ``` truncates every answer
+    written with four backticks — which is exactly how a model writes a block
+    that has markdown inside it."""
+    blocks = _fenced_blocks("````md\n```py\nx = 1\n```\n````\n")
+    assert blocks == ["```py\nx = 1\n```\n"], blocks
+
+
+def test_a_fence_the_deadline_cut_off_is_still_an_answer():
+    """A reply the budget interrupted still has its program in it. Requiring a
+    closing fence would turn a recoverable partial answer into no answer."""
+    assert _fenced_blocks("here:\n```python\ndef f():\n    return 1\n") == [
+        "def f():\n    return 1\n"
+    ]
+
+
+CLAUDE_ANSWER = "```python\ndef solve(xs):\n    return sorted(xs)\n```\n\nDone."
+LONG_THOUGHTS = "Let me reason this through carefully. " * 120
+
+
+def _claude_wire(answer: str = CLAUDE_ANSWER) -> str:
+    """A Claude-shaped SSE body: reasoning, a signature, then the answer."""
+    events = [
+        "event: message_start",
+        'data: {"type":"message_start","message":'
+        '{"id":"msg_1","role":"assistant","model":"claude"}}',
+    ]
+    for i in range(0, len(LONG_THOUGHTS), 25):
+        events.append("data: " + json.dumps({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": LONG_THOUGHTS[i:i + 25]},
+        }))
+    events.append("data: " + json.dumps({
+        "type": "content_block_delta", "index": 0,
+        "delta": {"type": "signature_delta", "signature": "x" * 900},
+    }))
+    for i in range(0, len(answer), 6):
+        events.append("data: " + json.dumps({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": answer[i:i + 6]},
+        }))
+    events.append('data: {"type":"message_stop"}')
+    return "\n\n".join(events) + "\n\n"
+
+
+def _chatgpt_wire(answer: str = CLAUDE_ANSWER) -> str:
+    """A ChatGPT-shaped SSE body, in its operation encoding.
+
+    Three things here are not padding. The answer and the site's own
+    bookkeeping come down the SAME `v` field, told apart only by the sibling
+    operation. After the first append the operation is OMITTED and bare
+    `{"v": "..."}` means "as before" — so the qualifier has to carry forward or
+    the answer's opening chunk lands in its own group and is lost, and this
+    answer opens with the fence. And a metadata `replace` lands in the middle.
+    """
+    events = []
+
+    def send(obj):
+        events.append("data: " + json.dumps(obj))
+
+    send({"v": {"message": {"id": "abc", "author": {"role": "assistant"},
+                            "content": {"content_type": "text", "parts": [""]},
+                            "status": "in_progress"}, "c": 0}})
+    first = True
+    for i in range(0, len(LONG_THOUGHTS), 30):
+        if first:
+            send({"p": "/message/content/thoughts/0/content", "o": "append",
+                  "v": LONG_THOUGHTS[i:i + 30]})
+            first = False
+        else:
+            send({"v": LONG_THOUGHTS[i:i + 30]})
+    send({"p": "/message/metadata/finished_text", "o": "replace",
+          "v": "Thought for 12 seconds"})
+    first = True
+    for i in range(0, len(answer), 5):
+        if first:
+            send({"p": "/message/content/parts/0", "o": "append",
+                  "v": answer[i:i + 5]})
+            first = False
+        else:
+            send({"v": answer[i:i + 5]})
+        if i == 20:
+            send({"p": "/message/metadata/model_slug", "o": "replace", "v": "gpt-x"})
+            first = True   # the site re-states the operation after interrupting
+    send({"p": "/message/status", "o": "replace", "v": "finished_successfully"})
+    events.append("data: [DONE]")
+    return "\n\n".join(events) + "\n\n"
+
+
+def _streaming_page(playwright, chrome, bodies, page_html="<!doctype html>hi"):
+    """A browser whose `/sse` returns each body in turn, with the hook armed.
+
+    Routed rather than served from a file because the capture only fires on a
+    streaming content type, and that is the property being tested.
+    """
+
+    async def opened(p):
+        browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+        page = await (await browser.new_context()).new_page()
+        await page.add_init_script(_STREAM_INSTALL)
+        turn = {"n": 0}
+
+        def stream(route):
+            body = bodies[min(turn["n"], len(bodies) - 1)]
+            turn["n"] += 1
+            return asyncio.ensure_future(route.fulfill(
+                status=200, content_type="text/event-stream", body=body))
+
+        await page.route("**/sse", stream)
+        await page.route("**/blank", lambda r: asyncio.ensure_future(
+            r.fulfill(status=200, content_type="text/html", body=page_html)))
+        await page.goto("https://example.test/blank")
+        return browser, page
+
+    return opened
+
+
+@pytest.mark.parametrize("shape", ["claude", "chatgpt"])
+def test_the_wire_answer_is_reconstructed_without_knowing_the_schema(shape):
+    """Neither site publishes its stream format, and both change theirs without
+    telling anyone, so nothing about either is hard-coded. What is relied on is
+    structural: an SSE stream is many small JSON events and the answer is the
+    one field appended to over and over. Both real shapes are pinned here
+    because a heuristic that fits one and not the other is not a heuristic."""
+    playwright, chrome = _chromium_or_skip()
+    body = _claude_wire() if shape == "claude" else _chatgpt_wire()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(playwright, chrome, [body])(p)
+            await page.evaluate("async () => { await (await fetch('/sse')).text(); }")
+            await page.wait_for_function("(window.__honeStreams||[])[0]")
+            await asyncio.sleep(0.2)
+            out = await page.evaluate(_STREAM_READ, 0)
+            await browser.close()
+            return out
+
+    got = asyncio.run(go())
+    assert got == CLAUDE_ANSWER, f"reconstructed something else: {got!r}"
+    assert _fenced_blocks(got) == ["def solve(xs):\n    return sorted(xs)\n"]
+
+
+@pytest.mark.parametrize("shape", ["claude", "chatgpt"])
+def test_the_models_rough_work_is_never_mistaken_for_its_answer(shape):
+    """Both bodies above carry far more reasoning than answer — Claude under
+    `delta.thinking`, ChatGPT under `/message/content/thoughts/...`. Picking
+    the largest group without excluding those submits the model's scratchpad,
+    which is a failure this miner has already had once."""
+    playwright, chrome = _chromium_or_skip()
+    body = _claude_wire() if shape == "claude" else _chatgpt_wire()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(playwright, chrome, [body])(p)
+            await page.evaluate("async () => { await (await fetch('/sse')).text(); }")
+            await asyncio.sleep(0.2)
+            out = await page.evaluate(_STREAM_READ, 0)
+            await browser.close()
+            return out
+
+    got = asyncio.run(go()) or ""
+    assert "reason this through" not in got, f"submitted the thinking: {got[:120]!r}"
+    assert len(got) < len(LONG_THOUGHTS), "took the larger group on size alone"
+
+
+def test_the_network_capture_cannot_break_the_page():
+    """This patches `fetch` on a signed-in account the operator cares about, so
+    what it must never do matters more than what it does.
+
+    `res.clone()` and not `res.body.tee()` with a hand-built `Response`: a
+    constructed one loses `url` and `redirected`, and a chat UI reading either
+    breaks in a way that looks like the site's own bug. The body must be left
+    unread for the app, non-streaming requests must not be touched at all, and
+    a fetch that fails must still fail.
+    """
+    playwright, chrome = _chromium_or_skip()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(playwright, chrome, ['data: {"a":"x"}\n\n'])(p)
+            await page.route("**/thing.json", lambda r: asyncio.ensure_future(
+                r.fulfill(status=200, content_type="application/json", body='{"k":1}')))
+            out = await page.evaluate("""async () => {
+                const s = await fetch('/sse');
+                const seen = {url: s.url, status: s.status, ok: s.ok,
+                              redirected: s.redirected, type: s.type,
+                              bodyUsed: s.bodyUsed};
+                seen.body = await s.text();
+                const j = await fetch('/thing.json');
+                seen.json = await j.json();
+                seen.captured = (window.__honeStreams || []).length;
+                try { await fetch('http://127.0.0.1:1/nope'); seen.failed = false; }
+                catch (e) { seen.failed = true; }
+                return seen;
+            }""")
+            await browser.close()
+            return out
+
+    seen = asyncio.run(go())
+    assert seen["url"].endswith("/sse"), f"lost the response url: {seen['url']!r}"
+    assert (seen["status"], seen["ok"], seen["type"]) == (200, True, "basic"), seen
+    assert seen["redirected"] is False, seen
+    assert seen["bodyUsed"] is False, "the app's own body had already been consumed"
+    assert seen["body"] == 'data: {"a":"x"}\n\n', "the app got a different body"
+    assert seen["json"] == {"k": 1}, seen
+    assert seen["captured"] == 1, (
+        f"cloned {seen['captured']} responses; ordinary requests must be untouched"
+    )
+    assert seen["failed"], "a fetch that should have failed resolved instead"
+
+
+def _wire_site(**kw):
+    return _site(
+        composer=("#composer",), send=("#send",),
+        assistant=('[data-message-author-role="assistant"]',),
+        **kw,
+    )
+
+
+# A page that streams its answer but never renders it. That is not contrived:
+# it is what every one of these failures looked like from Python — the reply
+# was there, and the reader could not see it.
+SILENT_PAGE = (
+    '<!doctype html><meta charset="utf-8">'
+    '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    '<div id="host"></div>'
+    "<script>document.getElementById('send').onclick = () => "
+    "{ fetch('/sse').then(r => r.text()); };</script>"
+)
+
+
+def test_the_wire_answers_when_the_page_reads_back_nothing(capsys):
+    """The whole reason this path exists. Every other reading is downstream of
+    a render, so when the render is unreadable they all return the same empty
+    string and the solve is a guaranteed zero. The wire still has the answer."""
+    playwright, chrome = _chromium_or_skip()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(
+                playwright, chrome, [_claude_wire()], page_html=SILENT_PAGE)(p)
+            reply = await _tab(page, _wire_site()).send("solve it", 6.0)
+            await browser.close()
+            return reply
+
+    reply = asyncio.run(go())
+    assert "def solve" in extract_code(reply, "solve"), f"still empty: {reply!r}"
+    assert "read NOTHING from the page" in capsys.readouterr().out, (
+        "took the wire without saying the page had failed"
+    )
+
+
+def test_a_previous_turns_stream_is_not_read_as_this_turns_answer():
+    """The buffer holds several responses, and a repair round asks again in the
+    same tab. Reading the whole buffer would re-submit the very answer the
+    repair was sent to replace, which reads as the model ignoring the fix."""
+    playwright, chrome = _chromium_or_skip()
+    # Built from a different ANSWER, not by editing the finished body: the
+    # answer is cut into 5- and 6-character JSON chunks before it is encoded,
+    # so no phrase of it survives contiguously in the bytes and a string
+    # replacement on the body silently changes nothing at all.
+    #
+    # And deliberately SHORTER than the first. Reading the whole buffer picks
+    # the largest group in it, so a longer second answer would come out right
+    # by accident and this test would pass with the floor removed — checked,
+    # it did.
+    second = _claude_wire("```python\ndef solve(xs):\n    return xs[::-1]\n```")
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(
+                playwright, chrome, [_claude_wire(), second], page_html=SILENT_PAGE)(p)
+            tab = _tab(page, _wire_site())
+            first = await tab.send("solve it", 6.0)
+            again = await tab.send("no, reverse it", 6.0)
+            await browser.close()
+            return first, again
+
+    first, again = asyncio.run(go())
+    assert "sorted(xs)" in first, f"lost the first answer: {first!r}"
+    assert "xs[::-1]" in again, f"re-submitted the first answer: {again!r}"
+    assert "sorted(xs)" not in again, f"the old turn leaked in: {again!r}"
+
+
+RENDERING_PAGE = (
+    '<!doctype html><meta charset="utf-8">'
+    '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    '<div id="host"></div><script>'
+    "document.getElementById('send').onclick = () => {"
+    # Rendered FROM the response, as a real chat UI does. A page that paints
+    # independently races the stream, and the comparison under test would
+    # then depend on which of the two happened to win.
+    "  fetch('/sse').then(r => r.text()).then(() => {"
+    "  const w = document.createElement('div');"
+    "  w.setAttribute('data-message-author-role', 'assistant');"
+    "  const pre = document.createElement('pre'), code = document.createElement('code');"
+    # No trailing newline, where the wire's block has one. That is the single
+    # most common difference between two honest readings of the same answer --
+    # `textContent` keeps the newline before a closing tag, a copy control
+    # trims it, a fenced block always has one -- and reporting it would fire
+    # the warning on every clean reply until nobody read it any more.
+    "  code.textContent = 'def solve(xs):\\n    return sorted(xs)';"
+    "  pre.appendChild(code); w.appendChild(pre);"
+    "  document.getElementById('host').appendChild(w); });"
+    "};</script>"
+)
+
+
+def test_the_page_is_believed_over_the_wire_until_an_operator_says_otherwise(capsys):
+    """The wire is the better source in principle and unverifiable in practice:
+    both formats are private, so the reconstruction is a heuristic that could be
+    silently wrong after any deploy. A heuristic that quietly replaced a good
+    answer with a bad one would be worse than the bug it was written to fix. So
+    it rescues an empty read, it reports every disagreement, and it takes over
+    only when an operator who has watched the two agree turns it on."""
+    playwright, chrome = _chromium_or_skip()
+    wire = _claude_wire(CLAUDE_ANSWER.replace("sorted(xs)", "WIRE_ONLY(xs)"))
+
+    async def go(stream_first):
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(
+                playwright, chrome, [wire], page_html=RENDERING_PAGE)(p)
+            site = _wire_site(stream_first=stream_first)
+            reply = await _tab(page, site).send("solve it", 6.0)
+            await browser.close()
+            return reply
+
+    reply = asyncio.run(go(False))
+    assert "sorted(xs)" in reply, f"took the wire by default: {reply!r}"
+    assert "WIRE_ONLY" not in reply, f"took the wire by default: {reply!r}"
+    logged = capsys.readouterr().out
+    assert "not the same" in logged, f"said nothing about the disagreement: {logged!r}"
+    assert "T_STREAM_FIRST=1" in logged, f"did not name the override: {logged!r}"
+
+    # ...and with it on, the wire is what gets submitted.
+    assert "WIRE_ONLY" in asyncio.run(go(True)), "the override does nothing"
+
+
+def test_agreeing_sources_are_not_reported_as_a_disagreement(capsys):
+    """A warning that fires on every clean answer is a warning nobody reads.
+    Trailing newlines especially: `textContent` on a `<code>` keeps the one
+    before the closing tag and a fenced block always ends in one, so comparing
+    them raw would cry wolf on literally every reply."""
+    playwright, chrome = _chromium_or_skip()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(
+                playwright, chrome, [_claude_wire()], page_html=RENDERING_PAGE)(p)
+            reply = await _tab(page, _wire_site()).send("solve it", 6.0)
+            await browser.close()
+            return reply
+
+    reply = asyncio.run(go())
+    assert "sorted(xs)" in reply, f"lost the answer: {reply!r}"
+    assert "not the same" not in capsys.readouterr().out, "cried wolf on a clean read"
+
+
+def test_the_capture_can_be_switched_off_entirely():
+    """A tab told not to touch the network must behave exactly as it did before
+    any of this existed — including reading nothing when the page shows
+    nothing, which is the honest old answer."""
+    playwright, chrome = _chromium_or_skip()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(
+                playwright, chrome, [_claude_wire()], page_html=SILENT_PAGE)(p)
+            reply = await _tab(page, _wire_site(stream=False)).send("solve it", 4.0)
+            await browser.close()
+            return reply
+
+    assert asyncio.run(go()) == "", "read the wire with the capture switched off"
+
+
+def test_one_read_that_hangs_does_not_eat_the_whole_budget():
+    """Found by accident, and the most expensive bug in this file.
+
+    A poll resolves a node and then reads it. If the site swaps the message
+    between those two steps, the read waits on an element that no longer
+    matches — and Playwright auto-waits THIRTY SECONDS. Bounded only by the
+    send's remaining budget, that one poll spends every second the solve had
+    left and returns nothing, while the finished answer sits on screen the
+    whole time. Measured on the real DOM transition, before the fix: an 8s
+    send spent 7.85s inside a single `inner_text()` and returned "". On a solve
+    with a five-minute budget that is a five-minute stall and a certain zero,
+    and it arrives as "the reply contained no code" like everything else.
+
+    The hang is injected rather than raced for. Aiming a DOM change at the
+    inside of an in-flight read does reproduce it — that is how it was found —
+    but only sometimes, and a test that catches a budget-eating bug two runs in
+    three is worse than no test at all: it goes green on the broken code and
+    gets believed. What must hold is simply that ONE unreturning read cannot
+    spend the whole send, whatever made it hang.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<div id="host"></div><script>'
+        "document.getElementById('send').onclick = () => {"
+        "  const d = document.createElement('div');"
+        "  d.className = 'done-msg';"
+        "  const pre = document.createElement('pre');"
+        "  const code = document.createElement('code');"
+        "  code.textContent = 'def pong():\\n    return 4';"
+        "  pre.appendChild(code); d.appendChild(pre);"
+        "  document.getElementById('host').appendChild(d);"
+        "};</script>"
+    )
+    site = _site(composer=("#composer",), send=("#send",), assistant=("div.done-msg",))
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            reads, real = {"n": 0}, tab._poll
+
+            async def hangs_once(before):
+                reads["n"] += 1
+                if reads["n"] == 1:
+                    await asyncio.sleep(3600)   # the auto-wait that never lands
+                return await real(before)
+
+            tab._poll = hangs_once
+            started = time.monotonic()
+            reply = await tab.send("solve it", 20.0)
+            elapsed = time.monotonic() - started
+            await browser.close()
+            return reply, elapsed, reads["n"]
+
+    reply, elapsed, reads = asyncio.run(go())
+    assert reads > 1, "the loop gave up after the first read instead of retrying"
+    assert "return 4" in extract_code(reply, "pong"), f"captured nothing: {reply!r}"
+    assert elapsed < 10, (
+        f"the answer took {elapsed:.1f}s of a 20s budget: one read is still "
+        f"allowed to run to the deadline"
+    )
+
+
+def test_a_tab_the_fleet_opens_has_the_capture_armed():
+    """`_spawn` is the ONLY place a real tab gets the hook, and every other
+    test in this file installs it by hand — so removing the line from `_spawn`
+    left the whole suite green. Checked: it did.
+
+    It also pins how the hook is installed. `add_init_script` takes script
+    source, not a function the way `evaluate` does; handed the arrow function
+    it builds one, discards it, and arms nothing, in total silence. It has to
+    go in before the goto, too, or the site's own bundle wraps `fetch` first.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    )
+    async def go(stream):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            ctx = await browser.new_context()
+            fleet = BrowserFleet([Browser("http://127.0.0.1:0", _site(
+                url=url, composer=("#composer",), send=("#send",),
+                assistant=("div.msg",), stream=stream))])
+            tab = await fleet._spawn(ctx, fleet._browsers_wanted[0], "t")
+            armed = None
+            if tab is not None:
+                armed = await tab._page.evaluate("!!window.__honeStreamHooked")
+            await browser.close()
+            return tab, armed
+
+    tab, armed = asyncio.run(go(True))
+    assert tab is not None, "the fleet could not open a tab on this page at all"
+    assert armed is True, "a tab the fleet opened has no network capture on it"
+    # ...and a site told not to touch the network gets a tab that never does.
+    assert asyncio.run(go(False))[1] is False, "armed a tab with the capture off"
+
+
+def test_a_round_that_captured_nothing_never_replaces_a_flawed_program():
+    """`best so far` is what gets submitted, so what it ranks matters.
+
+    Emptiness is not a defect — there is nothing there to be wrong — so a
+    ranking that asks "is it runnable?" before "is there anything there?" lets
+    a round that read NOTHING outrank a round that returned a program with a
+    fixable flaw, and take its place as best. Both score zero on chain, but one
+    is an answer and the other is the absence of one. `python_defect` is a
+    static check, and a static check that is too strict must not be able to
+    throw away work by being wrong.
+    """
+    from solvers.verify import Candidate
+
+    def candidate(code, defect=None, passed=0):
+        return Candidate(code=code, raw="", defect=defect, passed=passed, total=2)
+
+    clean = candidate("def pong():\n    return 'pong'")
+    flawed = candidate("pong = 1", defect="does not define pong()")
+    nothing = candidate("")
+
+    assert clean.score > flawed.score, "a repaired answer does not beat the broken one"
+    assert flawed.score > nothing.score, "an empty round displaced a real program"
+    assert candidate("x", passed=1).score > clean.score, "passing examples must win"
+
+
+# --- what the prompt promises about the grader must stay true ------------- #
+# The edge-case section makes specific factual claims: overflow is silent,
+# `True` is not `1`, each test gets five seconds. Claims like those rot without
+# anyone noticing — the prompt keeps saying them long after the policy that
+# made them true has moved — and a prompt that confidently states something
+# false is worse than one that says nothing, because the model acts on it.
+
+
+def test_the_edge_case_checklist_names_the_cases_rather_than_gesturing_at_them():
+    """"Handle edge cases" is a line every model agrees to and none acts on.
+    What earns its place in the prompt is a case with a right answer the
+    statement implies and a wrong answer a plausible implementation gives."""
+    from solvers.prompts import build_initial_prompt
+
+    for language, entry in (("python", "solve"), ("rust", "main")):
+        prompt = build_initial_prompt(language, "Do a thing.", entry, [])
+        for case in ("n = 0", "n = 1", "empty", "BOTH ENDS", "EXTREME VALUES",
+                     "DEGENERATE SHAPE", "-1"):
+            assert case in prompt, f"{language} prompt never mentions {case!r}"
+        assert "off-by-one" in prompt, f"{language} prompt omits the boundary case"
+
+
+def test_each_language_is_warned_about_its_own_way_of_losing_a_large_number():
+    """The large-number failure is not the same failure in both languages, and
+    telling either one the other's story wastes the only prompt there is:
+    Python cannot overflow at all, and Rust cannot grow an integer."""
+    from solvers.prompts import build_initial_prompt
+
+    rust = build_initial_prompt("rust", "Do a thing.", "main", [])
+    python = build_initial_prompt("python", "Do a thing.", "solve", [])
+
+    assert "OVERFLOW IS SILENT" in rust and "i64" in rust
+    assert "overflow" not in python.lower().replace("never overflow", ""), (
+        "told Python about an overflow it cannot have"
+    )
+    assert "recursion limit is 1000" in python
+    assert "recursion limit" not in rust, "told Rust about Python's limit"
+
+
+def test_the_prompts_claim_about_silent_overflow_is_true_of_this_grader():
+    """The most valuable sentence in the prompt, and the one most able to go
+    quietly wrong.
+
+    `rustc` disables overflow checks whenever opt-level > 0, and the validator
+    compiles at opt-level=2 — so `i32` arithmetic WRAPS and the program exits 0
+    with a plausible wrong number instead of panicking. There is no message and
+    nothing in the failure that points at the cause, which is exactly why the
+    model has to be told up front.
+
+    Compiled here with the validator's own flags rather than a copy of them, so
+    that changing `RELEASE_POLICY.rustc_flags` — adding `-C
+    debug-assertions=on`, say — fails this test instead of leaving the prompt
+    asserting something that stopped being true.
+    """
+    rustc = shutil.which("rustc")
+    if rustc is None:
+        pytest.skip("no rustc on this host")
+    from rlvr.policy import RELEASE_POLICY
+    from solvers.prompts import RUST_EDGE_CASES
+
+    work = Path(tempfile.mkdtemp())
+    src = work / "ov.rs"
+    src.write_text(
+        "fn main() {\n"
+        "    let vals: Vec<i32> = vec![2_000_000_000, 2_000_000_000];\n"
+        "    let mut t: i32 = 0;\n"
+        "    for v in &vals { t += *v; }\n"
+        "    println!(\"{}\", t);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    built = subprocess.run(
+        [rustc, f"--edition={RELEASE_POLICY.rust_edition}",
+         *RELEASE_POLICY.rustc_flags, "-o", str(work / "ov"), str(src)],
+        capture_output=True, text=True, cwd=work,
+    )
+    assert built.returncode == 0, built.stderr
+    ran = subprocess.run([str(work / "ov")], capture_output=True, text=True)
+
+    assert ran.returncode == 0, (
+        f"the overflow panicked (exit {ran.returncode}); the prompt says it is "
+        f"silent, so either the flags changed or the prompt is now wrong"
+    )
+    assert ran.stdout.strip() == "-294967296", (
+        f"i32 overflow produced {ran.stdout.strip()!r}; the prompt tells the "
+        f"model it produces -294967296"
+    )
+    assert "-294967296" in RUST_EDGE_CASES, "the prompt stopped quoting the value"
+
+
+def test_the_prompts_claims_about_answer_comparison_are_true():
+    """The Python prompt tells the model `True` is not `1` and that a list and
+    a tuple are interchangeable. Both are load-bearing — one makes it wrap a
+    boolean answer, the other stops it wasting a repair round converting a
+    perfectly acceptable tuple — and both are somebody else's code."""
+    from rlvr.execution.compare import values_equal
+    from solvers.prompts import PYTHON_EDGE_CASES
+
+    assert "`True` is not `1`" in PYTHON_EDGE_CASES
+    assert not values_equal(True, 1), "the prompt's bool claim is now false"
+
+    assert "tuple with equal contents do compare equal" in PYTHON_EDGE_CASES
+    assert values_equal([1, 2], (1, 2)), "the prompt's list/tuple claim is false"
+
+    assert "two integers must match exactly" in PYTHON_EDGE_CASES
+    assert not values_equal(1_000_000, 1_000_001), (
+        "a float tolerance is accepting wrong integers; the prompt says it cannot"
+    )
+
+
+def test_the_prompt_quotes_the_real_per_test_timeout():
+    """A budget the model is told about has to be the budget it gets. Quoting a
+    generous one invites an algorithm that does not fit."""
+    from rlvr.config import Settings
+    from solvers.prompts import PYTHON_EDGE_CASES, RUST_EDGE_CASES
+
+    seconds = Settings.model_fields["per_test_timeout_s"].default
+    assert seconds == 5.0, (
+        f"the per-test timeout is now {seconds}s; both prompts still say 5"
+    )
+    assert "5 seconds" in PYTHON_EDGE_CASES and "5 seconds" in RUST_EDGE_CASES
+
+
+def test_the_examples_are_framed_as_a_floor_and_come_after_the_checklist():
+    """The examples are the friendliest thing in the message and the easiest to
+    over-fit to. Read first, they become the specification and the checklist
+    reads as an afterthought; read last, they are a lower bound."""
+    from solvers.prompts import build_initial_prompt
+
+    prompt = build_initial_prompt(
+        "python", "Do a thing.", "solve",
+        [{"args": [[1]], "kwargs": {}, "expected": 1}],
+    )
+    assert prompt.index("Edge cases are where") < prompt.index("PUBLIC EXAMPLES"), (
+        "the examples are read before the checklist"
+    )
+    assert "a floor, not the specification" in prompt
+
+
+def test_the_prompt_asks_for_code_with_nothing_explaining_it():
+    """The grader imports the source and calls it. Nothing ever reads a comment
+    or a docstring, and every one of them is output the model spends before the
+    answer is finished — on a subnet that tiebreaks on latency, that is the only
+    thing they cost. Both languages are told, and neither is asked to narrate
+    its own edge-case reasoning back in a comment."""
+    from solvers.prompts import build_initial_prompt
+
+    for language, entry in (("python", "solve"), ("rust", "main")):
+        prompt = build_initial_prompt(language, "Do a thing.", entry, [])
+        assert "Write no comments and no docstrings" in prompt, (
+            f"the {language} prompt never says to leave the code unexplained"
+        )
+        assert "comment at the top" not in prompt, (
+            f"the {language} prompt still asks for an explanatory comment"
+        )
+
+
+def test_a_repair_round_is_sent_back_through_the_checklist():
+    """Repairs go into the SAME conversation, so the checklist is still above
+    them — and a repair that fixes the failing example while breaking a
+    boundary scores the same zero as the answer it replaced."""
+    from solvers.prompts import build_repair_prompt
+
+    prompt = build_repair_prompt(["solve([]) raised IndexError"], "python", "solve")
+    assert "edge-case checklist" in prompt
+    assert "n = 1" in prompt and "largest values" in prompt
+    # ...but a DEFECT is not a logic problem, and must not be answered with it.
+    for defect in ("the program does not define fn main()", NO_CODE):
+        repair = build_repair_prompt([], "rust", "main", defect=defect)
+        assert "edge-case checklist" not in repair, (
+            f"answered a delivery failure with logic advice: {defect!r}"
+        )

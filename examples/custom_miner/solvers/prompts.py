@@ -50,6 +50,24 @@ _INVISIBLE_RE = re.compile(
 # Exotic spaces render like a space and break indentation. Fold them.
 _ODD_SPACE_RE = re.compile("[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]")
 
+# Some models narrate in a <think> block before answering, and the narration
+# quotes code -- half a struct, a function it then discards. When that block
+# arrives as TEXT rather than as its own collapsed UI element, every fragment in
+# it looks exactly like a candidate answer to the fence scanner, and one of them
+# is the last block whenever the real answer has not arrived. So the reasoning
+# is removed before anything is matched. An unclosed opener takes the rest of
+# the reply with it: there is no answer after a `<think>` that never ended, and
+# "nothing arrived" is a far better thing to report than a fragment of the
+# model's rough work.
+_THINK_RE = re.compile(
+    r"<(think|thinking|reasoning|scratchpad)\b[^>]*>.*?</\1\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_OPEN_THINK_RE = re.compile(
+    r"<(?:think|thinking|reasoning|scratchpad)\b[^>]*>.*",
+    re.DOTALL | re.IGNORECASE,
+)
+
 # A rendered code block puts its language chip inside the element the reader
 # scrapes, so the inner text can begin with a bare "python" line. That is worse
 # than a syntax error: it PARSES, defines the entrypoint, passes every check —
@@ -81,7 +99,8 @@ Rules — the grader is automated and unforgiving:
 - RETURN the answer. Do not print it, do not read stdin, do not call input().
   Printed output is ignored by the grader.
 - Standard library only. No pip packages, no network, no file access.
-- Handle edge cases and large inputs; hidden tests go beyond the examples.
+- Write no comments and no docstrings. Nothing reads them, and the answer is
+  scored partly on how fast it arrives.
 - Do not include tests, example calls, or `if __name__ == "__main__"`."""
 
 RUST_RULES = """\
@@ -92,8 +111,66 @@ Rules — the grader is automated and unforgiving:
 - READ the input from stdin and WRITE only the requested answer to stdout.
 - Output is compared token-by-token after splitting on ASCII whitespace, so
   extra prose, labels or prompts make the answer wrong.
-- Handle edge cases and large inputs; hidden tests go beyond the examples.
-- Prefer fast I/O (lock stdout, use a BufWriter) — inputs can be large."""
+- Write no comments and no docstrings. Nothing reads them, and the answer is
+  scored partly on how fast it arrives."""
+
+# The public examples are the friendly ones. The hidden suite is where the
+# score comes from, and it is written to break a solution that only handles the
+# shape it was shown -- so the cases below are named one at a time rather than
+# summarised as "handle edge cases", which every model agrees to and none acts
+# on. Each line is a case that has a right answer the statement implies and a
+# wrong answer a plausible implementation produces.
+EDGE_CASES = """\
+Edge cases are where this is won or lost. Walk your solution through every one
+of these before you answer, and fix what breaks:
+- NOTHING: an empty list, an empty string, n = 0. Work out what the statement
+  says the answer is, then make sure your code reaches it instead of crashing
+  or dividing by a length of zero.
+- ONE: n = 1, a single element, a one-character string. Almost every
+  off-by-one bug is visible here and nowhere else.
+- TWO: the smallest case where "first" and "last" are different elements, and
+  where adjacent-pair logic stops agreeing with the general case.
+- BOTH ENDS: the first element and the last, an empty range, and an inclusive
+  bound against an exclusive one. Check the far end explicitly — a loop that is
+  right at the start and short by one at the finish passes every example.
+- EXTREME VALUES: 0, 1, -1, negative numbers, and the largest magnitude the
+  statement allows. If no bound is given, assume values up to 10^18 and n up to
+  10^5, and pick an algorithm and a type that survive both.
+- DEGENERATE SHAPE: every element equal, every element a duplicate, already
+  sorted, sorted backwards, all zeros."""
+
+
+# Two of these are facts about THIS grader, not general advice, and both cost a
+# solve when guessed at: the comparison is structural and strict about bools,
+# and each test is on a five-second clock.
+PYTHON_EDGE_CASES = """\
+- Python integers never overflow, but the default recursion limit is 1000, so a
+  recursive answer dies at n = 10^4 with RecursionError. Write it iteratively,
+  or raise the limit yourself at the top of the file.
+- Each test gets about 5 seconds. O(n^2) over n = 10^5 does not fit.
+- Return the exact shape the examples show. The comparison is structural:
+  `True` is not `1`, so a boolean answer must be a real bool; a dict must have
+  exactly the expected keys; two integers must match exactly. (A list and a
+  tuple with equal contents do compare equal, so that one is safe.)"""
+
+# The overflow line is the single most valuable sentence in this file, and it is
+# measured rather than assumed -- see the test that compiles it. `rustc`
+# switches overflow checks off whenever opt-level > 0, and the grader compiles
+# at opt-level=2, so the arithmetic wraps and the program exits 0 with a
+# plausible wrong number. There is no panic, no message, and nothing in the
+# failure that points at the cause.
+RUST_EDGE_CASES = """\
+- INTEGER OVERFLOW IS SILENT HERE. The grader compiles with `-C opt-level=2`,
+  which turns overflow checks OFF: `i32` arithmetic wraps around and the
+  program exits normally with a wrong answer instead of panicking. Two `i32`
+  values of 2_000_000_000 add up to -294967296. Use `i64` everywhere by
+  default, `i128` for products, and reach for `i32` only where you have proved
+  the range cannot be exceeded.
+- Read to EOF. Tolerate trailing newlines, blank lines and repeated spaces, and
+  do not assume a fixed number of lines unless the statement fixes it.
+- Deep recursion overflows the stack. Prefer iteration for n up to 10^5.
+- Each test gets about 5 seconds, so lock stdout once and wrap it in a
+  BufWriter rather than printing in a loop."""
 
 
 def _render_examples(language: str, examples: list[dict[str, Any]]) -> str:
@@ -121,29 +198,82 @@ def _render_examples(language: str, examples: list[dict[str, Any]]) -> str:
 def build_initial_prompt(
     language: str, statement: str, entrypoint: str, examples: list[dict[str, Any]]
 ) -> str:
-    rules = (RUST_RULES if language == "rust" else PYTHON_RULES).format(
-        entrypoint=entrypoint
-    )
-    parts = [f"Solve this programming problem in {'Rust' if language == 'rust' else 'Python'}.", "", rules, "", "PROBLEM:", statement.strip()]
+    """The one prompt that has to carry the whole contract.
+
+    The examples come LAST on purpose. They are the friendliest thing in the
+    message and the easiest to over-fit to, so the edge-case checklist is read
+    first and the examples arrive already framed as a lower bound rather than
+    as the specification.
+    """
+    is_rust = language == "rust"
+    rules = (RUST_RULES if is_rust else PYTHON_RULES).format(entrypoint=entrypoint)
+    edges = EDGE_CASES + "\n" + (RUST_EDGE_CASES if is_rust else PYTHON_EDGE_CASES)
+    parts = [
+        f"Solve this programming problem in {'Rust' if is_rust else 'Python'}.",
+        "", rules,
+        "", edges,
+        "", "PROBLEM:", statement.strip(),
+    ]
     rendered = _render_examples(language, examples)
     if rendered:
-        parts += ["", "PUBLIC EXAMPLES (your code must reproduce these exactly):", rendered]
+        parts += [
+            "",
+            "PUBLIC EXAMPLES — these are a floor, not the specification. Your "
+            "code must reproduce them exactly AND survive the cases above:",
+            rendered,
+        ]
     return "\n".join(parts)
 
 
-def build_repair_prompt(failures: list[str], language: str, entrypoint: str) -> str:
+def build_repair_prompt(
+    failures: list[str],
+    language: str,
+    entrypoint: str,
+    defect: Optional[str] = None,
+) -> str:
     """Ask for a fix, quoting the concrete failures the local grader found.
 
     The failures come from running the candidate through the validator's own
     executor, so this is real evidence rather than a vague 'try again' — which
     is the difference between a repair loop that converges and one that drifts.
+
+    A ``defect`` is the other kind of problem entirely, and it must not be
+    dressed up as the first. Defects are found BEFORE anything is executed —
+    nothing arrived, it will not parse, there is no ``fn main`` — so telling the
+    model "I ran the program against the examples and got: the program does not
+    define `fn main()`" is not evidence but a contradiction. Faced with one, a
+    model rewrites the logic, which was never the problem, and the repair round
+    is spent for nothing. Ask about delivery when delivery failed, and about
+    shape when the shape is wrong.
     """
+    if defect == NO_CODE:
+        return (
+            "Your previous reply did not reach me as code. I can only read the "
+            "chat message itself, so an artifact, a canvas, a preview pane or a "
+            "collapsed block is invisible to me.\n\n"
+            "Send the COMPLETE program again as one ordinary fenced code block "
+            "written directly in the chat. Do not create an artifact or canvas. "
+            "Do not abbreviate it or replace any part with a comment. Same rules "
+            "as before, and nothing outside the code block."
+        )
+    if defect:
+        return (
+            f"I could not run your previous reply: {defect}.\n\n"
+            "Nothing was executed, so none of this is about your logic yet — it "
+            "is about what arrived. Put that right and send the COMPLETE program "
+            "again as ONE ordinary fenced code block written directly in the "
+            "chat, with nothing outside it. Same rules as before."
+        )
     detail = "\n".join(f"  - {line}" for line in failures)
     target = "the program" if language == "rust" else f"`{entrypoint}`"
     return (
         f"Your solution is WRONG. I ran {target} against the examples and got:\n"
         f"{detail}\n\n"
         "Work out why, then reply with ONLY ONE corrected code block. "
+        "Before you send it, run the fix back through the edge-case checklist "
+        "from my first message — the empty case, n = 1, both ends, and the "
+        "largest values allowed — because a repair that fixes the example and "
+        "breaks a boundary scores the same zero. "
         "Same rules as before. Do not explain outside the code block."
     )
 
@@ -162,6 +292,9 @@ def extract_code(
     # Clean BEFORE matching: a stray invisible character inside the opening
     # fence would stop the block being recognised at all.
     reply = sanitize_code(reply)
+    # ...and drop the model's own reasoning before matching too, so the fences
+    # it quoted while thinking never compete with the answer.
+    reply = _OPEN_THINK_RE.sub("", _THINK_RE.sub("", reply))
     matches = [m.group(2) for m in _FENCE_RE.finditer(reply)]
     if not matches:
         return reply.strip()
@@ -185,6 +318,11 @@ def extract_code(
     return blocks[-1]
 
 
+# Said by both defect checks, and recognised by `build_repair_prompt`, because
+# "nothing arrived" needs a different conversation from "what arrived is wrong".
+NO_CODE = "the reply contained no code"
+
+
 def python_defect(code: str, entrypoint: str) -> Optional[str]:
     """Return a reason string if the source can't possibly be graded, else None.
 
@@ -193,7 +331,7 @@ def python_defect(code: str, entrypoint: str) -> Optional[str]:
     it never defines the function the validator is going to call.
     """
     if not code.strip():
-        return "the reply contained no code"
+        return NO_CODE
     try:
         tree = ast.parse(code)
     except SyntaxError as exc:
@@ -222,7 +360,7 @@ def python_defect(code: str, entrypoint: str) -> Optional[str]:
 def rust_defect(code: str) -> Optional[str]:
     """Cheap structural check before paying for a compile."""
     if not code.strip():
-        return "the reply contained no code"
+        return NO_CODE
     if "fn main" not in code:
         return "the program does not define `fn main()`"
     return None

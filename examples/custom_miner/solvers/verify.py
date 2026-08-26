@@ -103,9 +103,26 @@ class Candidate:
         return self.defect is None and self.total > 0 and self.passed == self.total
 
     @property
-    def score(self) -> tuple[int, int]:
-        """Ranking key for 'best so far' — pass count, then having any code."""
-        return (self.passed, 1 if self.code.strip() else 0)
+    def score(self) -> tuple[int, int, int]:
+        """Ranking key for 'best so far' — passes, then non-empty, then runnable.
+
+        A defect ranks BELOW clean code that merely could not be graded, and
+        that is not cosmetic. Without a defect term at all, a first answer with
+        no `fn main()` and a corrected second answer score identically -- a tie,
+        which `>` loses, so the repair round lands a good program and the broken
+        one is submitted anyway. The whole repair loop is dead weight for
+        structural defects until this ranks them apart.
+
+        Non-empty comes BEFORE runnable, and the order is the whole point.
+        Emptiness is not a defect -- there is nothing there to be wrong -- so
+        with the terms the other way round a round that captured nothing at all
+        outranks a round that returned a program with a fixable flaw, and
+        replaces it as "best". Both score zero on chain, but one of them is
+        still an answer and the other is the absence of one, and the answer is
+        the one to keep: `python_defect` is a static check, and a static check
+        that is too strict must not be able to throw work away.
+        """
+        return (self.passed, 1 if self.code.strip() else 0, 0 if self.defect else 1)
 
 
 class _Grader:
@@ -331,10 +348,17 @@ class VerifyingSolver:
                     best = candidate
                 if candidate.verified:
                     break
-                problems = ([candidate.defect] if candidate.defect else []) + candidate.failures
-                if not problems:
+                if not candidate.defect and not candidate.failures:
                     break  # nothing actionable to report (no examples shipped)
-                prompt = build_repair_prompt(problems, task.language, task.entrypoint)
+                # Kept apart, not merged into one list of "problems": a defect
+                # means the code never ran, and the repair prompt has to say so
+                # rather than blame logic that was never executed.
+                prompt = build_repair_prompt(
+                    candidate.failures,
+                    task.language,
+                    task.entrypoint,
+                    defect=candidate.defect,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a failed solve scores zero, never crashes
