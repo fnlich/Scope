@@ -351,7 +351,19 @@ class VerifyingSolver:
                 if left < 12.0:
                     break  # not enough left to be worth another round trip
                 # Give the first attempt the larger share; repairs are cheaper.
-                slice_s = left if attempt == self._max_attempts else left * 0.6
+                #
+                # How much larger depends on whether a repair can even happen.
+                # With public examples a repair is likely, and reserving 40% for
+                # it is well spent. With NONE -- every task on the run this was
+                # written for -- the only repair possible is defect-driven, and
+                # a first answer that is structurally fine ends the loop right
+                # there. Measured: a Claude tab spent its whole 135 second slice
+                # and the remaining 90 seconds of a 225 second budget went
+                # unused, on the one attempt that had to succeed.
+                first_share = 0.6 if task.public_examples else 0.85
+                slice_s = (
+                    left if attempt == self._max_attempts else left * first_share
+                )
 
                 reply = await conversation.send(prompt, slice_s)
                 candidate = self._grade(reply, task)

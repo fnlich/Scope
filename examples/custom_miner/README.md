@@ -143,6 +143,17 @@ edge cases", which every model agrees to and none acts on:
     EXTREME VALUES   0, 1, -1, negatives, the largest magnitude allowed
     DEGENERATE       all equal, all duplicates, sorted, reverse sorted
 
+The checklist opens by saying **write the program first, then check it** — and
+that order cost solves before it was fixed. It used to read *"walk your solution
+through every one of these before you answer"*, and a model does what it is told:
+it narrated the walkthrough at length and only then started the program.
+Reported from a live Claude tab. The reason it matters is not style — the first
+attempt gets a fixed slice of the budget, and prose spent before the code is time
+the code does not get. Written this way the artifact exists first, so a reply cut
+short loses the checking pass rather than the whole answer. The nudge, which is
+appended last and so is the final thing the model reads, says the same thing in
+its strongest form: start the reply with the code block.
+
 The examples are rendered *after* that list and labelled a floor rather than the
 specification, because read first they become the spec and the checklist reads
 as an afterthought. Repair rounds are sent back through the same checklist,
@@ -819,6 +830,18 @@ gets submitted if the repair produces nothing better. No compiler means no
 opinion — silence has to mean the same thing as success, or a missing toolchain
 becomes an outage. `SOLVER_RUST_COMPILE=0` turns it off. The candidate is
 compiled, never run.
+
+### The first attempt gets the budget when no repair can happen
+
+The solve budget was split 60/40 — the larger share to the first attempt, the
+rest held back for repair rounds. That is well spent when public examples exist
+and a repair is likely. With **none shipped**, a structurally sound first answer
+ends the loop immediately and the reserve is simply discarded: measured, a tab
+spent its whole 135-second slice while the remaining 90 seconds of a 225-second
+budget went unused, on the one attempt that had to succeed.
+
+The share now depends on whether a repair is even possible — 85% to the first
+attempt when nothing can be graded against, which turns 135 seconds into 191.
 
 ## Self-verification: the part that earns the money
 

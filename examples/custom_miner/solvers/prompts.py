@@ -120,9 +120,19 @@ Rules — the grader is automated and unforgiving:
 # summarised as "handle edge cases", which every model agrees to and none acts
 # on. Each line is a case that has a right answer the statement implies and a
 # wrong answer a plausible implementation produces.
+#
+# The ORDER of the first sentence is the expensive part. It used to read "walk
+# your solution through every one of these before you answer", and a model does
+# what it is told: it narrated the walkthrough, at length, and only then began
+# the program. Reported from a live tab, and the reason it costs a solve is not
+# style -- the first attempt has about 135 seconds of a 225 second budget, and
+# prose spent before the code is time the code does not get. Written the other
+# way round the artifact exists first, so a reply cut short loses the checking
+# pass rather than the whole answer.
 EDGE_CASES = """\
-Edge cases are where this is won or lost. Walk your solution through every one
-of these before you answer, and fix what breaks:
+Edge cases are where this is won or lost. Write the program FIRST, then check it
+against every one of these and fix what breaks. Do that checking silently — none
+of the walkthrough belongs in the reply:
 - NOTHING: an empty list, an empty string, n = 0. Work out what the statement
   says the answer is, then make sure your code reaches it instead of crashing
   or dividing by a length of zero.

@@ -3860,3 +3860,83 @@ def test_the_log_names_which_model_produced_the_answer(capsys):
         f"credited the last model ASKED rather than the one whose answer was "
         f"submitted: {logged!r}"
     )
+
+
+# --- prose before the code costs time, not correctness -------------------- #
+# Reported from a live Claude tab: long explanations arriving before the
+# program. The extractor was never the problem — it handles a preamble fine.
+# The clock is: the first attempt had 135 seconds of a 225 second budget, and
+# prose spent before the code is time the code does not get.
+
+
+def test_a_preamble_before_the_code_is_extracted_correctly():
+    """Worth pinning so the fix is aimed at the right thing. A model that
+    explains itself first has still answered, and nothing downstream should
+    care — including when it appends an example block afterwards, which is the
+    shape that WOULD break a reader that took the last block blindly."""
+    reply = (
+        "I'll solve this step by step. The values reach 10^18 so i64 is needed\n"
+        "throughout, and n = 0 must answer 0 rather than divide by a length.\n\n"
+        "Here is the complete program:\n\n"
+        "```rust\nuse std::io::{self, Read};\nfn main() {\n"
+        '    let mut s = String::new();\n'
+        "    io::stdin().read_to_string(&mut s).unwrap();\n"
+        '    println!("{}", s.trim().len());\n}\n```\n\n'
+        "Example run:\n\n```\n3\n1 2 3\n```\n"
+    )
+    code = extract_code(reply, "main", "rust")
+    assert code.startswith("use std::io"), f"a preamble broke extraction: {code[:60]!r}"
+    from solvers.prompts import rust_defect
+
+    assert rust_defect(code) is None
+
+
+def test_the_checklist_asks_for_the_program_first_not_a_walkthrough():
+    """The order of one sentence, and it cost solves. It used to read "walk
+    your solution through every one of these BEFORE YOU ANSWER" — and a model
+    does what it is told, so it narrated the walkthrough at length and only
+    then started the program. Written the other way round the artifact exists
+    first, so a reply cut short loses the checking pass rather than the answer.
+    """
+    from solvers.prompts import EDGE_CASES, build_initial_prompt
+
+    assert "Write the program FIRST" in EDGE_CASES, EDGE_CASES[:120]
+    assert "silently" in EDGE_CASES
+    assert "before you answer" not in EDGE_CASES.lower(), (
+        "the checklist still asks the model to narrate before answering"
+    )
+    for language, entry in (("rust", "main"), ("python", "solve")):
+        prompt = build_initial_prompt(language, "Do a thing.", entry, [])
+        assert prompt.index("Write the program FIRST") < prompt.index("PROBLEM:")
+
+
+def test_both_nudges_use_the_last_word_to_demand_code_first():
+    """The nudge is appended after everything else, so it is the last thing the
+    model reads before it starts generating. That slot is worth the strongest
+    version of the one instruction that decides whether the answer arrives."""
+    for site in (claude_site(), chatgpt_site()):
+        assert site.nudge.startswith("START your reply with the code block"), site.nudge[:70]
+        assert "may not arrive at all" in site.nudge
+
+
+def test_the_first_attempt_gets_the_budget_when_no_repair_can_happen():
+    """Reserving 40% of the budget for repair rounds is well spent when public
+    examples exist and a repair is likely. With none shipped — every task on the
+    run this was written for — a structurally fine first answer ends the loop,
+    and the reserve is simply discarded. Measured: a tab spent its whole 135s
+    slice while 90s of a 225s budget went unused, on the one attempt that had
+    to succeed."""
+    import inspect
+
+    from solvers.verify import VerifyingSolver
+
+    source = inspect.getsource(VerifyingSolver._attempt)
+    assert "first_share = 0.6 if task.public_examples else 0.85" in source, source[:200]
+
+    budget = 225.0
+    with_examples = budget * 0.6
+    without = budget * 0.85
+    assert without > with_examples
+    assert without > 135.1, (
+        "the first attempt still gets less than the slice that was running out"
+    )
