@@ -1918,6 +1918,34 @@ def test_a_missing_copy_control_falls_back_to_reading_the_dom():
     assert "return 7" in extract_code(reply, "pong"), f"lost the answer: {reply!r}"
 
 
+def test_a_control_that_does_not_call_itself_copy_is_never_pressed():
+    """A selector is a guess about structure and can drift onto a neighbour.
+    ChatGPT keeps "Run code" in the same header as "Copy": reading the answer is
+    worth a click, executing it is not. So the control's own name is checked
+    before anything is pressed, and a mismatch falls back to scraping."""
+    playwright, chrome = _chromium_or_skip()
+    url = _served('<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<script>\nwindow.__ran = false;\ndocument.getElementById(\'send\').onclick = () => {\n  const wrap = document.createElement(\'div\');\n  wrap.setAttribute(\'data-message-author-role\', \'assistant\');\n  const pre = document.createElement(\'pre\');\n  const code = document.createElement(\'code\');\n  code.textContent = "def pong():\\n    return 9";\n  pre.appendChild(code);\n  wrap.appendChild(pre);\n  // The selector has drifted onto the neighbour ChatGPT keeps in the same\n  // header. Pressing this would execute the answer instead of reading it.\n  const btn = document.createElement(\'button\');\n  btn.setAttribute(\'data-role\', \'copyish\');\n  btn.setAttribute(\'aria-label\', \'Run code\');\n  btn.onclick = () => { window.__ran = true; };\n  wrap.appendChild(btn);\n  document.getElementById(\'host\').appendChild(wrap);\n};\n</script>')
+    site = _site(
+        composer=("#composer",), send=("#send",),
+        assistant=('[data-message-author-role="assistant"]',),
+        copy=('button[data-role="copyish"]',),   # matches, but it is not Copy
+    )
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            reply = await _tab(page, site).send("solve it", 5.0)
+            ran = await page.evaluate("window.__ran")
+            await browser.close()
+            return reply, ran
+
+    reply, ran = asyncio.run(go())
+    assert not ran, "pressed a control labelled 'Run code'"
+    assert "return 9" in extract_code(reply, "pong"), f"lost the answer: {reply!r}"
+
+
 def test_a_defect_is_not_reported_as_a_failed_run():
     """Defects are found BEFORE anything executes. "I ran the program against
     the examples and got: the program does not define `fn main()`" is not

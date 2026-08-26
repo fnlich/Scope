@@ -396,6 +396,13 @@ A pool that read the clipboard would submit another task's program whenever two
 solves overlapped, silently. The one visible consequence of the patch: while the
 miner owns a tab, that tab's copy buttons no longer write to your real clipboard.
 
+Nothing is *clicked* unless it says what it is. A selector is a guess about
+structure and can drift onto a neighbour — ChatGPT keeps "Run code" in the same
+header as "Copy", and reading an answer is worth a click where executing it is
+not. So the control's accessible name is checked first and must contain `copy`.
+On a UI in another language, set `CLAUDE_COPY_NAME` / `CHATGPT_COPY_NAME`; until
+you do, the miner reads the DOM instead, which is the safe direction to fail.
+
 It is preferred, not required. If the control is missing or renamed, scraping
 answers instead, and a reply with two blocks whose controls only half-respond is
 handed back to scraping whole rather than losing a block.

@@ -132,6 +132,10 @@ class Site:
     # `_Tab._copied_code`. Must name the button that copies ONE code block, not
     # the one that copies the whole message and not, on ChatGPT, "Run code".
     copy: tuple[str, ...] = ()
+    # What the copy control must call itself before it is clicked. See
+    # `_Tab._copied_code`: the selector says where to look, this says what we
+    # are willing to press. Override for a non-English UI.
+    copy_name: str = "copy"
     # Attribute that uniquely identifies a message, if the site has one.
     # ChatGPT does (``data-message-id``); without one the reply is identified
     # by position, which works because every task starts a fresh conversation.
@@ -780,11 +784,24 @@ class _Tab:
         fenced: list[str] = []
         expected = await buttons.count()
         for i in range(expected):
+            button = buttons.nth(i)
+            # Check the control's own name before pressing it. A selector is a
+            # guess about structure and can drift onto a neighbour; ChatGPT puts
+            # "Run code" in the very same header as "Copy". Reading the code is
+            # worth a click, executing it is not, so nothing gets pressed unless
+            # it says what it is. A UI in another language degrades to scraping
+            # until `<PREFIX>_COPY_NAME` is set, which is the safe direction.
+            try:
+                name = await button.get_attribute("aria-label") or await button.inner_text()
+            except Exception:  # noqa: BLE001 - unreadable name is not a name
+                name = None
+            if self.site.copy_name not in (name or "").casefold():
+                return None
             await self._page.evaluate("window.__honeCopied = null")
             try:
                 # force: the control is often transparent until hover, and
                 # actionability would wait for a hover that never comes.
-                await buttons.nth(i).click(timeout=COPY_TIMEOUT_MS, force=True)
+                await button.click(timeout=COPY_TIMEOUT_MS, force=True)
                 await self._page.wait_for_function(
                     "window.__honeCopied !== null", timeout=COPY_TIMEOUT_MS
                 )

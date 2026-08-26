@@ -76,6 +76,7 @@ def chatgpt_site() -> Site:
         # The code block's own control. NOT "Copy response" (the whole message)
         # and emphatically NOT "Run code". See `_Tab._copied_code`.
         copy=selectors("CHATGPT_COPY", ('button[aria-label="Copy"]',)),
+        copy_name=os.environ.get("CHATGPT_COPY_NAME", "copy").casefold(),
         message_id_attr="data-message-id",
         nudge=os.environ.get("CHATGPT_NUDGE", NUDGE),
         poll_s=float(os.environ.get("CHATGPT_POLL_S", "2")),
