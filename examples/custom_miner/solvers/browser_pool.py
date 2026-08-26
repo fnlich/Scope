@@ -62,6 +62,13 @@ from dataclasses import dataclass, replace
 from itertools import zip_longest
 from typing import Any, NamedTuple, Optional, Sequence
 
+# One scanner for fenced markdown, not two. This module used to carry its own
+# copy while the extractor in `prompts` matched fences with a regular
+# expression instead -- and the two disagreed about where a block ends, in four
+# measured ways that each cost a whole answer. Two readers of the same markdown
+# that disagree is a bug waiting for the reply that tells them apart.
+from .prompts import fenced_blocks as _fenced_blocks
+
 # The port `scripts/start_debug_browser.sh` uses unless told otherwise, and so
 # the port every backend assumes when `<PREFIX>_CDP` is not set.
 DEFAULT_CDP_PORT = 9222
@@ -510,39 +517,6 @@ async def usable_busy_selectors(page, candidates: Sequence[str], name: str) -> t
             continue
         kept.append(selector)
     return tuple(kept)
-
-
-def _fenced_blocks(markdown: str) -> list[str]:
-    """Every fenced block in a markdown string, in order, without its fences.
-
-    Scanned line by line rather than matched with one regular expression,
-    because the closing fence has to be at least as long as the opening one --
-    that is what lets a block that itself contains ``` be written with four
-    backticks, and a regex that ignores it truncates such an answer at the
-    inner fence. An unclosed final fence is kept: a reply cut off by a deadline
-    still has its program in it, and dropping it turns a partial answer into no
-    answer.
-    """
-    blocks: list[str] = []
-    body: Optional[list[str]] = None
-    fence = ""
-    for line in markdown.splitlines():
-        stripped = line.strip()
-        if body is None:
-            opener = re.match(r"(`{3,}|~{3,})", stripped)
-            if opener:
-                fence = opener.group(1)
-                body = []
-            continue
-        if re.fullmatch(re.escape(fence[0]) + "{%d,}" % len(fence), stripped):
-            if "\n".join(body).strip():
-                blocks.append("\n".join(body) + "\n")
-            body, fence = None, ""
-            continue
-        body.append(line)
-    if body is not None and "\n".join(body).strip():
-        blocks.append("\n".join(body) + "\n")
-    return blocks
 
 
 def _describe_char(ch: str) -> str:

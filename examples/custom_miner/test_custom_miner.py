@@ -4868,3 +4868,207 @@ def test_nothing_anywhere_still_submits_nothing(capsys):
     tab._streamed_markdown = prose
     assert asyncio.run(tab._reconcile_stream((0, None), "", [])) == ""
     assert "Nothing to submit" in capsys.readouterr().out
+
+
+# --- one reader for fenced markdown, not two ----------------------------- #
+# `browser_pool` scanned fences line by line while `extract_code` matched them
+# with a regular expression, and the two disagreed about where a block ends.
+# Each disagreement below was measured losing a whole answer.
+
+
+def _grades(reply, entry="g", lang="python"):
+    from solvers.prompts import rust_defect
+
+    code = extract_code(reply, entry, lang)
+    defect = rust_defect(code) if lang == "rust" else python_defect(code, entry)
+    return code, defect
+
+
+def test_a_closing_fence_has_to_be_a_whole_line():
+    """`fence = "```"` inside a program is not the end of the block. The regex
+    matched its backticks anywhere and truncated the answer at that line."""
+    prog = 'def g(t):\n    fence = "```"\n    return t.count(fence)'
+    code, defect = _grades(f"Here:\n\n```python\n{prog}\n```\n")
+    assert defect is None, defect
+    assert code.strip() == prog, f"truncated at the inner fence: {code!r}"
+
+
+def test_a_reply_cut_off_mid_block_keeps_the_program_it_did_write():
+    """The commonest thing a deadline does. With no closing fence the regex
+    matched nothing, the extractor fell through to its all-prose path, and a
+    fully written program was returned as ''."""
+    code, defect = _grades(
+        "Here you go:\n\n```python\ndef g(n):\n    return sum(int(c) for c in str(n))"
+    )
+    assert defect is None, defect
+    assert code.strip().startswith("def g(n)"), f"lost the answer: {code!r}"
+    assert "Here you go" not in code, "the prose came with it"
+
+
+def test_tilde_fences_are_fences():
+    """CommonMark says so, and a model that uses them is not wrong."""
+    code, defect = _grades("~~~python\ndef g(n):\n    return len(str(n))\n~~~")
+    assert defect is None and code.strip().startswith("def g(n)"), code
+
+
+def test_a_four_backtick_fence_keeps_the_three_backticks_inside_it():
+    """Markdown's rule for a block that contains a fence. The regex's trailing
+    backtick run ate the wrong one and left a stray fence in the code."""
+    prog = 'FENCE = """\n```\n"""\n\n\ndef g(t):\n    return t.count(FENCE.strip())'
+    code, defect = _grades(f"````python\n{prog}\n````")
+    assert defect is None, defect
+    assert code.strip() == prog, f"the fence rule was not applied: {code!r}"
+    scope: dict = {}
+    exec(compile(code, "<test>", "exec"), scope)
+    assert scope["g"]("``` and ``` again") == 2
+
+
+def test_both_readers_are_now_the_same_function():
+    """The point of the change: two readers of one markdown format that
+    disagree is a bug waiting for the reply that tells them apart."""
+    from solvers import browser_pool
+    from solvers.prompts import fenced_blocks
+
+    assert browser_pool._fenced_blocks is fenced_blocks
+
+
+# --- an answer split across two blocks ----------------------------------- #
+# A model told to send ONE code block sometimes sends its imports in a block of
+# their own. Taking the block that defines the entrypoint then leaves the
+# imports behind, and the result is worse than a visibly broken answer: it
+# parses, it defines the right function, `python_defect` passes it, and every
+# hidden test fails with `NameError: name 'math' is not defined` while nothing
+# anywhere says so.
+
+
+def _runs(reply, entry="g", args=(16,)):
+    """Extract, then actually run it the way the grader will."""
+    code = extract_code(reply, entry)
+    assert python_defect(code, entry) is None, python_defect(code, entry)
+    scope: dict = {}
+    exec(compile(code, "<test>", "exec"), scope)
+    return code, scope[entry](*args)
+
+
+def test_imports_left_in_their_own_block_are_carried_to_the_answer():
+    code, value = _runs("```python\nimport math\n```\n\n"
+                        "```python\ndef g(n):\n    return math.isqrt(n)\n```")
+    assert value == 4, value
+    assert code.startswith("import math"), code
+
+
+def test_only_the_imports_the_answer_actually_needs_are_carried():
+    code, value = _runs("```python\nimport math\nimport json\n```\n\n"
+                        "```python\ndef g(n):\n    return math.isqrt(n)\n```")
+    assert value == 4 and "import json" not in code, code
+
+
+def test_a_from_import_is_carried_the_same_way():
+    code, value = _runs(
+        "```python\nfrom collections import Counter\n```\n\n"
+        "```python\ndef g(s):\n    return len(Counter(s))\n```",
+        args=("aab",),
+    )
+    assert value == 2 and "from collections import Counter" in code, code
+
+
+def test_an_import_the_answer_does_not_use_is_never_dragged_in():
+    """The dangerous direction. `import numpy` prepended to a self-contained
+    answer turns a working program into an ImportError on every hidden test."""
+    code, value = _runs("```python\nimport numpy\n```\n\n"
+                        "```python\ndef g(n):\n    return n * 2\n```", args=(3,))
+    assert value == 6 and "numpy" not in code, code
+
+
+def test_only_the_import_lines_are_taken_never_the_code_beside_them():
+    """The safety property. A header block that also RUNS something — a
+    `sys.setrecursionlimit` call, a `print` — still yields its imports, and the
+    statement that would execute at import time is left exactly where it is."""
+    code, value = _runs("```python\nprint('setting up')\nimport math\n```\n\n"
+                        "```python\ndef g(n):\n    return math.isqrt(n)\n```")
+    assert value == 4, value
+    assert "import math" in code, "the import was lost with the block around it"
+    assert "print(" not in code, f"a running statement was prepended: {code!r}"
+
+
+def test_a_block_with_no_imports_at_all_contributes_nothing():
+    code, value = _runs("```python\nprint('setting up')\n```\n\n"
+                        "```python\ndef g(n):\n    return n + 1\n```", args=(1,))
+    assert value == 2 and "print(" not in code, code
+
+
+def test_a_local_name_that_shadows_a_module_is_not_a_missing_import():
+    code, value = _runs("```python\nimport math\n```\n\n"
+                        "```python\ndef g(n):\n    math = 2\n    return n * math\n```",
+                        args=(3,))
+    assert value == 6 and "import math" not in code, code
+
+
+def test_carrying_imports_does_not_resurrect_the_usage_demo():
+    """The two rules have to hold together: take the block that defines the
+    entrypoint, and give it the imports it needs — not the demo below it."""
+    code, value = _runs("```python\nimport math\n```\n\n"
+                        "```python\ndef g(n):\n    return math.isqrt(n)\n```\n\n"
+                        "```python\nprint(g(16))\n```")
+    assert value == 4 and "print(g(" not in code, code
+
+
+def test_rust_is_left_to_its_compiler():
+    """`use` has the same shape, but a Rust answer is put through rustc, which
+    says so in a message a repair round can act on."""
+    got = extract_code("```rust\nuse std::io;\n```\n\n"
+                       "```rust\nfn main() {\n    println!(\"x\");\n}\n```", "main", "rust")
+    assert got.strip().startswith("fn main()"), got
+
+
+def test_a_fence_that_ends_a_line_of_prose_still_opens_a_block():
+    """Markdown says a fence opens a line, and a model that writes
+    `Here you go: ```python` has broken that rule — but it has still answered.
+    Requiring the line to START with the fence dropped that answer entirely:
+    no block found, so the extractor fell through to its all-prose path and
+    returned "". Caught by this suite when the reader was unified."""
+    ans = "def g(n):\n    return sum(int(c) for c in str(n))"
+    for reply in (
+        f"I will explain at length. ```python\n{ans}\n```",
+        f"Here you go: ```\n{ans}\n```",
+    ):
+        code, defect = _grades(reply)
+        assert defect is None, f"{reply[:30]!r}: {defect}"
+        assert code.strip() == ans, code
+
+
+def test_inline_backticks_in_a_sentence_do_not_open_a_block():
+    """The other side of that tolerance. A fence run mid-sentence, with prose
+    after it, would swallow the paragraph beneath — and the answer with it."""
+    ans = "def g(n):\n    return sum(int(c) for c in str(n))"
+    code, defect = _grades(f"Use ```code``` inline.\n\nThen:\n\n```python\n{ans}\n```")
+    assert defect is None and code.strip() == ans, code
+    assert extract_code("You can wrap it in ```fences``` if you like.", "g") == ""
+
+
+def test_an_indented_fence_and_a_spaced_info_string_are_still_fences():
+    ans = "def g(n):\n    return len(str(n))"
+    assert _grades(f"  ```python\n{ans}\n  ```")[1] is None
+    assert _grades(f"``` python\n{ans}\n```")[1] is None
+
+
+def test_a_star_import_does_not_hide_a_genuinely_missing_module():
+    """Treating `import *` as binding everything looked like the cautious
+    choice and cost a carry: a block holding `from collections import *` beside
+    a use of `math` reported nothing missing, the `math` split into an earlier
+    block was left behind, and every hidden test failed on NameError."""
+    code, value = _runs(
+        "```python\nimport math\n```\n\n"
+        "```python\nfrom collections import *\ndef g(n):\n    return math.isqrt(n)\n```"
+    )
+    assert value == 4, value
+    assert "import math" in code, code
+
+
+def test_a_star_import_is_never_itself_carried():
+    """The other half: `from x import *` binds names this cannot enumerate, so
+    it can never be the statement that answers a missing name."""
+    from solvers.prompts import _import_bindings
+
+    assert _import_bindings("from collections import *") == {}
+    assert _import_bindings("import math\nfrom os import *") == {}

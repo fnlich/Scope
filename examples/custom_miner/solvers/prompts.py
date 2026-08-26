@@ -24,6 +24,7 @@ those examples are the only disambiguation a miner is given.
 from __future__ import annotations
 
 import ast
+import builtins
 import json
 import re
 from typing import Any, Optional
@@ -35,7 +36,69 @@ from typing import Any, Optional
 # long as the opener. Hard-coding three cut a block short the moment its own
 # source contained ``` -- a docstring showing markdown was enough -- and missed
 # a longer fence entirely. The backreference makes the closer match the opener.
-_FENCE_RE = re.compile(r"(`{3,})[^\n`]*\n(.*?)\n?\1`*", re.DOTALL)
+def fenced_blocks(markdown: str) -> list[str]:
+    """Every fenced block in a markdown string, in order, without its fences.
+
+    Scanned line by line rather than matched with one regular expression, and
+    that is not a style preference -- the regex this replaced lost a whole
+    answer in four separate ways, each measured against the shape that produces
+    it:
+
+    * A closing fence has to be a whole LINE. The regex matched its backticks
+      anywhere, so `fence = "```"` inside a program ENDED the block, and the
+      answer was truncated at that line.
+    * A block written with four backticks because it contains three is the
+      markdown rule for exactly that case. The regex's trailing `` `* `` ate
+      the wrong run and left a stray fence inside the code.
+    * A reply cut off mid-block has no closing fence at all. The regex matched
+      nothing, so the extractor fell through to its "this reply is all prose"
+      path and returned NOTHING -- discarding a program that was fully written,
+      on the one failure a deadline causes most often.
+    * `~~~` is a fence too, and CommonMark says so.
+
+    An unclosed final fence is therefore kept: a reply cut off by a deadline
+    still has its program in it, and dropping it turns a partial answer into no
+    answer at all.
+    """
+    blocks: list[str] = []
+    body: Optional[list[str]] = None
+    fence = ""
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if body is None:
+            # The fence may END a line of prose rather than start one. Markdown
+            # says a fence opens a line, and a model that writes
+            # `Here you go: ```python` has broken that rule -- but it has still
+            # answered, and the reader that came before this one accepted it.
+            # Requiring the line to START with the fence dropped that answer
+            # entirely: no block found, so the extractor fell through to its
+            # all-prose path and returned "". Caught by the suite.
+            #
+            # A fence that STARTS its line is markdown's own rule and takes
+            # the info string markdown allows. The mid-line tolerance is
+            # deliberately narrower: the fence has to be the last thing on the
+            # line with its language word attached, so `Use ```code``` inline`
+            # is not an opener and cannot swallow the paragraph beneath it.
+            # Allowing a SPACE before that word was enough to break exactly
+            # that -- ``` inline.` read as a fence with the info string
+            # "inline.".
+            opener = re.match(r"(`{3,}|~{3,})", stripped) or re.search(
+                r"(`{3,}|~{3,})[A-Za-z0-9_+#.-]*$", line.rstrip()
+            )
+            if opener:
+                fence = opener.group(1)
+                body = []
+            continue
+        if re.fullmatch(re.escape(fence[0]) + "{%d,}" % len(fence), stripped):
+            if "\n".join(body).strip():
+                blocks.append("\n".join(body) + "\n")
+            body, fence = None, ""
+            continue
+        body.append(line)
+    if body is not None and "\n".join(body).strip():
+        blocks.append("\n".join(body) + "\n")
+    return blocks
+
 
 # Characters that only ever arrive from a RENDERED page, never from source a
 # grader would accept: zero-width marks, line/paragraph separators, the BOM,
@@ -390,7 +453,7 @@ def extract_code(
     # ...and drop the model's own reasoning before matching too, so the fences
     # it quoted while thinking never compete with the answer.
     reply = _OPEN_THINK_RE.sub("", _THINK_RE.sub("", reply))
-    matches = [m.group(2) for m in _FENCE_RE.finditer(reply)]
+    matches = fenced_blocks(reply)
     if not matches:
         # No fence anywhere. That is usually a reply that is ALL prose -- a
         # refusal, a clarifying question, or a model's reasoning scraped before
@@ -424,13 +487,13 @@ def extract_code(
     # last block is then the demo. Reusing the defect check as the test means
     # "gradeable" here is exactly what it means everywhere else.
     if entrypoint:
-        for block in reversed(blocks):
+        for i in range(len(blocks) - 1, -1, -1):
             defect = (
-                rust_defect(block) if language == "rust"
-                else python_defect(block, entrypoint)
+                rust_defect(blocks[i]) if language == "rust"
+                else python_defect(blocks[i], entrypoint)
             )
             if defect is None:
-                return block
+                return _carry_imports(blocks[i], blocks[:i], language)
     # Nothing clean. Fall back only as far as something that is plausibly
     # source: a broken program is still an attempt, and the defect it reports
     # is what the repair round needs to hear, but a tool call is not an attempt
@@ -451,10 +514,123 @@ def extract_code(
     # also teaches the repair round nothing: it is told the code does not define
     # `g`, about a block that was never trying to.
     if entrypoint:
-        for block in usable:
-            if _defines(block, entrypoint, language):
-                return block
+        for i in range(len(blocks) - 1, -1, -1):
+            if blocks[i] in usable and _defines(blocks[i], entrypoint, language):
+                return _carry_imports(blocks[i], blocks[:i], language)
     return usable[0]
+
+
+_BUILTIN_NAMES = frozenset(dir(builtins))
+
+
+def _import_bindings(code: str) -> dict[str, str]:
+    """``{name: the top-level import statement that binds it}``.
+
+    Only import statements are ever read out, and that is the safety property.
+    Whatever this returns gets PREPENDED to the answer, so it must not be able
+    to do work: an assignment, a call, a definition beside the imports stays
+    where it is and is never copied. An `import` is the one statement that
+    cannot surprise -- and where it can, because the module is unavailable, the
+    answer that needed it was already lost.
+
+    An earlier attempt required the whole block to be nothing but imports. That
+    read well and bought nothing: a block mixing `import sys` with a
+    `sys.setrecursionlimit(...)` call is still a header the model split off,
+    and refusing it lost the import as well as the call. Mutation testing is
+    what surfaced it -- removing the restriction changed no behaviour any test
+    could see, because only the import lines were ever taken either way.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return {}
+    bound: dict[str, str] = {}
+    lines = code.splitlines()
+    for node in tree.body:
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for alias in node.names:
+            if alias.name == "*":
+                return {}  # no way to know what it binds
+            bound[alias.asname or alias.name.split(".")[0]] = "\n".join(
+                lines[node.lineno - 1: node.end_lineno]
+            )
+    return bound
+
+
+def _unbound(code: str) -> set[str]:
+    """Names this block READS and never binds anywhere, builtins aside.
+
+    Bindings are collected from every scope at once rather than per-scope. That
+    is deliberately over-permissive: a local named `math` in some other function
+    hides a genuinely missing module-level `math`, and the cost of that is one
+    import not carried forward -- the failure this already had. The opposite
+    error would prepend an import the answer never asked for.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set()
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                # `import *` is NOT treated as binding everything. Doing that
+                # was the cautious-looking choice and it cost a carry: a block
+                # holding `from collections import *` beside a use of `math`
+                # reported nothing missing, so the `math` split into an earlier
+                # block was left behind and every test failed on NameError.
+                # A name a star-import really does supply is simply one that no
+                # earlier block binds either, so nothing is carried for it.
+                if alias.name != "*":
+                    bound.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+    used = {
+        n.id for n in ast.walk(tree)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+    }
+    return used - bound - _BUILTIN_NAMES
+
+
+def _carry_imports(block: str, earlier: list[str], language: str) -> str:
+    """Bring forward an imports-only block the chosen one turns out to need.
+
+    A model told to send ONE code block sometimes sends its imports in a block
+    of their own. Taking the block that defines the entrypoint then leaves the
+    imports behind, and the result is worse than a visibly broken answer: it
+    parses, it defines the right function, `python_defect` passes it, and every
+    hidden test fails with `NameError: name 'math' is not defined`. Nothing
+    anywhere says so. Measured on exactly that pair of blocks.
+
+    Narrow on purpose. Only top-level `import` statements are eligible, only
+    the ones binding a name this block reads and never binds are taken, and a
+    block that needs nothing is returned untouched. Rust is left alone: `use` has the
+    same shape, but a Rust answer is put through the compiler, which says so.
+    """
+    if language == "rust":
+        return block
+    missing = _unbound(block)
+    if not missing:
+        return block
+    carried: list[str] = []
+    for other in earlier:
+        bindings = _import_bindings(other)
+        for name in sorted(missing & set(bindings)):
+            if bindings[name] not in carried:
+                carried.append(bindings[name])
+        missing -= set(bindings)
+    if not carried:
+        return block
+    return "\n".join(carried) + "\n\n" + block
 
 
 def _defines(code: str, entrypoint: str, language: str = "python") -> bool:
