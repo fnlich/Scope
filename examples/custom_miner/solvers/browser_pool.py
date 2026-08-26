@@ -315,6 +315,7 @@ class _Tab:
         self._warned_branches = False
         self._warned_copy = False
         self._warned_diff = False
+        self._warned_relatch = False
         self.uses = 0
         self.alive = True
         # True while this tab is known to be sitting in an EMPTY conversation.
@@ -597,6 +598,8 @@ class _Tab:
                     f"Run `python -m solvers.doctor {self.site.name}` if answers "
                     f"start arriving mangled — the control may have been renamed."
                 )
+        if not best and self.alive:
+            await self._explain_empty(before)
         return best
 
     async def _poll(
@@ -638,18 +641,41 @@ class _Tab:
     async def _messages(self):
         """Assistant messages, through ONE selector for the whole send().
 
-        Latched on first match and reset by ``send()``. Re-resolving per call
+        Latched on first match and reset by ``send()``. Re-resolving *per call*
         would let the fingerprint count nodes matching one candidate and the
         poll count nodes matching another, and ``_new_reply`` compares those two
         numbers directly — so a site with several viable candidates and no
         message id (claude.ai exactly) would mis-detect replies on every repair
         round. Latching per send, not per tab, still lets a later send pick a
         better candidate once the DOM settles.
+
+        The latch is dropped in exactly one case: the candidate it holds matches
+        nothing at all. There is no count to corrupt at zero, and the
+        alternative is reading nothing for the rest of the send.
         """
+        if self._assistant is not None:
+            found = self._page.locator(self._assistant)
+            if await found.count() > 0:
+                return found
+            # The winning candidate has stopped matching. Sites stream a
+            # message under one attribute and drop it when the message is
+            # finished, so the selector that found the answer can be the one
+            # that cannot see it any more. Holding the latch here reads NOTHING
+            # for the rest of the send while the answer sits on screen under a
+            # sibling candidate -- captured nothing, reported as "the reply
+            # contained no code". Re-resolving costs one DOM query.
+            if not self._warned_relatch:
+                self._warned_relatch = True
+                print(
+                    f"[{self.site.name}] note: tab {self.label}: assistant selector "
+                    f"{self._assistant!r} stopped matching mid-answer; re-resolving. "
+                    f"Run `python -m solvers.doctor {self.site.name}` — it will show "
+                    f"which candidate to pin in {self.site.env_prefix}_ASSISTANT."
+                )
+            self._assistant = None
+        self._assistant = await self._first_match(self.site.assistant)
         if self._assistant is None:
-            self._assistant = await self._first_match(self.site.assistant)
-            if self._assistant is None:
-                return None
+            return None
         return self._page.locator(self._assistant)
 
     async def _fingerprint(self) -> tuple[int, Optional[str]]:
@@ -774,6 +800,55 @@ class _Tab:
                 f"{self.site.name}` and set {self.site.env_prefix}_ASSISTANT."
             )
         return True
+
+    async def _explain_empty(self, before: tuple[int, Optional[str]]) -> None:
+        """Say why nothing was captured, while the page is still there to ask.
+
+        "The reply contained no code" is what the grader says afterwards, and it
+        describes the symptom of every one of these causes identically: a
+        selector that matches nothing, a reply that never rendered, an answer
+        still streaming when the budget ran out. The page can distinguish them
+        in four DOM queries, and only right now.
+        """
+        try:
+            resolved = await self._first_match(self.site.assistant)
+            count = 0
+            if resolved is not None:
+                count = await self._page.locator(resolved).count()
+            reply = await self._new_reply(before)
+            busy = await self._busy_now()
+        except Exception as exc:  # noqa: BLE001 - the page is gone; say that
+            print(
+                f"[{self.site.name}] tab {self.label} captured nothing and the page "
+                f"could not be inspected ({type(exc).__name__})."
+            )
+            return
+        if resolved is None:
+            why = (
+                f"no assistant selector matched anything. Tried "
+                f"{list(self.site.assistant)}; set {self.site.env_prefix}_ASSISTANT"
+            )
+        elif count <= before[0]:
+            why = (
+                f"{resolved!r} matched {count} message(s), the same as before the "
+                f"prompt was sent — the answer never rendered"
+            )
+        elif reply is None:
+            why = (
+                f"{resolved!r} matched {count} message(s) but none of them could be "
+                f"identified as the answer to this prompt"
+            )
+        elif busy:
+            why = "the answer was still being written when the budget ran out"
+        else:
+            why = (
+                f"the answer rendered but read as empty — {self.site.env_prefix}_ASSISTANT "
+                f"may be matching a wrapper rather than the message"
+            )
+        print(
+            f"[{self.site.name}] tab {self.label} captured NOTHING from this reply: "
+            f"{why}. This is what surfaces later as \"the reply contained no code\"."
+        )
 
     async def _copied_blocks(self, reply) -> Optional[list[str]]:
         """The code as the PAGE would copy it, without touching the clipboard.

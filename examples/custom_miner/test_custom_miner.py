@@ -1964,6 +1964,80 @@ def test_a_control_that_does_not_call_itself_copy_is_never_pressed():
     assert "return 9" in extract_code(reply, "pong"), f"lost the answer: {reply!r}"
 
 
+def test_an_assistant_selector_that_dies_mid_answer_is_re_resolved(capsys):
+    """Captured nothing, and the answer was on screen the whole time.
+
+    Sites stream a message under one attribute and drop it when the message is
+    done. The candidate that found the message is then the one that cannot see
+    it, and a latch held for the whole send reads nothing for the rest of it --
+    which surfaces, much later and much less usefully, as "the reply contained
+    no code".
+
+    The transition is driven from here rather than a page timer: Chromium
+    throttles timers in background pages, and every tab this miner owns is a
+    background page.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served('<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<script>\ndocument.getElementById(\'send\').onclick = () => {\n  const d = document.createElement(\'div\');\n  d.setAttribute(\'data-is-streaming\', \'true\');   // painted, still empty\n  document.getElementById(\'host\').appendChild(d);\n};\n</script>')
+    site = _site(
+        composer=("#composer",), send=("#send",),
+        assistant=("div[data-is-streaming]", "div.done-msg"),
+    )
+    finish = """() => {
+        const d = document.querySelector('[data-is-streaming]');
+        d.removeAttribute('data-is-streaming');
+        d.className = 'done-msg';
+        const pre = document.createElement('pre');
+        const code = document.createElement('code');
+        code.textContent = 'def pong():\\n    return 4';
+        pre.appendChild(code);
+        d.appendChild(pre);
+    }"""
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            sending = asyncio.create_task(_tab(page, site).send("solve it", 8.0))
+            await asyncio.sleep(0.4)      # long enough to latch the streaming one
+            await page.evaluate(finish)   # ...which now matches nothing
+            reply = await sending
+            await browser.close()
+            return reply
+
+    reply = asyncio.run(go())
+    assert "return 4" in extract_code(reply, "pong"), f"captured nothing: {reply!r}"
+    assert "stopped matching mid-answer" in capsys.readouterr().out, "re-resolved silently"
+
+
+def test_capturing_nothing_says_why_while_the_page_can_still_be_asked(capsys):
+    """"The reply contained no code" describes a selector that matches nothing,
+    a reply that never rendered and an answer still streaming, identically. The
+    page can tell them apart in four queries, and only at the time."""
+    playwright, chrome = _chromium_or_skip()
+    url = _served('<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<script>\ndocument.getElementById(\'send\').onclick = () => {\n  const d = document.createElement(\'div\');\n  d.className = \'renamed-by-the-site\';     // nothing the miner knows about\n  d.textContent = \'def pong(): return 1\';\n  document.getElementById(\'host\').appendChild(d);\n};\n</script>')
+    site = _site(
+        composer=("#composer",), send=("#send",),
+        assistant=('[data-message-author-role="assistant"]',),
+    )
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            reply = await _tab(page, site).send("solve it", 3.0)
+            await browser.close()
+            return reply
+
+    assert asyncio.run(go()) == "", "expected an empty capture for this page"
+    logged = capsys.readouterr().out
+    assert "captured NOTHING" in logged, f"stayed silent about an empty read: {logged!r}"
+    assert "no assistant selector matched" in logged, f"did not name the cause: {logged!r}"
+    assert "_ASSISTANT" in logged, f"did not name the fix: {logged!r}"
+
+
 def test_a_defect_is_not_reported_as_a_failed_run():
     """Defects are found BEFORE anything executes. "I ran the program against
     the examples and got: the program does not define `fn main()`" is not

@@ -428,6 +428,28 @@ It names the codepoint because that is the part you can act on. It fires once
 per tab, and only on a real difference — a warning that appears on every answer
 is one nobody reads.
 
+### When nothing is captured at all, the tab says why
+
+`the reply contained no code` is what the grader reports afterwards, and it
+describes several very different causes identically: a selector that matches
+nothing, a reply that never rendered, an answer still being written when the
+budget ran out. Only the page can tell them apart, and only at the time — so it
+is asked before the tab moves on:
+
+```
+[claude] tab claude#1 captured NOTHING from this reply: 'div[data-is-streaming]'
+matched 1 message(s) but none of them could be identified as the answer to this
+prompt. This is what surfaces later as "the reply contained no code".
+```
+
+One related failure is now repaired rather than reported. A site streams a
+message under one attribute and drops it when the message is finished, so the
+candidate that *found* the answer can be the one that cannot see it. The
+assistant selector is latched for the whole send — deliberately, so message
+counts stay comparable — but the latch is dropped the moment it matches
+nothing, because there is no count to corrupt at zero and the alternative is
+reading nothing while the answer sits on screen.
+
 Three hazards are handled in code rather than left to the selectors:
 
 - **An assistant selector that also matches your own message** would make the
