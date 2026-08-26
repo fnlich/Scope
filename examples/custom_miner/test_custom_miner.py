@@ -16,6 +16,7 @@ to get wrong in production:
 
 from __future__ import annotations
 
+import json
 import asyncio
 import sys
 import tempfile
@@ -32,7 +33,10 @@ from solvers.browser_pool import (  # noqa: E402
     Browser,
     BrowserFleet,
     Site,
+    _STREAM_INSTALL,
+    _STREAM_READ,
     _Tab,
+    _fenced_blocks,
     usable_busy_selectors,
 )
 from solvers.chatgpt_web import chatgpt_site  # noqa: E402
@@ -1999,8 +2003,16 @@ def test_an_assistant_selector_that_dies_mid_answer_is_re_resolved(capsys):
             browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
             page = await (await browser.new_context()).new_page()
             await page.goto(url)
-            sending = asyncio.create_task(_tab(page, site).send("solve it", 8.0))
-            await asyncio.sleep(0.4)      # long enough to latch the streaming one
+            tab = _tab(page, site)
+            sending = asyncio.create_task(tab.send("solve it", 8.0))
+            # Wait for the latch itself, not for a length of time: a fixed
+            # sleep encodes a guess about how fast this machine is, and this
+            # suite runs a browser per test. The latch going non-None IS the
+            # state under test — the streaming candidate has won.
+            deadline = time.monotonic() + 5
+            while tab._assistant is None and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            assert tab._assistant == "div[data-is-streaming]", tab._assistant
             await page.evaluate(finish)   # ...which now matches nothing
             reply = await sending
             await browser.close()
@@ -2198,3 +2210,518 @@ def test_a_browser_backend_is_started_before_serving_not_on_first_request():
     assert started == [True]
     # An API backend has nothing to warm up and must not be a problem.
     asyncio.run(warm_up(_solver([RIGHT]), 1))
+
+
+# --- the answer as it came off the wire ---------------------------------- #
+# The source above every other one this reader has: the markdown the model
+# emitted, captured before the page turned any of it into DOM. `pre code` is
+# that source after a syntax highlighter rebuilt it; even the copy control is
+# the framework's own copy of a block it has already parsed. The wire is also
+# the only source with anything left to say when the page read comes back
+# empty, which is the failure that keeps arriving as "the reply contained no
+# code" — a selector that stopped matching, an id swapped mid-stream, a render
+# this tab cannot see.
+
+
+def test_a_block_that_contains_a_fence_is_not_cut_at_the_inner_one():
+    """Markdown's own rule: the closing fence must be at least as long as the
+    opening one. A parser that stops at the first ``` truncates every answer
+    written with four backticks — which is exactly how a model writes a block
+    that has markdown inside it."""
+    blocks = _fenced_blocks("````md\n```py\nx = 1\n```\n````\n")
+    assert blocks == ["```py\nx = 1\n```\n"], blocks
+
+
+def test_a_fence_the_deadline_cut_off_is_still_an_answer():
+    """A reply the budget interrupted still has its program in it. Requiring a
+    closing fence would turn a recoverable partial answer into no answer."""
+    assert _fenced_blocks("here:\n```python\ndef f():\n    return 1\n") == [
+        "def f():\n    return 1\n"
+    ]
+
+
+CLAUDE_ANSWER = "```python\ndef solve(xs):\n    return sorted(xs)\n```\n\nDone."
+LONG_THOUGHTS = "Let me reason this through carefully. " * 120
+
+
+def _claude_wire(answer: str = CLAUDE_ANSWER) -> str:
+    """A Claude-shaped SSE body: reasoning, a signature, then the answer."""
+    events = [
+        "event: message_start",
+        'data: {"type":"message_start","message":'
+        '{"id":"msg_1","role":"assistant","model":"claude"}}',
+    ]
+    for i in range(0, len(LONG_THOUGHTS), 25):
+        events.append("data: " + json.dumps({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": LONG_THOUGHTS[i:i + 25]},
+        }))
+    events.append("data: " + json.dumps({
+        "type": "content_block_delta", "index": 0,
+        "delta": {"type": "signature_delta", "signature": "x" * 900},
+    }))
+    for i in range(0, len(answer), 6):
+        events.append("data: " + json.dumps({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": answer[i:i + 6]},
+        }))
+    events.append('data: {"type":"message_stop"}')
+    return "\n\n".join(events) + "\n\n"
+
+
+def _chatgpt_wire(answer: str = CLAUDE_ANSWER) -> str:
+    """A ChatGPT-shaped SSE body, in its operation encoding.
+
+    Three things here are not padding. The answer and the site's own
+    bookkeeping come down the SAME `v` field, told apart only by the sibling
+    operation. After the first append the operation is OMITTED and bare
+    `{"v": "..."}` means "as before" — so the qualifier has to carry forward or
+    the answer's opening chunk lands in its own group and is lost, and this
+    answer opens with the fence. And a metadata `replace` lands in the middle.
+    """
+    events = []
+
+    def send(obj):
+        events.append("data: " + json.dumps(obj))
+
+    send({"v": {"message": {"id": "abc", "author": {"role": "assistant"},
+                            "content": {"content_type": "text", "parts": [""]},
+                            "status": "in_progress"}, "c": 0}})
+    first = True
+    for i in range(0, len(LONG_THOUGHTS), 30):
+        if first:
+            send({"p": "/message/content/thoughts/0/content", "o": "append",
+                  "v": LONG_THOUGHTS[i:i + 30]})
+            first = False
+        else:
+            send({"v": LONG_THOUGHTS[i:i + 30]})
+    send({"p": "/message/metadata/finished_text", "o": "replace",
+          "v": "Thought for 12 seconds"})
+    first = True
+    for i in range(0, len(answer), 5):
+        if first:
+            send({"p": "/message/content/parts/0", "o": "append",
+                  "v": answer[i:i + 5]})
+            first = False
+        else:
+            send({"v": answer[i:i + 5]})
+        if i == 20:
+            send({"p": "/message/metadata/model_slug", "o": "replace", "v": "gpt-x"})
+            first = True   # the site re-states the operation after interrupting
+    send({"p": "/message/status", "o": "replace", "v": "finished_successfully"})
+    events.append("data: [DONE]")
+    return "\n\n".join(events) + "\n\n"
+
+
+def _streaming_page(playwright, chrome, bodies, page_html="<!doctype html>hi"):
+    """A browser whose `/sse` returns each body in turn, with the hook armed.
+
+    Routed rather than served from a file because the capture only fires on a
+    streaming content type, and that is the property being tested.
+    """
+
+    async def opened(p):
+        browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+        page = await (await browser.new_context()).new_page()
+        await page.add_init_script(_STREAM_INSTALL)
+        turn = {"n": 0}
+
+        def stream(route):
+            body = bodies[min(turn["n"], len(bodies) - 1)]
+            turn["n"] += 1
+            return asyncio.ensure_future(route.fulfill(
+                status=200, content_type="text/event-stream", body=body))
+
+        await page.route("**/sse", stream)
+        await page.route("**/blank", lambda r: asyncio.ensure_future(
+            r.fulfill(status=200, content_type="text/html", body=page_html)))
+        await page.goto("https://example.test/blank")
+        return browser, page
+
+    return opened
+
+
+@pytest.mark.parametrize("shape", ["claude", "chatgpt"])
+def test_the_wire_answer_is_reconstructed_without_knowing_the_schema(shape):
+    """Neither site publishes its stream format, and both change theirs without
+    telling anyone, so nothing about either is hard-coded. What is relied on is
+    structural: an SSE stream is many small JSON events and the answer is the
+    one field appended to over and over. Both real shapes are pinned here
+    because a heuristic that fits one and not the other is not a heuristic."""
+    playwright, chrome = _chromium_or_skip()
+    body = _claude_wire() if shape == "claude" else _chatgpt_wire()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(playwright, chrome, [body])(p)
+            await page.evaluate("async () => { await (await fetch('/sse')).text(); }")
+            await page.wait_for_function("(window.__honeStreams||[])[0]")
+            await asyncio.sleep(0.2)
+            out = await page.evaluate(_STREAM_READ, 0)
+            await browser.close()
+            return out
+
+    got = asyncio.run(go())
+    assert got == CLAUDE_ANSWER, f"reconstructed something else: {got!r}"
+    assert _fenced_blocks(got) == ["def solve(xs):\n    return sorted(xs)\n"]
+
+
+@pytest.mark.parametrize("shape", ["claude", "chatgpt"])
+def test_the_models_rough_work_is_never_mistaken_for_its_answer(shape):
+    """Both bodies above carry far more reasoning than answer — Claude under
+    `delta.thinking`, ChatGPT under `/message/content/thoughts/...`. Picking
+    the largest group without excluding those submits the model's scratchpad,
+    which is a failure this miner has already had once."""
+    playwright, chrome = _chromium_or_skip()
+    body = _claude_wire() if shape == "claude" else _chatgpt_wire()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(playwright, chrome, [body])(p)
+            await page.evaluate("async () => { await (await fetch('/sse')).text(); }")
+            await asyncio.sleep(0.2)
+            out = await page.evaluate(_STREAM_READ, 0)
+            await browser.close()
+            return out
+
+    got = asyncio.run(go()) or ""
+    assert "reason this through" not in got, f"submitted the thinking: {got[:120]!r}"
+    assert len(got) < len(LONG_THOUGHTS), "took the larger group on size alone"
+
+
+def test_the_network_capture_cannot_break_the_page():
+    """This patches `fetch` on a signed-in account the operator cares about, so
+    what it must never do matters more than what it does.
+
+    `res.clone()` and not `res.body.tee()` with a hand-built `Response`: a
+    constructed one loses `url` and `redirected`, and a chat UI reading either
+    breaks in a way that looks like the site's own bug. The body must be left
+    unread for the app, non-streaming requests must not be touched at all, and
+    a fetch that fails must still fail.
+    """
+    playwright, chrome = _chromium_or_skip()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(playwright, chrome, ['data: {"a":"x"}\n\n'])(p)
+            await page.route("**/thing.json", lambda r: asyncio.ensure_future(
+                r.fulfill(status=200, content_type="application/json", body='{"k":1}')))
+            out = await page.evaluate("""async () => {
+                const s = await fetch('/sse');
+                const seen = {url: s.url, status: s.status, ok: s.ok,
+                              redirected: s.redirected, type: s.type,
+                              bodyUsed: s.bodyUsed};
+                seen.body = await s.text();
+                const j = await fetch('/thing.json');
+                seen.json = await j.json();
+                seen.captured = (window.__honeStreams || []).length;
+                try { await fetch('http://127.0.0.1:1/nope'); seen.failed = false; }
+                catch (e) { seen.failed = true; }
+                return seen;
+            }""")
+            await browser.close()
+            return out
+
+    seen = asyncio.run(go())
+    assert seen["url"].endswith("/sse"), f"lost the response url: {seen['url']!r}"
+    assert (seen["status"], seen["ok"], seen["type"]) == (200, True, "basic"), seen
+    assert seen["redirected"] is False, seen
+    assert seen["bodyUsed"] is False, "the app's own body had already been consumed"
+    assert seen["body"] == 'data: {"a":"x"}\n\n', "the app got a different body"
+    assert seen["json"] == {"k": 1}, seen
+    assert seen["captured"] == 1, (
+        f"cloned {seen['captured']} responses; ordinary requests must be untouched"
+    )
+    assert seen["failed"], "a fetch that should have failed resolved instead"
+
+
+def _wire_site(**kw):
+    return _site(
+        composer=("#composer",), send=("#send",),
+        assistant=('[data-message-author-role="assistant"]',),
+        **kw,
+    )
+
+
+# A page that streams its answer but never renders it. That is not contrived:
+# it is what every one of these failures looked like from Python — the reply
+# was there, and the reader could not see it.
+SILENT_PAGE = (
+    '<!doctype html><meta charset="utf-8">'
+    '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    '<div id="host"></div>'
+    "<script>document.getElementById('send').onclick = () => "
+    "{ fetch('/sse').then(r => r.text()); };</script>"
+)
+
+
+def test_the_wire_answers_when_the_page_reads_back_nothing(capsys):
+    """The whole reason this path exists. Every other reading is downstream of
+    a render, so when the render is unreadable they all return the same empty
+    string and the solve is a guaranteed zero. The wire still has the answer."""
+    playwright, chrome = _chromium_or_skip()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(
+                playwright, chrome, [_claude_wire()], page_html=SILENT_PAGE)(p)
+            reply = await _tab(page, _wire_site()).send("solve it", 6.0)
+            await browser.close()
+            return reply
+
+    reply = asyncio.run(go())
+    assert "def solve" in extract_code(reply, "solve"), f"still empty: {reply!r}"
+    assert "read NOTHING from the page" in capsys.readouterr().out, (
+        "took the wire without saying the page had failed"
+    )
+
+
+def test_a_previous_turns_stream_is_not_read_as_this_turns_answer():
+    """The buffer holds several responses, and a repair round asks again in the
+    same tab. Reading the whole buffer would re-submit the very answer the
+    repair was sent to replace, which reads as the model ignoring the fix."""
+    playwright, chrome = _chromium_or_skip()
+    # Built from a different ANSWER, not by editing the finished body: the
+    # answer is cut into 5- and 6-character JSON chunks before it is encoded,
+    # so no phrase of it survives contiguously in the bytes and a string
+    # replacement on the body silently changes nothing at all.
+    #
+    # And deliberately SHORTER than the first. Reading the whole buffer picks
+    # the largest group in it, so a longer second answer would come out right
+    # by accident and this test would pass with the floor removed — checked,
+    # it did.
+    second = _claude_wire("```python\ndef solve(xs):\n    return xs[::-1]\n```")
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(
+                playwright, chrome, [_claude_wire(), second], page_html=SILENT_PAGE)(p)
+            tab = _tab(page, _wire_site())
+            first = await tab.send("solve it", 6.0)
+            again = await tab.send("no, reverse it", 6.0)
+            await browser.close()
+            return first, again
+
+    first, again = asyncio.run(go())
+    assert "sorted(xs)" in first, f"lost the first answer: {first!r}"
+    assert "xs[::-1]" in again, f"re-submitted the first answer: {again!r}"
+    assert "sorted(xs)" not in again, f"the old turn leaked in: {again!r}"
+
+
+RENDERING_PAGE = (
+    '<!doctype html><meta charset="utf-8">'
+    '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    '<div id="host"></div><script>'
+    "document.getElementById('send').onclick = () => {"
+    # Rendered FROM the response, as a real chat UI does. A page that paints
+    # independently races the stream, and the comparison under test would
+    # then depend on which of the two happened to win.
+    "  fetch('/sse').then(r => r.text()).then(() => {"
+    "  const w = document.createElement('div');"
+    "  w.setAttribute('data-message-author-role', 'assistant');"
+    "  const pre = document.createElement('pre'), code = document.createElement('code');"
+    # No trailing newline, where the wire's block has one. That is the single
+    # most common difference between two honest readings of the same answer --
+    # `textContent` keeps the newline before a closing tag, a copy control
+    # trims it, a fenced block always has one -- and reporting it would fire
+    # the warning on every clean reply until nobody read it any more.
+    "  code.textContent = 'def solve(xs):\\n    return sorted(xs)';"
+    "  pre.appendChild(code); w.appendChild(pre);"
+    "  document.getElementById('host').appendChild(w); });"
+    "};</script>"
+)
+
+
+def test_the_page_is_believed_over_the_wire_until_an_operator_says_otherwise(capsys):
+    """The wire is the better source in principle and unverifiable in practice:
+    both formats are private, so the reconstruction is a heuristic that could be
+    silently wrong after any deploy. A heuristic that quietly replaced a good
+    answer with a bad one would be worse than the bug it was written to fix. So
+    it rescues an empty read, it reports every disagreement, and it takes over
+    only when an operator who has watched the two agree turns it on."""
+    playwright, chrome = _chromium_or_skip()
+    wire = _claude_wire(CLAUDE_ANSWER.replace("sorted(xs)", "WIRE_ONLY(xs)"))
+
+    async def go(stream_first):
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(
+                playwright, chrome, [wire], page_html=RENDERING_PAGE)(p)
+            site = _wire_site(stream_first=stream_first)
+            reply = await _tab(page, site).send("solve it", 6.0)
+            await browser.close()
+            return reply
+
+    reply = asyncio.run(go(False))
+    assert "sorted(xs)" in reply, f"took the wire by default: {reply!r}"
+    assert "WIRE_ONLY" not in reply, f"took the wire by default: {reply!r}"
+    logged = capsys.readouterr().out
+    assert "not the same" in logged, f"said nothing about the disagreement: {logged!r}"
+    assert "T_STREAM_FIRST=1" in logged, f"did not name the override: {logged!r}"
+
+    # ...and with it on, the wire is what gets submitted.
+    assert "WIRE_ONLY" in asyncio.run(go(True)), "the override does nothing"
+
+
+def test_agreeing_sources_are_not_reported_as_a_disagreement(capsys):
+    """A warning that fires on every clean answer is a warning nobody reads.
+    Trailing newlines especially: `textContent` on a `<code>` keeps the one
+    before the closing tag and a fenced block always ends in one, so comparing
+    them raw would cry wolf on literally every reply."""
+    playwright, chrome = _chromium_or_skip()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(
+                playwright, chrome, [_claude_wire()], page_html=RENDERING_PAGE)(p)
+            reply = await _tab(page, _wire_site()).send("solve it", 6.0)
+            await browser.close()
+            return reply
+
+    reply = asyncio.run(go())
+    assert "sorted(xs)" in reply, f"lost the answer: {reply!r}"
+    assert "not the same" not in capsys.readouterr().out, "cried wolf on a clean read"
+
+
+def test_the_capture_can_be_switched_off_entirely():
+    """A tab told not to touch the network must behave exactly as it did before
+    any of this existed — including reading nothing when the page shows
+    nothing, which is the honest old answer."""
+    playwright, chrome = _chromium_or_skip()
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser, page = await _streaming_page(
+                playwright, chrome, [_claude_wire()], page_html=SILENT_PAGE)(p)
+            reply = await _tab(page, _wire_site(stream=False)).send("solve it", 4.0)
+            await browser.close()
+            return reply
+
+    assert asyncio.run(go()) == "", "read the wire with the capture switched off"
+
+
+def test_one_read_that_hangs_does_not_eat_the_whole_budget():
+    """Found by accident, and the most expensive bug in this file.
+
+    A poll resolves a node and then reads it. If the site swaps the message
+    between those two steps, the read waits on an element that no longer
+    matches — and Playwright auto-waits THIRTY SECONDS. Bounded only by the
+    send's remaining budget, that one poll spends every second the solve had
+    left and returns nothing, while the finished answer sits on screen the
+    whole time. Measured on the real DOM transition, before the fix: an 8s
+    send spent 7.85s inside a single `inner_text()` and returned "". On a solve
+    with a five-minute budget that is a five-minute stall and a certain zero,
+    and it arrives as "the reply contained no code" like everything else.
+
+    The hang is injected rather than raced for. Aiming a DOM change at the
+    inside of an in-flight read does reproduce it — that is how it was found —
+    but only sometimes, and a test that catches a budget-eating bug two runs in
+    three is worse than no test at all: it goes green on the broken code and
+    gets believed. What must hold is simply that ONE unreturning read cannot
+    spend the whole send, whatever made it hang.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<div id="host"></div><script>'
+        "document.getElementById('send').onclick = () => {"
+        "  const d = document.createElement('div');"
+        "  d.className = 'done-msg';"
+        "  const pre = document.createElement('pre');"
+        "  const code = document.createElement('code');"
+        "  code.textContent = 'def pong():\\n    return 4';"
+        "  pre.appendChild(code); d.appendChild(pre);"
+        "  document.getElementById('host').appendChild(d);"
+        "};</script>"
+    )
+    site = _site(composer=("#composer",), send=("#send",), assistant=("div.done-msg",))
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            reads, real = {"n": 0}, tab._poll
+
+            async def hangs_once(before):
+                reads["n"] += 1
+                if reads["n"] == 1:
+                    await asyncio.sleep(3600)   # the auto-wait that never lands
+                return await real(before)
+
+            tab._poll = hangs_once
+            started = time.monotonic()
+            reply = await tab.send("solve it", 20.0)
+            elapsed = time.monotonic() - started
+            await browser.close()
+            return reply, elapsed, reads["n"]
+
+    reply, elapsed, reads = asyncio.run(go())
+    assert reads > 1, "the loop gave up after the first read instead of retrying"
+    assert "return 4" in extract_code(reply, "pong"), f"captured nothing: {reply!r}"
+    assert elapsed < 10, (
+        f"the answer took {elapsed:.1f}s of a 20s budget: one read is still "
+        f"allowed to run to the deadline"
+    )
+
+
+def test_a_tab_the_fleet_opens_has_the_capture_armed():
+    """`_spawn` is the ONLY place a real tab gets the hook, and every other
+    test in this file installs it by hand — so removing the line from `_spawn`
+    left the whole suite green. Checked: it did.
+
+    It also pins how the hook is installed. `add_init_script` takes script
+    source, not a function the way `evaluate` does; handed the arrow function
+    it builds one, discards it, and arms nothing, in total silence. It has to
+    go in before the goto, too, or the site's own bundle wraps `fetch` first.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    )
+    async def go(stream):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            ctx = await browser.new_context()
+            fleet = BrowserFleet([Browser("http://127.0.0.1:0", _site(
+                url=url, composer=("#composer",), send=("#send",),
+                assistant=("div.msg",), stream=stream))])
+            tab = await fleet._spawn(ctx, fleet._browsers_wanted[0], "t")
+            armed = None
+            if tab is not None:
+                armed = await tab._page.evaluate("!!window.__honeStreamHooked")
+            await browser.close()
+            return tab, armed
+
+    tab, armed = asyncio.run(go(True))
+    assert tab is not None, "the fleet could not open a tab on this page at all"
+    assert armed is True, "a tab the fleet opened has no network capture on it"
+    # ...and a site told not to touch the network gets a tab that never does.
+    assert asyncio.run(go(False))[1] is False, "armed a tab with the capture off"
+
+
+def test_a_round_that_captured_nothing_never_replaces_a_flawed_program():
+    """`best so far` is what gets submitted, so what it ranks matters.
+
+    Emptiness is not a defect — there is nothing there to be wrong — so a
+    ranking that asks "is it runnable?" before "is there anything there?" lets
+    a round that read NOTHING outrank a round that returned a program with a
+    fixable flaw, and take its place as best. Both score zero on chain, but one
+    is an answer and the other is the absence of one. `python_defect` is a
+    static check, and a static check that is too strict must not be able to
+    throw away work by being wrong.
+    """
+    from solvers.verify import Candidate
+
+    def candidate(code, defect=None, passed=0):
+        return Candidate(code=code, raw="", defect=defect, passed=passed, total=2)
+
+    clean = candidate("def pong():\n    return 'pong'")
+    flawed = candidate("pong = 1", defect="does not define pong()")
+    nothing = candidate("")
+
+    assert clean.score > flawed.score, "a repaired answer does not beat the broken one"
+    assert flawed.score > nothing.score, "an empty round displaced a real program"
+    assert candidate("x", passed=1).score > clean.score, "passing examples must win"

@@ -72,6 +72,18 @@ DEFAULT_CDP_PORT = 9222
 # the fast path slower than the thing it replaces.
 NEW_CHAT_TIMEOUT_MS = 5_000
 
+# How long ONE read round gets before it is abandoned and retried.
+#
+# Not a tidiness limit. A poll that straddles a DOM change finds a node, and
+# then waits on it after the site has already replaced it -- and Playwright
+# auto-waits 30 SECONDS on a locator by default. Bounded only by the send's
+# remaining budget, that single poll eats every second the send had left, on a
+# page where the answer is on screen the whole time. Measured on the DOM
+# transition claude.ai actually makes: an 8s send spent 7.85s inside one
+# `inner_text()` and returned "". The next poll re-resolves and costs
+# milliseconds, so the only thing this buys back is the entire budget.
+POLL_READ_TIMEOUT_S = 5.0
+
 # How long the last-resort copy gets, in total. Tight on purpose: it runs after
 # the read already came back empty, so it is spending time the solve has
 # notionally run out of, to turn a guaranteed zero into a possible answer.
@@ -110,6 +122,179 @@ _COPY_HOOK = """() => {
 }"""
 
 
+# How long the streamed answer gets to be reconstructed, in total. It is a
+# `page.evaluate` over text already in the tab, so this is a guard against a
+# wedged renderer rather than a real budget.
+STREAM_TIMEOUT_MS = 2_000
+
+# Installed with `add_init_script` on every tab, before the site's own code
+# runs, so it survives navigation, reloads and the in-app "new chat".
+#
+# This is the answer BEFORE the page exists. Everything else this class reads
+# is downstream of a render: `pre code` is the source after a syntax
+# highlighter rebuilt it as DOM, and even the copy control is the framework's
+# own copy of a block it has already parsed. The wire is the markdown the model
+# emitted, and it is the only source that still has something to say when the
+# DOM read comes back empty -- which is exactly the failure that surfaces,
+# much later and much less usefully, as "the reply contained no code".
+#
+# The patch is written to be unable to break the site, because it runs on a
+# signed-in account the operator cares about:
+#   * `res.clone()`, never `res.body.tee()` plus a constructed `Response`. A
+#     Response built by hand loses `url` and `redirected`, and a chat UI that
+#     reads either would break in a way that looks like the site's bug.
+#   * the original response object is returned untouched, on every path,
+#     including every path where this code throws.
+#   * only streaming content types are touched, so ordinary requests -- images,
+#     avatars, telemetry -- keep their bodies unread and uncloned.
+#   * the buffer is bounded in both records and characters, because a tab lives
+#     for weeks.
+_STREAM_HOOK = r"""() => {
+  if (window.__honeStreamHooked) return;
+  window.__honeStreamHooked = true;
+  window.__honeStreams = [];
+  window.__honeStreamSeq = 0;
+  var MAX_RECORDS = 6;
+  var MAX_CHARS = 2000000;
+  var original = window.fetch;
+  if (typeof original !== 'function') return;
+  var keep = function (res) {
+    var type = '';
+    try { type = (res.headers && res.headers.get('content-type')) || ''; } catch (e) { return; }
+    if (!/event-stream|ndjson/i.test(type)) return;
+    var copy = res.clone();
+    if (!copy.body || !copy.body.getReader) return;
+    var rec = { seq: ++window.__honeStreamSeq, text: '' };
+    window.__honeStreams.push(rec);
+    while (window.__honeStreams.length > MAX_RECORDS) window.__honeStreams.shift();
+    var reader = copy.body.getReader();
+    var dec = new TextDecoder();
+    var pump = function () {
+      return reader.read().then(function (r) {
+        if (r.done) return;
+        if (rec.text.length < MAX_CHARS) rec.text += dec.decode(r.value, { stream: true });
+        return pump();
+      });
+    };
+    pump().catch(function () {});
+  };
+  window.fetch = function () {
+    var out;
+    try {
+      out = original.apply(this, arguments);
+    } catch (e) {
+      throw e;                       // the site's own failure, unchanged
+    }
+    if (!out || typeof out.then !== 'function') return out;
+    return out.then(function (res) {
+      try { keep(res); } catch (e) { /* the site gets its response regardless */ }
+      return res;
+    });
+  };
+}"""
+
+# `add_init_script` takes SCRIPT SOURCE, not a function the way `evaluate`
+# does: handed the arrow function above it would build a function, discard it,
+# and install nothing at all -- measured, `window.__honeStreamHooked` came back
+# False and every stream went uncaptured, in total silence. Kept as a separate
+# constant so the hook itself stays callable from `evaluate` in tests.
+_STREAM_INSTALL = f"({_STREAM_HOOK})()"
+
+# Reconstructs the assistant's markdown out of whatever the site streamed,
+# without knowing the site's schema -- because there is no published schema to
+# know. Both formats in use here are undocumented, private, and changed without
+# notice, so anything hard-coded is a thing that breaks silently one Tuesday.
+#
+# What holds across both is structural: an SSE stream carries many small JSON
+# events, and the answer is the ONE field appended to over and over. So group
+# every string leaf and take the group that accumulated the most text. On
+# Claude that group is `/delta/text`; on ChatGPT's operation encoding it is
+# `/v`. Neither name appears below.
+#
+# A group is a path PLUS the short strings that came with it in the same event,
+# and that second half is not decoration. ChatGPT sends the answer and its own
+# bookkeeping down the same `/v` field, told apart only by the sibling
+# operation: `{p:/message/content/parts/0, o:append, v:"..."}` is the message,
+# `{p:/message/status, o:replace, v:"finished_successfully"}` is not. Measured,
+# grouping on the path alone appended `finished_successfully` to the answer.
+#
+# Those qualifiers carry forward, because the encoding omits them: after one
+# append, ChatGPT sends bare `{v:"..."}` meaning "same operation as before".
+# Reading each of those as its own group splits the answer and drops its
+# opening chunk -- which is the whole first line when a reply opens with code.
+#
+# Two kinds of string are dropped outright or they win on volume alone:
+#   * reasoning, by name, on the path or on its qualifiers. Claude streams
+#     thinking as `/delta/thinking` and ChatGPT under `/message/content/
+#     thoughts/...`, and a long reasoning block dwarfs the answer. Submitting
+#     the model's rough work is a failure this miner has already had once.
+#   * enums. `/delta/type` repeats "text_delta" on every event and can outweigh
+#     a short program. A handful of distinct values across many events is a
+#     tag, not prose.
+#
+# Not handled, and deliberately: an SSE payload split across several `data:`
+# lines. Neither site does it, and guessing at reassembly would corrupt more
+# than it recovered.
+_STREAM_READ = r"""(since) => {
+  var recs = (window.__honeStreams || []).filter(function (r) { return r.seq > since; });
+  if (!recs.length) return null;
+  var NOISE = /think|thought|reason|scratch|signature|citation|websearch|tool_use/i;
+  var TAG = /(^|\/)(id|role|type|model|status|name|kind|stop_reason|created|uuid|parent|slug|index|version|mime|lang|language)$/i;
+  var leaves = function (node, path, out) {
+    if (node === null || typeof node === 'undefined') return out;
+    if (typeof node === 'string') { out.push([path, node]); return out; }
+    if (typeof node !== 'object') return out;
+    if (Array.isArray(node)) {
+      for (var i = 0; i < node.length; i++) leaves(node[i], path + '/*', out);
+      return out;
+    }
+    for (var k in node) {
+      if (Object.prototype.hasOwnProperty.call(node, k)) leaves(node[k], path + '/' + k, out);
+    }
+    return out;
+  };
+  var best = null;
+  for (var r = 0; r < recs.length; r++) {
+    var buckets = Object.create(null);
+    var sticky = Object.create(null);
+    var lines = recs[r].text.split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].trim();
+      if (line.indexOf('data:') === 0) line = line.slice(5).trim();
+      if (!line || line === '[DONE]') continue;
+      if (line.charAt(0) !== '{' && line.charAt(0) !== '[') continue;
+      var event;
+      try { event = JSON.parse(line); } catch (e) { continue; }
+      var found = leaves(event, '', []);
+      for (var j = 0; j < found.length; j++) {
+        var path = found[j][0], value = found[j][1];
+        if (TAG.test(path)) continue;
+        var marks = [];
+        for (var m = 0; m < found.length; m++) {
+          if (found[m][0] === path) continue;
+          if (found[m][1].length <= 64) marks.push(found[m][0] + '=' + found[m][1]);
+        }
+        var sig = marks.sort().join('|');
+        if (sig) { sticky[path] = sig; } else { sig = sticky[path] || ''; }
+        if (NOISE.test(path) || NOISE.test(sig)) continue;
+        var key = path + '\u0000' + sig;
+        var e = buckets[key];
+        if (!e) { e = buckets[key] = { text: '', count: 0, distinct: Object.create(null), seen: 0 }; }
+        e.text += value;
+        e.count++;
+        if (e.seen < 8 && !(value in e.distinct)) { e.distinct[value] = 1; e.seen++; }
+      }
+    }
+    for (var b in buckets) {
+      var q = buckets[b];
+      if (q.seen <= 3 && q.count >= 8) continue;
+      if (best === null || q.text.length > best.length) best = q.text;
+    }
+  }
+  return best;
+}"""
+
+
 @dataclass(frozen=True)
 class Site:
     """Everything that differs between one chat UI and another."""
@@ -136,6 +321,17 @@ class Site:
     # `_Tab._copied_code`: the selector says where to look, this says what we
     # are willing to press. Override for a non-English UI.
     copy_name: str = "copy"
+    # Read the answer off the network stream as well as off the page. See
+    # `_STREAM_HOOK`: it is the markdown the model emitted, before any of this
+    # became DOM, and it is the last source left when the page read comes back
+    # empty. Off makes the tab behave exactly as it did before that existed.
+    stream: bool = True
+    # Take the streamed answer even when the page produced one of its own.
+    # Off by default and deliberately so: the wire format is private and
+    # undocumented, so until an operator has watched the two agree on THEIR
+    # accounts, the stream only rescues an empty read and reports differences.
+    # Turn it on once `python -m solvers.doctor` shows the sources agreeing.
+    stream_first: bool = False
     # Attribute that uniquely identifies a message, if the site has one.
     # ChatGPT does (``data-message-id``); without one the reply is identified
     # by position, which works because every task starts a fresh conversation.
@@ -263,6 +459,39 @@ async def usable_busy_selectors(page, candidates: Sequence[str], name: str) -> t
     return tuple(kept)
 
 
+def _fenced_blocks(markdown: str) -> list[str]:
+    """Every fenced block in a markdown string, in order, without its fences.
+
+    Scanned line by line rather than matched with one regular expression,
+    because the closing fence has to be at least as long as the opening one --
+    that is what lets a block that itself contains ``` be written with four
+    backticks, and a regex that ignores it truncates such an answer at the
+    inner fence. An unclosed final fence is kept: a reply cut off by a deadline
+    still has its program in it, and dropping it turns a partial answer into no
+    answer.
+    """
+    blocks: list[str] = []
+    body: Optional[list[str]] = None
+    fence = ""
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if body is None:
+            opener = re.match(r"(`{3,}|~{3,})", stripped)
+            if opener:
+                fence = opener.group(1)
+                body = []
+            continue
+        if re.fullmatch(re.escape(fence[0]) + "{%d,}" % len(fence), stripped):
+            if "\n".join(body).strip():
+                blocks.append("\n".join(body) + "\n")
+            body, fence = None, ""
+            continue
+        body.append(line)
+    if body is not None and "\n".join(body).strip():
+        blocks.append("\n".join(body) + "\n")
+    return blocks
+
+
 def _describe_char(ch: str) -> str:
     """A character a human can act on: the codepoint, not a blank space."""
     if not ch:
@@ -316,6 +545,11 @@ class _Tab:
         self._warned_copy = False
         self._warned_diff = False
         self._warned_relatch = False
+        self._warned_stream = False
+        self._warned_stream_diff = False
+        # Highest network record seen before this send's prompt went out, so a
+        # reply is never reconstructed out of the PREVIOUS answer's stream.
+        self._stream_before = 0
         self.uses = 0
         self.alive = True
         # True while this tab is known to be sitting in an EMPTY conversation.
@@ -496,6 +730,10 @@ class _Tab:
         submit_budget_s = max(5.0, min(20.0, timeout_s * 0.3))
         try:
             before = await self._fingerprint()
+            # Before the prompt, not after: the response starts streaming while
+            # `_submit` is still returning, so a floor taken afterwards can
+            # already have this answer's own record under it.
+            self._stream_before = await self._stream_seq()
             await asyncio.wait_for(
                 self._submit(text, int(submit_budget_s * 1000)),
                 timeout=submit_budget_s,
@@ -525,6 +763,9 @@ class _Tab:
         # closes it. The busy selector is supposed to cover this and usually
         # does, but it is per-site, overridable, and dropped at startup when it
         # matches an idle page -- so it is a guard, not the guarantee.
+        # What the PAGE gave us, block by block, for the stream to be checked
+        # against. None means "not looked at yet" and is not the same as [].
+        page_blocks: Optional[list[str]] = None
         best, stable = "", None
         try:
             while True:
@@ -537,9 +778,18 @@ class _Tab:
                     break
                 # Every DOM call below auto-waits up to 30s on its own, which
                 # would sail past the deadline the loop just checked.
-                text_now, busy, whole = await asyncio.wait_for(
-                    self._poll(before), timeout=remaining
-                )
+                try:
+                    text_now, busy, whole = await asyncio.wait_for(
+                        self._poll(before),
+                        timeout=min(remaining, POLL_READ_TIMEOUT_S),
+                    )
+                except asyncio.TimeoutError:
+                    # This read straddled a change in the page: it resolved a
+                    # node and then waited on one the site had already
+                    # replaced. Abandoning it costs one round; letting it run
+                    # to the deadline costs the answer. See POLL_READ_TIMEOUT_S.
+                    stable = None
+                    continue
                 if text_now is not None:
                     best = text_now  # keep it even mid-generation
                 if busy or text_now is None:
@@ -577,6 +827,7 @@ class _Tab:
                 raise
             except Exception:  # noqa: BLE001 - fall back to what scraping saw
                 copied = None
+            page_blocks = copied
             if copied:
                 if rendered and not self._warned_diff:
                     difference = self._disagreement(rendered, copied)
@@ -598,8 +849,80 @@ class _Tab:
                     f"Run `python -m solvers.doctor {self.site.name}` if answers "
                     f"start arriving mangled — the control may have been renamed."
                 )
+        if self.alive and self.site.stream:
+            best = await self._reconcile_stream(before, best, page_blocks)
         if not best and self.alive:
             await self._explain_empty(before)
+        return best
+
+    async def _reconcile_stream(
+        self, before: tuple[int, Optional[str]], best: str, page_blocks: Optional[list[str]]
+    ) -> str:
+        """Bring the network stream in as a third reading of the same answer.
+
+        The stream sits above everything else this class reads: it is the
+        markdown the model emitted, captured before the page turned it into
+        DOM, so none of the damage the other paths have to survive has happened
+        to it yet. It is also the only source that still holds the answer when
+        the page read comes back empty — a selector that stopped matching, a
+        message whose id was swapped mid-stream, a render this tab cannot see.
+        Every one of those has cost a whole solve here, and every one of them
+        arrives as the same five words: "the reply contained no code".
+
+        It does not simply win, and that is a statement about what can be
+        checked rather than about what is likely. Both wire formats are
+        private, undocumented and free to change on any deploy, and the
+        reconstruction in `_STREAM_READ` is a heuristic over their JSON. A
+        heuristic that silently replaced a good answer with a bad one would be
+        strictly worse than the bug it was written to fix. So it is used where
+        being wrong costs nothing that is not already lost — when the page
+        produced nothing at all — and everywhere else it reports, loudly and
+        once, whether it agrees. An operator who has watched it agree on their
+        own accounts turns `stream_first` on and gets it as the primary.
+        """
+        streamed = await self._streamed_markdown()
+        if streamed is None:
+            if not best and not self._warned_stream:
+                self._warned_stream = True
+                print(
+                    f"[{self.site.name}] note: tab {self.label} captured nothing from "
+                    f"the network either — this site may not stream its answers over "
+                    f"`fetch`. Run `python -m solvers.doctor {self.site.name}` to see "
+                    f"what each source returned."
+                )
+            return best
+        blocks = _fenced_blocks(streamed)
+        if page_blocks is None:
+            try:
+                reply = await self._new_reply(before)
+                page_blocks = await self._dom_blocks(reply) if reply is not None else []
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - nothing to compare against, then
+                page_blocks = []
+        if not page_blocks and not best:
+            # The page gave us nothing. This is the case the whole path exists
+            # for, so take the stream even unfenced: a model that answered
+            # without a fence still answered, and `extract_code` can salvage a
+            # bare program where an empty string can never be salvaged.
+            print(
+                f"[{self.site.name}] tab {self.label} read NOTHING from the page and "
+                f"recovered {len(blocks) or 'no'} code block(s) from the network "
+                f"stream instead. The answer below came off the wire, not the DOM."
+            )
+            return "\n".join(self._fence(b) for b in blocks) if blocks else streamed
+        if blocks and page_blocks and not self._warned_stream_diff:
+            gap = self._first_difference(page_blocks, blocks, "the page", "the wire")
+            if gap:
+                self._warned_stream_diff = True
+                print(
+                    f"[{self.site.name}] note: tab {self.label}: what the page shows and "
+                    f"what came off the wire are not the same — {gap}. Using the page. "
+                    f"If the wire is the one that is right, set "
+                    f"{self.site.env_prefix}_STREAM_FIRST=1."
+                )
+        if self.site.stream_first and blocks:
+            return "\n".join(self._fence(b) for b in blocks)
         return best
 
     async def _poll(
@@ -927,6 +1250,35 @@ class _Tab:
         except Exception:  # noqa: BLE001 - mid-navigation, or the node went away
             return ""
 
+    async def _stream_seq(self) -> int:
+        """How many streamed responses this tab has seen so far.
+
+        Taken before the prompt goes out and used as a floor afterwards, so the
+        answer is never reconstructed out of the previous turn's stream -- the
+        buffer holds several records, and a repair round would otherwise be at
+        risk of re-submitting the reply it was sent to repair.
+        """
+        try:
+            return int(await self._page.evaluate("window.__honeStreamSeq || 0") or 0)
+        except Exception:  # noqa: BLE001 - no hook, or a page mid-navigation
+            return 0
+
+    async def _streamed_markdown(self) -> Optional[str]:
+        """The answer as it came off the wire, or None if nothing was captured."""
+        if not self.site.stream:
+            return None
+        try:
+            text = await asyncio.wait_for(
+                self._page.evaluate(_STREAM_READ, self._stream_before),
+                timeout=STREAM_TIMEOUT_MS / 1000,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a reading, not the reading; never fatal
+            return None
+        text = (text or "").strip()
+        return text or None
+
     async def _copied_code(self, reply) -> Optional[str]:
         """`_copied_blocks`, fenced. Convenience for callers that want text."""
         blocks = await self._copied_blocks(reply)
@@ -949,16 +1301,34 @@ class _Tab:
                 f"the page renders {len(dom)} code block(s) but its copy "
                 f"controls give {len(copied)}"
             )
-        for rendered, source in zip(dom, copied):
-            if rendered == source:
+        return self._first_difference(dom, copied, "rendered", "copied")
+
+    @staticmethod
+    def _first_difference(
+        first: list[str], second: list[str], left: str, right: str
+    ) -> Optional[str]:
+        """Where two readings of the same answer part company, in one line.
+
+        Blank lines at the very start and end are not a difference. They are an
+        artefact of where each reading was taken -- `textContent` on a `<code>`
+        keeps the newline before the closing tag, a copy control usually trims
+        it, a fenced block always ends in one -- and reporting them would fire
+        the warning on every clean answer, which is how a warning stops being
+        read before the one that matters arrives.
+        """
+        if len(first) != len(second):
+            return f"{left} has {len(first)} code block(s), {right} has {len(second)}"
+        for raw_a, raw_b in zip(first, second):
+            a, b = raw_a.strip("\n"), raw_b.strip("\n")
+            if a == b:
                 continue
             at = next(
-                (i for i, (a, b) in enumerate(zip(rendered, source)) if a != b),
-                min(len(rendered), len(source)),
+                (i for i, (x, y) in enumerate(zip(a, b)) if x != y),
+                min(len(a), len(b)),
             )
             return (
-                f"they differ at character {at}: rendered {_describe_char(rendered[at:at + 1])}, "
-                f"copied {_describe_char(source[at:at + 1])}"
+                f"they differ at character {at}: {left} {_describe_char(a[at:at + 1])}, "
+                f"{right} {_describe_char(b[at:at + 1])}"
             )
         return None
 
@@ -1221,6 +1591,12 @@ class BrowserFleet:
         )
         try:
             page = await context.new_page()
+            if site.stream:
+                # Before the goto, and as an init script rather than an
+                # evaluate: it has to be in place before the site's own bundle
+                # installs its fetch wrappers, and it has to survive every
+                # navigation this tab makes for the weeks it stays open.
+                await page.add_init_script(_STREAM_INSTALL)
             await page.goto(site.url, wait_until="domcontentloaded")
             # Stamp it before anything can go wrong later, so even a tab that
             # fails its checks below is reclaimable after an unclean exit.

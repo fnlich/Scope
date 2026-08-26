@@ -77,6 +77,11 @@ def chatgpt_site() -> Site:
         # and emphatically NOT "Run code". See `_Tab._copied_code`.
         copy=selectors("CHATGPT_COPY", ('button[aria-label="Copy"]',)),
         copy_name=os.environ.get("CHATGPT_COPY_NAME", "copy").casefold(),
+        # The answer as it came off the wire, ahead of every render.
+        # `CHATGPT_STREAM=0` turns the capture off entirely;
+        # `CHATGPT_STREAM_FIRST=1` promotes it over what the page shows.
+        stream=os.environ.get("CHATGPT_STREAM", "1") != "0",
+        stream_first=os.environ.get("CHATGPT_STREAM_FIRST", "0") == "1",
         message_id_attr="data-message-id",
         nudge=os.environ.get("CHATGPT_NUDGE", NUDGE),
         poll_s=float(os.environ.get("CHATGPT_POLL_S", "2")),

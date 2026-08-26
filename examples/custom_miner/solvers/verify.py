@@ -104,16 +104,25 @@ class Candidate:
 
     @property
     def score(self) -> tuple[int, int, int]:
-        """Ranking key for 'best so far' — passes, then runnable, then non-empty.
+        """Ranking key for 'best so far' — passes, then non-empty, then runnable.
 
         A defect ranks BELOW clean code that merely could not be graded, and
-        that middle term is not cosmetic. Without it a first answer with no
-        `fn main()` scores (0, 1) and a corrected second answer scores (0, 1)
-        too -- a tie, which `>` loses, so the repair round lands a good program
-        and the broken one is submitted anyway. The whole repair loop is dead
-        weight for structural defects until this ranks them apart.
+        that is not cosmetic. Without a defect term at all, a first answer with
+        no `fn main()` and a corrected second answer score identically -- a tie,
+        which `>` loses, so the repair round lands a good program and the broken
+        one is submitted anyway. The whole repair loop is dead weight for
+        structural defects until this ranks them apart.
+
+        Non-empty comes BEFORE runnable, and the order is the whole point.
+        Emptiness is not a defect -- there is nothing there to be wrong -- so
+        with the terms the other way round a round that captured nothing at all
+        outranks a round that returned a program with a fixable flaw, and
+        replaces it as "best". Both score zero on chain, but one of them is
+        still an answer and the other is the absence of one, and the answer is
+        the one to keep: `python_defect` is a static check, and a static check
+        that is too strict must not be able to throw work away.
         """
-        return (self.passed, 0 if self.defect else 1, 1 if self.code.strip() else 0)
+        return (self.passed, 1 if self.code.strip() else 0, 0 if self.defect else 1)
 
 
 class _Grader:

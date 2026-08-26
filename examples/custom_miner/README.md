@@ -373,6 +373,31 @@ and it is how the code is normally taken (see below); if nothing matches, the
 miner reads the DOM instead and says so once. The doctor reports both like any
 other role.
 
+Two more are not selectors at all, and both are off by default in the direction
+that cannot hurt you:
+
+```dotenv
+CLAUDE_STREAM=0          # stop reading the answer off the network entirely
+CLAUDE_STREAM_FIRST=1    # ...or trust it over what the page shows
+```
+
+## Where the answer is read from
+
+There are four places the same answer can be taken from, and they are not
+equally good. In order:
+
+| Source | What it is | Used |
+| --- | --- | --- |
+| the network stream | the markdown the model emitted, before any of it was a page | when the page reads back empty; as primary with `*_STREAM_FIRST=1` |
+| framework state | the source string the site holds per block | not reachable from outside |
+| the copy control | that state, handed back on request | **primary** |
+| the rendered DOM | `pre code`, after a syntax highlighter rebuilt it | fallback |
+
+Everything below the first line is downstream of a render. The stream is not,
+which is why it is the one source with anything left to say when the page read
+comes back empty — and an empty page read is where *every* recent `the reply
+contained no code` has come from.
+
 ## The code comes from the copy control, not the DOM
 
 `pre code` gives you the source *after* a syntax highlighter has rebuilt it as
@@ -428,6 +453,54 @@ It names the codepoint because that is the part you can act on. It fires once
 per tab, and only on a real difference — a warning that appears on every answer
 is one nobody reads.
 
+### The answer as it came off the wire
+
+Every tab the miner opens patches `window.fetch` before the site's own code
+runs, and keeps a copy of any streaming response body. That is the answer
+*before* the page exists.
+
+The patch is written so it cannot break a site you are signed in to: it clones
+the response rather than replacing it (a hand-built `Response` loses `url` and
+`redirected`, and a chat UI reading either breaks in a way that looks like the
+site's own bug), it returns the original object untouched on every path
+including the ones where it throws, it ignores anything that is not a streaming
+content type, and it bounds what it keeps. Verified in a browser: `url`,
+`status`, `redirected` and `bodyUsed` all unchanged, ordinary JSON requests not
+cloned at all, a fetch that should fail still failing.
+
+Reconstructing the markdown is the part nobody can do for you. Neither site
+publishes its stream format and both change theirs without notice, so nothing
+about either is hard-coded. What is relied on is structural: an SSE stream is
+many small JSON events, and the answer is the one field appended to over and
+over. Group every string leaf by its path *plus* the short strings that came
+with it, concatenate, take the biggest group — dropping reasoning by name
+(`thinking`, `thoughts`), and dropping tags, which repeat a handful of values
+across hundreds of events. Both real shapes are pinned in the tests, including
+reasoning that outweighs the answer four to one and metadata interleaved into
+the middle of it.
+
+Because that is a heuristic over a private format, it does **not** simply win:
+
+- the page read back empty → the wire is used, and says so;
+- both produced code and they agree → nothing changes;
+- both produced code and they differ → the page is used and the difference is
+  logged, with the codepoint;
+- `CLAUDE_STREAM_FIRST=1` / `CHATGPT_STREAM_FIRST=1` → the wire is used as the
+  primary. Set this once `--probe` has shown you the two agreeing on your own
+  accounts, not before.
+
+`CLAUDE_STREAM=0` / `CHATGPT_STREAM=0` turns the capture off entirely.
+`python -m solvers.doctor claude --probe` reports all of it side by side:
+
+```
+  where the answer can be read from, on this page:
+    [ok   ] network — 1 streamed response(s) seen this turn, 812 chars
+            reconstructed, 2 code block(s)
+    the page and the wire AGREE on all 2 block(s). Setting CLAUDE_STREAM_FIRST=1
+    would read this page from the wire, which is the source before any rendering
+    happened to it.
+```
+
 ### When nothing is captured at all, the tab says why
 
 `the reply contained no code` is what the grader reports afterwards, and it
@@ -441,6 +514,16 @@ is asked before the tab moves on:
 matched 1 message(s) but none of them could be identified as the answer to this
 prompt. This is what surfaces later as "the reply contained no code".
 ```
+
+One read is never allowed to spend the whole budget. A poll resolves a node and
+then reads it, and if the site swaps the message between those two steps the
+read waits on an element that no longer matches — which Playwright does for
+thirty seconds. Bounded only by the send's remaining time, that single poll
+spends every second the solve had left and returns nothing, while the finished
+answer sits on screen. Measured on the transition claude.ai actually makes: an
+8s send spent 7.85s inside one `inner_text()` and returned `""`. Each read now
+gets five seconds and a timed-out read is retried, not fatal; the retry
+re-resolves and costs milliseconds.
 
 One related failure is now repaired rather than reported. A site streams a
 message under one attribute and drops it when the message is finished, so the
