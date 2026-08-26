@@ -1201,6 +1201,57 @@ task to whichever is free, so consecutive rehearsals will not always use the
 same provider. The `provider=` field on the `[verify]` line says which one
 answered.
 
+**9b. The real challenges.** `examples/sample_challenges/` holds five problems
+that came from the subnet — two Python, three Rust, each a page of prose with
+its edge cases stated rather than shown. They are the closest thing here to
+what a validator actually sends, and the built-in samples are toys beside them.
+
+```bash
+python -m solvers.rehearse --challenge all           # all five, one fleet
+python -m solvers.rehearse --challenge extent-journal
+python -m solvers.rehearse --challenge sparse-circular-array reactive-stat-board
+```
+
+One browser fleet is opened for the whole batch and closed at the end — the
+tabs are reused between challenges, which is what a miner does for its whole
+life. Budget roughly `--timeout` seconds per challenge; the default 300 makes
+`--challenge all` a 25-minute run at worst, so start it and come back.
+
+It ends in one table, because several hundred lines of per-challenge output
+scroll away:
+
+```
+[rehearse] summary
+  FAIL  asset-rebuild-planner        python  passed 0/3 — plan_rebuild(*[{'a': 'A'...
+  PASS  extent-journal               python  passed all 3 test(s)
+  ????  reactive-stat-board          rust    it compiles locally; the tests could...
+  PASS  revocable-verification-gate  rust    passed all 3 test(s)
+  FAIL  sparse-circular-array        rust    it does not compile: error[E0308]: mi...
+
+  2/5 would have scored
+```
+
+**How many cases the model is shown matters**, and it is a flag rather than a
+default nobody reads. Each challenge ships three public cases. Show the model
+all three and grade it on all three and the result is circular: the solver
+repairs its answer until the public examples pass, so the grade at the end can
+only agree with a check already made — it would report a success it was
+incapable of failing. So the model is shown a subset and graded on everything:
+two of three by default.
+
+```bash
+python -m solvers.rehearse --challenge all --examples 0
+```
+
+`--examples 0` shows none at all. That is not a handicap: on the run this miner
+was built for, no public examples shipped with any task, and the entire repair
+loop was dead code. It is the condition worth measuring against, and the
+hardest one.
+
+Rust needs Docker to run the cases. Without it you still learn whether each
+answer compiles, which is the difference between a zero and a maybe — the table
+says `it compiles locally` rather than claiming a pass.
+
 **10. Read what it wrote.**
 
 ```bash
