@@ -145,12 +145,14 @@ edge cases", which every model agrees to and none acts on:
 
 The examples are rendered *after* that list and labelled a floor rather than the
 specification, because read first they become the spec and the checklist reads
-as an afterthought. The model is also asked for one comment at the top of its
-code stating what the program does for the empty case and for `n = 1` — writing
-it down is what turns the list from something to agree with into something to
-do. Repair rounds are sent back through the same checklist, since they share the
-conversation and a repair that fixes the failing example while breaking a
-boundary scores the same zero.
+as an afterthought. Repair rounds are sent back through the same checklist,
+since they share the conversation and a repair that fixes the failing example
+while breaking a boundary scores the same zero.
+
+The code itself is asked for **unexplained** — no comments, no docstrings. The
+grader imports the source and calls it; nothing ever reads a comment, so the
+only thing one costs is output the model spends before the answer is finished,
+on a subnet that tiebreaks on latency.
 
 Each language is then warned about its own way of losing a large number, because
 they are not the same failure:

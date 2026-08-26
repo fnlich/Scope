@@ -2868,6 +2868,24 @@ def test_the_examples_are_framed_as_a_floor_and_come_after_the_checklist():
     assert "a floor, not the specification" in prompt
 
 
+def test_the_prompt_asks_for_code_with_nothing_explaining_it():
+    """The grader imports the source and calls it. Nothing ever reads a comment
+    or a docstring, and every one of them is output the model spends before the
+    answer is finished — on a subnet that tiebreaks on latency, that is the only
+    thing they cost. Both languages are told, and neither is asked to narrate
+    its own edge-case reasoning back in a comment."""
+    from solvers.prompts import build_initial_prompt
+
+    for language, entry in (("python", "solve"), ("rust", "main")):
+        prompt = build_initial_prompt(language, "Do a thing.", entry, [])
+        assert "Write no comments and no docstrings" in prompt, (
+            f"the {language} prompt never says to leave the code unexplained"
+        )
+        assert "comment at the top" not in prompt, (
+            f"the {language} prompt still asks for an explanatory comment"
+        )
+
+
 def test_a_repair_round_is_sent_back_through_the_checklist():
     """Repairs go into the SAME conversation, so the checklist is still above
     them — and a repair that fixes the failing example while breaking a

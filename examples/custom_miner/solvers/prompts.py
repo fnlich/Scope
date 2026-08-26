@@ -99,6 +99,8 @@ Rules — the grader is automated and unforgiving:
 - RETURN the answer. Do not print it, do not read stdin, do not call input().
   Printed output is ignored by the grader.
 - Standard library only. No pip packages, no network, no file access.
+- Write no comments and no docstrings. Nothing reads them, and the answer is
+  scored partly on how fast it arrives.
 - Do not include tests, example calls, or `if __name__ == "__main__"`."""
 
 RUST_RULES = """\
@@ -108,7 +110,9 @@ Rules — the grader is automated and unforgiving:
   `rustc --edition=2021 -C opt-level=2`. No Cargo, no crates, std only.
 - READ the input from stdin and WRITE only the requested answer to stdout.
 - Output is compared token-by-token after splitting on ASCII whitespace, so
-  extra prose, labels or prompts make the answer wrong."""
+  extra prose, labels or prompts make the answer wrong.
+- Write no comments and no docstrings. Nothing reads them, and the answer is
+  scored partly on how fast it arrives."""
 
 # The public examples are the friendly ones. The hidden suite is where the
 # score comes from, and it is written to break a solution that only handles the
@@ -135,12 +139,6 @@ of these before you answer, and fix what breaks:
 - DEGENERATE SHAPE: every element equal, every element a duplicate, already
   sorted, sorted backwards, all zeros."""
 
-# Deliberately last, AFTER the language-specific cases: it is the one line that
-# turns the list above from something to agree with into something to do, and a
-# closing instruction has to close.
-EDGE_CASES_CLOSE = """\
-Put ONE short comment at the top of your code saying what it produces for the
-empty case and for n = 1. Writing it down is what makes the check real."""
 
 # Two of these are facts about THIS grader, not general advice, and both cost a
 # solve when guessed at: the comparison is structural and strict about bools,
@@ -209,11 +207,7 @@ def build_initial_prompt(
     """
     is_rust = language == "rust"
     rules = (RUST_RULES if is_rust else PYTHON_RULES).format(entrypoint=entrypoint)
-    edges = "\n".join((
-        EDGE_CASES,
-        RUST_EDGE_CASES if is_rust else PYTHON_EDGE_CASES,
-        EDGE_CASES_CLOSE,
-    ))
+    edges = EDGE_CASES + "\n" + (RUST_EDGE_CASES if is_rust else PYTHON_EDGE_CASES)
     parts = [
         f"Solve this programming problem in {'Rust' if is_rust else 'Python'}.",
         "", rules,
