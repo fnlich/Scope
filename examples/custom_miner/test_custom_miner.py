@@ -4088,3 +4088,145 @@ def test_the_environment_facts_are_not_filed_as_edge_cases():
     contract = prompt.split("<contract>")[1].split("</contract>")[0]
     assert "OVERFLOW IS SILENT" in contract
     assert "5 seconds" in contract
+
+
+# --- the question, beside the answer -------------------------------------- #
+# The code alone answers "what did we submit". It cannot answer "was that a
+# reasonable thing to submit" — the statement, the entrypoint, the examples and
+# the model's own reply all lived somewhere the archive could not see.
+
+
+def _archived(pid, solver, tmp_path, language="rust"):
+    from rlvr.protocol import TaskRequest
+    from rlvr.types import TestCase
+
+    request = TaskRequest(
+        problem_id=pid, language=language,
+        statement="Read N then N integers and print their sum.",
+        entrypoint="main" if language == "rust" else "solve",
+        public_examples=[TestCase(args=["3\n1 2 3"], kwargs={}, expected="6")],
+        deadline_s=240.0,
+    )
+    payload = _solved_by(solver, request, tmp_path)
+    stem = tmp_path / pid
+    return payload, stem
+
+
+def test_the_request_and_the_reply_are_archived_beside_the_code(tmp_path):
+    """Same stem, different extension: the pair is obvious in a listing and
+    trivial to join, and the code file stays a program that something can
+    compile, diff or grade without stripping a header off it first."""
+    program = 'fn main(){ println!("6"); }'
+    transcript = f"Here is the program:\n\n```rust\n{program}\n```"
+
+    class _S:
+        async def solve_task(self, task, timeout_s):
+            from custom_miner import SolveResult
+
+            return SolveResult(code=program, raw_response=transcript)
+
+    payload, stem = _archived("pair", _S(), tmp_path)
+
+    assert stem.with_suffix(".rs").read_text() == program, "the code file is not pure code"
+    record = json.loads(stem.with_suffix(".json").read_text())
+    assert record["problem_id"] == "pair"
+    # the question...
+    assert record["request"]["statement"].startswith("Read N then N integers")
+    assert record["request"]["entrypoint"] == "main"
+    assert record["request"]["public_examples"][0]["expected"] == "6"
+    assert record["request"]["deadline_s"] == 240.0
+    # ...and the answer, including what the model actually said.
+    assert record["response"]["code"] == payload.code == program
+    assert record["response"]["raw_response"] == transcript
+
+
+def test_a_solve_that_crashed_still_records_what_it_was_asked(tmp_path):
+    """The path most worth having afterwards, and the one that never reaches
+    the solver's own return. An empty `.rs` says a problem was seen and
+    answered with silence; only the record says WHICH problem, and why."""
+
+    class _Dies:
+        async def solve_task(self, task, timeout_s):
+            raise RuntimeError("the tab died")
+
+    payload, stem = _archived("boom", _Dies(), tmp_path)
+
+    assert payload.code == ""
+    assert stem.with_suffix(".rs").stat().st_size == 0
+    record = json.loads(stem.with_suffix(".json").read_text())
+    assert record["request"]["statement"], "the question was lost with the answer"
+    assert record["response"]["code"] == ""
+    assert record["response"]["raw_response"] == "<solver failed>"
+
+
+def test_the_two_expensive_bugs_would_have_been_one_glance(tmp_path):
+    """Why `raw_response` is in the record rather than summarised out of it.
+
+    A tool call submitted as Rust and a prompt submitted as Rust were both
+    invisible in the code file — each looked like a finished program. Both are
+    unmistakable in the transcript beside it.
+    """
+    tool_call = '{"command": "cat > /home/claude/sol/main.rs << \'EOF\'\\nfn main(){}\\nEOF"}'
+
+    class _ToolCall:
+        async def solve_task(self, task, timeout_s):
+            from custom_miner import SolveResult
+
+            return SolveResult(code=tool_call, raw_response=f"```\n{tool_call}\n```")
+
+    _, stem = _archived("tool", _ToolCall(), tmp_path)
+    record = json.loads(stem.with_suffix(".json").read_text())
+    assert "/home/claude/sol" in record["response"]["raw_response"], (
+        "the transcript that identifies the provider and the failure was dropped"
+    )
+
+
+def test_archiving_off_writes_neither_file(tmp_path):
+    from solution_archive import save_exchange, save_solution
+
+    previous = os.environ.get("SOLVER_SOLUTION_DIR")
+    os.environ["SOLVER_SOLUTION_DIR"] = ""
+    try:
+        assert save_solution("p", "rust", "fn main(){}") is None
+        assert save_exchange("p", {"a": 1}, {"b": 2}) is None
+    finally:
+        if previous is None:
+            os.environ.pop("SOLVER_SOLUTION_DIR", None)
+        else:
+            os.environ["SOLVER_SOLUTION_DIR"] = previous
+
+
+def test_a_record_that_will_not_serialise_does_not_cost_the_solve(tmp_path):
+    """Same rule as everywhere else in this file: the archive is a convenience
+    and the answer is the product. Neither an unserialisable field nor an
+    unwritable disk may take a solve with it."""
+    from solution_archive import save_exchange
+
+    class _Opaque:
+        def __repr__(self):
+            return "<opaque>"
+
+    # `default=str` catches most of it; a repr that itself raises is the case
+    # that must still not propagate.
+    class _Hostile:
+        def __repr__(self):
+            raise ValueError("no")
+
+    assert save_exchange("p", {"weird": _Opaque()}, {}, tmp_path) is not None
+    assert save_exchange("q", {"weird": _Hostile()}, {}, tmp_path) is None
+
+    blocked = tmp_path / "wall"
+    blocked.write_text("I am a file, not a directory")
+    assert save_exchange("r", {"a": 1}, {"b": 2}, blocked) is None
+
+
+def test_a_hostile_problem_id_cannot_place_the_record_outside_the_archive(tmp_path):
+    """Same sanitisation as the code file — `problem_id` still arrives over the
+    network and is still being used to build a path."""
+    from solution_archive import save_exchange
+
+    for hostile in ("../../etc/passwd", "..\\..\\windows", "/abs/olute", "..", ""):
+        written = save_exchange(hostile, {"a": 1}, {"b": 2}, tmp_path)
+        assert written is not None and written.parent == tmp_path, (
+            f"{hostile!r} escaped to {written}"
+        )
