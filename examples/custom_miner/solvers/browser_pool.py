@@ -263,6 +263,13 @@ async def usable_busy_selectors(page, candidates: Sequence[str], name: str) -> t
     return tuple(kept)
 
 
+def _describe_char(ch: str) -> str:
+    """A character a human can act on: the codepoint, not a blank space."""
+    if not ch:
+        return "nothing (it ends here)"
+    return f"{ch!r} (U+{ord(ch):04X})"
+
+
 class _Tab:
     """One chat tab: a single conversation slot leased from the pool.
 
@@ -307,6 +314,7 @@ class _Tab:
         self._warned_echo = False
         self._warned_branches = False
         self._warned_copy = False
+        self._warned_diff = False
         self.uses = 0
         self.alive = True
         # True while this tab is known to be sitting in an EMPTY conversation.
@@ -557,15 +565,30 @@ class _Tab:
             # clicking a control on every poll would be dozens of clicks a
             # solve. Scraping decided WHEN to read; the copy control decides
             # WHAT was read, because it predates the syntax highlighter.
+            copied = rendered = None
             try:
                 reply = await self._new_reply(before)
-                copied = await self._copied_code(reply) if reply is not None else None
+                if reply is not None:
+                    copied = await self._copied_blocks(reply)
+                    if copied:
+                        rendered = await self._dom_blocks(reply)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - fall back to what scraping saw
                 copied = None
             if copied:
-                best = copied
+                if rendered and not self._warned_diff:
+                    difference = self._disagreement(rendered, copied)
+                    if difference:
+                        self._warned_diff = True
+                        print(
+                            f"[{self.site.name}] note: tab {self.label}: what the page "
+                            f"RENDERS and what it COPIES are not the same — {difference}. "
+                            f"Using the copy, which is the source before syntax "
+                            f"highlighting. If answers start failing for no visible "
+                            f"reason, this line is where to look."
+                        )
+                best = "\n".join(self._fence(b) for b in copied)
             elif not self._warned_copy:
                 self._warned_copy = True
                 print(
@@ -752,7 +775,7 @@ class _Tab:
             )
         return True
 
-    async def _copied_code(self, reply) -> Optional[str]:
+    async def _copied_blocks(self, reply) -> Optional[list[str]]:
         """The code as the PAGE would copy it, without touching the clipboard.
 
         This is the preferred extractor, and the reason is not tidiness. What
@@ -810,10 +833,10 @@ class _Tab:
                 continue
             if not block or not block.strip():
                 continue
-            fenced.append(self._fence(block))
+            fenced.append(block)
         if len(fenced) != expected or not fenced:
             return None  # see the docstring: all of them, or none of them
-        return "\n".join(fenced)
+        return fenced
 
     @staticmethod
     async def _whole(reply) -> str:
@@ -828,6 +851,41 @@ class _Tab:
             return await reply.inner_text()
         except Exception:  # noqa: BLE001 - mid-navigation, or the node went away
             return ""
+
+    async def _copied_code(self, reply) -> Optional[str]:
+        """`_copied_blocks`, fenced. Convenience for callers that want text."""
+        blocks = await self._copied_blocks(reply)
+        return "\n".join(self._fence(b) for b in blocks) if blocks else None
+
+    def _disagreement(self, dom: list[str], copied: list[str]) -> Optional[str]:
+        """How the rendered code differs from the copied code, in one line.
+
+        The point is not to choose — the copy already wins, because it is the
+        source before the highlighter touched it. The point is to SAY SO. Every
+        extraction bug this miner has had was silent: a Private Use Area
+        character, a leaked language chip, a blank line inserted at a render
+        boundary. Each one looked exactly like the model writing bad code, and
+        each cost days to find. Two independent readings of the same answer are
+        already in hand here, so disagreement costs nothing to detect and turns
+        a mystery into a log line.
+        """
+        if len(dom) != len(copied):
+            return (
+                f"the page renders {len(dom)} code block(s) but its copy "
+                f"controls give {len(copied)}"
+            )
+        for rendered, source in zip(dom, copied):
+            if rendered == source:
+                continue
+            at = next(
+                (i for i, (a, b) in enumerate(zip(rendered, source)) if a != b),
+                min(len(rendered), len(source)),
+            )
+            return (
+                f"they differ at character {at}: rendered {_describe_char(rendered[at:at + 1])}, "
+                f"copied {_describe_char(source[at:at + 1])}"
+            )
+        return None
 
     @staticmethod
     def _fence(block: str) -> str:
@@ -847,30 +905,34 @@ class _Tab:
         Choosing between them needs the entrypoint, which belongs to the task
         rather than the tab, so hand them all over and let the caller pick.
         """
-        code_blocks = reply.locator("pre code")
-        count = await code_blocks.count()
-        if count > 0:
-            fenced = []
-            for i in range(count):
-                # textContent, not innerText, and measured rather than assumed:
-                # claude.ai splits a <code> into `data-code-line-group` blocks,
-                # and innerText adds a line break at every block boundary -- a
-                # 15-line program came back as 17. Rust does not care about a
-                # stray blank line; a Python multi-line string literal does, and
-                # the corruption is invisible until a hidden test disagrees
-                # about the text. Each line already carries its own newline, so
-                # the raw text IS the source. Only safe on the code block: at
-                # message level textContent returns the markup's own
-                # indentation as whitespace, which is why the fallback below
-                # and the echo guard both still read innerText.
-                block = await code_blocks.nth(i).text_content() or ""
-                if not block.strip():
-                    continue
-                fenced.append(_Tab._fence(block))
-            if fenced:
-                return "\n".join(fenced)
+        blocks = await _Tab._dom_blocks(reply)
+        if blocks:
+            return "\n".join(_Tab._fence(b) for b in blocks)
         text = (await reply.inner_text()).strip()
         return text or None
+
+    @staticmethod
+    async def _dom_blocks(reply) -> list[str]:
+        """Every rendered code block, raw. The second opinion on what was said."""
+        blocks: list[str] = []
+        code_blocks = reply.locator("pre code")
+        for i in range(await code_blocks.count()):
+            # textContent, not innerText, and measured rather than assumed:
+            # claude.ai splits a <code> into `data-code-line-group` blocks,
+            # and innerText adds a line break at every block boundary -- a
+            # 15-line program came back as 17. Rust does not care about a
+            # stray blank line; a Python multi-line string literal does, and
+            # the corruption is invisible until a hidden test disagrees
+            # about the text. Each line already carries its own newline, so
+            # the raw text IS the source. Only safe on the code block: at
+            # message level textContent returns the markup's own
+            # indentation as whitespace, which is why the fallback below
+            # and the echo guard both still read innerText.
+            block = await code_blocks.nth(i).text_content() or ""
+            if not block.strip():
+                continue
+            blocks.append(block)
+        return blocks
 
     @property
     def provider(self) -> str:

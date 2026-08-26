@@ -407,6 +407,27 @@ It is preferred, not required. If the control is missing or renamed, scraping
 answers instead, and a reply with two blocks whose controls only half-respond is
 handed back to scraping whole rather than losing a block.
 
+### Both readings are taken, and disagreement is reported
+
+Choosing the better source is only half of it. Every extraction bug this miner
+has had was *silent* — a Private Use Area character, a leaked language chip, a
+blank line inserted at a render boundary. Each one looked exactly like the model
+writing bad code, and each cost days to find.
+
+Two independent readings of the same answer are already in hand by the time a
+send finishes, so they are compared. The copy still wins; the difference gets
+logged:
+
+```
+[claude] note: tab claude#1: what the page RENDERS and what it COPIES are not
+the same — they differ at character 14: rendered '\ue027' (U+E027), copied
+'+' (U+002B). Using the copy, which is the source before syntax highlighting.
+```
+
+It names the codepoint because that is the part you can act on. It fires once
+per tab, and only on a real difference — a warning that appears on every answer
+is one nobody reads.
+
 Three hazards are handled in code rather than left to the selectors:
 
 - **An assistant selector that also matches your own message** would make the

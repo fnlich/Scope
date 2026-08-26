@@ -1886,7 +1886,7 @@ def _send_in_browser(body, then=None):
     return asyncio.run(go())
 
 
-def test_the_copy_control_is_preferred_over_the_rendered_dom():
+def test_the_copy_control_is_preferred_over_the_rendered_dom(capsys):
     """Why the copy control leads rather than backs up.
 
     `pre code` hands over the source AFTER a syntax highlighter has rebuilt it
@@ -1909,6 +1909,24 @@ def test_the_copy_control_is_preferred_over_the_rendered_dom():
     exec(compile(code, "<submitted>", "exec"), scope)
     assert scope["pong"]() == 3, "the recovered source does not run"
     assert clicks == 1, f"clicked the copy control {clicks} times, expected once per send"
+
+    # Preferring the copy silently would leave the next render bug as invisible
+    # as the last three were. Two readings are already in hand, so say when they
+    # disagree, and name the character a human can act on.
+    logged = capsys.readouterr().out
+    assert "RENDERS and what it COPIES are not the same" in logged, (
+        f"took the copy but never said the page rendered something else: {logged!r}"
+    )
+    assert "U+E027" in logged, f"did not name the offending codepoint: {logged!r}"
+
+
+def test_agreeing_readings_are_not_reported_as_a_problem(capsys):
+    """The warning has to mean something. If it fires on every answer, nobody
+    reads it, and the one time it matters it is lost in the noise."""
+    body = '<!doctype html><meta charset="utf-8">\n<div id="composer" contenteditable="true"></div><button id="send">go</button>\n<div id="host"></div>\n<script>\nconst SOURCE = "def pong():\\n    return 5";\ndocument.getElementById(\'send\').onclick = () => {\n  const wrap = document.createElement(\'div\');\n  wrap.setAttribute(\'data-message-author-role\', \'assistant\');\n  const pre = document.createElement(\'pre\');\n  const code = document.createElement(\'code\');\n  code.textContent = SOURCE;                       // render and source agree\n  pre.appendChild(code);\n  wrap.appendChild(pre);\n  const btn = document.createElement(\'button\');\n  btn.setAttribute(\'aria-label\', \'Copy\');\n  btn.onclick = () => navigator.clipboard.writeText(SOURCE);\n  wrap.appendChild(btn);\n  document.getElementById(\'host\').appendChild(wrap);\n};\n</script>'
+    reply, _ = _send_in_browser(body)
+    assert "return 5" in extract_code(reply, "pong"), f"lost the answer: {reply!r}"
+    assert "not the same" not in capsys.readouterr().out, "cried wolf on a clean read"
 
 
 def test_a_missing_copy_control_falls_back_to_reading_the_dom():
