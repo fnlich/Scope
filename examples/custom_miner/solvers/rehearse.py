@@ -449,7 +449,13 @@ async def _rehearse_one(miner, problem: Problem, settings, args) -> tuple[str, s
 
     where = archive_dir()
     if where is not None:
-        print(f"[rehearse] archived under {where}/ "
+        # Resolved, not as configured. `SOLVER_SOLUTION_DIR` defaults to the
+        # relative "solutions", so the line used to read "archived under
+        # solutions/" and leave the reader to work out which directory that was
+        # relative to -- and the repository has a `solutions/` at its root as
+        # well as the one this creates beside the miner. An operator went
+        # looking in the wrong one.
+        print(f"[rehearse] archived under {where.resolve()} "
               f"({request.problem_id}.{'rs' if request.language == 'rust' else 'py'}, "
               f"and the exchange beside it)")
 

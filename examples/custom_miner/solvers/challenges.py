@@ -119,3 +119,14 @@ def load_all(
 ) -> list[Challenge]:
     root = directory or challenge_dir()
     return [load(name, root) for name in (which if which is not None else names(root))]
+
+
+if __name__ == "__main__":  # `python -m solvers.challenges` lists what there is
+    directory = challenge_dir()
+    if directory is None:
+        raise SystemExit(f"no challenges found; set {DIRECTORY_ENV}")
+    print(f"{directory}\n")
+    for challenge_name in names(directory):
+        one = load(challenge_name, directory)
+        print(f"  {one.name:30} {one.language:7} {one.entrypoint:18} "
+              f"{len(one.cases)} public case(s)")
