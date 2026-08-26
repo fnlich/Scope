@@ -99,7 +99,9 @@ Reply with ONE fenced {language} code block and nothing else. No preamble, no
 explanation before it or after it. Only the code inside the fence is ever read."""
 
 PYTHON_RULES = """\
-Rules — the grader is automated and unforgiving:
+- There is no partial credit. A program wrong on ONE hidden case scores
+  exactly what no answer at all scores, so prefer the safe implementation
+  over the clever one every time.
 - Define exactly one top-level function named `{entrypoint}`. It is called
   directly as `{entrypoint}(*args, **kwargs)`.
 - RETURN the answer. Do not print it, do not read stdin, do not call input().
@@ -110,7 +112,9 @@ Rules — the grader is automated and unforgiving:
 - Do not include tests, example calls, or `if __name__ == "__main__"`."""
 
 RUST_RULES = """\
-Rules — the grader is automated and unforgiving:
+- There is no partial credit. A program wrong on ONE hidden case scores
+  exactly what no answer at all scores, so prefer the safe implementation
+  over the clever one every time.
 - Write ONE complete program with `fn main()`, compiled as a single file with
   `rustc --edition=2021 -C opt-level=2`. No Cargo, no crates, std only.
 - READ the input from stdin and WRITE only the requested answer to stdout.
@@ -134,10 +138,28 @@ Rules — the grader is automated and unforgiving:
 # prose spent before the code is time the code does not get. Written the other
 # way round the artifact exists first, so a reply cut short loses the checking
 # pass rather than the whole answer.
+# An ordered procedure, not advice. Ordering is the thing this prompt has had to
+# fight hardest: told to check "before you answer", models narrated the check and
+# ran out of time before the program existed. A numbered list leaves no room to
+# read the steps in a different order, and step 6 is the one that must be last.
+METHOD = """\
+Work in this order:
+1. Read the problem, then the examples. Where the statement is ambiguous, the
+   examples decide — they are the only disambiguation you are given.
+2. Write the program FIRST, complete and runnable.
+3. Trace every example by hand through the code you wrote. If one disagrees,
+   the code is wrong, not the example.
+4. Put the code through the edge cases below and fix what breaks.
+5. Read the program back against itself, using the self-check below.
+6. Send the code and nothing else.
+
+Steps 1 to 5 happen silently, in your reasoning. None of that work appears in
+the reply."""
+
 EDGE_CASES = """\
-Edge cases are where this is won or lost. Write the program FIRST, then check it
-against every one of these and fix what breaks. Do that checking silently — none
-of the walkthrough belongs in the reply:
+The hidden tests are adversarial; the examples are not. Each line below is a
+case with a right answer the statement implies and a wrong answer a plausible
+implementation produces:
 - NOTHING: an empty list, an empty string, n = 0. Work out what the statement
   says the answer is, then make sure your code reaches it instead of crashing
   or dividing by a length of zero.
@@ -158,11 +180,16 @@ of the walkthrough belongs in the reply:
 # Two of these are facts about THIS grader, not general advice, and both cost a
 # solve when guessed at: the comparison is structural and strict about bools,
 # and each test is on a five-second clock.
-PYTHON_EDGE_CASES = """\
+PYTHON_ENVIRONMENT = """\
 - Python integers never overflow, but the default recursion limit is 1000, so a
   recursive answer dies at n = 10^4 with RecursionError. Write it iteratively,
   or raise the limit yourself at the top of the file.
 - Each test gets about 5 seconds. O(n^2) over n = 10^5 does not fit.
+- Iterating a `set` or `dict` of STRINGS gives a different order in every
+  process — `PYTHONHASHSEED` is random by default. Measured: four runs of
+  `list({'alpha','beta','gamma'})` gave four different orders, while a set of
+  small ints gave the same order every time. So a solution tested with integers
+  looks stable and is not. Sort before returning anything order-sensitive.
 - Return the exact shape the examples show. The comparison is structural:
   `True` is not `1`, so a boolean answer must be a real bool; a dict must have
   exactly the expected keys; two integers must match exactly. (A list and a
@@ -174,7 +201,7 @@ PYTHON_EDGE_CASES = """\
 # at opt-level=2, so the arithmetic wraps and the program exits 0 with a
 # plausible wrong number. There is no panic, no message, and nothing in the
 # failure that points at the cause.
-RUST_EDGE_CASES = """\
+RUST_ENVIRONMENT = """\
 - INTEGER OVERFLOW IS SILENT HERE. The grader compiles with `-C opt-level=2`,
   which turns overflow checks OFF: `i32` arithmetic wraps around and the
   program exits normally with a wrong answer instead of panicking. Two `i32`
@@ -184,6 +211,8 @@ RUST_EDGE_CASES = """\
 - Read to EOF. Tolerate trailing newlines, blank lines and repeated spaces, and
   do not assume a fixed number of lines unless the statement fixes it.
 - Deep recursion overflows the stack. Prefer iteration for n up to 10^5.
+- `HashMap` and `HashSet` iteration order is unspecified and differs run to run.
+  Use `BTreeMap`/`BTreeSet`, or sort, before emitting anything order-sensitive.
 - Each test gets about 5 seconds, so lock stdout once and wrap it in a
   BufWriter rather than printing in a loop."""
 
@@ -201,8 +230,9 @@ RUST_EDGE_CASES = """\
 # it needs to catch these and simply does not look again. So it is asked to,
 # once, against a list of exactly the things that have gone wrong.
 SELF_CHECK = """\
-Then read the program back against itself. Every line here is a bug that has
-reached this grader inside a program that looked finished:
+Read the program back against itself and answer each of these about it. Every
+line is a bug that has reached this grader inside a program that looked
+finished:
 - Every function you CALL, you also wrote. A helper you meant to add and did not
   is a compile error sitting in a file that otherwise looks complete.
 - Every index is in range. Watch for two numberings of the same objects — an id
@@ -261,7 +291,7 @@ def build_initial_prompt(
     """
     is_rust = language == "rust"
     rules = (RUST_RULES if is_rust else PYTHON_RULES).format(entrypoint=entrypoint)
-    edges = EDGE_CASES + "\n" + (RUST_EDGE_CASES if is_rust else PYTHON_EDGE_CASES)
+    environment = RUST_ENVIRONMENT if is_rust else PYTHON_ENVIRONMENT
 
     parts = [
         "<output>",
@@ -281,8 +311,11 @@ def build_initial_prompt(
             "</examples>", "",
         ]
     parts += [
-        "<contract>", rules, "</contract>", "",
-        "<method>", edges, "", SELF_CHECK, "</method>",
+        "<contract>", rules, "", environment, "</contract>", "",
+        "<method>", METHOD, "",
+        "<edge_cases>", EDGE_CASES, "</edge_cases>", "",
+        "<self_check>", SELF_CHECK, "</self_check>",
+        "</method>",
     ]
     return "\n".join(parts)
 

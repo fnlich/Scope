@@ -2816,7 +2816,7 @@ def test_the_prompts_claim_about_silent_overflow_is_true_of_this_grader():
     if rustc is None:
         pytest.skip("no rustc on this host")
     from rlvr.policy import RELEASE_POLICY
-    from solvers.prompts import RUST_EDGE_CASES
+    from solvers.prompts import RUST_ENVIRONMENT
 
     work = Path(tempfile.mkdtemp())
     src = work / "ov.rs"
@@ -2845,7 +2845,7 @@ def test_the_prompts_claim_about_silent_overflow_is_true_of_this_grader():
         f"i32 overflow produced {ran.stdout.strip()!r}; the prompt tells the "
         f"model it produces -294967296"
     )
-    assert "-294967296" in RUST_EDGE_CASES, "the prompt stopped quoting the value"
+    assert "-294967296" in RUST_ENVIRONMENT, "the prompt stopped quoting the value"
 
 
 def test_the_prompts_claims_about_answer_comparison_are_true():
@@ -2854,15 +2854,15 @@ def test_the_prompts_claims_about_answer_comparison_are_true():
     boolean answer, the other stops it wasting a repair round converting a
     perfectly acceptable tuple — and both are somebody else's code."""
     from rlvr.execution.compare import values_equal
-    from solvers.prompts import PYTHON_EDGE_CASES
+    from solvers.prompts import PYTHON_ENVIRONMENT
 
-    assert "`True` is not `1`" in PYTHON_EDGE_CASES
+    assert "`True` is not `1`" in PYTHON_ENVIRONMENT
     assert not values_equal(True, 1), "the prompt's bool claim is now false"
 
-    assert "tuple with equal contents do compare equal" in PYTHON_EDGE_CASES
+    assert "tuple with equal contents do compare equal" in PYTHON_ENVIRONMENT
     assert values_equal([1, 2], (1, 2)), "the prompt's list/tuple claim is false"
 
-    assert "two integers must match exactly" in PYTHON_EDGE_CASES
+    assert "two integers must match exactly" in PYTHON_ENVIRONMENT
     assert not values_equal(1_000_000, 1_000_001), (
         "a float tolerance is accepting wrong integers; the prompt says it cannot"
     )
@@ -2872,13 +2872,13 @@ def test_the_prompt_quotes_the_real_per_test_timeout():
     """A budget the model is told about has to be the budget it gets. Quoting a
     generous one invites an algorithm that does not fit."""
     from rlvr.config import Settings
-    from solvers.prompts import PYTHON_EDGE_CASES, RUST_EDGE_CASES
+    from solvers.prompts import PYTHON_ENVIRONMENT, RUST_ENVIRONMENT
 
     seconds = Settings.model_fields["per_test_timeout_s"].default
     assert seconds == 5.0, (
         f"the per-test timeout is now {seconds}s; both prompts still say 5"
     )
-    assert "5 seconds" in PYTHON_EDGE_CASES and "5 seconds" in RUST_EDGE_CASES
+    assert "5 seconds" in PYTHON_ENVIRONMENT and "5 seconds" in RUST_ENVIRONMENT
 
 
 def test_the_examples_are_framed_as_a_floor_not_the_specification():
@@ -3952,17 +3952,20 @@ def test_the_checklist_asks_for_the_program_first_not_a_walkthrough():
     then started the program. Written the other way round the artifact exists
     first, so a reply cut short loses the checking pass rather than the answer.
     """
-    from solvers.prompts import EDGE_CASES, build_initial_prompt
+    from solvers.prompts import EDGE_CASES, METHOD, build_initial_prompt
 
-    assert "Write the program FIRST" in EDGE_CASES, EDGE_CASES[:120]
-    assert "silently" in EDGE_CASES
-    assert "before you answer" not in EDGE_CASES.lower(), (
-        "the checklist still asks the model to narrate before answering"
-    )
+    # The instruction lives in METHOD now — `<edge_cases>` is a list of input
+    # shapes and says nothing about when to write anything.
+    assert "Write the program FIRST" in METHOD, METHOD[:120]
+    assert "silently" in METHOD
+    for text in (METHOD, EDGE_CASES):
+        assert "before you answer" not in text.lower(), (
+            "the prompt still asks the model to narrate before answering"
+        )
     for language, entry in (("rust", "main"), ("python", "solve")):
         prompt = build_initial_prompt(language, "Do a thing.", entry, [])
-        # The instruction now lives in <method>, which comes last on purpose —
-        # see test_how_to_answer_comes_last_where_it_is_most_likely_to_be_obeyed.
+        # ...inside <method>, which comes last on purpose — see
+        # test_how_to_answer_comes_last_where_it_is_most_likely_to_be_obeyed.
         assert "Write the program FIRST" in prompt.split("<method>")[1]
 
 
@@ -3996,3 +3999,92 @@ def test_the_first_attempt_gets_the_budget_when_no_repair_can_happen():
     assert without > 135.1, (
         "the first attempt still gets less than the slice that was running out"
     )
+
+
+def test_the_method_is_a_numbered_procedure_ending_in_send_the_code():
+    """Ordering is what this prompt has had to fight hardest. Told to check
+    "before you answer", models narrated the check and ran out of time before
+    the program existed. A numbered list leaves no room to read the steps in a
+    different order, and the last step is the one that must be last."""
+    from solvers.prompts import METHOD, build_initial_prompt
+
+    steps = [line for line in METHOD.splitlines() if line[:2] in
+             ("1.", "2.", "3.", "4.", "5.", "6.")]
+    assert len(steps) == 6, steps
+    assert "Write the program FIRST" in steps[1], steps[1]
+    assert "Send the code and nothing else" in steps[5], steps[5]
+    assert "silently" in METHOD
+    assert METHOD in build_initial_prompt("rust", "Do a thing.", "main", [])
+
+
+def test_the_examples_decide_when_the_statement_is_ambiguous():
+    """The examples are the only disambiguation a solver is given — the README
+    says so and nothing in the prompt used to. Without the rule the model has
+    to guess which of its readings the author meant."""
+    from solvers.prompts import build_initial_prompt
+
+    for language, entry in (("rust", "main"), ("python", "solve")):
+        # Normalised, because the prompt is hard-wrapped: the phrase under test
+        # spans a line break and an indent, and asserting on the raw text would
+        # fail on formatting rather than on meaning.
+        prompt = " ".join(
+            build_initial_prompt(language, "Do a thing.", entry, []).split()
+        )
+        assert "the examples decide" in prompt, "no disambiguation rule"
+        assert "the code is wrong, not the example" in prompt
+
+
+def test_both_contracts_say_there_is_no_partial_credit():
+    """It changes the risk calculus. A model that thinks a near-miss scores
+    something will reach for the clever implementation; one that knows a single
+    wrong hidden case scores zero will not."""
+    from solvers.prompts import build_initial_prompt
+
+    for language, entry in (("rust", "main"), ("python", "solve")):
+        prompt = build_initial_prompt(language, "Do a thing.", entry, [])
+        assert "no partial credit" in prompt
+        assert "prefer the safe implementation" in prompt
+
+
+def test_each_language_is_warned_that_hash_order_is_not_stable():
+    """Measured rather than assumed, and it is the kind that hides: four runs of
+    `list({'alpha','beta','gamma'})` gave four different orders because
+    PYTHONHASHSEED is random per process, while a set of small ints gave the
+    same order every time. A solution tested with integers looks stable and is
+    not. Rust randomises HashMap/HashSet iteration for the same reason."""
+    from solvers.prompts import PYTHON_ENVIRONMENT, RUST_ENVIRONMENT
+
+    assert "PYTHONHASHSEED" in PYTHON_ENVIRONMENT
+    assert "Sort before returning" in PYTHON_ENVIRONMENT
+    assert "HashMap" in RUST_ENVIRONMENT and "BTreeMap" in RUST_ENVIRONMENT
+
+    # ...and the claim itself is true of this interpreter.
+    import subprocess
+    import sys
+
+    orders = {
+        subprocess.run([sys.executable, "-c",
+                        "print(list({'alpha','beta','gamma','delta','epsilon'}))"],
+                       capture_output=True, text=True).stdout
+        for _ in range(8)
+    }
+    assert len(orders) > 1, (
+        "string set order was stable across 8 processes; the prompt's claim "
+        "about PYTHONHASHSEED no longer holds on this interpreter"
+    )
+
+
+def test_the_environment_facts_are_not_filed_as_edge_cases():
+    """They were, and it was a category error: `<edge_cases>` is about the
+    INPUT, `<contract>` is about the machine. Silent overflow and a five-second
+    limit are facts about how the grader runs the code, not shapes of data, and
+    reading them in a list of "try n = 0" made both lists harder to act on."""
+    from solvers.prompts import EDGE_CASES, build_initial_prompt
+
+    for banned in ("OVERFLOW", "5 seconds", "recursion", "PYTHONHASHSEED"):
+        assert banned not in EDGE_CASES, f"{banned!r} is not an edge case"
+
+    prompt = build_initial_prompt("rust", "Do a thing.", "main", [])
+    contract = prompt.split("<contract>")[1].split("</contract>")[0]
+    assert "OVERFLOW IS SILENT" in contract
+    assert "5 seconds" in contract

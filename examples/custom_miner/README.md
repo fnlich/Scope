@@ -132,11 +132,14 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 ### The prompt is one delimited document, and the order is the argument
 
 ```
-<output>    one fenced block, nothing else          ← first
-<problem>   the statement
-<examples>  labelled a floor, not the specification
-<contract>  how the grader runs and compares it
-<method>    edge cases, then read the program back  ← last
+<output>       one fenced block, nothing else            ← first
+<problem>      the statement
+<examples>     labelled a floor, not the specification
+<contract>     what is TRUE: how it is run, compared, and
+               what the environment does silently
+<method>       what to DO: a numbered procedure           ← last
+  <edge_cases>  shapes of input that break a solution
+  <self_check>  reading the program back against itself
 ```
 …then the site's nudge, appended after everything, repeats the output rule.
 
@@ -148,6 +151,36 @@ is. Everything shaping *how* to answer comes last, closest to where generation
 begins — and the section is called `<method>`, not `<before_you_answer>`, because
 that phrase is exactly what used to make models narrate a walkthrough instead of
 writing the program.
+
+`<contract>` and `<method>` answer different questions — what is *true* versus
+what to *do* — and four items used to be filed under the wrong one. Silent
+overflow, the recursion limit, the five-second budget and hash ordering are
+facts about the machine, not shapes of input, and reading them in a list that
+began "try n = 0" made both lists harder to act on.
+
+`<method>` is a numbered procedure rather than advice, because ordering is what
+this prompt has fought hardest:
+
+```
+1. Read the problem, then the examples. Where the statement is ambiguous,
+   the examples decide.
+2. Write the program FIRST, complete and runnable.
+3. Trace every example by hand. If one disagrees, the code is wrong.
+4. Put it through the edge cases.
+5. Read the program back against itself.
+6. Send the code and nothing else.
+```
+
+Three facts were missing that change decisions rather than decorate them.
+**There is no partial credit** — a program wrong on one hidden case scores what
+no answer scores, which is the difference between reaching for the clever
+implementation and the safe one. **The examples decide** when the statement is
+ambiguous; they are the only disambiguation a solver is given, and nothing said
+so. And **hash order is not stable across processes**: measured, four runs of
+`list({'alpha','beta','gamma'})` gave four different orders because
+`PYTHONHASHSEED` is random per process, while a set of small ints gave the same
+order every time — so a solution tested with integers looks stable and is not.
+Rust randomises `HashMap`/`HashSet` iteration for the same reason.
 
 ### The hidden suite is where the score is, so the prompt is written for it
 
