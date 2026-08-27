@@ -597,6 +597,14 @@ class _Tab:
         self._warned_echo = False
         self._warned_branches = False
         self._warned_copy = False
+        # A COUNT, not a flag. The other notes on this class are configuration
+        # advice and say themselves once; this one is damage to the answer being
+        # submitted right now, and how OFTEN it happens is the number an
+        # operator needs. Silencing it after the first would have reported two
+        # incidents in a run of 56 solves on two tabs -- exactly one per tab,
+        # which is what a once-per-tab flag reports whether it happened twice
+        # or forty times.
+        self._cut_short_count = 0
         self._warned_diff = False
         self._warned_relatch = False
         self._warned_stream = False
@@ -1048,7 +1056,49 @@ class _Tab:
                 copied = rendered = None
             page_blocks = copied
             if copied:
-                if rendered and not self._warned_diff:
+                # The copy control wins on FIDELITY -- it is the source before
+                # the highlighter rebuilt it as DOM -- but it has no authority
+                # at all on COMPLETENESS, and the two are different questions.
+                #
+                # Measured on a real page: the DOM held a complete 182-character
+                # Rust program, the copy control gave the first 60, and those 60
+                # were submitted. `rust_defect` returned None on them, because a
+                # truncated program keeps its `fn main` -- so nothing downstream
+                # caught it and it went to the validator as a confident answer.
+                # In the live log this arrived twice, on the only two tasks that
+                # spent the entire budget:
+                #
+                #   what the page RENDERS and what it COPIES are not the same --
+                #   they differ at character 1630: rendered '\n', copied nothing
+                #   (it ends here). Using the copy.
+                #
+                # When the copied source is the rendered source CUT SHORT, the
+                # two readings were simply taken at different moments and the
+                # shorter one is older. Take the fuller one. Anything else --
+                # a difference in the middle, which is what a highlighter
+                # artefact looks like -- leaves the copy in charge as before.
+                lost = self._copy_was_cut_short(rendered or [], copied)
+                if lost:
+                    self._cut_short_count += 1
+                    if self._cut_short_count == 1:
+                        print(
+                            f"[{self.site.name}] note: tab {self.label}: the copy "
+                            f"control gave the answer CUT SHORT — {lost} character(s) "
+                            f"fewer than the page shows, and the page's version "
+                            f"starts with all of it. Submitting what the page shows. "
+                            f"This is what a copy taken while the reply was still "
+                            f"streaming looks like, and every one of these is an "
+                            f"answer that would have gone out truncated."
+                        )
+                    else:
+                        print(
+                            f"[{self.site.name}] tab {self.label}: copy CUT SHORT "
+                            f"again, {lost} character(s) missing "
+                            f"(#{self._cut_short_count} on this tab)"
+                        )
+                    copied = list(rendered or [])
+                    page_blocks = copied
+                elif rendered and not self._warned_diff:
                     difference = self._disagreement(rendered, copied)
                     if difference:
                         self._warned_diff = True
@@ -1624,6 +1674,39 @@ class _Tab:
         """`_copied_blocks`, fenced. Convenience for callers that want text."""
         blocks = await self._copied_blocks(reply)
         return "\n".join(self._fence(b) for b in blocks) if blocks else None
+
+    # How much shorter the copy may be before it is treated as cut short
+    # rather than as an artefact. A truncated program loses a line at the very
+    # least; nothing that loses four non-whitespace characters or fewer is a
+    # truncation, and down there the copy's fidelity advantage is worth more
+    # than the render's extra character -- a highlighter that appends one is
+    # precisely the thing the copy control exists to beat.
+    _CUT_SHORT_SLACK = 4
+
+    @staticmethod
+    def _copy_was_cut_short(rendered: list[str], copied: list[str]) -> int:
+        """Characters the copy is missing, when it is the same answer cut short.
+
+        Zero unless the copied source is a strict PREFIX of the rendered source
+        with whitespace ignored, which is what distinguishes the two ways these
+        readings disagree. A copy taken while the reply was still streaming is
+        the beginning of the answer and nothing else. A highlighter artefact --
+        the measured one was a Private Use Area character inside a Python
+        program -- is a difference in the MIDDLE, so the prefix test fails and
+        the copy keeps its authority, which is the whole reason it is preferred.
+
+        Whitespace is ignored on both sides so that indentation rebuilt by the
+        renderer, or the newline a copy control trims, is never mistaken for
+        lost code.
+        """
+        if not rendered or not copied:
+            return 0
+        whole = "".join("".join(b.split()) for b in rendered)
+        part = "".join("".join(b.split()) for b in copied)
+        if len(part) >= len(whole) or not whole.startswith(part):
+            return 0
+        missing = len(whole) - len(part)
+        return missing if missing > _Tab._CUT_SHORT_SLACK else 0
 
     def _disagreement(self, dom: list[str], copied: list[str]) -> Optional[str]:
         """How the rendered code differs from the copied code, in one line.

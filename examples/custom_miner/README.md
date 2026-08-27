@@ -1034,6 +1034,39 @@ which is its config and not the miner's — so the miner's own caps are set not
 to bind if it ever does: `min(deadline_s, GLM_REQUEST_TIMEOUT_S)` with the
 latter at 600, and `SOLVER_MAX_BUDGET_S` as the single runaway guard above it.
 
+### The copy control wins on fidelity, never on completeness
+
+`pre code` hands over the source *after* a syntax highlighter rebuilt it as
+DOM; the copy control hands over what the model actually wrote. That is why the
+copy is preferred — a highlighter once put U+E027, a Private Use Area character
+present in no source file, inside a Python answer.
+
+But the copy has no authority on *completeness*, and the code used to give it
+that too. From a live run, on the only two tasks that spent the entire budget:
+
+```
+what the page RENDERS and what it COPIES are not the same — they differ at
+character 1630: rendered '\n', copied nothing (it ends here). Using the copy.
+```
+
+Reproduced: the DOM held a complete 182-character Rust program, the copy control
+gave the first 60, and **those 60 were submitted**. `rust_defect` returned `None`
+on them — a truncated program keeps its `fn main` — so the structural check
+passed and it reached the validator as a confident answer that cannot compile.
+
+A copy clicked while the reply is still streaming is the beginning of the answer
+and nothing else. The two readings were taken at different moments and the
+shorter one is simply older, so when the copied source is the rendered source
+**cut short** — a strict prefix, whitespace ignored — the fuller reading wins.
+Anything else, including a difference in the middle (which is what a highlighter
+artefact looks like), leaves the copy in charge exactly as before. A plain "is
+it shorter" test would hand every highlighter bug back to the DOM.
+
+The warning now carries the **amount** lost, and it is a count rather than a
+once-per-tab flag. That distinction matters: a once-per-tab flag reported two
+incidents across 56 solves on two tabs — exactly one per tab, which is what it
+reports whether it happened twice or forty times.
+
 ### A model still writing is waited for, never interrupted
 
 The slice a read is given is an internal **allocation**, not a deadline: part of

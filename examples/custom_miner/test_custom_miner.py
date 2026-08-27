@@ -7031,3 +7031,97 @@ def test_a_backend_that_cannot_wait_is_never_asked_to():
             f"{backend.__name__}.send was called with {len(seen[0])} budget "
             f"argument(s); it takes {arity}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# The copy control wins on FIDELITY, never on COMPLETENESS.
+# --------------------------------------------------------------------------- #
+def test_a_copy_taken_mid_stream_never_replaces_the_fuller_page(capsys):
+    """Measured on a live miner, twice, on the only two tasks that spent the
+    whole budget:
+
+        what the page RENDERS and what it COPIES are not the same — they differ
+        at character 1630: rendered '\\n', copied nothing (it ends here).
+        Using the copy.
+
+    Reproduced: the DOM held a complete 182-character Rust program, the copy
+    control gave the first 60, and those 60 were submitted. `rust_defect`
+    returned None on them — a truncated program keeps its `fn main` — so
+    nothing downstream caught it and it reached the validator as a confident
+    answer that cannot compile.
+
+    A copy clicked while the reply is still streaming is the beginning of the
+    answer and nothing else. The two readings were taken at different moments;
+    the shorter one is simply older.
+    """
+    from solvers.prompts import rust_defect
+
+    FULL = (
+        "fn main() {\\n"
+        "    let mut total = 0i64;\\n"
+        "    for line in std::io::stdin().lines() {\\n"
+        "        total += line.unwrap().trim().parse::<i64>().unwrap_or(0);\\n"
+        "    }\\n"
+        "    println!(\\\"{}\\\", total);\\n"
+        "}"
+    )
+    reply, _ = _send_in_browser(
+        '<!doctype html><meta charset="utf-8">\n'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>\n'
+        '<div id="host"></div>\n<script>\n'
+        f'const FULL = "{FULL}";\n'
+        "document.getElementById('send').onclick = () => {\n"
+        "  const wrap = document.createElement('div');\n"
+        "  wrap.setAttribute('data-message-author-role', 'assistant');\n"
+        "  const pre = document.createElement('pre');\n"
+        "  const code = document.createElement('code');\n"
+        "  code.textContent = FULL;\n"                     # the page has it all
+        "  pre.appendChild(code); wrap.appendChild(pre);\n"
+        "  const btn = document.createElement('button');\n"
+        "  btn.setAttribute('aria-label', 'Copy');\n"
+        "  btn.onclick = () => navigator.clipboard.writeText(FULL.slice(0, 60));\n"
+        "  wrap.appendChild(btn);\n"
+        "  document.getElementById('host').appendChild(wrap);\n"
+        "};\n</script>"
+    )
+    code = extract_code(reply, "main", "rust")
+    assert "println!" in code and code.rstrip().endswith("}"), (
+        f"submitted the copy control's truncated version: {code!r}"
+    )
+    assert rust_defect(code) is None
+
+    said = capsys.readouterr().out
+    assert "CUT SHORT" in said, f"took the fuller reading but never said why: {said!r}"
+    assert "98 character(s) fewer" in said, (
+        f"the warning has to carry the AMOUNT — without it a reader cannot tell "
+        f"a truncated program from a trailing newline: {said!r}"
+    )
+
+
+def test_a_copy_that_differs_in_the_middle_still_wins():
+    """The other half, and the reason the guard is a PREFIX test rather than a
+    length test. A highlighter artefact is a difference in the MIDDLE — the
+    measured one was U+E027 inside a Python program — and there the copy is
+    complete and authoritative. Only a copy that is the same answer cut short
+    loses. A plain "is it shorter" test would hand every highlighter bug back
+    to the DOM, which is the damage the copy control exists to avoid."""
+    cut = _Tab._copy_was_cut_short
+
+    whole = ["def g(n):\n    total = 1 + 2\n    return total"]
+    # Truncated: a strict prefix, materially shorter -> the render wins.
+    assert cut(whole, ["def g(n):\n    total = 1"]) > 0
+    # Damaged in the middle: same length, different content -> the copy wins.
+    assert cut(whole, ["def g(n):\n    total = 1 * 2\n    return total"]) == 0
+    # A highlighter INSERTION. The render is LONGER than the copy, so a plain
+    # "is the copy shorter" test would hand the answer back to the DOM -- and
+    # the DOM is the one carrying the damage. Only the prefix test tells them
+    # apart: an insertion in the middle breaks the prefix, a truncation does not.
+    assert cut(["def g(n):\n    total = 1 + 2\n    return total"], whole) == 0
+    # Trailing whitespace the renderer kept and the copy control trimmed. RAW
+    # this is a strict prefix and five characters short -- exactly the false
+    # alarm that would fire on clean answers; normalised it is no loss at all.
+    assert cut(["def g(n):\n    return 1\n\n   "], ["def g(n):\n    return 1"]) == 0
+    # Below the slack -> the copy keeps its fidelity advantage.
+    assert cut(["def g(n):\n    return 12"], ["def g(n):\n    return 1"]) == 0
+    # Nothing to compare against.
+    assert cut([], ["x"]) == 0 and cut(["x"], []) == 0
