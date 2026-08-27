@@ -1799,6 +1799,7 @@ Five layers, cheapest first, each isolating a different failure:
 ```bash
 # from the repo root
 python -m pytest examples/custom_miner    # 1. code only — no browser, no chain
+python scripts/two_turn_demo.py           # 1b. see the two turns, still no browser
 
 # from examples/custom_miner
 cd examples/custom_miner
