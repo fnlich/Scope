@@ -236,7 +236,7 @@ PYTHON_RULES = """\
 - Write no comments and no docstrings. Nothing reads them, and every
   character you emit spends wall-clock inside the deadline.
 - Put no tests, example calls or `if __name__ == "__main__"` INSIDE the
-  program block. Your cases go in the second block, as JSON."""
+  program block. {cases_home}"""
 
 RUST_RULES = """\
 - There is no partial credit: a program wrong on ONE hidden case pays exactly
@@ -265,117 +265,221 @@ RUST_RULES = """\
 # prose spent before the code is time the code does not get. Written the other
 # way round the artifact exists first, so a reply cut short loses the checking
 # pass rather than the whole answer.
-# The budget the model is actually working against, stated as a number.
+# What the time budget was actually carrying.
 #
-# The prompt has always talked about "the deadline" -- METHOD says to spend it,
-# METHOD_CODA says a reply it cuts off scores zero -- and never once said how
-# long it was. That asks the model to ration an unknown, and a model rationing
-# an unknown does one of two things: hurries a 240-second budget away on a
-# shallow answer, or explores a 40-second one until the reply is cut off
-# mid-program. Both pay zero. The number costs nothing to supply and it is the
-# one thing that makes "test it thoroughly" and "arrive in time" compatible
-# instructions instead of competing ones.
+# The number itself is gone: a model has no clock, cannot measure "260 seconds",
+# and the only concrete behaviour it drove was a depth ladder that said how many
+# cases to trace. Under the two-turn split the case counts are stated outright,
+# by class, in the turn that asks for them -- which is both more precise and
+# checkable, where a number the model cannot perceive is neither.
 #
-# The two rules under it are what make a partial answer impossible.
-# COMPLETE BEFORE CORRECT fixes the order, because a program improved into
-# existence is a program that may not exist when the clock stops. SENDABLE AT
-# EVERY MOMENT fixes the invariant between edits, because the dangerous state is
-# not "wrong", it is "half-rewritten".
-TIME_BUDGET = """\
-You have about {budget} seconds for this reply, reasoning and writing together.
-Nothing you have not sent when it runs out is worth anything: a reply cut off
-mid-program scores exactly what no reply scores.
-
-Two rules follow, and neither bends.
+# These two rules were filed under it and are not about time at all. They are
+# what makes a PARTIAL program impossible, so they belong with the request for a
+# program.
+WHOLE_PROGRAM = """\
+Two rules, and neither bends.
 
 COMPLETE BEFORE CORRECT. Write the whole program out -- every function, every
 branch, nothing elided, nothing deferred to a comment or an ellipsis -- before
-you test any of it. Testing a program that does not yet exist in full is how a
-deadline turns a nearly-finished answer into a zero.
+you check any of it. Checking a program that does not yet exist in full is how
+a deadline turns a nearly-finished answer into a zero.
 
 SENDABLE AT EVERY MOMENT. When you improve it, change it from one complete
-program into another complete program; never leave it half-rewritten. If the
-time is nearly gone, send the complete version you have rather than the better
-version you do not.
-
-{depth}"""
+program into another complete program; never leave it half-rewritten. If you
+must choose, send the complete version you have rather than the better version
+you do not."""
 
 
-# How deep to test, by how much time there is. Concrete counts rather than
-# "thoroughly": a count can be checked against the work actually done and an
-# adverb cannot, and one adverb cannot mean the right thing at both 40 seconds
-# and 240.
-_DEPTH_GENEROUS = """\
-That is a generous budget, so use it: trace every example, then at least eight
-of the invented cases below, and re-trace the ones that already passed after
-every fix. An untested branch is a hidden test you have not read yet."""
+# The two output contracts, and why they share an opening.
+#
+# `_Tab._is_our_own_prompt` (browser_pool.py) recognises a stale scrape by
+# testing whether the message begins with the first 80 normalised characters of
+# whatever was last sent. Give the two turns DIFFERENT openings and a scrape
+# that returns turn 1's text is no longer recognised after turn 2 -- it is
+# reported as a defect instead, and a repair round is spent on it. So the first
+# sentence is identical in both, and only the line naming the block differs.
+_ONE_BLOCK = """\
+Reply with ONE fenced block written directly in the chat — not into an artifact
+or canvas — and nothing else. No preamble, no explanation before it or after it.
+Only what is inside the fence is ever read.
 
-_DEPTH_WORKING = """\
-That is a working budget: trace every example, then at least five of the
-invented cases below -- the ones this statement actually makes reachable -- and
-re-trace what already passed after every fix."""
+"""
 
-_DEPTH_TIGHT = """\
-That is a tight budget. Write the safe, obvious implementation rather than the
-clever one, trace every example, and trace the three cases that break
-implementations most often: the empty or zero input, the single element, and
-the exact bound the statement names. Then send."""
+TESTS_OUTPUT_CONTRACT = _ONE_BLOCK + """\
+That block is `json`, and it holds test cases. Do NOT write the program yet —
+you will be asked for it next."""
 
-
-def _budget_seconds(budget_s):
-    """``budget_s`` as whole seconds, or 0 when there is no usable number."""
-    if budget_s is None:
-        return 0
-    try:
-        seconds = int(float(budget_s))
-    except (TypeError, ValueError, OverflowError):
-        # OverflowError is the one that is easy to miss: `int(float("inf"))`
-        # raises it where `int(float("nan"))` raises ValueError. This is called
-        # while building the prompt, so raising here would lose the whole solve
-        # to a bad number -- the one outcome worse than having no number.
-        return 0
-    return seconds if seconds > 0 else 0
+CODE_OUTPUT_CONTRACT = _ONE_BLOCK + """\
+That block is the {language} program. Nothing else is graded."""
 
 
-def _render_budget(budget_s) -> str:
-    """The time section, or "" when the caller does not know the budget.
+# Turn 1. The cases, before the program exists.
+#
+# The ordering is the user's and it is right: three ordinary cases first, so the
+# common path is checked at all, then the boundaries where implementations
+# actually break. Counts are stated per class rather than as a total, because a
+# total invites a model to spend it all on the easy classes.
+#
+# "You have not written the program yet, and that is deliberate" is the whole
+# argument for splitting the turns. Cases written ALONGSIDE a program can be
+# back-filled from what the program happens to do, and then they agree with its
+# bugs. Cases written first cannot.
+TESTS_TASK_PYTHON = """\
+Write the test cases for this problem — the cases, not the program. You will be
+asked for the program in my next message, and these cases are what it will be
+RUN against before it is submitted, so a case you leave out is a case nobody
+runs.
 
-    Returning "" rather than a guess is deliberate: a number invented here would
-    be worse than none at all, because the model would ration against it. A
-    backend with no deadline to report gets the prompt exactly as it was.
-    """
-    seconds = _budget_seconds(budget_s)
-    if not seconds:
-        return ""
-    depth = (
-        _DEPTH_GENEROUS if seconds >= 180
-        else _DEPTH_WORKING if seconds >= 60
-        else _DEPTH_TIGHT
-    )
-    return TIME_BUDGET.format(budget=seconds, depth=depth)
+[{{"name": "ordinary",   "args": [[3, 1, 2]], "expected": 6}},
+ {{"name": "empty",      "args": [[]],        "expected": 0}},
+ {{"name": "one item",   "args": [[5]],       "expected": 5}}]
+
+- `args` is the argument list for `{entrypoint}(*args)`; `kwargs` is optional.
+- `expected` is the exact value the program must RETURN, written as JSON.
+- Every value must be JSON: no tuples, no sets, no `inf`, no `NaN`, no code.
+- `name` is a short label so a failure report can say which case broke.
+
+Cover, in this order:
+
+1. THREE ordinary cases. Typical inputs, nothing special about them. These are
+   the common path, and a suite that tests only boundaries never checks it.
+
+2. Then, for EACH class below that this statement makes reachable, between TWO
+   and TEN cases. Skip a class only when the statement makes it impossible, and
+   spend the most cases on the classes this problem actually turns on:
+   - ZERO, and the empty input: 0, [], "", {{}}, an empty line of stdin.
+   - ONE and TWO: a single element, exactly two, and the step from one to two.
+   - EVERY LIMIT AND BOUND THE STATEMENT NAMES: at the value, one below it, and
+     one above it. The hidden tests always probe the boundary the statement
+     bothered to write down.
+   - NEGATIVE VALUES and zero-crossings, wherever the statement allows them.
+   - THE LARGEST AND SMALLEST values allowed, and the value that overflows a
+     32-bit accumulator if one is reachable.
+   - TIES AND DUPLICATES: equal keys, repeated elements, two answers with an
+     equal claim, and whatever the statement says breaks the tie.
+   - DEGENERATE SHAPE: everything identical, everything distinct, already
+     sorted, exactly reversed, one element repeated throughout.
+   - EACH RULE THE STATEMENT STATES: one input that makes it fire, and one that
+     NEARLY does and must not.
+   - THE CASE YOU ARE MOST LIKELY TO GET WRONG when you write the program.
+
+At most {limit} cases in total. Derive every `expected` from the STATEMENT by
+reasoning it out. You have not written the program yet, and that is deliberate:
+a case computed from code agrees with the code's bugs, which is exactly what a
+test is supposed to catch."""
 
 
-# A repair round is always the shorter half of the budget, and the failure it
-# invites is a rewrite: a model handed a fault list with no sense of the clock
-# reconsiders its approach, and the approach was rarely the problem. Naming the
-# time turns "try again" into "change this much and send".
-_REPAIR_BUDGET = """
+TESTS_TASK_RUST = """\
+Write the test cases for this problem — the cases, not the program. You will be
+asked for the program in my next message, and these cases are what it will be
+RUN against before it is submitted, so a case you leave out is a case nobody
+runs.
 
-You have about {budget} seconds left -- enough to FIX this program, not to start
-again. Change what the report above names, leave everything it does not, and
-send the complete program."""
+[{{"name": "ordinary", "args": ["3\\n1 2 3\\n"], "expected": "6"}},
+ {{"name": "one item", "args": ["1\\n5\\n"],     "expected": "5"}}]
+
+- `args` holds exactly ONE string: the complete stdin the program reads.
+- `expected` is the complete stdout it must write, as a string.
+- Output is compared after splitting on whitespace, so spacing is forgiving but
+  an extra or missing token is not.
+- `name` is a short label so a failure report can say which case broke.
+
+Cover, in this order:
+
+1. THREE ordinary cases. Typical inputs, nothing special about them.
+
+2. Then, for EACH class below that this statement makes reachable, between TWO
+   and TEN cases. Skip a class only when the statement makes it impossible:
+   - ZERO and the smallest legal input, including an empty payload after the
+     count if the format allows one.
+   - ONE and TWO items, and the step from one to two.
+   - EVERY LIMIT AND BOUND THE STATEMENT NAMES: at the value, one below, one
+     above.
+   - NEGATIVE VALUES and zero-crossings, wherever allowed.
+   - THE LARGEST AND SMALLEST values allowed, and anything that overflows `i32`
+     — Rust wraps silently in release, so a sum that fits `i64` and not `i32` is
+     a wrong answer with no error.
+   - TIES AND DUPLICATES, and whatever the statement says breaks the tie.
+   - DEGENERATE SHAPE: all identical, all distinct, already sorted, reversed.
+   - EACH RULE THE STATEMENT STATES: one input that makes it fire, one that
+     NEARLY does.
+   - THE CASE YOU ARE MOST LIKELY TO GET WRONG when you write the program.
+
+At most {limit} cases in total. Derive every `expected` from the STATEMENT by
+reasoning it out. You have not written the program yet, and that is deliberate:
+a case computed from code agrees with the code's bugs."""
+
+
+def build_tests_prompt(
+    language: str, statement: str, entrypoint: str, examples: list[dict[str, Any]]
+) -> str:
+    """Turn 1: ask for the cases and nothing else."""
+    is_rust = language == "rust"
+    parts = [
+        "<output>", TESTS_OUTPUT_CONTRACT, "</output>", "",
+        f'<problem language="{"rust" if is_rust else "python"}" '
+        f'entrypoint="{entrypoint}">',
+        statement.strip(),
+        "</problem>", "",
+    ]
+    rendered = _render_examples(language, examples)
+    if rendered:
+        parts += [
+            '<examples note="PUBLIC EXAMPLES — already known to be right. Your '
+            'cases must AGREE with these and go far beyond them.">',
+            rendered, "</examples>", "",
+        ]
+    parts += [
+        "<task>",
+        (TESTS_TASK_RUST if is_rust else TESTS_TASK_PYTHON).format(
+            entrypoint=entrypoint, limit=MAX_SELF_TESTS
+        ),
+        "</task>",
+    ]
+    return "\n".join(parts)
+
+
+def _render_cases(cases: list[dict[str, Any]], language: str, entrypoint: str) -> str:
+    """The agreed cases, as the call the grader will actually make."""
+    lines = []
+    for index, case in enumerate(cases, 1):
+        name = case.get("name") or ""
+        label = f"{index}. {name}: " if name else f"{index}. "
+        if language == "rust":
+            lines.append(
+                f"{label}stdin {json.dumps(case.get('args', [''])[0])} "
+                f"-> stdout {json.dumps(case.get('expected'))}"
+            )
+        else:
+            args = ", ".join(json.dumps(a) for a in case.get("args", []))
+            kwargs = "".join(
+                f", {k}={json.dumps(v)}" for k, v in (case.get("kwargs") or {}).items()
+            )
+            lines.append(
+                f"{label}{entrypoint}({args}{kwargs}) -> {json.dumps(case.get('expected'))}"
+            )
+    return "\n".join(lines)
 
 
 # An ordered procedure, not advice. Ordering is the thing this prompt has had to
 # fight hardest: told to check "before you answer", models narrated the check and
 # ran out of time before the program existed. A numbered list leaves no room to
 # read the steps in a different order, and step 6 is the one that must be last.
+#
+# The three fields exist because METHOD is shared by turns that ask for
+# different replies, and a shared instruction that names the WRONG reply is
+# worse than no instruction at all. Under the two-turn split the code turn's
+# contract says ONE block; a method that then says "the reply itself is only the
+# two blocks" and "send the program, then the cases" is a flat contradiction,
+# and a model resolves a contradiction by obeying the more specific-sounding
+# half -- it emits a second JSON block, which `extract_code` has to step over
+# and which spends output tokens inside the deadline for nothing.
 METHOD = """\
 Correctness is the only thing worth optimising: a wrong answer pays zero and
 speed pays almost nothing, so prefer the safe implementation over the clever
 one, and spend the deadline where it buys correctness — in your reasoning,
 before the reply. Work in this order, all of it silently, in your reasoning;
-the reply itself is only the two blocks:
+the reply itself is only {reply}:
 1. Read the statement twice, then the examples. Every rule the statement
    states and every bound and constant it names is the specification the
    hidden tests are written from. Where the statement is ambiguous, the
@@ -390,10 +494,36 @@ the reply itself is only the two blocks:
 4. Invent inputs of your own and trace them the same way: the edge cases below
    say which, and every rule the statement states gets one input that triggers
    it and one that NEARLY does. After every fix, re-trace the cases that
-   already passed — repairs break earlier answers. These are the cases that go
-   in the second block, so write down the expected value as you trace it.
+   already passed — repairs break earlier answers.{step4}
 5. Read the program back against itself, using the self-check below.
-6. Send the program, then the cases, and nothing else."""
+6. Send {send}, and nothing else."""
+
+
+# What each turn puts in those three slots.
+_METHOD_SLOTS = {
+    # Single turn: program and cases together, exactly as before the split.
+    "combined": {
+        "reply": "the two blocks",
+        "step4": (
+            "\n   These are the cases that go in the second block, so write down"
+            " the expected\n   value as you trace it."
+        ),
+        "send": "the program, then the cases",
+    },
+    # Turn 2 with cases agreed in turn 1: the bar is already written down, so
+    # the tracing has somewhere concrete to point instead of a block to fill.
+    "given": {
+        "reply": "the program",
+        "step4": (
+            "\n   Every case in <must_pass> above has to come out right; those"
+            " are the ones\n   that will actually be run against this program."
+        ),
+        "send": "the program",
+    },
+    # Turn 2 after a cases turn that produced nothing usable. No second block,
+    # and nothing to point at either.
+    "bare": {"reply": "the program", "step4": "", "send": "the program"},
+}
 
 
 # The strongest sentence in the prompt, fired once, from the last slot before
@@ -505,7 +635,7 @@ RUST_ENVIRONMENT = """\
 # once, against a list of exactly the things that have gone wrong.
 SELF_CHECK = """\
 Read the program back against itself and verify each of these, silently — the
-reply is still only the two blocks. Every line is a bug that has reached this
+reply is still only {reply}. Every line is a bug that has reached this
 grader inside a program that looked finished:
 - Every function you CALL, you also wrote. A helper you meant to add and did not
   is a compile error sitting in a file that otherwise looks complete.
@@ -551,14 +681,26 @@ def _render_examples(language: str, examples: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_initial_prompt(
+def build_code_prompt(
     language: str,
     statement: str,
     entrypoint: str,
     examples: list[dict[str, Any]],
-    budget_s: Optional[float] = None,
+    cases: Any = "ask",
 ) -> str:
-    """The one prompt that has to carry the whole contract.
+    """Ask for the program.
+
+    ``cases`` has three values and they are three different conversations:
+
+    * ``"ask"``   -- the single-turn prompt: program AND cases in one reply, two
+                     fenced blocks. Used when the budget is too small to spend a
+                     round trip on cases alone, and byte-for-byte what this
+                     builder produced before the split.
+    * a list      -- turn 2 of a two-turn solve. The cases already exist, so the
+                     contract is ONE block and they are restated as the bar the
+                     program has to clear.
+    * ``None``/[] -- turn 2 after turn 1 produced nothing usable. One block, no
+                     cases, and the answer still goes out.
 
     Laid out in delimited sections, and the order is the argument. The output
     contract goes FIRST because it is the only instruction whose failure costs
@@ -572,19 +714,26 @@ def build_initial_prompt(
     friendliest thing in the message and the easiest to over-fit to, and the
     label is what stops them being read as the whole job.
 
-    ``budget_s`` is how long the model actually has. It opens ``<method>`` so
-    the numbered steps are read with it in view, and it is optional because a
-    backend that cannot report a deadline should get the prompt it always got
-    rather than an invented number to ration against.
     """
     is_rust = language == "rust"
-    rules = (RUST_RULES if is_rust else PYTHON_RULES).format(entrypoint=entrypoint)
+    combined = cases == "ask"
+    given = [] if combined or not cases else list(cases)
+    slots = _METHOD_SLOTS["combined" if combined else "given" if given else "bare"]
+    rules = (RUST_RULES if is_rust else PYTHON_RULES).format(
+        entrypoint=entrypoint,
+        cases_home=(
+            "Your cases go in the second block, as JSON."
+            if combined
+            else "Nothing but the function and whatever it needs to run."
+        ),
+    )
     environment = RUST_ENVIRONMENT if is_rust else PYTHON_ENVIRONMENT
+    contract = (OUTPUT_CONTRACT if combined else CODE_OUTPUT_CONTRACT).format(
+        language="Rust" if is_rust else "Python"
+    )
 
     parts = [
-        "<output>",
-        OUTPUT_CONTRACT.format(language="Rust" if is_rust else "Python"),
-        "</output>", "",
+        "<output>", contract, "</output>", "",
         f'<problem language="{"rust" if is_rust else "python"}" '
         f'entrypoint="{entrypoint}">',
         statement.strip(),
@@ -598,26 +747,35 @@ def build_initial_prompt(
             rendered,
             "</examples>", "",
         ]
-    budget = _render_budget(budget_s)
     parts += ["<contract>", rules, "", environment, "</contract>", ""]
-    # Immediately after the contract that asks for two blocks and before the
-    # method that produces them, so "write the cases" is read as part of
-    # answering rather than as an afterthought.
+    if combined:
+        # Immediately after the contract that asks for two blocks and before the
+        # method that produces them, so "write the cases" is read as part of
+        # answering rather than as an afterthought.
+        parts += [
+            "<self_tests>",
+            (RUST_SELF_TESTS if is_rust else SELF_TESTS_PYTHON).format(
+                entrypoint=entrypoint
+            ),
+            "</self_tests>", "",
+        ]
+    elif given:
+        # The bar, stated as the calls the grader will actually make. These are
+        # the model's OWN cases from the previous turn, echoed rather than
+        # referred to: a model asked to honour "the cases you sent" has to
+        # scroll back past its own JSON to find them, and what it half-
+        # remembers is what the program gets checked against.
+        parts += [
+            '<must_pass note="YOUR OWN cases from the previous message. Every '
+            'one of these is RUN against your program before it is submitted.">',
+            _render_cases(given, language, entrypoint),
+            "</must_pass>", "",
+        ]
+    parts += ["<method>", WHOLE_PROGRAM, ""]
     parts += [
-        "<self_tests>",
-        (RUST_SELF_TESTS if is_rust else SELF_TESTS_PYTHON).format(entrypoint=entrypoint),
-        "</self_tests>", "",
-    ]
-    parts += ["<method>"]
-    if budget:
-        # First inside <method>, so step 2 ("Write the program FIRST") is read
-        # knowing how long there is to write it in. METHOD_CODA closes the same
-        # section, so the budget holds both ends of the procedure.
-        parts += ["<budget>", budget, "</budget>", ""]
-    parts += [
-        METHOD, "",
+        METHOD.format(**slots), "",
         "<edge_cases>", EDGE_CASES, "</edge_cases>", "",
-        "<self_check>", SELF_CHECK, "</self_check>", "",
+        "<self_check>", SELF_CHECK.format(reply=slots["reply"]), "</self_check>", "",
         METHOD_CODA,
         "</method>",
     ]
@@ -629,7 +787,6 @@ def build_repair_prompt(
     language: str,
     entrypoint: str,
     defect: Optional[str] = None,
-    budget_s: Optional[float] = None,
     from_self_tests: bool = False,
 ) -> str:
     """Ask for a fix, quoting the concrete failures the local grader found.
@@ -652,20 +809,18 @@ def build_repair_prompt(
             "Your previous reply did not reach me as code. I can only read the "
             "chat message itself, so an artifact, a canvas, a preview pane or a "
             "collapsed block is invisible to me.\n\n"
-            "Send the COMPLETE program again as an ordinary fenced code block "
-            "written directly in the chat, followed by the JSON cases block. Do "
-            "not create an artifact or canvas. Do not abbreviate it or replace "
-            "any part with a comment. Same rules as before, and nothing outside "
-            "the two blocks."
+            "Send the COMPLETE program again as one ordinary fenced code block "
+            "written directly in the chat. Do not create an artifact or canvas. "
+            "Do not abbreviate it or replace any part with a comment. Same rules "
+            "as before, and nothing outside the block."
         )
     elif defect:
         body = (
             f"I could not run your previous reply: {defect}.\n\n"
             "Nothing was executed, so none of this is about your logic yet — it "
             "is about what arrived. Put that right and send the COMPLETE program "
-            "again as an ordinary fenced code block written directly in the "
-            "chat, followed by the JSON cases block, with nothing outside the "
-            "two. Same rules as before."
+            "again as one ordinary fenced code block written directly in the "
+            "chat, with nothing outside it. Same rules as before."
         )
     elif from_self_tests:
         # Deliberately not "your solution is WRONG". These cases came from the
@@ -688,8 +843,9 @@ def build_repair_prompt(
             "Then re-check the fix silently against the boundaries from my first "
             "message — the empty case, n = 1, both ends, and the largest values "
             "allowed — because a repair that fixes one case and breaks a "
-            "boundary scores the same zero. Reply with the corrected program "
-            "block and the corrected JSON cases block, and nothing else."
+            "boundary scores the same zero. Reply with the corrected program block. "
+            "If it was the CASE that was wrong, add a second `json` block "
+            "holding the corrected cases; otherwise send the program alone."
         )
     else:
         detail = "\n".join(f"  - {line}" for line in failures)
@@ -706,17 +862,14 @@ def build_repair_prompt(
             "example and breaks a boundary scores the same zero. Then reply with "
             "ONLY ONE corrected code block and nothing else."
         )
-    # Appended at the ONE exit, so a repair variant added later cannot silently
-    # forget to say how much time is left.
-    seconds = _budget_seconds(budget_s)
-    return body + (_REPAIR_BUDGET.format(budget=seconds) if seconds else "")
+    return body
 
 
 # The most cases one reply may contribute. Each one is an executor run against
 # the solve's own budget -- a subprocess for Python, a container for Rust -- so
 # a model that emits forty of them would spend the deadline proving its own
 # program right instead of getting it submitted.
-MAX_SELF_TESTS = 12
+MAX_SELF_TESTS = 20
 
 
 def extract_self_tests(
@@ -754,8 +907,31 @@ def extract_self_tests(
         # sufficient and the one that cannot misfire.
         cases = _parse_cases(block, language)
         if cases:
-            return cases[:MAX_SELF_TESTS]
+            return _thin(cases, MAX_SELF_TESTS)
     return []
+
+
+def _thin(cases: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """At most ``limit`` cases, keeping the SHAPE of the coverage.
+
+    A head-slice was what this used to do, and the turn-1 prompt inverts the
+    assumption that made it safe. Cases now arrive ordinary-first by explicit
+    instruction, so `cases[:limit]` keeps the three easy ones and throws away
+    the boundaries -- discarding exactly the cases the whole mechanism exists to
+    run, and doing it silently.
+
+    The first three are kept because the prompt puts the common path there, and
+    the rest are sampled at an even stride so no class is dropped wholesale
+    whatever order the model actually used.
+    """
+    if len(cases) <= limit:
+        return list(cases)
+    head = cases[: min(3, limit)]
+    rest, room = cases[len(head):], limit - len(head)
+    if room <= 0:
+        return head
+    stride = len(rest) / float(room)
+    return head + [rest[int(i * stride)] for i in range(room)]
 
 
 def _parse_cases(block: str, language: str) -> list[dict[str, Any]]:
