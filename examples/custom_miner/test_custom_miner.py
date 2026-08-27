@@ -2957,9 +2957,16 @@ def test_the_output_contract_holds_the_first_word_and_the_nudge_the_last():
                                   (chatgpt_site(), "python", "solve")):
         prompt = build_initial_prompt(language, "Do a thing.", entry, [])
         assert prompt.startswith("<output>"), prompt[:40]
-        assert "ONE fenced" in prompt.split("</output>")[0]
+        head = prompt.split("</output>")[0]
+        # TWO blocks now, and the count is the load-bearing part: `extract_code`
+        # picks the block that DEFINES the entrypoint, so a third one is the
+        # thing that could still confuse it.
+        assert "EXACTLY TWO fenced blocks" in head, head[:200]
+        assert "Never a third block" in head, head[:200]
         # ...and the site's nudge, appended after everything, repeats it.
-        assert site.nudge.startswith("START your reply with the code block")
+        assert site.nudge.startswith(
+            "START your reply with the program's code block"
+        ), site.nudge[:70]
 
 
 def test_the_section_that_asks_for_a_check_does_not_say_before_you_answer():
@@ -4002,7 +4009,12 @@ def test_both_nudges_use_the_last_word_to_demand_code_first():
     model reads before it starts generating. That slot is worth the strongest
     version of the one instruction that decides whether the answer arrives."""
     for site in (claude_site(), chatgpt_site()):
-        assert site.nudge.startswith("START your reply with the code block"), site.nudge[:70]
+        assert site.nudge.startswith(
+            "START your reply with the program's code block"
+        ), site.nudge[:70]
+        # The nudge holds the recency slot, so it must agree with the contract
+        # that opens the prompt rather than contradict it.
+        assert "two ordinary fenced blocks" in site.nudge, site.nudge
         assert "may not arrive at all" in site.nudge
 
 
@@ -4040,7 +4052,7 @@ def test_the_method_is_a_numbered_procedure_ending_in_send_the_code():
              ("1.", "2.", "3.", "4.", "5.", "6.")]
     assert len(steps) == 6, steps
     assert "Write the program FIRST" in steps[1], steps[1]
-    assert "Send the code and nothing else" in steps[5], steps[5]
+    assert "Send the program, then the cases, and nothing else" in steps[5], steps[5]
     assert "silently" in METHOD
     assert METHOD in build_initial_prompt("rust", "Do a thing.", "main", [])
 
@@ -5956,7 +5968,7 @@ def test_the_method_licenses_depth_and_forbids_trading_checks_for_speed():
              if line[:2] in ("1.", "2.", "3.", "4.", "5.", "6.")]
     assert len(steps) == 6
     assert "Write the program FIRST" in steps[1]
-    assert "Send the code and nothing else" in steps[5]
+    assert "Send the program, then the cases, and nothing else" in steps[5]
     assert "before you answer" not in METHOD.lower()
 
 
@@ -7651,3 +7663,258 @@ def test_the_readme_table_matches_the_defaults_it_documents():
         "the README documents defaults the code does not use "
         + ", ".join(f"{n}: says {s}, is {a}" for n, (s, a) in sorted(wrong.items()))
     )
+
+
+# --------------------------------------------------------------------------- #
+# The model's own cases, run with the validator's executor.
+#
+# Live traffic ships no `public_examples`: 56 solves in a row reported
+# `examples=0/0`. The repair loop -- the one mechanism here that turns a nearly
+# right answer into a right one -- therefore never had anything to run.
+# --------------------------------------------------------------------------- #
+_WRONG_WITH_CASES = '''```python
+def g(n):
+    s = 0
+    while n > 9:
+        s += n % 10
+        n //= 10
+    return s
+```
+
+```json
+[{"name": "zero", "args": [0], "expected": 0},
+ {"name": "single digit", "args": [7], "expected": 7},
+ {"name": "carries", "args": [12345], "expected": 15}]
+```'''
+
+_RIGHT_WITH_CASES = _WRONG_WITH_CASES.replace("while n > 9", "while n > 0")
+
+_NO_EXAMPLES = SolveTask(
+    problem_id="live", language="python", statement="Sum the digits of n.",
+    entrypoint="g", public_examples=[], deadline_s=300.0,
+)
+
+
+def _solver_seeing(replies, **kw):
+    sent: list[str] = []
+
+    class _Chat:
+        provider = "claude"
+        def __init__(self): self.n = -1
+        async def send(self, text, timeout_s, extend_to_s=None):
+            sent.append(text)
+            self.n += 1
+            return replies[min(self.n, len(replies) - 1)]
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    return VerifyingSolver(_Fleet(), **kw), sent
+
+
+def test_the_models_own_boundary_case_catches_a_wrong_program(capsys):
+    """The whole point, end to end, on a task shaped exactly like live traffic:
+    no public examples at all.
+
+    The program has the classic `while n > 9` bug — right for 12345, wrong for
+    0 and for any single digit. The model's own boundary case catches it, the
+    repair round fires, and the corrected program is what gets submitted.
+    Before this existed there was nothing to run and the bug shipped.
+    """
+    solver, sent = _solver_seeing([_WRONG_WITH_CASES, _RIGHT_WITH_CASES])
+    answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+
+    assert "while n > 0" in answer.code, f"submitted the buggy program: {answer.code!r}"
+    assert len(sent) == 2, f"expected one repair round, sent {len(sent)} prompts"
+    assert "DISAGREE" in sent[1], sent[1][:200]
+    assert "'single digit'" in sent[1], (
+        f"the repair has to name the case that broke: {sent[1][:300]}"
+    )
+    assert "self=3/3" in capsys.readouterr().out
+
+
+def test_self_tests_never_reach_the_validator():
+    """The output contract was ONE block for good reasons, and the JSON block
+    relaxes it. `extract_code` picks the block that DEFINES the entrypoint, so
+    the cases cannot be submitted as a program — checked here against the
+    layouts a model actually produces, including the one where it forgets the
+    program entirely."""
+    layouts = {
+        "program then tests": _WRONG_WITH_CASES,
+        "tests then program": "\n\n".join(reversed(_WRONG_WITH_CASES.split("\n\n```json"))),
+        "untagged json": _WRONG_WITH_CASES.replace("```json", "```"),
+    }
+    for label, reply in layouts.items():
+        code = extract_code(reply, "g", "python")
+        assert '"expected"' not in code, f"{label}: the cases leaked into the answer"
+        assert "def g" in code, f"{label}: lost the program"
+
+    # Only tests, no program: the honest outcome is "no code", not "here is JSON".
+    only = extract_code('```json\n[{"args": [0], "expected": 0}]\n```', "g", "python")
+    assert only == "", f"submitted the cases as a program: {only!r}"
+    assert python_defect(only, "g") == NO_CODE
+
+
+def test_the_model_grading_itself_is_never_recorded_as_verification():
+    """`verified` gates the answer cache. A model agreeing with itself is not
+    proof of anything, so self-tests must never set it — otherwise one wrong
+    answer that matched its own wrong cases is cached and re-served for every
+    later task with the same statement."""
+    solver, _ = _solver_seeing([_RIGHT_WITH_CASES])
+    answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+    assert answer.code, "the answer still comes back"
+    assert answer.verified is False, "self-grading claimed to be verification"
+    assert answer.total == 0, "self-tests must not masquerade as public examples"
+    assert solver._cache == {}, "an unverified answer was cached"
+
+
+def test_a_disagreement_is_not_reported_as_the_program_being_wrong():
+    """These cases came from the model, so a disagreement proves only that two
+    things it wrote contradict each other. Telling it the CODE is at fault when
+    the CASE was wrong is how a repair round breaks a correct program."""
+    failures = ["g(*[0], **{}) returned 1, expected 0"]
+    mine = build_repair_prompt(failures, "python", "g", from_self_tests=True)
+    theirs = build_repair_prompt(failures, "python", "g")
+
+    assert "DISAGREE" in mine and "WRONG" not in mine.split("\n")[0]
+    assert "Exactly one of the two is wrong" in mine
+    assert "leave the program alone" in mine
+    # The validator's own examples are ground truth and keep the blunt wording.
+    assert "Your solution is WRONG" in theirs
+    assert "DISAGREE" not in theirs
+
+
+def test_self_tests_can_be_turned_off_completely():
+    """`SOLVER_SELF_TESTS=0` has to restore exactly the behaviour that preceded
+    them — a new mechanism on the path that decides what gets submitted needs a
+    way back."""
+    solver, sent = _solver_seeing([_WRONG_WITH_CASES], self_tests=False)
+    answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+    assert len(sent) == 1, "graded anyway with self-tests switched off"
+    assert "while n > 9" in answer.code, "the buggy program is submitted, as before"
+
+
+def test_the_case_parser_survives_whatever_a_model_writes():
+    """A model wrote both halves of this — the cases and the JSON they arrived
+    in — so every failure mode must end at "no self-tests ran", which is exactly
+    where this code path started. It is parsed on the path that decides what
+    gets submitted; an exception here loses the answer."""
+    from solvers.prompts import MAX_SELF_TESTS, extract_self_tests
+
+    def cases(block, ep="g", lang="python"):
+        return extract_self_tests(f"```python\ndef g(n):\n    return n\n```\n\n{block}", ep, lang)
+
+    assert cases('```json\n[{"args": [1], "expected": 2}]\n```') == [
+        {"args": [1], "kwargs": {}, "expected": 2, "name": ""}
+    ]
+    # Junk of every shape degrades to nothing, never to an exception.
+    for junk in (
+        "```json\nnot json at all\n```",
+        "```json\n{}\n```",                       # an object, not a list
+        "```json\n[1, 2, 3]\n```",                # not case objects
+        '```json\n[{"args": [1]}]\n```',          # no `expected`
+        "```json\n[]\n```",
+        "```\n\n```",
+    ):
+        assert cases(junk) == [], junk
+    assert extract_self_tests("", "g") == []
+    assert extract_self_tests("```json\n[]\n```", "") == []
+
+    # A bare value for `args` is wrapped rather than dropped.
+    assert cases('```json\n[{"args": 5, "expected": 5}]\n```')[0]["args"] == [5]
+    # Bad `kwargs` is replaced, not trusted.
+    assert cases('```json\n[{"args": [], "kwargs": 3, "expected": 0}]\n```')[0]["kwargs"] == {}
+
+    # Capped: each case is an executor run against the solve's own budget.
+    many = ", ".join('{"args": [1], "expected": 1}' for _ in range(40))
+    assert len(cases(f"```json\n[{many}]\n```")) == MAX_SELF_TESTS
+
+
+def test_rust_cases_that_cannot_run_are_discarded_rather_than_run():
+    """The Rust judge feeds `args[0]` to stdin and compares stdout, so a case
+    shaped for a function call cannot run at all. Keeping it would produce a
+    failure report about the miner's own parsing rather than the program, and
+    send a repair round chasing it."""
+    from solvers.prompts import extract_self_tests
+
+    def cases(block):
+        return extract_self_tests(
+            f'```rust\nfn main() {{}}\n```\n\n{block}', "main", "rust"
+        )
+
+    ok = cases('```json\n[{"name": "n", "args": ["3\\n"], "expected": "6"}]\n```')
+    assert ok == [{"args": ["3\n"], "kwargs": {}, "expected": "6", "name": "n"}]
+
+    for unusable in (
+        '```json\n[{"args": [3], "expected": "6"}]\n```',        # int stdin
+        '```json\n[{"args": ["3"], "expected": 6}]\n```',        # int stdout
+        '```json\n[{"args": ["a", "b"], "expected": "6"}]\n```', # two streams
+        '```json\n[{"args": [], "expected": "6"}]\n```',         # no stdin
+    ):
+        assert cases(unusable) == [], unusable
+
+
+def test_a_candidate_that_passes_its_own_cases_outranks_one_that_does_not():
+    """`score` decides which round's answer is submitted. Self-test passes rank
+    below the validator's own examples, which are ground truth, and above
+    anything structural — but a candidate with NO self-tests ties with one that
+    failed them all, deliberately: having tests must not rank an answer below
+    not having them."""
+    from solvers.verify import Candidate
+
+    def c(**kw):
+        return Candidate(code="def g(n): return n", raw="", **kw)
+
+    passing = c(self_passed=3, self_total=3)
+    failing = c(self_passed=0, self_total=3)
+    untested = c()
+    assert passing.score > failing.score
+    assert failing.score == untested.score, "penalised a candidate for having tests"
+    # Ground truth still wins outright.
+    assert c(passed=1, total=1).score > passing.score
+    # And none of it is verification.
+    assert passing.verified is False
+
+
+def test_the_program_is_never_mistaken_for_the_cases():
+    """`_parse_cases` is the only thing separating the two blocks, and it has to
+    be enough: no Python or Rust program starts with `[`.
+
+    An is-this-the-program check was tried and removed. It had no reachable
+    upside and one real downside — `_defines` for Rust is a text search for
+    `fn main`, so a task about GENERATING Rust would have its cases discarded
+    for quoting the phrase in an expected value, which is this case.
+    """
+    from solvers.prompts import extract_self_tests
+
+    reply = (
+        '```rust\nfn main() { println!("x"); }\n```\n\n'
+        '```json\n[{"name": "emits a program", "args": ["1\\n"], '
+        '"expected": "fn main() {}"}]\n```'
+    )
+    cases = extract_self_tests(reply, "main", "rust")
+    assert len(cases) == 1, (
+        f"discarded a valid case for quoting `fn main` in its expected output: "
+        f"{cases}"
+    )
+    assert cases[0]["expected"] == "fn main() {}"
+    assert extract_code(reply, "main", "rust") == 'fn main() { println!("x"); }'
+
+
+def test_the_roster_wires_the_self_test_switch_through(monkeypatch):
+    """Testing the constructor is not testing the wiring: `SOLVER_SELF_TESTS=0`
+    has to reach the solver an operator actually gets."""
+    from solvers.roster import build_solver
+
+    monkeypatch.delenv("SOLVER_SELF_TESTS", raising=False)
+    assert build_solver([])._self_tests is True, "self-tests are on by default"
+
+    for off in ("0", "false", "NO", "False"):
+        monkeypatch.setenv("SOLVER_SELF_TESTS", off)
+        assert build_solver([])._self_tests is False, off
+
+    monkeypatch.setenv("SOLVER_SELF_TESTS", "true")
+    assert build_solver([])._self_tests is True

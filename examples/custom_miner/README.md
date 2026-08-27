@@ -1033,6 +1033,60 @@ What remains is not a deadline but the **cost of delivering**:
 grading, archiving, signing and transmission. The budget is the advertised
 deadline minus that, and nothing else.
 
+### The model writes the tests, because nobody else does
+
+Live traffic ships **no** `public_examples`. Measured over one run, 56 solves in
+a row reported `examples=0/0` — so the repair loop, the one mechanism here that
+turns a nearly-right answer into a right one, never had anything to run, and
+`verified` was False on every answer because nothing *could* be checked rather
+than because anything was wrong.
+
+The only source of cases is the model. So the output contract now asks for two
+blocks: the program, then a `json` array of the cases it traced.
+
+```json
+[{"name": "empty input",  "args": [[]],        "expected": 0},
+ {"name": "single item",  "args": [[5]],       "expected": 5},
+ {"name": "stated bound", "args": [[1000000]], "expected": 1000000}]
+```
+
+Those run through **the validator's own executor**, and a disagreement fires the
+existing repair round. End to end, on a program with the classic `while n > 9`
+bug — right for 12345, wrong for 0 and every single digit:
+
+```
+[verify] python entrypoint=g examples=0/0 self=3/3 verified=False
+  repair: case 2 'single digit': g(*[7], **{}) returned 0, expected 7
+  submitted: while n > 0   ← the corrected program
+```
+
+**What this does not do is verify anything.** A model cannot confirm its own
+reading of a statement, and cases that encode the same misreading agree with the
+code. That class stays uncaught. What it catches is the commoner one by far —
+the model knowing what the answer should be and coding it wrong — and that is
+objectively checkable.
+
+So `self_passed` is kept in its own field. It never touches `passed`/`total`,
+`verified` stays False, and the answer is never cached: one wrong answer that
+matched its own wrong cases must not be re-served for every later task with the
+same statement.
+
+The repair wording changes with it. Not *"your solution is WRONG"* — these cases
+came from the model, so a disagreement proves only that two things it wrote
+contradict each other, and blaming the code when the **case** was wrong is how a
+repair round breaks a correct program:
+
+> Your program and your own test cases DISAGREE. … Exactly one of the two is
+> wrong, and which one is the question. … If the case is right, fix the program;
+> if the case was wrong, fix the case and leave the program alone.
+
+Relaxing the one-block contract is safe because `extract_code` picks the block
+that **defines the entrypoint**, not the first or last one. Verified against the
+layouts models actually produce — program first, cases first, an untagged JSON
+block, and a reply carrying only cases, which still reports *"the reply
+contained no code"* exactly as before. `SOLVER_SELF_TESTS=0` turns the whole
+mechanism off.
+
 ### A short deadline must still get an answer
 
 `TaskRequest.deadline_s` is only `Field(gt=0.0, le=3600.0)`. Nothing in the

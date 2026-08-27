@@ -158,9 +158,71 @@ def sanitize_code(text: str) -> str:
 # whose failure costs the whole answer rather than degrading it, so it gets both
 # the primacy and the recency slot and nothing else competes for either.
 OUTPUT_CONTRACT = """\
-Reply with ONE fenced {language} code block written directly in the chat — not
-into an artifact or canvas — and nothing else. No preamble, no explanation
-before it or after it. Only the code inside the fence is ever read."""
+Reply with EXACTLY TWO fenced blocks written directly in the chat — not into an
+artifact or canvas — and nothing else. No preamble, no explanation before them,
+between them or after them. Never a third block.
+
+1. The {language} program. This block alone is graded.
+2. A `json` block holding the cases you checked it against — see <self_tests>.
+
+Only what is inside those two fences is ever read."""
+
+
+# The second block, and why it is worth relaxing a rule that was ONE block for
+# good reasons.
+#
+# Production ships no `public_examples`: 56 solves in a row on a live run
+# reported `examples=0/0`. The repair loop -- the one mechanism here that turns
+# a nearly-right answer into a right one -- therefore never had anything to
+# run, and `verified` was False on every answer because nothing COULD be
+# checked, not because anything was wrong. The model is the only source of
+# cases there is.
+#
+# The relaxation is safe because `extract_code` picks the block that DEFINES
+# the entrypoint rather than the first or the last one. Measured against four
+# adversarial layouts -- tests only, tests first, a misnamed function, an
+# untagged JSON block -- the JSON never reached the submission, and a reply
+# carrying only tests reported `the reply contained no code` exactly as before.
+SELF_TESTS_PYTHON = """\
+The second block is a JSON array of the cases you traced, so I can RUN them
+against your program before it goes anywhere. No tests ship with this task, so
+a case you do not write is a case nobody runs.
+
+[{{"name": "empty input",  "args": [[]],        "expected": 0}},
+ {{"name": "single item",  "args": [[5]],       "expected": 5}},
+ {{"name": "stated bound", "args": [[1000000]], "expected": 1000000}}]
+
+- `args` is the argument list for `{entrypoint}(*args)`; `kwargs` is optional.
+- `expected` is the exact value your program must RETURN, written as JSON.
+- Every value must be JSON: no tuples, no sets, no `inf`, no `NaN`, no code.
+- Six to twelve cases, and BOUNDARIES before anything else. Whenever the
+  statement makes them reachable, include: the empty input, one element, the
+  smallest and largest values the statement names, one below and one above each
+  stated bound, a tie, and the case your own implementation is most likely to
+  get wrong.
+- Derive every `expected` from the STATEMENT, not by running your code again in
+  your head. A case that agrees with the bug is worse than no case at all."""
+
+
+RUST_SELF_TESTS = """\
+The second block is a JSON array of the cases you traced, so I can RUN them
+against your program before it goes anywhere. No tests ship with this task, so
+a case you do not write is a case nobody runs.
+
+[{{"name": "empty input",  "args": ["0\\n"],     "expected": "0"}},
+ {{"name": "single item",  "args": ["1\\n5\\n"],  "expected": "5"}}]
+
+- `args` holds exactly ONE string: the complete stdin your program reads.
+- `expected` is the complete stdout it must write, as a string.
+- Both are compared after splitting on whitespace, so spacing is forgiving but
+  extra or missing tokens are not.
+- Six to twelve cases, and BOUNDARIES before anything else. Whenever the
+  statement makes them reachable, include: the smallest legal input, one
+  element, the largest values the statement names, one below and one above each
+  stated bound, a tie, and the case your own implementation is most likely to
+  get wrong.
+- Derive every `expected` from the STATEMENT, not by running your code again in
+  your head. A case that agrees with the bug is worse than no case at all."""
 
 PYTHON_RULES = """\
 - There is no partial credit: a program wrong on ONE hidden case pays exactly
@@ -173,7 +235,8 @@ PYTHON_RULES = """\
 - Standard library only. No pip packages, no network, no file access.
 - Write no comments and no docstrings. Nothing reads them, and every
   character you emit spends wall-clock inside the deadline.
-- Do not include tests, example calls, or `if __name__ == "__main__"`."""
+- Put no tests, example calls or `if __name__ == "__main__"` INSIDE the
+  program block. Your cases go in the second block, as JSON."""
 
 RUST_RULES = """\
 - There is no partial credit: a program wrong on ONE hidden case pays exactly
@@ -312,7 +375,7 @@ Correctness is the only thing worth optimising: a wrong answer pays zero and
 speed pays almost nothing, so prefer the safe implementation over the clever
 one, and spend the deadline where it buys correctness — in your reasoning,
 before the reply. Work in this order, all of it silently, in your reasoning;
-the reply itself is only the code block:
+the reply itself is only the two blocks:
 1. Read the statement twice, then the examples. Every rule the statement
    states and every bound and constant it names is the specification the
    hidden tests are written from. Where the statement is ambiguous, the
@@ -327,9 +390,10 @@ the reply itself is only the code block:
 4. Invent inputs of your own and trace them the same way: the edge cases below
    say which, and every rule the statement states gets one input that triggers
    it and one that NEARLY does. After every fix, re-trace the cases that
-   already passed — repairs break earlier answers.
+   already passed — repairs break earlier answers. These are the cases that go
+   in the second block, so write down the expected value as you trace it.
 5. Read the program back against itself, using the self-check below.
-6. Send the code and nothing else."""
+6. Send the program, then the cases, and nothing else."""
 
 
 # The strongest sentence in the prompt, fired once, from the last slot before
@@ -441,7 +505,7 @@ RUST_ENVIRONMENT = """\
 # once, against a list of exactly the things that have gone wrong.
 SELF_CHECK = """\
 Read the program back against itself and verify each of these, silently — the
-reply is still only the code block. Every line is a bug that has reached this
+reply is still only the two blocks. Every line is a bug that has reached this
 grader inside a program that looked finished:
 - Every function you CALL, you also wrote. A helper you meant to add and did not
   is a compile error sitting in a file that otherwise looks complete.
@@ -535,7 +599,16 @@ def build_initial_prompt(
             "</examples>", "",
         ]
     budget = _render_budget(budget_s)
-    parts += ["<contract>", rules, "", environment, "</contract>", "", "<method>"]
+    parts += ["<contract>", rules, "", environment, "</contract>", ""]
+    # Immediately after the contract that asks for two blocks and before the
+    # method that produces them, so "write the cases" is read as part of
+    # answering rather than as an afterthought.
+    parts += [
+        "<self_tests>",
+        (RUST_SELF_TESTS if is_rust else SELF_TESTS_PYTHON).format(entrypoint=entrypoint),
+        "</self_tests>", "",
+    ]
+    parts += ["<method>"]
     if budget:
         # First inside <method>, so step 2 ("Write the program FIRST") is read
         # knowing how long there is to write it in. METHOD_CODA closes the same
@@ -557,6 +630,7 @@ def build_repair_prompt(
     entrypoint: str,
     defect: Optional[str] = None,
     budget_s: Optional[float] = None,
+    from_self_tests: bool = False,
 ) -> str:
     """Ask for a fix, quoting the concrete failures the local grader found.
 
@@ -578,18 +652,44 @@ def build_repair_prompt(
             "Your previous reply did not reach me as code. I can only read the "
             "chat message itself, so an artifact, a canvas, a preview pane or a "
             "collapsed block is invisible to me.\n\n"
-            "Send the COMPLETE program again as one ordinary fenced code block "
-            "written directly in the chat. Do not create an artifact or canvas. "
-            "Do not abbreviate it or replace any part with a comment. Same rules "
-            "as before, and nothing outside the code block."
+            "Send the COMPLETE program again as an ordinary fenced code block "
+            "written directly in the chat, followed by the JSON cases block. Do "
+            "not create an artifact or canvas. Do not abbreviate it or replace "
+            "any part with a comment. Same rules as before, and nothing outside "
+            "the two blocks."
         )
     elif defect:
         body = (
             f"I could not run your previous reply: {defect}.\n\n"
             "Nothing was executed, so none of this is about your logic yet — it "
             "is about what arrived. Put that right and send the COMPLETE program "
-            "again as ONE ordinary fenced code block written directly in the "
-            "chat, with nothing outside it. Same rules as before."
+            "again as an ordinary fenced code block written directly in the "
+            "chat, followed by the JSON cases block, with nothing outside the "
+            "two. Same rules as before."
+        )
+    elif from_self_tests:
+        # Deliberately not "your solution is WRONG". These cases came from the
+        # model itself, so a disagreement proves only that two things it wrote
+        # contradict each other -- and telling it the CODE is at fault when the
+        # CASE was wrong is how a repair round breaks a correct program. Naming
+        # the real question is also the more useful prompt: one of the two is
+        # wrong, and deciding which is exactly the work.
+        detail = "\n".join(f"  - {line}" for line in failures)
+        target = "the program" if language == "rust" else f"`{entrypoint}`"
+        body = (
+            f"Your program and your own test cases DISAGREE. I ran {target} "
+            f"against the cases you sent and got:\n"
+            f"{detail}\n\n"
+            "Exactly one of the two is wrong, and which one is the question. In "
+            "your reasoning — not in the reply — go back to the STATEMENT and "
+            "work out what it says the answer for that input is. If the case is "
+            "right, fix the program; if the case was wrong, fix the case and "
+            "leave the program alone. Do not change both to make them agree.\n\n"
+            "Then re-check the fix silently against the boundaries from my first "
+            "message — the empty case, n = 1, both ends, and the largest values "
+            "allowed — because a repair that fixes one case and breaks a "
+            "boundary scores the same zero. Reply with the corrected program "
+            "block and the corrected JSON cases block, and nothing else."
         )
     else:
         detail = "\n".join(f"  - {line}" for line in failures)
@@ -610,6 +710,98 @@ def build_repair_prompt(
     # forget to say how much time is left.
     seconds = _budget_seconds(budget_s)
     return body + (_REPAIR_BUDGET.format(budget=seconds) if seconds else "")
+
+
+# The most cases one reply may contribute. Each one is an executor run against
+# the solve's own budget -- a subprocess for Python, a container for Rust -- so
+# a model that emits forty of them would spend the deadline proving its own
+# program right instead of getting it submitted.
+MAX_SELF_TESTS = 12
+
+
+def extract_self_tests(
+    reply: str, entrypoint: str, language: str = "python"
+) -> list[dict[str, Any]]:
+    """The cases the model wrote for its OWN program, or [].
+
+    Production ships no `public_examples`: measured over a live run, 56 solves
+    in a row reported `examples=0/0`. So the repair loop -- the one mechanism
+    here that turns a nearly-right answer into a right one -- never had anything
+    to run, and `verified` was False on every answer because nothing could be
+    checked rather than because anything was wrong.
+
+    A model cannot verify its own understanding of a statement, and nothing here
+    pretends otherwise: cases that encode the same misreading as the code agree
+    with it, and that class goes uncaught. What they DO catch is the commoner
+    one by far -- the model knows what the answer should be and coded it wrong.
+    That is exactly the "nearly right" class this miner exists to close, and it
+    is objectively checkable: the program either produces the model's own stated
+    value or it does not.
+
+    Returns [] for anything unexpected. A malformed block must degrade to the
+    behaviour that existed before this function did, never to an exception --
+    it is parsed on the path that decides what gets submitted.
+    """
+    if not reply or not entrypoint:
+        return []
+    for block in fenced_blocks(reply):
+        # The program is skipped by `_parse_cases` rather than by an
+        # is-this-the-program check, and that is deliberate. Such a check has no
+        # reachable upside -- no Python or Rust program starts with `[` -- and a
+        # real downside: `_defines` for Rust is a text search for `fn main`, so a
+        # task about generating Rust would have its cases thrown away for
+        # quoting the phrase in an expected value. The structural test is both
+        # sufficient and the one that cannot misfire.
+        cases = _parse_cases(block, language)
+        if cases:
+            return cases[:MAX_SELF_TESTS]
+    return []
+
+
+def _parse_cases(block: str, language: str) -> list[dict[str, Any]]:
+    """One block as a case list, or []. Never raises.
+
+    The `[` test is a FAST PATH, not a guard: `json.loads` on a program raises
+    and this returns [] either way. It is here because it runs against every
+    fenced block of every reply, and a program can be a hundred kilobytes -- the
+    cost of parsing one as JSON comes out of the solve's own budget. Removing it
+    changes no outcome, only how much work is done to reach the same one.
+    """
+    text = block.strip()
+    if not text.startswith("["):
+        return []
+    try:
+        raw = json.loads(text)
+    except Exception:  # noqa: BLE001 - a model wrote it; anything is possible
+        return []
+    if not isinstance(raw, list):
+        return []
+    cases: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict) or "expected" not in item:
+            continue
+        args = item.get("args", [])
+        if not isinstance(args, list):
+            args = [args]
+        kwargs = item.get("kwargs") or {}
+        if not isinstance(kwargs, dict):
+            kwargs = {}
+        if language == "rust":
+            # The Rust judge feeds `args[0]` to stdin and compares stdout, so a
+            # case shaped for a function call cannot run at all. Discarding it
+            # is the honest outcome: a case that cannot run is not evidence.
+            if len(args) != 1 or not isinstance(args[0], str):
+                continue
+            if not isinstance(item.get("expected"), str):
+                continue
+        name = item.get("name")
+        cases.append({
+            "args": args,
+            "kwargs": kwargs,
+            "expected": item.get("expected"),
+            "name": str(name)[:80] if isinstance(name, str) else "",
+        })
+    return cases
 
 
 def extract_code(
