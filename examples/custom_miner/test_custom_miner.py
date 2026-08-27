@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import asyncio
 import shutil
 import subprocess
@@ -32,7 +33,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from custom_miner import TRUNCATED, CustomMiner, SolveTask, fit_response  # noqa: E402
+from solvers import browser_pool as _browser_pool  # noqa: E402
 from solvers.browser_pool import (  # noqa: E402
+    BLIND_TAB_GRACE_S,
     Browser,
     BrowserFleet,
     Site,
@@ -44,8 +47,21 @@ from solvers.browser_pool import (  # noqa: E402
 )
 from solvers.chatgpt_web import chatgpt_site  # noqa: E402
 from solvers.claude_web import claude_site  # noqa: E402
-from solvers.prompts import NO_CODE, extract_code, python_defect  # noqa: E402
-from solvers.verify import Answer, VerifyingSolver  # noqa: E402
+from solvers.prompts import (  # noqa: E402
+    NO_CODE,
+    build_initial_prompt,
+    build_repair_prompt,
+    extract_code,
+    python_defect,
+)
+from solvers.verify import (  # noqa: E402
+    EMPTY_HANDED_FLOOR_S,
+    MAX_PASSES,
+    SECOND_OPINION_FLOOR_S,
+    SECOND_OPINION_PASSES,
+    Answer,
+    VerifyingSolver,
+)
 
 from rlvr.config import Settings  # noqa: E402
 from rlvr.neurons.demo_miner import DemoMinerSettings, build_demo_miner_app  # noqa: E402
@@ -3137,12 +3153,12 @@ def _solved_by(solver, request, directory):
             os.environ["SOLVER_SOLUTION_DIR"] = previous
 
 
-def _solver_returning(code):
+def _solver_returning(code, transcript="transcript"):
     from custom_miner import SolveResult
 
     class _S:
         async def solve_task(self, task, timeout_s):
-            return SolveResult(code=code, raw_response="transcript")
+            return SolveResult(code=code, raw_response=transcript)
 
     return _S()
 
@@ -5985,4 +6001,1653 @@ def test_a_repair_asks_for_a_diagnosis_not_a_guess():
     )
     assert prompt.rstrip().endswith("ONLY ONE corrected code block and nothing else."), (
         "the repair prompt no longer ends on the output rule"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The archive is only evidence if it is EXACTLY what the validator received.
+# --------------------------------------------------------------------------- #
+def test_the_file_holds_the_exact_bytes_the_validator_was_sent(tmp_path, monkeypatch):
+    """Byte-for-byte, against the code decoded from the real signed HTTP
+    response — not against the variable that fed it, and not through
+    `read_text`, which applies universal-newline translation on READ and would
+    hide a CRLF answer being rewritten on the way to disk.
+
+    Every shape below is one the reader can actually produce: CRLF from a
+    Windows-flavoured paste, non-ASCII from a string literal, characters JSON
+    has to escape, and a transcript big enough to force `fit_response` to trim
+    (which must trim `raw_response` and never touch `code`)."""
+    from custom_miner import response_limit
+
+    shapes = {
+        "ordinary": "def solve(n):\n    return n + 1\n",
+        "no trailing newline": "def solve(n):\n    return n",
+        "trailing whitespace": "def solve(n):\n    return n   \n   \n",
+        "non-ascii": "def solve(n):\n    return '→ ✓ 日本語 🎯'\n",
+        "json metachars": 'def solve(n):\n    return "q\\" b\\\\s \\ttab"\n',
+        "CRLF": "def solve(n):\r\n    return n\r\n",
+        "control chars": "def solve(n):\n    return '\\x01\\x02'\n",
+        "huge transcript": "def solve(n):\n    return n\n",
+    }
+    for name, program in shapes.items():
+        transcript = "x" * (response_limit() * 2) if name == "huge transcript" else "t"
+        payload = _solved_by(
+            _solver_returning(program, transcript), _request("shape", "python"), tmp_path
+        )
+        assert payload.code == program, f"{name}: the graded field was rewritten"
+        written = tmp_path / "shape.py"
+        assert written.read_bytes() == program.encode("utf-8"), (
+            f"{name}: the file is not the bytes that were sent"
+        )
+        record = json.loads((tmp_path / "shape.json").read_text(encoding="utf-8"))
+        assert record["response"]["code"] == program, f"{name}: the exchange disagrees"
+
+
+def test_two_problem_ids_can_never_share_one_file(tmp_path):
+    """Sanitising is lossy in both directions — `abc/def` and `abc:def` both
+    became `abc_def`, and two over-long ids sharing a prefix truncated to the
+    same name. Either way the second solve overwrote the first and the file
+    then held an answer to a DIFFERENT problem than its name claimed, which is
+    the one promise this module makes."""
+    from solution_archive import save_solution
+
+    collide = [("abc/def", "abc:def"), ("z" * 120 + "X", "z" * 120 + "Y"),
+               ("p 1", "p_1"), ("../x", "x"), ("a.b", "a:b")]
+    for first, second in collide:
+        a = save_solution(first, "python", "x = 1", tmp_path)
+        b = save_solution(second, "python", "x = 2", tmp_path)
+        assert a != b, f"{first!r} and {second!r} share the file {a}"
+        assert a.read_text() == "x = 1", f"{second!r} overwrote {first!r}"
+        assert a.parent == b.parent == tmp_path
+
+
+def test_an_id_that_needs_no_sanitising_keeps_its_readable_name(tmp_path):
+    """The disambiguating digest is only for ids that were ALTERED. Real ones —
+    sha256 hex, or a slug like `extent-journal` — must stay exactly themselves,
+    or every filename an operator has learned changes for nothing."""
+    from solution_archive import save_solution
+
+    for readable in ("extent-journal", "rehearsal-python-1", "a" * 64, "req-1"):
+        written = save_solution(readable, "python", "x = 1", tmp_path)
+        assert written.name == f"{readable}.py", written.name
+
+
+def test_the_file_follows_the_payload_even_if_fit_response_rewrites_the_code(tmp_path, monkeypatch):
+    """`save_solution` is handed `payload.code`, not the variable that fed it.
+    Today those are identical — `fit_response` trims only `raw_response` — so
+    nothing observable distinguishes the two, and a refactor could quietly swap
+    them back. This forces the difference: a `fit_response` that DOES rewrite
+    the graded field must take the file with it, because the file is only worth
+    having if it is the submission rather than something that resembles it."""
+    import custom_miner
+
+    original = custom_miner.fit_response
+
+    def rewriting(payload, limit=None):
+        trimmed = original(payload, limit)
+        return trimmed.model_copy(update={"code": trimmed.code + "\n# rewritten\n"})
+
+    monkeypatch.setattr(custom_miner, "fit_response", rewriting)
+    payload = _solved_by(_solver_returning("x = 1\n"), _request("rw", "python"), tmp_path)
+    assert payload.code.endswith("# rewritten\n"), "the stand-in did not fire"
+    assert (tmp_path / "rw.py").read_bytes() == payload.code.encode("utf-8"), (
+        "the file kept the pre-fit_response code, not what was sent"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Never give up on a task while an answer is still obtainable.
+#
+# `all_passed` is a hard gate and speed is a multiplier floored at 0.95: the
+# slowest CORRECT answer earns 95% of what the fastest earns, and an empty one
+# earns nothing at all. Every test below pins one of the places the miner used
+# to stop early and hand the validator an empty response it would have paid for.
+# --------------------------------------------------------------------------- #
+def test_a_tab_that_never_renders_a_reply_is_dropped_in_seconds_not_at_the_deadline():
+    """Measured twice in one live run, on two different sites:
+
+        chatgpt tab 9227: no assistant selector matched anything
+        claude  tab 9222: matched 1 message(s), the same as before the prompt
+                          was sent -- the answer never rendered
+
+    Both polled a tab that could not be read for the whole 191s first slice,
+    then spent a 29s repair round on the same dead conversation, and ended the
+    task with 5s left -- fewer than the 20s a second opinion needs. Five healthy
+    tabs sat idle through both. The task scored zero.
+
+    The distinction that makes this fixable is `on_screen`: a model that is
+    merely slow has ALREADY painted its bubble, so it is never mistaken for
+    this. The tab here paints nothing, ever.
+    """
+    playwright, chrome = _chromium_or_skip()
+    # A composer and a send button, and a send that renders nothing at all.
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    )
+    site = _site(assistant=("#assistant",))  # matches nothing, now and forever
+
+    async def go(grace):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            real, _browser_pool.BLIND_TAB_GRACE_S = _browser_pool.BLIND_TAB_GRACE_S, grace
+            try:
+                started = time.monotonic()
+                reply = await tab.send("solve it", 120.0)
+                elapsed = time.monotonic() - started
+            finally:
+                _browser_pool.BLIND_TAB_GRACE_S = real
+                await browser.close()
+            return reply, elapsed, tab.alive
+
+    reply, elapsed, alive = asyncio.run(go(2.0))
+    assert reply == "", f"there was nothing on the page to capture: {reply!r}"
+    assert elapsed < 30.0, (
+        f"the send spent {elapsed:.1f}s of a 120s budget on a tab that showed "
+        f"nothing. That time is the whole point: it belongs to another tab."
+    )
+    assert alive is False, "an unreadable tab must be retired, not handed back"
+
+
+def test_the_tab_says_WHY_a_send_came_back_empty():
+    """`""` is the same string for three different failures, and only one of
+    them is worth another prompt in the same conversation. The tab is the only
+    place that can tell them apart, so it records which it was.
+
+    Getting this wrong in either direction costs a task: treat a prose reply as
+    unreadable and the repair round that would have fixed it never happens;
+    treat an unreadable tab as prose and the repair goes into a conversation
+    that has already proved it cannot be read.
+    """
+    playwright, chrome = _chromium_or_skip()
+
+    BUBBLE = (
+        "  const d = document.createElement('div');"
+        "  d.className = 'msg';"
+        "  d.textContent = 'Sure! Here is the approach...';"
+        "  document.getElementById('host').appendChild(d);"
+    )
+    shell = (
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<div id="host"></div>__STOP__<script>'
+        "document.getElementById('send').onclick = () => {__BODY__};</script>"
+    )
+    cases = [
+        # A finished reply that simply has no code block in it.
+        ("no-code", _served(shell.replace("__STOP__", "").replace("__BODY__", BUBBLE)),
+         _site(assistant=("div.msg",))),
+        # The same reply, with the site still showing its stop control.
+        ("unfinished",
+         _served(shell.replace("__STOP__", '<button id="stop">stop</button>')
+                      .replace("__BODY__", BUBBLE)),
+         _site(assistant=("div.msg",), busy=("#stop",))),
+        # Nothing renders at all.
+        ("unreadable", _served(shell.replace("__STOP__", "").replace("__BODY__", "")),
+         _site(assistant=("div.msg",))),
+    ]
+
+    async def go(url, site, grace):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            real, _browser_pool.BLIND_TAB_GRACE_S = _browser_pool.BLIND_TAB_GRACE_S, grace
+            try:
+                await tab.send("solve it", 3.0)
+            finally:
+                _browser_pool.BLIND_TAB_GRACE_S = real
+                await browser.close()
+            return tab.empty_reason
+
+    for expected, url, site in cases:
+        got = asyncio.run(go(url, site, 1.0))
+        assert got == expected, f"expected {expected!r}, the tab said {got!r}"
+
+
+def test_the_grace_is_long_enough_that_a_thinking_model_is_never_dropped():
+    """The bound this fix must not break. A reply that has rendered -- even as
+    an empty bubble with a cursor in it -- keeps its whole slice, because the
+    check is 'did it EVER appear', not 'has it finished'. Getting this wrong
+    would trade two zeros a run for a zero on every slow answer."""
+    assert BLIND_TAB_GRACE_S >= 20.0, (
+        "a site under load can take seconds to paint the assistant bubble; "
+        "anything tighter starts killing tabs that were about to answer"
+    )
+
+
+@pytest.mark.parametrize("reason", ["unreadable", "unfinished"])
+def test_a_conversation_that_cannot_answer_is_not_asked_to_repair_itself(reason):
+    """Nothing captured, and the CONVERSATION is why.
+
+    "unreadable" is a tab that never rendered a reply or died; "unfinished" is a
+    model still writing when the budget ran out. A repair round goes straight
+    back into the first, and queues behind an answer that does not exist yet in
+    the second. Measured on a live miner, twice in one run: 191s for nothing,
+    then 29s more for nothing, ending the task with 5s left while five healthy
+    tabs sat idle.
+
+    The distinction cannot be made from the candidate -- an empty one always
+    carries a `defect`, because the structural checks reject empty source
+    exactly as they reject a broken program. Only the tab knows, and this is it
+    saying so.
+    """
+    sends: list[str] = []
+
+    class _Silent(_Chat):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.empty_reason = reason
+        async def send(self, text, timeout_s):
+            sends.append(text)
+            return ""
+
+    class _Fleet:
+        async def open(self, avoid=None):
+            return _Silent([""], "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(
+        _Fleet(), max_attempts=3, safety_margin_s=0, max_budget_s=120,
+        second_opinion=False,
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.code == "", "nothing was captured; nothing is the honest answer"
+    assert len(sends) == 1, (
+        f"sent {len(sends)} prompts into a conversation that returned nothing. "
+        f"Each one is a full slice of the budget spent to be told the same thing."
+    )
+
+
+def test_a_reply_that_arrived_without_code_is_still_repaired_in_place():
+    """The other side of the same guard, and the reason it is not simply
+    "empty means give up".
+
+    A FINISHED reply with no code block in it is the model breaking the output
+    contract, not a conversation that cannot be used -- and telling it so is
+    exactly what fixes it. `test_a_reply_with_no_code_is_rejected_and_retried`
+    pins the recovery; this pins that the fail-fast did not swallow it.
+    """
+    sends: list[str] = []
+
+    class _Prose(_Chat):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.empty_reason = "no-code"   # rendered, settled, simply no code
+        async def send(self, text, timeout_s):
+            sends.append(text)
+            return "Sure! Here is the approach..." if len(sends) == 1 else RIGHT
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Prose([""], "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(
+        _Fleet(), max_attempts=3, safety_margin_s=0, max_budget_s=120,
+        second_opinion=False,
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.verified, "the repair round recovers a reply that forgot the fence"
+    assert len(sends) == 2, f"expected one repair in place, sent {len(sends)}"
+
+
+def test_an_empty_answer_keeps_asking_while_the_clock_allows_it():
+    """Two passes was a policy for 'the first model was WRONG'. Empty is a
+    different state and has a different price: a wrong answer pays zero and so
+    does no answer, but an extra ask can only turn the second into a payment.
+    So while nothing is in hand, keep asking until the clock says stop.
+    """
+    seen: list[str] = []
+
+    class _Fleet:
+        def __init__(self, replies): self._replies = replies
+        async def open(self, avoid=None):
+            provider = "chatgpt" if avoid == "claude" else "claude"
+            seen.append(provider)
+            return _Chat(self._replies[min(len(seen) - 1, len(self._replies) - 1)], provider)
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    # Three tabs in a row capture nothing; the fourth answers.
+    solver = VerifyingSolver(
+        _Fleet([["nope"], ["nope"], ["nope"], [RIGHT]]),
+        max_attempts=1, safety_margin_s=0, max_budget_s=120,
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.verified, (
+        f"gave up after {len(seen)} model(s) with time still on the clock and "
+        f"submitted nothing. The answer was one ask away."
+    )
+    assert seen == ["claude", "chatgpt", "claude", "chatgpt"], seen
+
+
+def test_the_run_of_asks_is_capped_so_a_dead_fleet_cannot_spin():
+    """The other side of the same loop. Every tab failing must cost a bounded
+    number of asks, not one per poll until the deadline."""
+    seen: list[str] = []
+
+    class _Fleet:
+        async def open(self, avoid=None):
+            seen.append(avoid or "first")
+            return _Chat(["nothing here"], "chatgpt" if avoid == "claude" else "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(
+        _Fleet(), max_attempts=1, safety_margin_s=0, max_budget_s=120,
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.code == ""
+    assert len(seen) == MAX_PASSES, f"asked {len(seen)} times, cap is {MAX_PASSES}"
+
+
+def test_holding_nothing_lowers_the_bar_for_one_more_ask():
+    """The two floors encode what each state has to lose. Holding an unverified
+    answer, spending the tail of the budget on another model risks the time.
+    Holding nothing, there is nothing to risk -- what is in hand pays zero."""
+    assert EMPTY_HANDED_FLOOR_S <= SECOND_OPINION_FLOOR_S, (
+        f"empty-handed needs {EMPTY_HANDED_FLOOR_S}s to justify one more ask "
+        f"but holding an answer needs only {SECOND_OPINION_FLOOR_S}s. That is "
+        f"backwards: the state with nothing to lose is being made the harder "
+        f"one to act on."
+    )
+    assert EMPTY_HANDED_FLOOR_S > 0, "an ask still has to be able to happen"
+
+
+def test_the_first_read_gets_the_deadline_the_validator_actually_advertised():
+    """The self-imposed cap that produced both live zeros.
+
+    `SOLVER_MAX_BUDGET_S=240` against the 300s deadline this subnet advertises
+    made the budget 225s and the first read 191s. A model still writing at 191s
+    had its answer discarded HERE -- not by the validator, which pays ~96% for
+    the same answer arriving at six minutes, because the speed multiplier is
+    floored at 0.95 while correctness is a hard gate.
+
+    The cap stays as a runaway guard. It must not bind at the advertised
+    deadline.
+    """
+    slices: list[float] = []
+
+    class _Timed(_Chat):
+        async def send(self, text, timeout_s):
+            slices.append(timeout_s)
+            return RIGHT
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Timed([RIGHT], "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    # No public examples -- which is every task on live traffic.
+    task = SolveTask(
+        problem_id="live", language="python", statement=DIGITS.statement,
+        entrypoint="g", public_examples=[], deadline_s=300.0,
+    )
+    # Defaults on purpose: this is what an operator who has tuned nothing gets.
+    asyncio.run(VerifyingSolver(_Fleet()).solve_task(task, timeout_s=300.0))
+    assert slices[0] > 230.0, (
+        f"the first read got {slices[0]:.0f}s of a 300s deadline. The old cap "
+        f"gave it 191.2s and threw away answers the validator would have paid "
+        f"~96% for."
+    )
+
+
+def test_a_shorter_advertised_deadline_still_wins():
+    """The cap is a ceiling, and raising it must not let the miner overrun a
+    validator that advertises less. `min()` is the whole guarantee: a 60s
+    deadline stays a 60s deadline."""
+    slices: list[float] = []
+
+    class _Timed(_Chat):
+        async def send(self, text, timeout_s):
+            slices.append(timeout_s)
+            return RIGHT
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Timed([RIGHT], "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    asyncio.run(VerifyingSolver(_Fleet()).solve_task(DIGITS, timeout_s=60.0))
+    assert slices[0] < 60.0, (
+        f"the first read got {slices[0]:.0f}s of a 60s deadline; the whole solve "
+        f"has to be signed and on the wire before it expires"
+    )
+
+
+def test_a_reply_that_has_rendered_keeps_its_whole_slice_however_slow_it_is():
+    """The bound the fail-fast must not cross, and the one that would hurt most
+    if it did.
+
+    `BLIND_TAB_GRACE_S` retires a tab that renders NOTHING. Almost every real
+    answer takes longer than the grace to finish — so if the check ever asks
+    "has it finished" instead of "did it appear", it stops being a fix for two
+    zeros a run and becomes a zero on every answer slower than 30 seconds,
+    which is most of them.
+
+    The page here does exactly what a chat UI does: paints an empty assistant
+    bubble on submit, and fills the code in long after the grace has passed.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<div id="host"></div><script>'
+        "document.getElementById('send').onclick = () => {"
+        "  const d = document.createElement('div');"
+        "  d.className = 'msg';"                       # the bubble, empty
+        "  document.getElementById('host').appendChild(d);"
+        "  setTimeout(() => {"                          # ...the code, much later
+        "    const pre = document.createElement('pre');"
+        "    const code = document.createElement('code');"
+        "    code.textContent = 'def pong():\\n    return 4';"
+        "    pre.appendChild(code); d.appendChild(pre);"
+        "  }, 3000);"
+        "};</script>"
+    )
+    site = _site(assistant=("div.msg",))
+
+    async def go(grace):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            real, _browser_pool.BLIND_TAB_GRACE_S = _browser_pool.BLIND_TAB_GRACE_S, grace
+            try:
+                reply = await tab.send("solve it", 30.0)
+            finally:
+                _browser_pool.BLIND_TAB_GRACE_S = real
+                await browser.close()
+            return reply, tab.alive
+
+    # The grace expires at 1s; the code does not arrive until 3s.
+    reply, alive = asyncio.run(go(1.0))
+    assert "return 4" in extract_code(reply, "pong"), (
+        f"a reply that had already rendered was dropped for being slow: {reply!r}. "
+        f"The check is 'did it EVER appear', not 'has it finished'."
+    )
+    assert alive is True, "a tab that answered must not be retired"
+
+
+def test_a_wrong_answer_still_gets_exactly_one_second_opinion():
+    """`MAX_PASSES` is for the empty case only.
+
+    Letting it apply to a wrong-but-running answer would quietly double or
+    quadruple what every failing task costs a real account's quota — to improve
+    on something that was already worth submitting. The empty case is different
+    precisely because there is nothing there to improve on.
+    """
+    seen: list[str] = []
+
+    class _Fleet:
+        async def open(self, avoid=None):
+            seen.append(avoid or "first")
+            return _Chat([WRONG], "chatgpt" if avoid == "claude" else "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(
+        _Fleet(), max_attempts=1, safety_margin_s=0, max_budget_s=120,
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.code, "the wrong answer is still submitted; it may pass the hidden suite"
+    assert answer.verified is False
+    assert len(seen) == SECOND_OPINION_PASSES, (
+        f"asked {len(seen)} models about an answer that was already in hand; "
+        f"the policy for a wrong answer is one second opinion"
+    )
+
+
+def test_a_deadline_the_miner_shortens_itself_is_reported_once(capsys):
+    """`GLM_REQUEST_TIMEOUT_S` is named for the reference miner's model client,
+    but `handle_request` applies it to whatever solver is plugged in. Left at
+    the 280 that `docs/DEMO_MINER.md` documents, it silently cuts 20 seconds off
+    every solve against this subnet's 300s deadline — and nothing else in the
+    logs says so. That gap is worth more than it looks: a correct answer
+    arriving late still earns 95%+, an unfinished one earns nothing.
+    """
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat([RIGHT], "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(_Fleet())
+    # deadline_s=300 (what the validator advertised) vs timeout_s=280 (ours).
+    asyncio.run(solver.solve_task(DIGITS, timeout_s=280.0))
+    said = capsys.readouterr().out
+    assert "300s" in said and "280s" in said, said
+    assert "GLM_REQUEST_TIMEOUT_S" in said, f"the fix has to be nameable: {said}"
+
+    # Once per run, not once per task: this is a configuration fact, and a
+    # miner answering hundreds of tasks would otherwise say it hundreds of times.
+    asyncio.run(solver.solve_task(DIGITS, timeout_s=280.0))
+    assert "GLM_REQUEST_TIMEOUT_S" not in capsys.readouterr().out
+
+    # And silent when nothing is being given up.
+    quiet = VerifyingSolver(_Fleet())
+    asyncio.run(quiet.solve_task(DIGITS, timeout_s=300.0))
+    assert "GLM_REQUEST_TIMEOUT_S" not in capsys.readouterr().out
+
+
+def test_a_reply_that_vanishes_mid_answer_is_waited_for_not_written_off():
+    """Why the fail-fast asks "did it EVER appear" and not "is it there now".
+
+    Sites stream a message under one attribute and drop it when the message is
+    finished, so the selector that found the answer can be the one that cannot
+    see it any more — `_messages` has a whole re-resolve path for exactly this,
+    and says so in the log. During that window the reply is off screen while
+    being written.
+
+    A tab in that window looks identical to one that never rendered at all:
+    both report nothing on screen. Only the memory that it was there ONCE
+    separates them — and getting it wrong means retiring tabs in the middle of
+    producing the answer, which is worse than the bug the fail-fast fixes.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<div id="host"></div><script>'
+        "document.getElementById('send').onclick = () => {"
+        "  const d = document.createElement('div');"
+        "  d.className = 'msg';"                       # the bubble appears...
+        "  document.getElementById('host').appendChild(d);"
+        "  setTimeout(() => { d.className = 'gone'; }, 1200);"   # ...stops matching...
+        "  setTimeout(() => {"                                    # ...and comes back with the code
+        "    const pre = document.createElement('pre');"
+        "    const code = document.createElement('code');"
+        "    code.textContent = 'def pong():\\n    return 4';"
+        "    pre.appendChild(code); d.appendChild(pre);"
+        "    d.className = 'msg';"
+        "  }, 3000);"
+        "};</script>"
+    )
+    site = _site(assistant=("div.msg",))
+
+    async def go(grace):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            real, _browser_pool.BLIND_TAB_GRACE_S = _browser_pool.BLIND_TAB_GRACE_S, grace
+            try:
+                reply = await tab.send("solve it", 30.0)
+            finally:
+                _browser_pool.BLIND_TAB_GRACE_S = real
+                await browser.close()
+            return reply, tab.alive
+
+    # The grace expires at 1s. The reply goes off screen at 1.2s -- after the
+    # grace, so every poll from then until 3s reports nothing on screen.
+    reply, alive = asyncio.run(go(1.0))
+    assert "return 4" in extract_code(reply, "pong"), (
+        f"the tab was written off while its answer was between selectors: "
+        f"{reply!r}. It had already rendered once; that is the whole test."
+    )
+    assert alive is True, "a tab that answered must not be retired"
+
+
+def test_the_solve_timeout_default_tracks_the_deadline_the_subnet_advertises(monkeypatch):
+    """`GLM_REQUEST_TIMEOUT_S` is the miner's own 504 deadline, and leaving it
+    below what validators advertise is a self-inflicted cut on every solve.
+
+    The assertion that matters is the last one: it ties the default to
+    `Settings.solve_deadline_s` rather than to a number someone typed, so if the
+    subnet moves its deadline this fails instead of quietly going back to
+    throwing answers away.
+    """
+    from solvers.config import DEFAULT_SOLVE_TIMEOUT_S, apply_solve_timeout_default
+
+    monkeypatch.delenv("GLM_REQUEST_TIMEOUT_S", raising=False)
+    apply_solve_timeout_default()
+    assert os.environ["GLM_REQUEST_TIMEOUT_S"] == DEFAULT_SOLVE_TIMEOUT_S
+
+    # An operator who set it keeps it, whether from the shell or from .env --
+    # `load_env_file` has already copied .env into the environment by now.
+    monkeypatch.setenv("GLM_REQUEST_TIMEOUT_S", "120")
+    apply_solve_timeout_default()
+    assert os.environ["GLM_REQUEST_TIMEOUT_S"] == "120", "the operator's value must win"
+
+    advertised = Settings().solve_deadline_s
+    assert float(DEFAULT_SOLVE_TIMEOUT_S) > advertised, (
+        f"the miner caps solves at {DEFAULT_SOLVE_TIMEOUT_S}s while validators "
+        f"advertise {advertised:g}s. Every solve gets less time than it was "
+        f"offered, and an unfinished answer earns nothing while a late correct "
+        f"one still earns 95%+."
+    )
+    # Strictly greater, not equal. Sitting exactly ON the advertised deadline
+    # binds the moment the subnet raises it, which is the same bug one level up
+    # and just as quiet. The runaway guard for an absurd deadline is
+    # SOLVER_MAX_BUDGET_S, in the solver; a second one here only adds a way to
+    # be wrong.
+    assert float(DEFAULT_SOLVE_TIMEOUT_S) >= 2 * advertised or (
+        float(DEFAULT_SOLVE_TIMEOUT_S) - advertised >= 60.0
+    ), "leave real headroom above the deadline, not a rounding error"
+
+
+def test_a_send_that_never_starts_still_reports_why():
+    """Tabs are recycled across tasks, so `empty_reason` outlives the
+    conversation that set it. The two paths that return before the read loop
+    runs at all — a tab already known dead, and a prompt that never reached the
+    composer — would otherwise leave the PREVIOUS task's reason standing, and a
+    stale `no-code` buys a repair round in a conversation that was never opened.
+    """
+    site = _site()
+
+    async def go(prepare):
+        tab = _Tab(_SoloPool(site), None, None, "probe", site, composer="#composer")
+        tab.empty_reason = "no-code"          # left over from an earlier task
+        prepare(tab)
+        return await tab.send("solve it", 5.0), tab.empty_reason
+
+    def kill(tab): tab.alive = False
+
+    reply, reason = asyncio.run(go(kill))
+    assert reply == ""
+    assert reason == "unreadable", (
+        f"a dead tab reported {reason!r} — the previous task's reason, which "
+        f"would earn this one a repair round in a conversation that is gone"
+    )
+
+
+def test_a_blind_tab_still_gets_its_answer_off_the_wire():
+    """Retiring an unreadable tab must not stop it being READ one last time.
+
+    The network stream is captured by CDP off the wire and has never touched the
+    DOM, so a selector matching nothing says nothing at all about it —
+    `_reconcile_stream`'s own docstring names this case: "a selector that
+    stopped matching, a render this tab cannot see". Clearing `alive` inside the
+    read loop skipped both the copy control and the stream, which is the
+    difference between a zero and the whole payment on the one tab that needed
+    them.
+
+    So the loop stops polling, the recovery phases run, and only then is the tab
+    retired.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    )
+    site = _site(assistant=("#nothing-matches-this",), stream=True)
+
+    async def go(grace):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+
+            async def wire():
+                return "here it is:\n\n```python\ndef pong():\n    return 4\n```\n"
+
+            tab._streamed_markdown = wire
+            real, _browser_pool.BLIND_TAB_GRACE_S = _browser_pool.BLIND_TAB_GRACE_S, grace
+            try:
+                reply = await tab.send("solve it", 60.0)
+            finally:
+                _browser_pool.BLIND_TAB_GRACE_S = real
+                await browser.close()
+            return reply, tab.alive, tab.empty_reason
+
+    reply, alive, reason = asyncio.run(go(1.0))
+    assert "return 4" in extract_code(reply, "pong"), (
+        f"the DOM was unreadable and the answer was on the wire, and the tab was "
+        f"retired before anything looked: {reply!r}"
+    )
+    assert alive is False, "the DOM is still unreadable; the tab is finished"
+    assert reason is None, "an answer came back, so there is no empty to explain"
+
+
+def test_no_assistant_candidate_can_match_a_user_turn():
+    """The one selector mistake that costs money silently.
+
+    An assistant candidate that also matched the user's turn would have the
+    miner read its own prompt back and submit it: no error, no empty reply, a
+    permanent zero. `_Tab.send`'s echo guard is the backstop and has caught it
+    in production — this is the check that stops it reaching the guard.
+
+    Every candidate on both sites is asserted against a page carrying only user
+    turns, in the shapes each site actually uses. A new fallback that is merely
+    *broad* fails here rather than in a live solve.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        # ChatGPT's user turn: the same attributes as an assistant turn, the
+        # other value.
+        '<article data-turn="user" class="group/conversation-turn">'
+        '  <div data-message-author-role="user" data-message-id="aaa">'
+        '    <div class="whitespace-pre-wrap">solve it</div>'
+        '  </div>'
+        '</article>'
+        # claude.ai's user turn.
+        '<div data-testid="user-message"><p>solve it</p></div>'
+        '<div class="font-user-message"><p>solve it</p></div>'
+    )
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            hits = {}
+            for site in (chatgpt_site(), claude_site()):
+                for candidate in site.assistant:
+                    n = await page.locator(candidate).count()
+                    if n:
+                        hits[f"{site.name}: {candidate}"] = n
+            await browser.close()
+            return hits
+
+    hits = asyncio.run(go())
+    assert not hits, (
+        f"these assistant candidates match a USER turn: {hits}. The miner would "
+        f"read its own prompt back and submit it as the answer."
+    )
+
+
+def test_the_assistant_role_has_more_than_one_candidate_on_every_site():
+    """The role whose failure is total is the role that must not be a single
+    point of failure. Every other role degrades when its selector stops
+    matching — the submit falls back, the copy falls back to scraping. An
+    assistant selector matching nothing reads no answer at all, for every task,
+    until somebody notices. A live run cost a whole task to exactly that, with
+    one candidate on the list."""
+    for site in (chatgpt_site(), claude_site()):
+        assert len(site.assistant) >= 2, (
+            f"{site.name} has {len(site.assistant)} assistant candidate(s); one "
+            f"deploy away from reading nothing at all"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# A model still writing is waited for, never interrupted.
+#
+# The slice a read is given is an internal ALLOCATION -- part of the budget is
+# held back for a repair round. That reserve is well spent on an answer that
+# arrived WRONG and worth nothing at all on one that has not finished arriving.
+# --------------------------------------------------------------------------- #
+_STREAMING_PAGE = (
+    '<!doctype html><meta charset="utf-8">'
+    '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    '<button id="stop" style="display:none">stop</button>'
+    '<div id="host"></div><script>'
+    "const LINES = ['def g(n):','    t = 0','    while n > 0:',"
+    "               '        t += n % 10','        n //= 10','    return t'];"
+    "document.getElementById('send').onclick = () => {"
+    "  const stop = document.getElementById('stop'); stop.style.display = '';"
+    "  const d = document.createElement('div'); d.className='msg';"
+    "  const pre = document.createElement('pre'); const code = document.createElement('code');"
+    "  pre.appendChild(code); d.appendChild(pre);"
+    "  document.getElementById('host').appendChild(d);"
+    "  let i = 0;"
+    "  const t = setInterval(() => {"
+    "    if (i < LINES.length) { code.textContent += LINES[i++] + '\\n'; }"
+    "    else { clearInterval(t); stop.style.display='none'; }"
+    "  }, 800);"                                     # finishes at ~4.8s
+    "};</script>"
+)
+
+
+def _send_on_streaming_page(slice_s, extend_to, *, busy=("#stop:visible",)):
+    playwright, chrome = _chromium_or_skip()
+    url = _served(_STREAMING_PAGE)
+    site = _site(assistant=("div.msg",), busy=busy, poll_s=0.2)
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            started = time.monotonic()
+            reply = await tab.send("solve it", slice_s, extend_to_s=extend_to)
+            elapsed = time.monotonic() - started
+            await browser.close()
+            return reply, elapsed, tab.still_writing, tab.empty_reason
+
+    return asyncio.run(go())
+
+
+def test_a_read_waits_out_an_answer_that_is_still_arriving():
+    """The slice is not a deadline, and stopping at it threw away answers.
+
+    Measured on this page, whose model finishes at ~4.8s against a 3s slice:
+
+        slice only:      read 3.0s, code = 'def g(n):\\n    t = 0\\n    while n > 0:'
+        slice + budget:  read 6.0s, the whole program
+
+    The truncated version is not merely worse, it is a certain zero AND a wasted
+    repair round: `python_defect` reports "expected an indented block after
+    'while' statement", so the miner interrupts a model that is still writing to
+    tell it about a syntax error in a program it has not finished.
+    """
+    reply, elapsed, writing, _ = _send_on_streaming_page(3.0, 8.0)
+    code = extract_code(reply, "g", "python")
+    assert "return t" in code, f"stopped mid-answer and kept a fragment: {code!r}"
+    assert python_defect(code, "g") is None, "the program that came back must be whole"
+    assert elapsed > 3.0, "it cannot have waited without spending longer than the slice"
+    assert writing is False, "the model finished; nothing is still being written"
+
+
+def test_waiting_stops_at_the_budget_and_not_a_second_later():
+    """The extension is bounded by what the CALLER still has, not by the model.
+
+    `handle_request` answers 504 -- nothing at all -- past its own deadline, so
+    a read that waits for ever does not deliver a late answer, it throws away
+    the whole solve. `extend_to_s` is that bound.
+    """
+    _, elapsed, writing, _ = _send_on_streaming_page(1.0, 3.0)
+    assert elapsed < 8.0, (
+        f"read for {elapsed:.1f}s against a 3s cap; the model is still writing "
+        f"and would be waited for indefinitely"
+    )
+    assert writing is True, (
+        "the caller has to be told the answer was cut off rather than absent — "
+        "it is what stops a repair prompt going into a live conversation"
+    )
+
+
+def test_a_finished_reply_does_not_spend_the_repair_reserve():
+    """The other half of the bound. A reply that has SETTLED must stop at its
+    slice, because the reserve it would eat is exactly what pays for the repair
+    round that fixes it. Extending on everything would trade one bug for a
+    worse one: a no-code reply with no budget left to ask again."""
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<div id="host"></div><script>'
+        "document.getElementById('send').onclick = () => {"
+        "  const d = document.createElement('div'); d.className='msg';"
+        "  d.textContent = 'Sure! Here is the approach...';"   # settles at once
+        "  document.getElementById('host').appendChild(d);"
+        "};</script>"
+    )
+    site = _site(assistant=("div.msg",), poll_s=0.2)
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            started = time.monotonic()
+            await tab.send("solve it", 2.0, extend_to_s=30.0)
+            elapsed = time.monotonic() - started
+            await browser.close()
+            return elapsed, tab.still_writing, tab.empty_reason
+
+    elapsed, writing, reason = asyncio.run(go())
+    assert elapsed < 6.0, (
+        f"a settled reply held the read for {elapsed:.1f}s of a 30s budget. That "
+        f"time belongs to the repair round that turns it into an answer."
+    )
+    assert writing is False
+    assert reason == "no-code", "a finished reply with no code is the model's doing"
+
+
+def test_still_writing_is_detected_without_a_busy_selector():
+    """`usable_busy_selectors` DROPS any busy candidate that matches an idle
+    page at startup, so a site legitimately runs with none — and then the stop
+    control says False through the whole of an answer that is still arriving.
+    Measured before the fallback existed, with the model mid-sentence:
+
+        busy selector present:  empty_reason='unfinished'   (no repair)
+        busy selector dropped:  empty_reason='no-code'      (REPAIRED)
+
+    A message longer than it was one poll ago is being written, whatever the
+    DOM calls its stop button. That needs no selector at all.
+
+    The page here is the shape the live failure had: the model thinking out
+    loud, with no code block yet. `_read` returns None throughout, so the read
+    runs to its deadline rather than settling, and the growth of the message is
+    the only thing left that knows an answer is on its way.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<div id="host"></div><script>'
+        "document.getElementById('send').onclick = () => {"
+        "  const d = document.createElement('div'); d.className='msg';"
+        "  document.getElementById('host').appendChild(d);"
+        "  let n = 0;"
+        "  setInterval(() => { d.textContent += 'considering case ' + (++n) + '. '; }, 150);"
+        "};</script>"
+    )
+    site = _site(assistant=("div.msg",), busy=(), poll_s=0.2)   # no stop control
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            await tab.send("solve it", 2.0)
+            await browser.close()
+            return tab.still_writing, tab.empty_reason
+
+    writing, reason = asyncio.run(go())
+    assert writing is True, "the message was growing on every poll"
+    assert reason == "unfinished", (
+        f"reported {reason!r} with no busy selector, which buys a repair prompt "
+        f"in a conversation the model is still writing into"
+    )
+
+
+@pytest.mark.parametrize(
+    "captured, what",
+    [("", "nothing at all"), ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n```", "a half-written program")],
+)
+def test_a_model_still_writing_is_never_sent_a_repair_prompt(captured, what):
+    """The two shapes of the same mistake, both measured on a real page.
+
+    Nothing captured, the model mid-sentence:
+        -> "Your previous reply did not reach me as code..."
+    A code block half-rendered, the model mid-sentence:
+        -> "the code is not valid Python (expected an indented block after
+            'while' statement)"
+
+    Neither can help. The composer is usually disabled while a reply streams,
+    and where it is not the prompt queues behind the answer it is asking about.
+    The second is the worse of the two because nothing else catches it: the
+    candidate is non-empty, so the empty-capture guard does not apply, and a
+    truncated program looks exactly like a broken one to `python_defect`.
+    """
+    sends: list[str] = []
+
+    class _StillWriting(_Chat):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.still_writing = True
+            self.empty_reason = "unfinished" if not captured else None
+        async def send(self, text, timeout_s, extend_to_s=None):
+            sends.append(text)
+            return captured
+
+    class _Fleet:
+        async def open(self, avoid=None): return _StillWriting([""], "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(
+        _Fleet(), max_attempts=3, safety_margin_s=0, max_budget_s=120,
+        second_opinion=False,
+    )
+    asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert len(sends) == 1, (
+        f"captured {what} from a model that had not finished, and sent "
+        f"{len(sends) - 1} more prompt(s) into the conversation it was still "
+        f"writing in:\n{sends[1:2]}"
+    )
+
+
+def test_a_backend_that_cannot_wait_is_never_asked_to():
+    """`extend_to_s` is optional on the `Conversation` protocol.
+
+    A backend written outside this package satisfies the protocol with the
+    two-argument `send` that has always been the contract, and calling it with
+    a keyword it does not take would raise TypeError inside the single call the
+    whole solve depends on. Catching that TypeError is not an option either: one
+    raised from INSIDE `send` is indistinguishable, and retrying would send the
+    prompt twice.
+    """
+    from solvers.verify import _reads_past_its_slice
+
+    seen: list[tuple] = []
+
+    class _OldStyle:
+        provider = "claude"
+        async def send(self, text, timeout_s):      # the historic two-arg form
+            seen.append((timeout_s,))
+            return RIGHT
+        async def close(self): pass
+
+    class _NewStyle(_OldStyle):
+        async def send(self, text, timeout_s, extend_to_s=None):
+            seen.append((timeout_s, extend_to_s))
+            return RIGHT
+
+    assert _reads_past_its_slice(_OldStyle()) is False
+    assert _reads_past_its_slice(_NewStyle()) is True
+
+    for backend, arity in ((_OldStyle, 1), (_NewStyle, 2)):
+        seen.clear()
+
+        class _Fleet:
+            async def open(self, avoid=None): return backend()
+            async def aclose(self): pass
+            def stats(self): return {}
+
+        answer = asyncio.run(
+            VerifyingSolver(_Fleet(), safety_margin_s=0, max_budget_s=120)
+            .solve_task(DIGITS, timeout_s=120)
+        )
+        assert answer.verified, f"{backend.__name__} stopped producing answers"
+        assert len(seen[0]) == arity, (
+            f"{backend.__name__}.send was called with {len(seen[0])} budget "
+            f"argument(s); it takes {arity}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# The copy control wins on FIDELITY, never on COMPLETENESS.
+# --------------------------------------------------------------------------- #
+def test_a_copy_taken_mid_stream_never_replaces_the_fuller_page(capsys):
+    """Measured on a live miner, twice, on the only two tasks that spent the
+    whole budget:
+
+        what the page RENDERS and what it COPIES are not the same — they differ
+        at character 1630: rendered '\\n', copied nothing (it ends here).
+        Using the copy.
+
+    Reproduced: the DOM held a complete 182-character Rust program, the copy
+    control gave the first 60, and those 60 were submitted. `rust_defect`
+    returned None on them — a truncated program keeps its `fn main` — so
+    nothing downstream caught it and it reached the validator as a confident
+    answer that cannot compile.
+
+    A copy clicked while the reply is still streaming is the beginning of the
+    answer and nothing else. The two readings were taken at different moments;
+    the shorter one is simply older.
+    """
+    from solvers.prompts import rust_defect
+
+    FULL = (
+        "fn main() {\\n"
+        "    let mut total = 0i64;\\n"
+        "    for line in std::io::stdin().lines() {\\n"
+        "        total += line.unwrap().trim().parse::<i64>().unwrap_or(0);\\n"
+        "    }\\n"
+        "    println!(\\\"{}\\\", total);\\n"
+        "}"
+    )
+    reply, _ = _send_in_browser(
+        '<!doctype html><meta charset="utf-8">\n'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>\n'
+        '<div id="host"></div>\n<script>\n'
+        f'const FULL = "{FULL}";\n'
+        "document.getElementById('send').onclick = () => {\n"
+        "  const wrap = document.createElement('div');\n"
+        "  wrap.setAttribute('data-message-author-role', 'assistant');\n"
+        "  const pre = document.createElement('pre');\n"
+        "  const code = document.createElement('code');\n"
+        "  code.textContent = FULL;\n"                     # the page has it all
+        "  pre.appendChild(code); wrap.appendChild(pre);\n"
+        "  const btn = document.createElement('button');\n"
+        "  btn.setAttribute('aria-label', 'Copy');\n"
+        "  btn.onclick = () => navigator.clipboard.writeText(FULL.slice(0, 60));\n"
+        "  wrap.appendChild(btn);\n"
+        "  document.getElementById('host').appendChild(wrap);\n"
+        "};\n</script>"
+    )
+    code = extract_code(reply, "main", "rust")
+    assert "println!" in code and code.rstrip().endswith("}"), (
+        f"submitted the copy control's truncated version: {code!r}"
+    )
+    assert rust_defect(code) is None
+
+    said = capsys.readouterr().out
+    assert "CUT SHORT" in said, f"took the fuller reading but never said why: {said!r}"
+    assert "98 character(s) fewer" in said, (
+        f"the warning has to carry the AMOUNT — without it a reader cannot tell "
+        f"a truncated program from a trailing newline: {said!r}"
+    )
+
+
+def test_a_copy_that_differs_in_the_middle_still_wins():
+    """The other half, and the reason the guard is a PREFIX test rather than a
+    length test. A highlighter artefact is a difference in the MIDDLE — the
+    measured one was U+E027 inside a Python program — and there the copy is
+    complete and authoritative. Only a copy that is the same answer cut short
+    loses. A plain "is it shorter" test would hand every highlighter bug back
+    to the DOM, which is the damage the copy control exists to avoid."""
+    cut = _Tab._copy_was_cut_short
+
+    whole = ["def g(n):\n    total = 1 + 2\n    return total"]
+    # Truncated: a strict prefix, materially shorter -> the render wins.
+    assert cut(whole, ["def g(n):\n    total = 1"]) > 0
+    # Damaged in the middle: same length, different content -> the copy wins.
+    assert cut(whole, ["def g(n):\n    total = 1 * 2\n    return total"]) == 0
+    # A highlighter INSERTION. The render is LONGER than the copy, so a plain
+    # "is the copy shorter" test would hand the answer back to the DOM -- and
+    # the DOM is the one carrying the damage. Only the prefix test tells them
+    # apart: an insertion in the middle breaks the prefix, a truncation does not.
+    assert cut(["def g(n):\n    total = 1 + 2\n    return total"], whole) == 0
+    # Trailing whitespace the renderer kept and the copy control trimmed. RAW
+    # this is a strict prefix and five characters short -- exactly the false
+    # alarm that would fire on clean answers; normalised it is no loss at all.
+    assert cut(["def g(n):\n    return 1\n\n   "], ["def g(n):\n    return 1"]) == 0
+    # Below the slack -> the copy keeps its fidelity advantage.
+    assert cut(["def g(n):\n    return 12"], ["def g(n):\n    return 1"]) == 0
+    # Nothing to compare against.
+    assert cut([], ["x"]) == 0 and cut(["x"], []) == 0
+
+
+# --------------------------------------------------------------------------- #
+# The request's deadline is the only deadline, and the model is told what it is.
+# --------------------------------------------------------------------------- #
+def test_no_miner_cap_can_bind_on_a_spec_compliant_request():
+    """`TaskRequest.deadline_s` is `Field(gt=0.0, le=3600.0)`. Every cap the
+    miner keeps must sit at or above that ceiling, or it is a second, PRIVATE
+    deadline — and a private deadline silently costs the difference the moment
+    a validator advertises more than it.
+
+    This has already happened twice on this branch: `SOLVER_MAX_BUDGET_S=240`
+    against a 300s deadline cut the first read from 238s to 191s, and
+    `GLM_REQUEST_TIMEOUT_S=280` cut the whole solve by 20s. Both were invisible
+    except as answers that arrived unfinished.
+    """
+    from solvers.config import DEFAULT_SOLVE_TIMEOUT_S
+
+    ceiling = next(
+        m.le for m in TaskRequest.model_fields["deadline_s"].metadata
+        if getattr(m, "le", None) is not None
+    )
+    caps = {
+        "GLM_REQUEST_TIMEOUT_S": float(DEFAULT_SOLVE_TIMEOUT_S),
+        "VerifyingSolver(max_budget_s=)": VerifyingSolver(object())._max_budget,
+        "SOLVER_MAX_BUDGET_S": float(
+            _roster_default("SOLVER_MAX_BUDGET_S")
+        ),
+    }
+    for name, value in caps.items():
+        assert value >= ceiling, (
+            f"{name} is {value:g} but a validator may legally advertise "
+            f"deadline_s={ceiling:g}. That gap is a private deadline, and every "
+            f"second of it is time the model is not given."
+        )
+
+
+def _roster_default(var: str) -> str:
+    """The default `roster.build_solver` uses for one env var, read from source
+    so the test cannot drift from the code it is checking."""
+    text = (Path(__file__).parent / "solvers" / "roster.py").read_text("utf-8")
+    m = re.search(rf'os\.environ\.get\("{var}",\s*"([\d.]+)"\)', text)
+    assert m, f"{var} is no longer read with a literal default"
+    return m.group(1)
+
+
+@pytest.mark.parametrize(
+    "budget, marker",
+    [(600, "generous budget"), (180, "generous budget"),
+     (179, "working budget"), (60, "working budget"),
+     (59, "tight budget"), (1, "tight budget")],
+)
+def test_the_prompt_states_the_budget_and_scales_the_testing_to_it(budget, marker):
+    """The prompt has always talked about "the deadline" — METHOD says to spend
+    it, METHOD_CODA says a reply it cuts off scores zero — and never once said
+    how long it was. A model rationing an unknown either hurries a generous
+    budget away on a shallow answer or explores a tight one until the reply is
+    cut off mid-program. Both pay zero.
+
+    The depth ladder is why the number is worth stating rather than merely
+    enforcing: "test it thoroughly" cannot mean the same thing at 40 seconds
+    and at 240, and a count can be checked against the work done where an
+    adverb cannot.
+    """
+    prompt = build_initial_prompt("python", "Sum the digits.", "g", [], budget_s=budget)
+    assert f"about {budget} seconds" in prompt, (
+        f"the budget is enforced but never stated: {budget}s"
+    )
+    assert marker in prompt, f"{budget}s did not select {marker!r}"
+    # The two rules that make a partial answer impossible.
+    assert "COMPLETE BEFORE CORRECT" in prompt
+    assert "SENDABLE AT EVERY MOMENT" in prompt
+
+
+def test_the_budget_opens_the_method_section():
+    """Placement is the argument. Step 2 of METHOD is "Write the program FIRST",
+    and it has to be read knowing how long there is to write it in — the whole
+    failure this fixes is a model that budgets wrong. METHOD_CODA closes the
+    same section, so the budget holds both ends of the procedure."""
+    prompt = build_initial_prompt("python", "s", "g", [], budget_s=200)
+    method = prompt.index("<method>")
+    assert method < prompt.index("<budget>") < prompt.index("Correctness is the only"), (
+        "the budget must sit between <method> and the numbered steps it shapes"
+    )
+
+
+def test_an_unknown_budget_invents_nothing():
+    """A number guessed here would be worse than none: the model would ration
+    against it. A backend that cannot report a deadline gets the prompt it
+    always got."""
+    from solvers.prompts import _budget_seconds
+
+    bare = build_initial_prompt("python", "s", "g", [])
+    assert "<budget>" not in bare and "seconds for this reply" not in bare
+    # Building a prompt must never raise on a bad number: that loses the whole
+    # solve, which is the one outcome worse than having no number at all.
+    # `int(float("inf"))` raises OverflowError where nan raises ValueError.
+    for junk in (None, 0, -1, -0.4, 0.9, "", "abc", [], float("nan"), float("inf")):
+        assert _budget_seconds(junk) == 0, junk
+    assert _budget_seconds(None) == 0
+    assert _budget_seconds(0) == 0
+    assert _budget_seconds(-30) == 0
+    assert _budget_seconds("abc") == 0
+    assert _budget_seconds(0.9) == 0, "sub-second budgets round to no budget"
+    assert _budget_seconds(240.7) == 240, "truncated, never rounded up"
+    assert _budget_seconds("120") == 120, "a numeric string is a number"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"defect": NO_CODE}, {"defect": "the program does not define `fn main()`"}, {}],
+)
+def test_every_repair_variant_says_how_much_time_is_left(kwargs):
+    """A repair round is always the shorter half of the budget, and the failure
+    it invites is a rewrite: a model handed a fault list with no sense of the
+    clock reconsiders its approach, and the approach was rarely the problem.
+
+    Parametrised over all three variants because the suffix is appended at the
+    single exit precisely so a variant added later cannot forget it."""
+    args = ([] if kwargs else ["g(1) returned 2, expected 3"], "rust", "main")
+    with_time = build_repair_prompt(*args, budget_s=32, **kwargs)
+    assert "about 32 seconds left" in with_time, with_time[-200:]
+    assert "not to start\nagain" in with_time or "not to start again" in with_time
+
+    without = build_repair_prompt(*args, **kwargs)
+    assert "seconds left" not in without, "invented a budget nobody supplied"
+
+
+def test_the_model_is_told_the_budget_the_solver_actually_has():
+    """End to end: the number in the prompt has to be the number the read will
+    really run for, or it is worse than silence. With a 300s deadline the solver
+    keeps 280 and the first read may use all of it."""
+    seen: list[str] = []
+
+    class _Chat:
+        provider = "claude"
+        async def send(self, text, timeout_s, extend_to_s=None):
+            seen.append(text)
+            return RIGHT
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    asyncio.run(VerifyingSolver(_Fleet()).solve_task(DIGITS, timeout_s=300.0))
+    stated = re.search(r"about (\d+) seconds for this reply", seen[0])
+    assert stated, f"the prompt carried no budget:\n{seen[0][:400]}"
+    said = int(stated.group(1))
+    assert 260 <= said <= 280, (
+        f"told the model {said}s of a 280s budget — a number that is not the "
+        f"truth is worse than no number, because it is rationed against"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# A short deadline must still get an answer.
+#
+# `TaskRequest.deadline_s` is only `Field(gt=0.0, le=3600.0)`. Nothing in the
+# protocol promises the comfortable numbers this subnet happens to send today,
+# and at the small end three separate floors — each sensible alone — combined
+# into a guaranteed total loss.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("deadline", [3600.0, 300.0, 60.0, 40.0, 32.0, 25.0, 20.0, 15.0, 10.0, 5.0, 2.0])
+def test_every_deadline_the_protocol_allows_leaves_room_to_answer(deadline):
+    """The arithmetic that used to invert, checked across the legal range.
+
+    Measured before the fix, and every row is a silent total loss:
+
+        deadline  budget   asks?   read+tail   504 at
+             32    12.0     NO        --         32    empty, model never asked
+             20    10.0     NO        --         20    empty, model never asked
+             15     7.5     yes      18.5        15    504, NO ANSWER
+              5     5.0     yes      16.0         5    504, NO ANSWER
+
+    `handle_request` wraps the solve in an `asyncio.wait_for` and answers 504
+    with nothing at all past the deadline, so an overrun does not deliver a
+    late answer — it throws away the whole solve. And a 504 is indistinguishable
+    from a dead miner.
+    """
+    from solvers.browser_pool import tail_budget
+
+    solver = VerifyingSolver(object())
+    budget = min(deadline, solver._max_budget) - solver._margin
+    if budget <= 5.0:
+        budget = max(1.0, deadline * 0.5)
+    attempt_budget = max(1.0, budget)
+
+    # The first read always happens, however little there is — pinned as
+    # behaviour by `test_the_first_attempt_runs_however_little_time_there_is`.
+    first_slice = max(1.0, attempt_budget * 0.85)
+
+    spent = attempt_budget + tail_budget(first_slice)
+    assert spent < deadline, (
+        f"a {deadline:g}s deadline budgets {budget:.1f}s and then spends "
+        f"{spent:.1f}s before the answer is even signed — `handle_request` "
+        f"cancels the solve and the validator gets nothing"
+    )
+
+
+def test_the_post_read_tail_never_outlives_the_read_it_rescues():
+    """Eleven seconds is sized against the safety margin, which is sized against
+    a 300-second deadline. A rescue that costs more than half again what the
+    attempt cost has stopped being a rescue — and below ~16s the fixed tail
+    outlived the whole request."""
+    from solvers.browser_pool import (
+        FULL_TAIL_S, COPY_PHASE_TIMEOUT_S, STREAM_PHASE_TIMEOUT_S,
+        POSTMORTEM_TIMEOUT_S, tail_budget,
+    )
+
+    assert FULL_TAIL_S == COPY_PHASE_TIMEOUT_S + STREAM_PHASE_TIMEOUT_S + POSTMORTEM_TIMEOUT_S
+    # Unchanged wherever there is room — which is every read in production.
+    for generous in (22.0, 34.0, 238.0, 3600.0):
+        assert tail_budget(generous) == FULL_TAIL_S
+    # Never more than half the read below that, and never negative.
+    for tight in (21.0, 10.0, 4.25, 1.0, 0.0, -5.0):
+        assert 0.0 <= tail_budget(tight) <= max(0.0, tight) / 2.0 + 1e-9, tight
+    assert tail_budget(10.0) == 5.0
+
+
+def test_the_first_attempt_runs_however_little_time_there_is():
+    """"Not enough left to be worth another ROUND TRIP" is what that guard has
+    always been about, and it never should have gated the first one. It did:
+    below a 32-second deadline the budget lands under twelve seconds and the
+    model was never asked at all — an empty answer with no line of log to say
+    why, which reads exactly like a broken browser."""
+    asked: list[float] = []
+
+    class _Chat:
+        provider = "claude"
+        async def send(self, text, timeout_s, extend_to_s=None):
+            asked.append(timeout_s)
+            return RIGHT
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    task = SolveTask(
+        problem_id="tight", language="python", statement=DIGITS.statement,
+        entrypoint="g", public_examples=[], deadline_s=20.0,
+    )
+    answer = asyncio.run(VerifyingSolver(_Fleet()).solve_task(task, timeout_s=20.0))
+    assert asked, "the model was never asked at all on a 20s deadline"
+    assert answer.code, f"returned nothing having asked nobody: {answer!r}"
+
+
+def test_a_send_that_never_reads_reports_no_stale_writing_state():
+    """`still_writing` decides whether `_attempt` may send a repair prompt, and
+    the tab outlives the send that set it. The two paths that return before the
+    read loop runs left the PREVIOUS send's verdict standing — so a tab that had
+    been mid-answer last time reported "still writing" for a send it never even
+    submitted."""
+    site = _site()
+
+    async def go():
+        tab = _Tab(_SoloPool(site), None, None, "probe", site, composer="#composer")
+        tab.alive = False
+        tab.still_writing = True            # left over from an earlier send
+        reply = await tab.send("solve it", 5.0)
+        return reply, tab.still_writing, tab.empty_reason
+
+    reply, writing, reason = asyncio.run(go())
+    assert reply == ""
+    assert reason == "unreadable"
+    assert writing is False, (
+        "a send that never submitted anything cannot have left a model writing"
+    )
+
+
+def test_a_page_that_died_mid_answer_is_not_reported_as_still_writing():
+    """The read also exits with the tab dead when the PAGE died, and there the
+    last successful poll can leave `last_busy` True. Reporting that as "still
+    writing" sends the reader looking for a slow model instead of a dead tab —
+    the same misdirection every other diagnostic here exists to remove."""
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<button id="stop">stop</button><div id="host"></div><script>'
+        "document.getElementById('send').onclick = () => {"
+        "  const d = document.createElement('div'); d.className='msg';"
+        "  d.textContent = 'thinking';"
+        "  document.getElementById('host').appendChild(d);"
+        "};</script>"
+    )
+    site = _site(assistant=("div.msg",), busy=("#stop",), poll_s=0.2)
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            real = tab._poll
+            calls = {"n": 0}
+
+            async def dies_after_one(before):
+                calls["n"] += 1
+                if calls["n"] > 1:
+                    raise RuntimeError("Target page, context or browser has been closed")
+                return await real(before)
+
+            tab._poll = dies_after_one
+            await tab.send("solve it", 4.0)
+            await browser.close()
+            return tab.alive, tab.still_writing, tab.empty_reason
+
+    alive, writing, reason = asyncio.run(go())
+    assert alive is False, "the page died; the tab must be retired"
+    assert writing is False, f"a dead page is not a model at work (reason={reason!r})"
+    assert reason == "unreadable"
+
+
+def test_a_rust_compile_is_not_paid_for_past_the_deadline(monkeypatch):
+    """`compile_defect` floors its own timeout at one second, so an overrun
+    budget still bought a temp directory and a rustc process — a whole second,
+    spent past the deadline, on a verdict nothing can act on: there is no time
+    for a repair round and `defect` never reaches the validator.
+
+    The read now extends into that reserve whenever the model is still writing,
+    so arriving here with nothing left is the ordinary case rather than a
+    strange one."""
+    import solvers.verify as verify
+
+    calls: list[Any] = []
+
+    def _counting(code, budget_s=None):
+        calls.append(budget_s)
+        return None
+
+    monkeypatch.setattr(verify, "compile_defect", _counting)
+    solver = VerifyingSolver(object())
+    task = SimpleNamespace(
+        language="rust", entrypoint="main", public_examples=[],
+        statement="s", problem_id="p", deadline_s=300.0,
+    )
+    reply = "```rust\nfn main() { println!(\"hi\"); }\n```"
+
+    solver._grade(reply, task, left=30.0)
+    assert calls == [30.0], "a compile with budget left must still happen"
+
+    calls.clear()
+    solver._grade(reply, task, left=-4.0)
+    solver._grade(reply, task, left=0.0)
+    assert calls == [], f"paid for a compile past the deadline: {calls}"
+
+
+@pytest.mark.parametrize("deadline", [40.0, 32.0, 25.0, 20.0, 15.0, 10.0, 5.0, 2.0])
+def test_a_short_deadline_leaves_room_to_answer_from_the_real_numbers(deadline):
+    """The same guarantee as the arithmetic test above, but read OUT of the code
+    instead of recomputed beside it.
+
+    That distinction is the whole point of this test existing separately: a test
+    that re-derives the formula it is checking passes whatever the code does,
+    and both short-deadline floors survived exactly that mistake here. The slice
+    and the cap below are the numbers `solve_task` and `_attempt` actually
+    produced, taken off the conversation they were handed to.
+    """
+    from solvers.browser_pool import tail_budget
+
+    seen: list[tuple] = []
+
+    class _Chat:
+        provider = "claude"
+        async def send(self, text, timeout_s, extend_to_s=None):
+            seen.append((timeout_s, extend_to_s))
+            return RIGHT
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    task = SolveTask(
+        problem_id="short", language="python", statement=DIGITS.statement,
+        entrypoint="g", public_examples=[], deadline_s=deadline,
+    )
+    asyncio.run(VerifyingSolver(_Fleet()).solve_task(task, timeout_s=deadline))
+    assert seen, f"the model was never asked at all on a {deadline:g}s deadline"
+
+    slice_s, cap = seen[0]
+    # The read may run to `cap` (it extends there while the model is writing),
+    # and the tail is sized from the slice.
+    worst = (cap if cap else slice_s) + tail_budget(slice_s)
+    assert worst < deadline, (
+        f"a {deadline:g}s deadline hands out a {slice_s:.1f}s read capped at "
+        f"{cap:.1f}s, then up to {tail_budget(slice_s):.1f}s of post-read "
+        f"phases — {worst:.1f}s before the answer is even signed. "
+        f"`handle_request` cancels the solve and the validator gets nothing."
+    )
+
+
+def test_the_post_read_phases_are_actually_bounded_by_the_short_read():
+    """`tail_budget` being right is worth nothing if `send` does not apply it.
+
+    The hang is injected rather than raced for, exactly as
+    `test_one_unreturning_read_cannot_spend_the_whole_send` does: what must hold
+    is that a two-second read cannot be followed by eleven seconds of rescue,
+    whatever made the rescue slow.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<div id="host"></div><script>'
+        "document.getElementById('send').onclick = () => {"
+        "  const d = document.createElement('div'); d.className='msg';"
+        "  const pre = document.createElement('pre'); const code = document.createElement('code');"
+        "  code.textContent = 'def pong():\\n    return 4';"
+        "  pre.appendChild(code); d.appendChild(pre);"
+        "  document.getElementById('host').appendChild(d);"
+        "};</script>"
+    )
+    site = _site(assistant=("div.msg",), copy=('button[aria-label="Copy"]',), poll_s=0.2)
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+
+            async def never_returns(before):
+                await asyncio.sleep(3600)
+
+            tab._copy_phase = never_returns
+            started = time.monotonic()
+            reply = await tab.send("solve it", 2.0)
+            elapsed = time.monotonic() - started
+            await browser.close()
+            return reply, elapsed
+
+    reply, elapsed = asyncio.run(go())
+    assert "return 4" in extract_code(reply, "pong"), (
+        f"the DOM reading has to survive a copy control that hangs: {reply!r}"
+    )
+    assert elapsed < 5.0, (
+        f"a 2s read was followed by {elapsed - 2:.1f}s of post-read phases. On a "
+        f"short deadline that alone outlives the whole request, and "
+        f"`handle_request` answers 504 with nothing."
+    )
+
+
+def test_getting_the_prompt_in_never_outlives_the_read_itself():
+    """The third place on this branch where a floor sat above what the caller
+    could afford. `max(5.0, ...)` alone gave a one-second read a five-second
+    submit — which does not buy a better submit, it buys an overrun, and on a
+    short request `handle_request` answers 504 with nothing at all.
+
+    A submit that fills the whole read is a read that finds nothing, which is
+    bad. A submit that outlives it is a solve that is cancelled, which is worse.
+    """
+    playwright, chrome = _chromium_or_skip()
+    # A composer that is never there, so the submit spends its whole allowance
+    # looking for it.
+    url = _served('<!doctype html><meta charset="utf-8"><div id="host"></div>')
+    site = _site(composer=("#nothing",), send=("#nothing",), assistant=("div.msg",))
+
+    async def go(slice_s):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            started = time.monotonic()
+            await tab.send("solve it", slice_s)
+            elapsed = time.monotonic() - started
+            await browser.close()
+            return elapsed
+
+    elapsed = asyncio.run(go(1.5))
+    assert elapsed < 4.0, (
+        f"a 1.5s read spent {elapsed:.1f}s failing to submit. The whole request "
+        f"may be shorter than that, and the solve is cancelled rather than late."
+    )
+
+
+def test_the_readme_table_matches_the_defaults_it_documents():
+    """Documented defaults drift, and this branch drifted twice in one session:
+    the table said 600 for `SOLVER_MAX_BUDGET_S` and `GLM_REQUEST_TIMEOUT_S`
+    while the code had moved to 3600.
+
+    That is worse than an out-of-date sentence. These are the knobs an operator
+    reaches for when a miner is misbehaving, and a table that lies about the
+    default sends them to change a value that was never the one in effect.
+    """
+    here = Path(__file__).parent
+    readme = (here / "README.md").read_text("utf-8")
+    roster = (here / "solvers" / "roster.py").read_text("utf-8")
+    from solvers.config import DEFAULT_SOLVE_TIMEOUT_S
+
+    documented = {
+        name: value
+        for name, value in re.findall(r"^\| `([A-Z_]+)` \| `([\d.]+)` \|", readme, re.M)
+    }
+    assert documented, "the environment table is gone or no longer parses"
+
+    actual = {
+        name: value
+        for name, value in re.findall(
+            r'os\.environ\.get\("([A-Z_]+)",\s*"([\d.]+)"\)', roster
+        )
+    }
+    actual["GLM_REQUEST_TIMEOUT_S"] = DEFAULT_SOLVE_TIMEOUT_S
+
+    wrong = {
+        name: (said, actual[name])
+        for name, said in documented.items()
+        if name in actual and float(said) != float(actual[name])
+    }
+    assert not wrong, (
+        "the README documents defaults the code does not use "
+        + ", ".join(f"{n}: says {s}, is {a}" for n, (s, a) in sorted(wrong.items()))
     )

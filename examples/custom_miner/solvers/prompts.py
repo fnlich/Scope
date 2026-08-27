@@ -202,6 +202,107 @@ RUST_RULES = """\
 # prose spent before the code is time the code does not get. Written the other
 # way round the artifact exists first, so a reply cut short loses the checking
 # pass rather than the whole answer.
+# The budget the model is actually working against, stated as a number.
+#
+# The prompt has always talked about "the deadline" -- METHOD says to spend it,
+# METHOD_CODA says a reply it cuts off scores zero -- and never once said how
+# long it was. That asks the model to ration an unknown, and a model rationing
+# an unknown does one of two things: hurries a 240-second budget away on a
+# shallow answer, or explores a 40-second one until the reply is cut off
+# mid-program. Both pay zero. The number costs nothing to supply and it is the
+# one thing that makes "test it thoroughly" and "arrive in time" compatible
+# instructions instead of competing ones.
+#
+# The two rules under it are what make a partial answer impossible.
+# COMPLETE BEFORE CORRECT fixes the order, because a program improved into
+# existence is a program that may not exist when the clock stops. SENDABLE AT
+# EVERY MOMENT fixes the invariant between edits, because the dangerous state is
+# not "wrong", it is "half-rewritten".
+TIME_BUDGET = """\
+You have about {budget} seconds for this reply, reasoning and writing together.
+Nothing you have not sent when it runs out is worth anything: a reply cut off
+mid-program scores exactly what no reply scores.
+
+Two rules follow, and neither bends.
+
+COMPLETE BEFORE CORRECT. Write the whole program out -- every function, every
+branch, nothing elided, nothing deferred to a comment or an ellipsis -- before
+you test any of it. Testing a program that does not yet exist in full is how a
+deadline turns a nearly-finished answer into a zero.
+
+SENDABLE AT EVERY MOMENT. When you improve it, change it from one complete
+program into another complete program; never leave it half-rewritten. If the
+time is nearly gone, send the complete version you have rather than the better
+version you do not.
+
+{depth}"""
+
+
+# How deep to test, by how much time there is. Concrete counts rather than
+# "thoroughly": a count can be checked against the work actually done and an
+# adverb cannot, and one adverb cannot mean the right thing at both 40 seconds
+# and 240.
+_DEPTH_GENEROUS = """\
+That is a generous budget, so use it: trace every example, then at least eight
+of the invented cases below, and re-trace the ones that already passed after
+every fix. An untested branch is a hidden test you have not read yet."""
+
+_DEPTH_WORKING = """\
+That is a working budget: trace every example, then at least five of the
+invented cases below -- the ones this statement actually makes reachable -- and
+re-trace what already passed after every fix."""
+
+_DEPTH_TIGHT = """\
+That is a tight budget. Write the safe, obvious implementation rather than the
+clever one, trace every example, and trace the three cases that break
+implementations most often: the empty or zero input, the single element, and
+the exact bound the statement names. Then send."""
+
+
+def _budget_seconds(budget_s):
+    """``budget_s`` as whole seconds, or 0 when there is no usable number."""
+    if budget_s is None:
+        return 0
+    try:
+        seconds = int(float(budget_s))
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is the one that is easy to miss: `int(float("inf"))`
+        # raises it where `int(float("nan"))` raises ValueError. This is called
+        # while building the prompt, so raising here would lose the whole solve
+        # to a bad number -- the one outcome worse than having no number.
+        return 0
+    return seconds if seconds > 0 else 0
+
+
+def _render_budget(budget_s) -> str:
+    """The time section, or "" when the caller does not know the budget.
+
+    Returning "" rather than a guess is deliberate: a number invented here would
+    be worse than none at all, because the model would ration against it. A
+    backend with no deadline to report gets the prompt exactly as it was.
+    """
+    seconds = _budget_seconds(budget_s)
+    if not seconds:
+        return ""
+    depth = (
+        _DEPTH_GENEROUS if seconds >= 180
+        else _DEPTH_WORKING if seconds >= 60
+        else _DEPTH_TIGHT
+    )
+    return TIME_BUDGET.format(budget=seconds, depth=depth)
+
+
+# A repair round is always the shorter half of the budget, and the failure it
+# invites is a rewrite: a model handed a fault list with no sense of the clock
+# reconsiders its approach, and the approach was rarely the problem. Naming the
+# time turns "try again" into "change this much and send".
+_REPAIR_BUDGET = """
+
+You have about {budget} seconds left -- enough to FIX this program, not to start
+again. Change what the report above names, leave everything it does not, and
+send the complete program."""
+
+
 # An ordered procedure, not advice. Ordering is the thing this prompt has had to
 # fight hardest: told to check "before you answer", models narrated the check and
 # ran out of time before the program existed. A numbered list leaves no room to
@@ -387,7 +488,11 @@ def _render_examples(language: str, examples: list[dict[str, Any]]) -> str:
 
 
 def build_initial_prompt(
-    language: str, statement: str, entrypoint: str, examples: list[dict[str, Any]]
+    language: str,
+    statement: str,
+    entrypoint: str,
+    examples: list[dict[str, Any]],
+    budget_s: Optional[float] = None,
 ) -> str:
     """The one prompt that has to carry the whole contract.
 
@@ -402,6 +507,11 @@ def build_initial_prompt(
     The examples are labelled a floor rather than the specification. They are the
     friendliest thing in the message and the easiest to over-fit to, and the
     label is what stops them being read as the whole job.
+
+    ``budget_s`` is how long the model actually has. It opens ``<method>`` so
+    the numbered steps are read with it in view, and it is optional because a
+    backend that cannot report a deadline should get the prompt it always got
+    rather than an invented number to ration against.
     """
     is_rust = language == "rust"
     rules = (RUST_RULES if is_rust else PYTHON_RULES).format(entrypoint=entrypoint)
@@ -424,9 +534,15 @@ def build_initial_prompt(
             rendered,
             "</examples>", "",
         ]
+    budget = _render_budget(budget_s)
+    parts += ["<contract>", rules, "", environment, "</contract>", "", "<method>"]
+    if budget:
+        # First inside <method>, so step 2 ("Write the program FIRST") is read
+        # knowing how long there is to write it in. METHOD_CODA closes the same
+        # section, so the budget holds both ends of the procedure.
+        parts += ["<budget>", budget, "</budget>", ""]
     parts += [
-        "<contract>", rules, "", environment, "</contract>", "",
-        "<method>", METHOD, "",
+        METHOD, "",
         "<edge_cases>", EDGE_CASES, "</edge_cases>", "",
         "<self_check>", SELF_CHECK, "</self_check>", "",
         METHOD_CODA,
@@ -440,6 +556,7 @@ def build_repair_prompt(
     language: str,
     entrypoint: str,
     defect: Optional[str] = None,
+    budget_s: Optional[float] = None,
 ) -> str:
     """Ask for a fix, quoting the concrete failures the local grader found.
 
@@ -457,7 +574,7 @@ def build_repair_prompt(
     shape when the shape is wrong.
     """
     if defect == NO_CODE:
-        return (
+        body = (
             "Your previous reply did not reach me as code. I can only read the "
             "chat message itself, so an artifact, a canvas, a preview pane or a "
             "collapsed block is invisible to me.\n\n"
@@ -466,28 +583,33 @@ def build_repair_prompt(
             "Do not abbreviate it or replace any part with a comment. Same rules "
             "as before, and nothing outside the code block."
         )
-    if defect:
-        return (
+    elif defect:
+        body = (
             f"I could not run your previous reply: {defect}.\n\n"
             "Nothing was executed, so none of this is about your logic yet — it "
             "is about what arrived. Put that right and send the COMPLETE program "
             "again as ONE ordinary fenced code block written directly in the "
             "chat, with nothing outside it. Same rules as before."
         )
-    detail = "\n".join(f"  - {line}" for line in failures)
-    target = "the program" if language == "rust" else f"`{entrypoint}`"
-    return (
-        f"Your solution is WRONG. I ran {target} against the examples and got:\n"
-        f"{detail}\n\n"
-        "In your reasoning — not in the reply — trace the failing call through "
-        "your code until you find the actual line where the computed value and "
-        "the expected one part company; do not guess at the fix from the shape "
-        "of the failure. Re-check the fix silently against the edge-case "
-        "checklist from my first message — the empty case, n = 1, both ends, "
-        "and the largest values allowed — because a repair that fixes the "
-        "example and breaks a boundary scores the same zero. Then reply with "
-        "ONLY ONE corrected code block and nothing else."
-    )
+    else:
+        detail = "\n".join(f"  - {line}" for line in failures)
+        target = "the program" if language == "rust" else f"`{entrypoint}`"
+        body = (
+            f"Your solution is WRONG. I ran {target} against the examples and got:\n"
+            f"{detail}\n\n"
+            "In your reasoning — not in the reply — trace the failing call through "
+            "your code until you find the actual line where the computed value and "
+            "the expected one part company; do not guess at the fix from the shape "
+            "of the failure. Re-check the fix silently against the edge-case "
+            "checklist from my first message — the empty case, n = 1, both ends, "
+            "and the largest values allowed — because a repair that fixes the "
+            "example and breaks a boundary scores the same zero. Then reply with "
+            "ONLY ONE corrected code block and nothing else."
+        )
+    # Appended at the ONE exit, so a repair variant added later cannot silently
+    # forget to say how much time is left.
+    seconds = _budget_seconds(budget_s)
+    return body + (_REPAIR_BUDGET.format(budget=seconds) if seconds else "")
 
 
 def extract_code(

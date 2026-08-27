@@ -41,6 +41,32 @@ SEND_BUTTON_LEGACY = '[data-testid="send-button"]'
 STOP_BUTTON = '[data-testid="chat-input-stop"]'
 STOP_BUTTON_LEGACY = '[data-testid="stop-button"]'
 ASSISTANT_MSG = '[data-message-author-role="assistant"]'
+# Fallbacks behind it, and the reason this role gets them at all: it is the one
+# whose failure is TOTAL. A composer or copy control that stops matching
+# degrades -- the submit falls back, the copy falls back to scraping the DOM.
+# An assistant selector that matches nothing reads no answer at all, for every
+# task, until somebody notices. A live run showed what that costs:
+#
+#     no assistant selector matched anything. Tried
+#     ['[data-message-author-role="assistant"]']
+#
+# One candidate is one deploy away from that, and Claude's list has had three
+# since it was written. What these are NOT is a fix for that particular tab:
+# five other ChatGPT tabs answered the same minute with the same selector, so
+# the page on 9227 was in a bad state rather than a new shape. These are
+# insurance against the shape changing under all of them at once.
+#
+# Both are assistant-only BY CONSTRUCTION -- the attribute value and the class
+# name each say so -- which is the hazard `claude_web`'s docstring documents:
+# a candidate that also matched the user's turn would have the miner hand its
+# own prompt back as the answer. `_Tab.send`'s echo guard is the backstop, and
+# `test_no_assistant_candidate_can_match_a_user_turn` is the check.
+#
+# They are unverified against a live page, unlike the first. Run
+# `python -m solvers.doctor chatgpt --probe` to see which one your account's
+# DOM actually has, and pin it in CHATGPT_ASSISTANT.
+ASSISTANT_TURN = 'article[data-turn="assistant"]'
+ASSISTANT_AGENT_TURN = ".agent-turn"
 
 # Same hazard as Claude's artifacts panel, different name: a long program is
 # exactly when a model moves the answer out of the message and into a side
@@ -71,7 +97,10 @@ def chatgpt_site() -> Site:
             "CHATGPT_STOP_BUTTON",
             (STOP_BUTTON, STOP_BUTTON_LEGACY, 'button[aria-label*="Stop"]'),
         ),
-        assistant=selectors("CHATGPT_ASSISTANT", (ASSISTANT_MSG,)),
+        assistant=selectors(
+            "CHATGPT_ASSISTANT",
+            (ASSISTANT_MSG, ASSISTANT_TURN, ASSISTANT_AGENT_TURN),
+        ),
         # An in-app new chat rather than a reload; see `_Tab.start`. A miss here
         # only costs speed, since the reset falls back to loading `url`.
         new_chat=selectors(

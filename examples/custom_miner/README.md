@@ -948,7 +948,296 @@ spent its whole 135-second slice while the remaining 90 seconds of a 225-second
 budget went unused, on the one attempt that had to succeed.
 
 The share now depends on whether a repair is even possible — 85% to the first
-attempt when nothing can be graded against, which turns 135 seconds into 191.
+attempt when nothing can be graded against.
+
+### Never give up on a task while an answer is still obtainable
+
+An empty answer and a wrong answer pay exactly the same: nothing. `all_passed`
+is a hard gate in `rlvr/scoring/payment.py`, checked *before* the speed
+multiplier is ever computed. Above that gate speed is worth almost nothing —
+the multiplier is `floor + (1 - floor) · 2^(-delay / half_life)` with
+`speed_floor = 0.95`, so the slowest correct answer still earns 95% of what the
+fastest earns, and one arriving at six minutes earns 96%. Correctness is worth
+100%. Speed is worth at most 5%.
+
+The miner used to give up long before the validator did, three ways, and a live
+run cost two whole tasks to the combination:
+
+**The budget cap bound below the advertised deadline.** `SOLVER_MAX_BUDGET_S`
+was 240 against the 300-second deadline this subnet advertises, so the budget
+was 225s and the first read got `225 × 0.85 = 191s`. A model still writing at
+191s had its answer discarded *here*, by this miner, not by the validator that
+would have paid 96% for it. The cap is now a runaway guard that does not bind:
+the budget comes from the deadline the validator actually advertised, minus the
+margin. `min()` is what makes raising it safe — a validator advertising 60
+seconds still gets 60 seconds.
+
+**A tab that could not be read was polled to the deadline.** Two shapes of the
+same failure, both from one run:
+
+```
+chatgpt tab 9227: no assistant selector matched anything
+claude  tab 9222: matched 1 message(s), the same as before the prompt was
+                  sent — the answer never rendered
+```
+
+Each burned the full first slice and then a repair round on the same dead
+conversation. A working tab paints its assistant bubble within a second or two
+of the submit, empty, and fills it in after — so "has the reply appeared at
+all" is a different question from "has it finished", and only the first one
+separates an unreadable tab from a slow model. A tab that renders nothing for
+`BLIND_TAB_GRACE_S` (30s) stops being polled and the rest of the budget goes to
+another tab. A model that is merely thinking is never touched: its bubble is
+already on screen.
+
+It stops being *polled*, not read. The copy control and the network stream run
+first, and only then is the tab retired — because both read the answer by other
+means than the selector that just failed. The stream especially: it is captured
+off the wire by CDP and has never touched the DOM, so a selector matching
+nothing says nothing at all about it. `_reconcile_stream` was written for
+exactly this case and names it — *"a selector that stopped matching, a render
+this tab cannot see"* — and nine bounded seconds there is the difference
+between a zero and the whole payment.
+
+`CHATGPT_ASSISTANT` also had exactly **one** candidate, which is one deploy
+away from the same failure across every tab at once. It now has three, and
+Claude has had three since it was written. This is the one role whose failure
+is total — a composer or copy control that stops matching degrades, an
+assistant selector that matches nothing reads no answer at all, for every task,
+until somebody notices. Every candidate on both sites is assistant-only *by
+construction*, and a test asserts none of them matches a user turn: a candidate
+that did would have the miner read its own prompt back and submit it, which is
+a silent permanent zero.
+
+What the fallbacks are *not* is a fix for tab 9227 specifically — five other
+ChatGPT tabs answered that same minute with the same selector, so that page was
+in a bad state rather than a new shape. The wire recovery covers both; the
+fallbacks are insurance against the shape changing under all of them at once.
+
+### The request's deadline is the only deadline
+
+`TaskRequest.deadline_s` is `Field(gt=0.0, le=3600.0)`, so every cap the miner
+keeps sits at **3600** — at the protocol ceiling, where it is structurally
+incapable of binding on a spec-compliant request. `min(deadline_s, 3600)` is
+`deadline_s`, always.
+
+Anything smaller is a second, *private* deadline, and a private deadline
+silently costs the difference the moment a validator advertises more than it.
+That has already happened twice here: `SOLVER_MAX_BUDGET_S=240` against a 300s
+deadline cut the first read from 238s to 191s, and `GLM_REQUEST_TIMEOUT_S=280`
+cut the whole solve by 20 seconds. Neither was visible as anything except
+answers that arrived unfinished.
+
+What remains is not a deadline but the **cost of delivering**:
+`SOLVER_SAFETY_MARGIN_S` covers `send`'s post-read phases (5 + 4 + 2 = 11s) plus
+grading, archiving, signing and transmission. The budget is the advertised
+deadline minus that, and nothing else.
+
+### A short deadline must still get an answer
+
+`TaskRequest.deadline_s` is only `Field(gt=0.0, le=3600.0)`. Nothing in the
+protocol promises the comfortable numbers this subnet happens to send today,
+and at the small end the arithmetic used to invert — three separate floors,
+each sensible on its own, combined into a guaranteed total loss:
+
+```
+deadline  budget   asks?   read+tail   504 at   before
+     40    20.0     yes       28.5       40     ok
+     32    12.0     NO        --         32     empty answer, model never asked
+     20    10.0     NO        --         20     empty answer, model never asked
+     15     7.5     yes       18.5       15     504, NO ANSWER
+     10     5.0     yes       16.0       10     504, NO ANSWER
+      5     5.0     yes       16.0        5     504, NO ANSWER
+```
+
+Three separate causes:
+
+- **The post-read tail was a constant.** Eleven seconds is sized against the
+  safety margin, which is sized against a 300-second deadline. Below ~16s the
+  tail alone outlived the whole request. It is now `min(11s, read / 2)` — a
+  rescue that costs more than half again what the attempt cost has stopped
+  being a rescue — and at any read of 22s or more it is still the full eleven,
+  which is every read on the deadlines seen in production.
+- **`_attempt`'s "not worth another round trip" guard gated the FIRST trip.**
+  Below a 32-second deadline the budget lands under twelve seconds and the
+  model was never asked at all — an empty answer with no log line to say why.
+  The first attempt now always runs, exactly as the first pass does in
+  `solve_task`.
+- **Getting the prompt in had one too.** `max(5.0, …)` gave a one-second read a
+  five-second submit. A submit that fills the whole read is a read that finds
+  nothing, which is bad; a submit that outlives it is a solve that is
+  cancelled, which is worse.
+- **The short-deadline fallback had a five-second floor.** At a five-second
+  deadline it budgeted the entire request and `handle_request` cancelled the
+  solve mid-flight. A floor above what the caller can afford does not buy a
+  longer read, it buys a cancelled solve — and a 504 is indistinguishable from
+  a dead miner.
+
+Every deadline from 2 seconds to 3600 now returns an answer. One second does
+not, and cannot: `send` enforces a one-second minimum read.
+
+### The model is told how long it has
+
+The prompt had always talked about "the deadline" — `METHOD` says to spend it,
+`METHOD_CODA` says a reply it cuts off scores zero — and **never once said how
+long it was**. That asks a model to ration an unknown, and a model rationing an
+unknown does one of two things: hurries a 240-second budget away on a shallow
+answer, or explores a 40-second one until the reply is cut off mid-program.
+Both pay zero.
+
+`<budget>` now opens `<method>`, so step 2 (*"Write the program FIRST"*) is read
+knowing how long there is to write it in, and `METHOD_CODA` closes the same
+section — the budget holds both ends of the procedure. Two rules make a partial
+answer impossible:
+
+- **COMPLETE BEFORE CORRECT** — write the whole program out before testing any
+  of it. A program improved *into* existence is a program that may not exist
+  when the clock stops.
+- **SENDABLE AT EVERY MOMENT** — change it from one complete program into
+  another; never leave it half-rewritten. The dangerous state is not "wrong",
+  it is "half-rewritten".
+
+Then the testing depth scales to the number, because *"test it thoroughly"*
+cannot mean the same thing at 40 seconds and at 240:
+
+| budget | depth |
+|---|---|
+| ≥ 180s | every example, then **at least eight** invented cases, re-traced after every fix |
+| 60–180s | every example, then **at least five** the statement makes reachable |
+| < 60s | the safe implementation, every example, and the three that break implementations most often — empty/zero, single element, the stated bound |
+
+Counts rather than adverbs: a count can be checked against the work actually
+done. A repair round carries the remaining seconds too, appended at the single
+exit so a variant added later cannot forget it — *"enough to FIX this program,
+not to start again"*, because a model handed a fault list with no sense of the
+clock reconsiders an approach that was rarely the problem.
+
+A budget the caller cannot supply renders **nothing**. A number invented here
+would be worse than none, because the model would ration against it.
+
+### How long the miner actually waits, and why it stops there
+
+**280 seconds — 4m40s.** Not five or six minutes, and that is not a setting.
+Everything above 300s belongs to the validator:
+
+```
+310s  validator stops listening        (live.py:148 — deadline_s + 10)
+300s  miner answers 504 past here      (demo_miner.py:324 — wait_for)
+ -11s send tail: copy 5 + stream 4 + postmortem 2, all AFTER the read
+ -~9s grade, archive, sign, put on the wire
+----
+280s  the last moment a read can still end   ← SOLVER_SAFETY_MARGIN_S = 20
+```
+
+A model needing 300s misses by 20; one needing 360s misses by 80. The only
+thing that would change this is a validator advertising a longer `deadline_s`,
+which is its config and not the miner's — so the miner's own caps are set not
+to bind if it ever does: both sit at 3600, the protocol's own maximum for
+`deadline_s`, so `min(deadline_s, …)` is always `deadline_s`.
+
+### The copy control wins on fidelity, never on completeness
+
+`pre code` hands over the source *after* a syntax highlighter rebuilt it as
+DOM; the copy control hands over what the model actually wrote. That is why the
+copy is preferred — a highlighter once put U+E027, a Private Use Area character
+present in no source file, inside a Python answer.
+
+But the copy has no authority on *completeness*, and the code used to give it
+that too. From a live run, on the only two tasks that spent the entire budget:
+
+```
+what the page RENDERS and what it COPIES are not the same — they differ at
+character 1630: rendered '\n', copied nothing (it ends here). Using the copy.
+```
+
+Reproduced: the DOM held a complete 182-character Rust program, the copy control
+gave the first 60, and **those 60 were submitted**. `rust_defect` returned `None`
+on them — a truncated program keeps its `fn main` — so the structural check
+passed and it reached the validator as a confident answer that cannot compile.
+
+A copy clicked while the reply is still streaming is the beginning of the answer
+and nothing else. The two readings were taken at different moments and the
+shorter one is simply older, so when the copied source is the rendered source
+**cut short** — a strict prefix, whitespace ignored — the fuller reading wins.
+Anything else, including a difference in the middle (which is what a highlighter
+artefact looks like), leaves the copy in charge exactly as before. A plain "is
+it shorter" test would hand every highlighter bug back to the DOM.
+
+The warning now carries the **amount** lost, and it is a count rather than a
+once-per-tab flag. That distinction matters: a once-per-tab flag reported two
+incidents across 56 solves on two tabs — exactly one per tab, which is what it
+reports whether it happened twice or forty times.
+
+### A model still writing is waited for, never interrupted
+
+The slice a read is given is an internal **allocation**, not a deadline: part of
+the budget is held back for a repair round. That reserve is well spent on an
+answer that arrived *wrong*. It is worth nothing at all on one that has not
+finished arriving — the composer is usually disabled while a reply streams, and
+where it is not the prompt simply queues behind the answer it is asking about.
+
+So when the slice runs out with the model still writing, the read extends once
+to the caller's real remaining budget rather than stopping to do something that
+cannot help. Measured on a page whose model finishes at 4.8s against a 3s slice:
+
+```
+slice only:      read 3.0s, code = 'def g(n):\n    t = 0\n    while n > 0:'
+slice + budget:  read 6.0s, the whole program
+```
+
+The truncated version is not merely worse, it is a certain zero **and** a wasted
+repair round: `python_defect` reports *"expected an indented block after 'while'
+statement"*, so the miner interrupts a model that is still writing to tell it
+about a syntax error in a program it has not finished. Both shapes of that
+mistake are now blocked outright — a conversation that comes back
+`still_writing` is never sent another prompt, whether it captured nothing or a
+fragment.
+
+Knowing that a model is still writing used to rest entirely on the site's stop
+control, and `usable_busy_selectors` **drops** any busy candidate that matches
+an idle page at startup — so a site legitimately runs with none, and then the
+signal reads False through the whole of an answer that is still arriving:
+
+```
+busy selector present:  empty_reason='unfinished'   (no repair)
+busy selector dropped:  empty_reason='no-code'      (REPAIRED, mid-answer)
+```
+
+A message longer than it was one poll ago is being written, whatever the DOM
+calls its stop button — so message growth is now the fallback, and it needs no
+selector at all. It does not rescue everything: with no busy selector, a reply
+whose *code* stops changing for two polls is still accepted as finished by the
+settle test, which is the documented cost of losing that selector. It covers the
+commoner shape by far — a model thinking in prose, where the read runs to its
+deadline.
+
+A reply that has **settled** still stops at its slice, because the reserve it
+would otherwise eat is exactly what pays for the repair round that turns a
+no-code reply into an answer.
+
+**An empty capture was repaired like a wrong answer.** They are
+indistinguishable at the point the decision is made — the structural checks
+reject empty source, so an empty candidate carries a `defect` exactly like a
+broken program does. So the tab now records *why* its last send came back
+empty, because `""` is the same string for three different failures and only
+one of them is worth another prompt in the same conversation:
+
+| `empty_reason` | what happened | repair in place? |
+|---|---|---|
+| `unreadable` | no reply ever rendered, or the tab died | **no** — the prompt goes into a conversation that has just proved it cannot be read |
+| `unfinished` | the model was still writing when the budget ran out | **no** — the prompt queues behind an answer that does not exist yet |
+| `no-code` | a *finished* reply that simply had no code block in it | **yes** — the model broke the output contract, and telling it so is what fixes it |
+
+Getting that distinction wrong costs a task in either direction, so it is not
+inferred from the empty string: only the tab can see it, and it says so. A
+backend that does not report one keeps the historic behaviour.
+
+Together those left the two failed tasks with 5 seconds against a 20-second
+second-opinion guard, while five healthy tabs sat idle. The pass loop now keeps
+asking while it is holding **nothing** and the clock allows one more round trip
+(`EMPTY_HANDED_FLOOR_S`, capped at `MAX_PASSES`). Holding an answer, the old
+policy stands: one second opinion, because there is then something worth
+submitting and each further ask spends a real account's quota.
 
 ## Self-verification: the part that earns the money
 
@@ -979,9 +1268,10 @@ fresh conversation.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SOLVER_SAFETY_MARGIN_S` | `15` | Headroom kept before the cutoff |
-| `SOLVER_MAX_BUDGET_S` | `240` | Hard cap on one solve |
+| `SOLVER_SAFETY_MARGIN_S` | `20` | Headroom kept before the cutoff, for `send`'s post-deadline phases and for grading, signing and transport |
+| `SOLVER_MAX_BUDGET_S` | `3600` | The protocol's own maximum for `deadline_s`, so it cannot bind on a spec-compliant request. Lowering it below the advertised deadline throws away answers the validator would still pay for |
 | `SOLVER_VERIFY_EXECUTOR` | `subprocess` | Python grading backend; Rust always uses Docker |
+| `GLM_REQUEST_TIMEOUT_S` | `3600` | The deadline `handle_request` answers **504** at, `min()`-ed with the validator's own. Named for the reference miner's GLM client but applied to whatever solver is plugged in. `docs/DEMO_MINER.md` documents `280` for that miner; leaving `280` in your `.env` costs the browser solver 20 seconds of every solve |
 
 `GET /solver-status` reports per-provider counters and fleet health. Watch it —
 a browser miner fails quietly, and silence looks identical to success.

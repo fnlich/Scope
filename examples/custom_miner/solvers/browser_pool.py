@@ -121,15 +121,72 @@ COPY_TIMEOUT_MS = 1_500
 # nothing: copy falls back to what scraping saw, the stream leaves `best`
 # untouched, and the post-mortem is a log line whose absence costs no answer.
 #
-# The three together must stay inside VerifyingSolver's safety margin, which is
-# 15 seconds, and the reason is not tidiness either: `handle_request` wraps the
-# whole solve in an `asyncio.wait_for` and answers 504 -- NOTHING -- when it is
-# exceeded. Overrunning does not deliver the answer late; it throws away an
-# answer already in hand. 5 + 4 + 2 = 11 leaves the last grade and the tab
-# close the rest of it.
+# The three together must stay inside VerifyingSolver's safety margin
+# (`SOLVER_SAFETY_MARGIN_S`, 20 seconds), and the reason is not tidiness either:
+# `handle_request` wraps the whole solve in an `asyncio.wait_for` and answers
+# 504 -- NOTHING -- when it is exceeded. Overrunning does not deliver the answer
+# late; it throws away an answer already in hand. 5 + 4 + 2 = 11 leaves the last
+# grade, the tab close, and the archive-and-sign on the way out the rest of it.
 COPY_PHASE_TIMEOUT_S = 5.0
 STREAM_PHASE_TIMEOUT_S = 4.0
 POSTMORTEM_TIMEOUT_S = 2.0
+FULL_TAIL_S = COPY_PHASE_TIMEOUT_S + STREAM_PHASE_TIMEOUT_S + POSTMORTEM_TIMEOUT_S
+
+
+def tail_budget(timeout_s: float) -> float:
+    """How long the post-read phases may take, for a read of ``timeout_s``.
+
+    The eleven seconds above are sized against the solver's safety margin, and
+    that margin is sized against the deadlines this subnet usually advertises.
+    `TaskRequest.deadline_s` is only `Field(gt=0.0, le=3600.0)`, and at the
+    small end the arithmetic inverts: `solve_task` falls back to half the
+    timeout when the margin would leave nothing, and then a fixed eleven-second
+    tail is larger than the whole request. Measured, before this existed:
+
+        deadline  budget   read + tail   504 at
+            25     12.5        23.5        25    ok
+            15      7.5        18.5        15    504, NO ANSWER
+            10      5.0        16.0        10    504, NO ANSWER
+             5      5.0        16.0         5    504, NO ANSWER
+
+    Every one of those is a total loss with no log line to explain it: the
+    solve is cancelled mid-flight by `handle_request` and the validator gets an
+    error. A miner that cannot answer a short request at all is worse than one
+    that answers it badly.
+
+    Half the read, because a rescue that costs more than half again what the
+    attempt cost has stopped being a rescue. At any read of 22 seconds or more
+    this returns the full eleven and nothing changes, which is every read on
+    the deadlines actually seen in production.
+    """
+    return min(FULL_TAIL_S, max(0.0, float(timeout_s)) / 2.0)
+
+# How long a tab gets to put SOMETHING on screen before it is declared unreadable.
+#
+# A healthy chat UI paints the assistant bubble within a second or two of the
+# submit, empty, and fills it in afterwards. So "the reply element has still not
+# appeared" and "the model is thinking" are different states, and the read loop
+# used to treat them identically -- it polled a tab that could not be read at
+# all for the whole slice, then reported the same empty answer a slow model
+# would have produced.
+#
+# Measured on a live miner, both shapes of the failure:
+#
+#     chatgpt tab 9227: no assistant selector matched anything
+#     claude  tab 9222: matched 1 message(s), the same as before the prompt
+#                       was sent -- the answer never rendered
+#
+# Each burned 191 seconds of a 225 second budget and then a 29 second repair
+# round on the same dead conversation, leaving 5 seconds -- too few to ask
+# anyone else. Five healthy tabs sat idle through both. Detecting it here turns
+# a whole-task loss into a 30 second one, and hands the rest of the budget to a
+# tab that works.
+#
+# Generous on purpose: this must never fire on a model that is merely slow. A
+# reply that has rendered -- even as an empty bubble with a cursor in it --
+# resets nothing, because the check is "did it EVER appear", not "has it
+# finished".
+BLIND_TAB_GRACE_S = 30.0
 
 # Installed before the copy button is clicked. It makes the page hand the code
 # to US instead of to the operating system.
@@ -570,6 +627,14 @@ class _Tab:
         self._warned_echo = False
         self._warned_branches = False
         self._warned_copy = False
+        # A COUNT, not a flag. The other notes on this class are configuration
+        # advice and say themselves once; this one is damage to the answer being
+        # submitted right now, and how OFTEN it happens is the number an
+        # operator needs. Silencing it after the first would have reported two
+        # incidents in a run of 56 solves on two tabs -- exactly one per tab,
+        # which is what a once-per-tab flag reports whether it happened twice
+        # or forty times.
+        self._cut_short_count = 0
         self._warned_diff = False
         self._warned_relatch = False
         self._warned_stream = False
@@ -579,6 +644,32 @@ class _Tab:
         self._stream_before = 0
         self.uses = 0
         self.alive = True
+        # Why the last `send` came back empty, or None if it did not. Three
+        # causes look identical from "" and only one of them is worth another
+        # prompt in the same conversation:
+        #
+        #   "unreadable" -- no reply ever rendered, or the tab died. Prompting
+        #                   again sends the repair into a conversation that has
+        #                   just proved it cannot be read.
+        #   "unfinished" -- the model was still writing when the budget ran out.
+        #                   A second prompt queues behind an answer that has not
+        #                   been produced yet.
+        #   "no-code"    -- a FINISHED reply that simply had no code block in
+        #                   it. That is the model breaking the output contract,
+        #                   and telling it so is exactly what fixes it.
+        #
+        # Callers that cannot see this attribute (any non-browser backend) get
+        # the historic behaviour, because only the first two suppress a repair.
+        self.empty_reason: Optional[str] = None
+        # Was the model STILL WRITING when the last send stopped reading?
+        #
+        # Separate from `empty_reason` because it is true whether or not
+        # anything was captured, and both cases matter: nothing captured, and a
+        # code block captured half-written. Prompting into a conversation that
+        # is mid-answer cannot help in either -- the composer is usually
+        # disabled, and if it is not the prompt queues behind the answer that
+        # has not arrived yet.
+        self.still_writing = False
         # True while this tab is known to be sitting in an EMPTY conversation.
         # It starts true because `_spawn` builds a tab only after loading
         # `site.url` — the site's own new-conversation URL — and seeing the
@@ -759,16 +850,38 @@ class _Tab:
         rendered = await self._dom_blocks(reply) if copied else None
         return copied, rendered
 
-    async def send(self, text: str, timeout_s: float) -> str:
+    async def send(
+        self, text: str, timeout_s: float, extend_to_s: Optional[float] = None
+    ) -> str:
+        """Ask, then read. ``timeout_s`` is the slice; ``extend_to_s`` the cap.
+
+        They differ because the slice is an internal ALLOCATION, not a
+        deadline. The caller holds back part of its budget for a repair round,
+        and that reserve is well spent on an answer that arrived wrong. It is
+        worth nothing at all on one that has not finished arriving: the composer
+        is usually disabled mid-stream, and where it is not the prompt simply
+        queues behind the answer it is asking about.
+
+        So when the slice runs out with the model still writing, the read
+        extends ONCE to ``extend_to_s`` -- the caller's real remaining budget --
+        rather than stopping to do something that cannot help. Waiting is the
+        only move that can still produce the answer, and the payment policy
+        agrees: a correct answer arriving late earns at least 95% of what the
+        fastest earns, and an unfinished one earns nothing.
+        """
         if not self.alive:
             # The pool has not recycled this tab yet. Retrying a known-dead tab
             # only burns the caller's budget one submit-timeout at a time.
+            self.empty_reason = "unreadable"
+            self.still_writing = False
             return ""
         # Start the clock BEFORE the submit. Deriving the read deadline after it
         # would hand the read a fresh `timeout_s` on top of however long typing
         # took — an overrun larger than the solver's whole safety margin.
         started = time.monotonic()
         deadline = started + max(1.0, timeout_s)
+        # Never before the slice, and never past the caller's own budget.
+        hard = started + max(max(1.0, timeout_s), float(extend_to_s or 0.0))
         self.uses += 1
         # Dirty from here on, whatever happens next: a submit that raises
         # part-way may still have left the prompt in the composer or even sent
@@ -786,7 +899,18 @@ class _Tab:
         self._reply_key = None
         # Reserve a slice of the caller's budget for getting the prompt in;
         # the rest is for waiting on the answer.
-        submit_budget_s = max(5.0, min(20.0, timeout_s * 0.3))
+        #
+        # Bounded by the read's own deadline, and that bound is the third place
+        # on this branch where a floor sat above what the caller could afford.
+        # `max(5.0, ...)` alone gave a one-second read a five-second submit --
+        # it does not buy a better submit, it buys an overrun, and on a short
+        # request `handle_request` answers 504 with nothing at all. A submit
+        # that fills the whole read is a read that finds nothing, which is bad;
+        # a submit that outlives it is a solve that is cancelled, which is
+        # worse.
+        submit_budget_s = min(
+            max(5.0, min(20.0, timeout_s * 0.3)), max(1.0, timeout_s)
+        )
         try:
             # The snapshot is inside the bound, not outside it. `_fingerprint`
             # ends in a `get_attribute` on the last message, and that is the
@@ -805,6 +929,8 @@ class _Tab:
             # The prompt never reached the model. Treat the tab as unusable so
             # the pool replaces it rather than failing the next request too.
             self.alive = False
+            self.empty_reason = "unreadable"
+            self.still_writing = False
             print(f"[{self.site.name}] tab {self.label} failed to submit: {type(exc).__name__}")
             return ""
 
@@ -826,21 +952,78 @@ class _Tab:
         # matches an idle page -- so it is a guard, not the guarantee.
         # What the PAGE gave us, block by block, for the stream to be checked
         # against. None means "not looked at yet" and is not the same as [].
+        # Sized once per send: the three phases below share it in proportion,
+        # so the whole tail is what `tail_budget` says and no phase can quietly
+        # spend the deadline of a short request on its own.
+        tail = tail_budget(timeout_s) / FULL_TAIL_S
         page_blocks: Optional[list[str]] = None
         best, stable = "", None
+        # Has the reply to THIS prompt ever appeared on screen? Not "has it
+        # finished" -- an empty bubble counts. A tab that never manages even
+        # that inside BLIND_TAB_GRACE_S cannot be read, and every further poll
+        # spends budget the healthy tabs could have had.
+        submitted_at = time.monotonic()
+        saw_reply = blind = False
+        # Two independent readings of "is it still writing", because either
+        # alone is wrong often enough to matter.
+        #
+        # `last_busy` is the site's own stop control. It is authoritative when
+        # present and absent altogether when it is not: `usable_busy_selectors`
+        # DROPS any candidate that matches an idle page at startup, so a site
+        # can legitimately run with none, and then this reads False through the
+        # whole of an answer that is still arriving. Measured, with the busy
+        # selector dropped and the model mid-sentence at the deadline:
+        #
+        #     empty_reason='no-code'     <- and so a repair round fired, telling
+        #                                   a model still writing its first
+        #                                   answer that it had sent no code
+        #
+        # `grew` is the fallback and needs no selector at all: a message that
+        # is longer than it was one poll ago is being written, whatever the DOM
+        # calls its stop button.
+        #
+        # What it does NOT rescue, and neither did anything before it: with no
+        # busy selector, a reply whose CODE stops changing for two polls is
+        # accepted as finished by the settle test and the read exits early --
+        # so a model that pauses longer than 2x poll_s mid-block can still have
+        # a truncated answer taken as final. That is the known cost of losing
+        # the busy selector, documented on `usable_busy_selectors`, and the
+        # reason it says keeping one working is worth it. `grew` covers the
+        # commoner shape by far: a model thinking in prose, where `_read`
+        # returns None throughout and the read runs to its deadline.
+        last_busy = False
+        grew = False
+        last_whole: Optional[str] = None
+        def out_of_time() -> bool:
+            """Stop reading? Extends once, and only mid-answer."""
+            nonlocal deadline
+            if time.monotonic() < deadline:
+                return False
+            # `hard <= deadline` is also what makes this happen at most once:
+            # the extension below sets them equal.
+            if hard <= deadline or not (last_busy or grew):
+                return True
+            deadline = hard
+            print(
+                f"[{self.site.name}] tab {self.label} is still writing at its "
+                f"{timeout_s:.0f}s slice; reading on to {hard - started:.0f}s rather "
+                f"than interrupting an answer that is still arriving."
+            )
+            return time.monotonic() >= deadline
+
         try:
             while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if out_of_time():
                     break
+                remaining = max(0.0, deadline - time.monotonic())
                 await asyncio.sleep(min(self.site.poll_s, remaining))
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if out_of_time():
                     break
+                remaining = max(0.0, deadline - time.monotonic())
                 # Every DOM call below auto-waits up to 30s on its own, which
                 # would sail past the deadline the loop just checked.
                 try:
-                    text_now, busy, whole = await asyncio.wait_for(
+                    text_now, busy, whole, on_screen = await asyncio.wait_for(
                         self._poll(before),
                         timeout=min(remaining, POLL_READ_TIMEOUT_S),
                     )
@@ -851,6 +1034,39 @@ class _Tab:
                     # to the deadline costs the answer. See POLL_READ_TIMEOUT_S.
                     stable = None
                     continue
+                last_busy = busy
+                grew = last_whole is not None and whole != last_whole
+                last_whole = whole
+                if on_screen:
+                    saw_reply = True
+                elif (
+                    not saw_reply
+                    and time.monotonic() - submitted_at >= BLIND_TAB_GRACE_S
+                ):
+                    # Nothing has rendered in the time a working tab needs to
+                    # paint an empty bubble. Polling on is not patience, it is
+                    # the rest of the budget: stop, and let the caller ask
+                    # somebody else while there is still time to.
+                    #
+                    # `alive` is NOT cleared here, and that is the whole point
+                    # of the distinction. Retiring the tab now would skip the
+                    # copy control and the network stream, and those are read by
+                    # other means than the selector that just failed -- the
+                    # stream especially, which is captured off the wire by CDP
+                    # and has never touched the DOM. `_reconcile_stream` exists
+                    # for exactly this case and says so: "a selector that
+                    # stopped matching, a render this tab cannot see". Nine
+                    # bounded seconds there can turn this zero into the whole
+                    # payment. The tab is retired at the single exit below,
+                    # after they have had their say.
+                    blind = True
+                    print(
+                        f"[{self.site.name}] tab {self.label} showed no reply at all "
+                        f"in {BLIND_TAB_GRACE_S:.0f}s; giving up on it now rather "
+                        f"than at the deadline, so the rest of the budget can go to "
+                        f"another tab."
+                    )
+                    break
                 if text_now is not None:
                     best = text_now  # keep it even mid-generation
                 if busy or text_now is None:
@@ -879,7 +1095,7 @@ class _Tab:
             # WHAT was read, because it predates the syntax highlighter.
             try:
                 copied, rendered = await asyncio.wait_for(
-                    self._copy_phase(before), timeout=COPY_PHASE_TIMEOUT_S
+                    self._copy_phase(before), timeout=COPY_PHASE_TIMEOUT_S * tail
                 )
             except asyncio.CancelledError:
                 raise
@@ -887,7 +1103,49 @@ class _Tab:
                 copied = rendered = None
             page_blocks = copied
             if copied:
-                if rendered and not self._warned_diff:
+                # The copy control wins on FIDELITY -- it is the source before
+                # the highlighter rebuilt it as DOM -- but it has no authority
+                # at all on COMPLETENESS, and the two are different questions.
+                #
+                # Measured on a real page: the DOM held a complete 182-character
+                # Rust program, the copy control gave the first 60, and those 60
+                # were submitted. `rust_defect` returned None on them, because a
+                # truncated program keeps its `fn main` -- so nothing downstream
+                # caught it and it went to the validator as a confident answer.
+                # In the live log this arrived twice, on the only two tasks that
+                # spent the entire budget:
+                #
+                #   what the page RENDERS and what it COPIES are not the same --
+                #   they differ at character 1630: rendered '\n', copied nothing
+                #   (it ends here). Using the copy.
+                #
+                # When the copied source is the rendered source CUT SHORT, the
+                # two readings were simply taken at different moments and the
+                # shorter one is older. Take the fuller one. Anything else --
+                # a difference in the middle, which is what a highlighter
+                # artefact looks like -- leaves the copy in charge as before.
+                lost = self._copy_was_cut_short(rendered or [], copied)
+                if lost:
+                    self._cut_short_count += 1
+                    if self._cut_short_count == 1:
+                        print(
+                            f"[{self.site.name}] note: tab {self.label}: the copy "
+                            f"control gave the answer CUT SHORT — {lost} character(s) "
+                            f"fewer than the page shows, and the page's version "
+                            f"starts with all of it. Submitting what the page shows. "
+                            f"This is what a copy taken while the reply was still "
+                            f"streaming looks like, and every one of these is an "
+                            f"answer that would have gone out truncated."
+                        )
+                    else:
+                        print(
+                            f"[{self.site.name}] tab {self.label}: copy CUT SHORT "
+                            f"again, {lost} character(s) missing "
+                            f"(#{self._cut_short_count} on this tab)"
+                        )
+                    copied = list(rendered or [])
+                    page_blocks = copied
+                elif rendered and not self._warned_diff:
                     difference = self._disagreement(rendered, copied)
                     if difference:
                         self._warned_diff = True
@@ -911,7 +1169,7 @@ class _Tab:
             try:
                 best = await asyncio.wait_for(
                     self._reconcile_stream(before, best, page_blocks),
-                    timeout=STREAM_PHASE_TIMEOUT_S,
+                    timeout=STREAM_PHASE_TIMEOUT_S * tail,
                 )
             except asyncio.CancelledError:
                 raise
@@ -921,6 +1179,13 @@ class _Tab:
                     f"checking the answer against the network stream in "
                     f"{STREAM_PHASE_TIMEOUT_S:.0f}s. Submitting what the page gave."
                 )
+        if blind:
+            # Now, and not before: the recovery phases above needed a tab that
+            # was still allowed to be read. Whatever they found, the DOM here is
+            # unreadable and the next task on this tab would spend another
+            # BLIND_TAB_GRACE_S discovering that. Retire it; the pool spawns a
+            # replacement in the background.
+            self.alive = False
         if best and self._is_our_own_prompt(best):
             # Last line of defence, at the ONE exit, because everything above
             # it can produce a submission and only one of them was guarded.
@@ -933,10 +1198,28 @@ class _Tab:
                 f"this tab is reconstructing the conversation rather than the reply."
             )
             best = ""
-        if not best and self.alive:
+        # One exit, one verdict. `best` non-empty clears it: the attribute
+        # describes the LAST send, and a stale reason would suppress a repair
+        # round on a later one.
+        # `self.alive`, not `not blind`: the read also exits with the tab dead
+        # when the PAGE died mid-answer, and there `last_busy` can still be True
+        # from the last poll that worked. Reporting that as "still writing"
+        # sends the caller looking for a slow model instead of a dead tab --
+        # the same class of misdirection every other diagnostic here exists to
+        # remove. Blind already clears `alive` above, so this covers both.
+        self.still_writing = bool(last_busy or grew) and self.alive
+        if best:
+            self.empty_reason = None
+        elif blind or not self.alive:
+            self.empty_reason = "unreadable"
+        elif self.still_writing:
+            self.empty_reason = "unfinished"
+        else:
+            self.empty_reason = "no-code"
+        if not best and (self.alive or blind):
             try:
                 await asyncio.wait_for(
-                    self._explain_empty(before), timeout=POSTMORTEM_TIMEOUT_S
+                    self._explain_empty(before), timeout=POSTMORTEM_TIMEOUT_S * tail
                 )
             except asyncio.CancelledError:
                 raise
@@ -1050,8 +1333,14 @@ class _Tab:
 
     async def _poll(
         self, before: tuple[int, Optional[str]]
-    ) -> tuple[Optional[str], bool, str]:
-        """One read round: ``(code_or_None, still_generating, whole_message)``.
+    ) -> tuple[Optional[str], bool, str, bool]:
+        """One round: ``(code_or_None, still_generating, whole_message, on_screen)``.
+
+        ``on_screen`` is the answer to "has this reply rendered at all", which
+        is not the same question as either of the first two and is the only one
+        that separates a tab that cannot be read from a model that is thinking.
+        ``code_or_None`` is None for both; ``still_generating`` is False for
+        both once the page settles. See BLIND_TAB_GRACE_S.
 
         The read happens whether or not the model is still typing. Checking busy
         first and returning early — the obvious shape — means a reply that never
@@ -1067,12 +1356,12 @@ class _Tab:
         busy = await self._busy_now()
         reply = await self._new_reply(before)
         if reply is None:
-            return None, busy, ""  # ours hasn't rendered yet
+            return None, busy, "", False  # ours hasn't rendered yet
         text_now = await self._read(reply)
         whole = await self._whole(reply)
         if text_now is None or self._echoes_prompt(whole or text_now):
-            return None, busy, whole
-        return text_now, busy, whole
+            return None, busy, whole, True
+        return text_now, busy, whole, True
 
     # -- DOM helpers -------------------------------------------------------- #
     async def _first_match(self, candidates: Sequence[str]) -> Optional[str]:
@@ -1438,6 +1727,39 @@ class _Tab:
         """`_copied_blocks`, fenced. Convenience for callers that want text."""
         blocks = await self._copied_blocks(reply)
         return "\n".join(self._fence(b) for b in blocks) if blocks else None
+
+    # How much shorter the copy may be before it is treated as cut short
+    # rather than as an artefact. A truncated program loses a line at the very
+    # least; nothing that loses four non-whitespace characters or fewer is a
+    # truncation, and down there the copy's fidelity advantage is worth more
+    # than the render's extra character -- a highlighter that appends one is
+    # precisely the thing the copy control exists to beat.
+    _CUT_SHORT_SLACK = 4
+
+    @staticmethod
+    def _copy_was_cut_short(rendered: list[str], copied: list[str]) -> int:
+        """Characters the copy is missing, when it is the same answer cut short.
+
+        Zero unless the copied source is a strict PREFIX of the rendered source
+        with whitespace ignored, which is what distinguishes the two ways these
+        readings disagree. A copy taken while the reply was still streaming is
+        the beginning of the answer and nothing else. A highlighter artefact --
+        the measured one was a Private Use Area character inside a Python
+        program -- is a difference in the MIDDLE, so the prefix test fails and
+        the copy keeps its authority, which is the whole reason it is preferred.
+
+        Whitespace is ignored on both sides so that indentation rebuilt by the
+        renderer, or the newline a copy control trims, is never mistaken for
+        lost code.
+        """
+        if not rendered or not copied:
+            return 0
+        whole = "".join("".join(b.split()) for b in rendered)
+        part = "".join("".join(b.split()) for b in copied)
+        if len(part) >= len(whole) or not whole.startswith(part):
+            return 0
+        missing = len(whole) - len(part)
+        return missing if missing > _Tab._CUT_SHORT_SLACK else 0
 
     def _disagreement(self, dom: list[str], copied: list[str]) -> Optional[str]:
         """How the rendered code differs from the copied code, in one line.
