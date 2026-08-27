@@ -1014,6 +1014,26 @@ ChatGPT tabs answered that same minute with the same selector, so that page was
 in a bad state rather than a new shape. The wire recovery covers both; the
 fallbacks are insurance against the shape changing under all of them at once.
 
+### How long the miner actually waits, and why it stops there
+
+**280 seconds — 4m40s.** Not five or six minutes, and that is not a setting.
+Everything above 300s belongs to the validator:
+
+```
+310s  validator stops listening        (live.py:148 — deadline_s + 10)
+300s  miner answers 504 past here      (demo_miner.py:324 — wait_for)
+ -11s send tail: copy 5 + stream 4 + postmortem 2, all AFTER the read
+ -~9s grade, archive, sign, put on the wire
+----
+280s  the last moment a read can still end   ← SOLVER_SAFETY_MARGIN_S = 20
+```
+
+A model needing 300s misses by 20; one needing 360s misses by 80. The only
+thing that would change this is a validator advertising a longer `deadline_s`,
+which is its config and not the miner's — so the miner's own caps are set not
+to bind if it ever does: `min(deadline_s, GLM_REQUEST_TIMEOUT_S)` with the
+latter at 600, and `SOLVER_MAX_BUDGET_S` as the single runaway guard above it.
+
 ### A model still writing is waited for, never interrupted
 
 The slice a read is given is an internal **allocation**, not a deadline: part of
@@ -1117,7 +1137,7 @@ fresh conversation.
 | `SOLVER_SAFETY_MARGIN_S` | `20` | Headroom kept before the cutoff, for `send`'s post-deadline phases and for grading, signing and transport |
 | `SOLVER_MAX_BUDGET_S` | `600` | Runaway guard, not a target. Deliberately does not bind at the advertised deadline — lowering it below the deadline throws away answers the validator would still pay for |
 | `SOLVER_VERIFY_EXECUTOR` | `subprocess` | Python grading backend; Rust always uses Docker |
-| `GLM_REQUEST_TIMEOUT_S` | `300` | The deadline `handle_request` answers **504** at, `min()`-ed with the validator's own. Named for the reference miner's GLM client but applied to whatever solver is plugged in. `docs/DEMO_MINER.md` documents `280` for that miner; leaving `280` in your `.env` costs the browser solver 20 seconds of every solve |
+| `GLM_REQUEST_TIMEOUT_S` | `600` | The deadline `handle_request` answers **504** at, `min()`-ed with the validator's own. Named for the reference miner's GLM client but applied to whatever solver is plugged in. `docs/DEMO_MINER.md` documents `280` for that miner; leaving `280` in your `.env` costs the browser solver 20 seconds of every solve |
 
 `GET /solver-status` reports per-provider counters and fleet health. Watch it —
 a browser miner fails quietly, and silence looks identical to success.

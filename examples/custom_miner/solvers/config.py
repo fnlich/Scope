@@ -33,7 +33,15 @@ from typing import Optional, Sequence
 #
 # `min()` is what makes raising it safe. It can never overrun a validator that
 # advertises LESS; it only stops us giving up early on one that advertises more.
-DEFAULT_SOLVE_TIMEOUT_S = "300"
+#
+# So it is set ABOVE the deadline rather than exactly on it, and that is the
+# whole point of the value. Pinned at 300 it would sit exactly on today's
+# `solve_deadline_s` and bind the moment the subnet raised it -- the same bug
+# one level up, silently costing the difference on every solve. There is one
+# runaway guard for a validator advertising something absurd, and it is
+# SOLVER_MAX_BUDGET_S in the solver; a second one here only adds a way to be
+# wrong. At today's 300s deadline this is a no-op: `min(300, 600)` is 300.
+DEFAULT_SOLVE_TIMEOUT_S = "600"
 
 
 def apply_solve_timeout_default() -> None:

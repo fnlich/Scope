@@ -6609,12 +6609,21 @@ def test_the_solve_timeout_default_tracks_the_deadline_the_subnet_advertises(mon
     apply_solve_timeout_default()
     assert os.environ["GLM_REQUEST_TIMEOUT_S"] == "120", "the operator's value must win"
 
-    assert float(DEFAULT_SOLVE_TIMEOUT_S) >= Settings().solve_deadline_s, (
+    advertised = Settings().solve_deadline_s
+    assert float(DEFAULT_SOLVE_TIMEOUT_S) > advertised, (
         f"the miner caps solves at {DEFAULT_SOLVE_TIMEOUT_S}s while validators "
-        f"advertise {Settings().solve_deadline_s:g}s. Every solve gets less time "
-        f"than it was offered, and an unfinished answer earns nothing while a "
-        f"late correct one still earns 95%+."
+        f"advertise {advertised:g}s. Every solve gets less time than it was "
+        f"offered, and an unfinished answer earns nothing while a late correct "
+        f"one still earns 95%+."
     )
+    # Strictly greater, not equal. Sitting exactly ON the advertised deadline
+    # binds the moment the subnet raises it, which is the same bug one level up
+    # and just as quiet. The runaway guard for an absurd deadline is
+    # SOLVER_MAX_BUDGET_S, in the solver; a second one here only adds a way to
+    # be wrong.
+    assert float(DEFAULT_SOLVE_TIMEOUT_S) >= 2 * advertised or (
+        float(DEFAULT_SOLVE_TIMEOUT_S) - advertised >= 60.0
+    ), "leave real headroom above the deadline, not a rounding error"
 
 
 def test_a_send_that_never_starts_still_reports_why():
