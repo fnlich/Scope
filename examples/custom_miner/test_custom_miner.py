@@ -5863,3 +5863,126 @@ def test_the_image_check_only_speaks_when_docker_actually_said_no_such_image(mon
 
     monkeypatch.setattr(subprocess, "run", explode)
     assert rehearse._rust_sandbox_missing() is None
+
+
+# --------------------------------------------------------------------------- #
+# Quality over speed: the prompt must tell the model the truth about what the
+# payment rule actually rewards.
+# --------------------------------------------------------------------------- #
+def test_the_prompt_tells_the_truth_about_how_little_speed_is_worth():
+    """The prompt used to say the answer is "scored partly on how fast it
+    arrives" — technically true, catastrophically miscalibrated. The payment
+    rule gates everything on all-pass correctness and caps the speed spread at
+    the floor: fastest correct earns at most (1 - floor) more than slowest
+    correct, 5% under this release, with a 180s half-life. A model told speed
+    matters trades checks for pace, which is exactly the trade the rule
+    punishes. The claim in the prompt is DERIVED here from the payment module's
+    own constants, so a policy change fails this test rather than leaving the
+    prompt asserting something that stopped being true."""
+    from rlvr.policy import RELEASE_POLICY
+    from rlvr.scoring.payment import DEFAULT_SPEED_FLOOR
+    from solvers.prompts import PYTHON_RULES, RUST_RULES, build_initial_prompt
+
+    # Production reads ValidatorPolicy.payment_speed_floor, a constant
+    # DUPLICATED from payment.py's default. The prompt's claim is derived from
+    # the production one; this assertion is what keeps the duplicate honest,
+    # because editing policy.py alone would otherwise leave the prompt
+    # test-green and wrong on chain.
+    assert RELEASE_POLICY.payment_speed_floor == DEFAULT_SPEED_FLOOR
+    floor = f"{round(RELEASE_POLICY.payment_speed_floor * 100)}%"
+    for rules in (PYTHON_RULES, RUST_RULES):
+        assert f"at least {floor} of what the fastest" in rules, (
+            f"the prompt's speed floor does not match the payment policy "
+            f"({floor} from RELEASE_POLICY.payment_speed_floor)"
+        )
+        assert "how fast it arrives" not in rules, (
+            "the prompt still tells the model that speed is scored"
+        )
+    for language, entry in (("python", "solve"), ("rust", "main")):
+        prompt = build_initial_prompt(language, "Do a thing.", entry, [])
+        assert "no partial credit" in prompt
+        assert "prefer the safe implementation" in prompt
+
+
+def test_the_method_licenses_depth_and_forbids_trading_checks_for_speed():
+    """The other half of the same correction. Telling the model speed is
+    nearly worthless only helps if the method then says what to spend the
+    time ON: real traces with computed values, not a skim that ends "looks
+    right", and a closing line that makes skipping a check for speed a named
+    mistake rather than a judgement call."""
+    from solvers.prompts import METHOD, METHOD_CODA, build_initial_prompt
+
+    # The license is an ALLOCATION rule, not a claim that reasoning is free —
+    # on a UI with little or no hidden reasoning channel, "invisible and free"
+    # invites the model to reason visibly in the reply.
+    assert "spend the deadline where it buys correctness" in " ".join(METHOD.split())
+    assert "invisible and free" not in METHOD
+    # Silence is declared ABOVE the numbered steps, so every step is read
+    # under it rather than discovering it forty lines later.
+    steps_start = METHOD.index("1.")
+    assert "silently" in METHOD[:steps_start]
+    assert "computing the real" in METHOD and "intermediate values" in METHOD
+    assert "in your head" in METHOD, "the trace is not anchored to reasoning"
+    assert '"looks right" catches nothing' in " ".join(METHOD.split())
+    # The verbs that could be obeyed as artifacts are gone: no building tests
+    # (test code in the block), no listing rules (a visible bulleted list).
+    assert "Build tests" not in METHOD and "List for yourself" not in METHOD
+    assert "Invent inputs of your own" in METHOD
+    # The strongest sentence fires once, from the last slot in <method>.
+    assert "The check you skip is the hidden test you fail" in " ".join(METHOD_CODA.split())
+    assert "the deadline cuts off scores the same zero" in " ".join(METHOD_CODA.split())
+    prompt = build_initial_prompt("python", "Do a thing.", "solve", [])
+    tail = prompt.split("</self_check>")[1]
+    assert "The check you skip" in tail, "the coda is not in the final slot"
+    # The protective invariants that earlier cost solves must survive the
+    # rewrite: program before checking, silence, code-only close.
+    steps = [line for line in METHOD.splitlines()
+             if line[:2] in ("1.", "2.", "3.", "4.", "5.", "6.")]
+    assert len(steps) == 6
+    assert "Write the program FIRST" in steps[1]
+    assert "Send the code and nothing else" in steps[5]
+    assert "before you answer" not in METHOD.lower()
+
+
+def test_the_model_is_told_to_build_its_own_tests_from_the_statement():
+    """The generic checklist catches generic bugs. Both graded failures on the
+    real challenges were problem-specific boundaries: extent-journal's resize
+    rule (a statement sentence with no code behind it) and the thresholds the
+    statement itself named. The method now makes the model derive its battery
+    from the statement — every named bound at, below and above; counts at 0,
+    1, 2; every rule triggered and NEARLY triggered — and re-trace after
+    every fix."""
+    from solvers.prompts import EDGE_CASES, METHOD, SELF_CHECK
+
+    normalised_method = " ".join(METHOD.split())
+    assert "one input that triggers it and one that NEARLY does" in normalised_method
+    assert "re-trace the cases that already passed" in normalised_method
+    assert "THE STATEMENT'S OWN CONSTANTS" in EDGE_CASES
+    assert "AT that exact value, one below it, and one above" in EDGE_CASES
+    for case in ("TIES", "A REJECTED OPERATION", "TWO RULES AT ONCE",
+                 "WRAPAROUND", "A BATCH APPLIED AT ONCE"):
+        assert case in EDGE_CASES, f"the checklist dropped {case}"
+    assert "nothing half-committed" in " ".join(EDGE_CASES.split())
+    # The seventh self-check line: a statement sentence with no code behind it.
+    assert "code you can point at" in SELF_CHECK
+    assert "verify each of these, silently" in " ".join(SELF_CHECK.split()), (
+        "the self-check header invites a visible Q&A again"
+    )
+
+
+def test_a_repair_asks_for_a_diagnosis_not_a_guess():
+    """A repair that edits from the shape of the failure fixes the symptom the
+    failure happened to show. The prompt now demands the model find the actual
+    line where computed and expected part company before touching anything."""
+    from solvers.prompts import build_repair_prompt
+
+    prompt = build_repair_prompt(["g(*[0], **{}) returned 1, expected 0"],
+                                 "python", "g")
+    assert "In your reasoning — not in the reply" in prompt
+    assert "do not guess at the fix" in prompt
+    assert "before you send" not in prompt.lower(), (
+        "the repair prompt reintroduced the phrase that caused narration"
+    )
+    assert prompt.rstrip().endswith("ONLY ONE corrected code block and nothing else."), (
+        "the repair prompt no longer ends on the output rule"
+    )
