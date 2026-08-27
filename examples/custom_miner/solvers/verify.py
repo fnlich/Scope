@@ -43,6 +43,7 @@ from .prompts import (
     build_initial_prompt,
     build_repair_prompt,
     extract_code,
+    extract_self_tests,
     python_defect,
     rust_defect,
 )
@@ -104,6 +105,14 @@ class Candidate:
     total: int = 0
     defect: Optional[str] = None
     failures: list[str] = field(default_factory=list)
+    # Cases the MODEL wrote for its own program, kept apart from the validator's
+    # examples on purpose. They are evidence, not verification: a model cannot
+    # confirm its own reading of a statement, so folding these into
+    # `passed`/`total` would let `verified` -- which gates the answer cache --
+    # go True on nothing more than the model agreeing with itself.
+    self_passed: int = 0
+    self_total: int = 0
+    from_self_tests: bool = False
 
     @property
     def verified(self) -> bool:
@@ -130,7 +139,18 @@ class Candidate:
         the one to keep: `python_defect` is a static check, and a static check
         that is too strict must not be able to throw work away.
         """
-        return (self.passed, 1 if self.code.strip() else 0, 0 if self.defect else 1)
+        # `self_passed` sits second: below the validator's own examples, which
+        # are ground truth, and above everything structural, because a program
+        # that reproduces cases it was checked against is better evidence than
+        # one that merely parses. A candidate with no self-tests scores 0 there
+        # and ties with one that failed all of them -- deliberately. Having
+        # tests must not rank an answer below not having them.
+        return (
+            self.passed,
+            self.self_passed,
+            1 if self.code.strip() else 0,
+            0 if self.defect else 1,
+        )
 
 
 class _Grader:
@@ -313,12 +333,14 @@ class VerifyingSolver:
         max_budget_s: float = 3600.0,
         cache_size: int = 256,
         second_opinion: bool = True,
+        self_tests: bool = True,
     ):
         self._backend = backend
         self._max_attempts = max(1, int(max_attempts))
         self._margin = max(0.0, float(safety_margin_s))
         self._max_budget = max(5.0, float(max_budget_s))
         self._second_opinion = bool(second_opinion)
+        self._self_tests = bool(self_tests)
         self._grader = _Grader()
         self._cache: dict[str, tuple[str, str]] = {}
         self._cache_size = max(0, int(cache_size))
@@ -451,7 +473,12 @@ class VerifyingSolver:
             # because two ungradeable candidates tie at `score` and `>` loses a
             # tie. Twice the time and twice the quota for no information at all.
             if best.total == 0:
-                if not self._warned_ungradeable:
+                if best.from_self_tests:
+                    # Not ungradeable after all: the model shipped cases and
+                    # they ran. The warning below is about having NOTHING to
+                    # run and would be false here.
+                    pass
+                elif not self._warned_ungradeable:
                     self._warned_ungradeable = True
                     why = (
                         "no public examples shipped with this task"
@@ -459,7 +486,8 @@ class VerifyingSolver:
                         else "the public examples could not be run here"
                     )
                     print(
-                        f"[verify] {why}, so nothing can be graded locally: no "
+                        f"[verify] {why}, and the model sent no usable cases of "
+                        f"its own either, so nothing can be graded locally: no "
                         f"repair rounds, no second opinion once an answer is in "
                         f"hand, and verified=False however good it is. Once per run."
                     )
@@ -502,7 +530,9 @@ class VerifyingSolver:
         print(
             f"[verify] {task.language} entrypoint={task.entrypoint} "
             f"provider={won_with or 'none'} "
-            f"examples={best.passed}/{best.total} verified={best.verified} "
+            f"examples={best.passed}/{best.total} "
+            + (f"self={best.self_passed}/{best.self_total} " if best.self_total else "")
+            + f"verified={best.verified} "
             f"{elapsed:.1f}s/{budget:.0f}s"
         )
         return Answer(
@@ -658,6 +688,7 @@ class VerifyingSolver:
                     task.entrypoint,
                     defect=candidate.defect,
                     budget_s=budget - (time.monotonic() - started),
+                    from_self_tests=candidate.from_self_tests,
                 )
         except asyncio.CancelledError:
             raise
@@ -717,6 +748,35 @@ class VerifyingSolver:
             row["verified"] += 1
 
     # ---------------------------------------------------------------------- #
+    def _run_self_tests(self, candidate: Candidate, reply: str, task) -> None:
+        """Grade a candidate against the cases the model sent with it.
+
+        Never raises and never blocks the answer. A model wrote both halves of
+        this -- the cases and the JSON they arrived in -- so every failure mode
+        here ends in "no self-tests ran", which is exactly where this code path
+        started.
+        """
+        cases = extract_self_tests(reply, task.entrypoint, task.language)
+        if not cases:
+            return
+        names = [case.get("name", "") for case in cases]
+        try:
+            passed, total, failures = self._grader.check(
+                candidate.code, task.language, task.entrypoint, cases, names
+            )
+        except Exception as exc:  # noqa: BLE001 - a broken executor loses no answer
+            print(f"[verify] could not run the model's own cases: "
+                  f"{type(exc).__name__}: {exc}")
+            return
+        if not total:
+            return
+        candidate.self_passed, candidate.self_total = passed, total
+        candidate.from_self_tests = True
+        # Only failures drive a repair. A clean run is left silent: it is the
+        # ordinary outcome and saying so on every solve would bury the line
+        # that matters.
+        candidate.failures = failures
+
     def _grade(self, reply: str, task, left: Optional[float] = None) -> Candidate:
         code = extract_code(reply, task.entrypoint, task.language)
         candidate = Candidate(code=code, raw=reply)
@@ -752,7 +812,17 @@ class VerifyingSolver:
             candidate.code = "" if not code.strip() else code
             return candidate
         if not task.public_examples:
-            return candidate  # nothing to verify against; take it as-is
+            # Nothing SHIPPED to verify against -- which is every task on live
+            # traffic -- so the only cases that can exist are the ones the model
+            # wrote for its own program. Running them is not verification and is
+            # never recorded as any: `passed`/`total` stay at zero, so `verified`
+            # stays False and the answer is never cached. What it does catch is
+            # the commonest failure by far, the model knowing what the answer
+            # should be and coding it wrong, and that is objectively checkable
+            # with the validator's own executor.
+            if self._self_tests and not out_of_budget and code.strip():
+                self._run_self_tests(candidate, reply, task)
+            return candidate
         if out_of_budget:
             # The budget is gone, so running the examples buys nothing that can
             # still be acted on: there is no time for a repair round, and

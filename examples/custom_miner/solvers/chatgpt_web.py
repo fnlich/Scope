@@ -73,11 +73,11 @@ ASSISTANT_AGENT_TURN = ".agent-turn"
 # panel, where the reader cannot see it. The reply then looks like prose with
 # no code, which costs a whole solve to discover.
 NUDGE = (
-    "START your reply with the code block. No preamble, no explanation before "
-    "it and none after — an answer that arrives after a paragraph of prose may "
-    "not arrive at all. Reply directly in the chat with one ordinary fenced "
-    "code block, however "
-    "long the program is. Do not use canvas. Do not run code and do not try to "
+    "START your reply with the program's code block. No preamble and no "
+    "explanation — an answer that arrives after a paragraph of prose may not "
+    "arrive at all. Reply directly in the chat with the two ordinary fenced "
+    "blocks the output contract asks for, the program first and the JSON cases "
+    "second, however long the program is. Do not use canvas. Do not run code and do not try to "
     "compile or test anything — there is no toolchain here and every tool "
     "call is time the answer does not get."
 )
