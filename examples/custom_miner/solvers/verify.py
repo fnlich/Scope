@@ -310,7 +310,7 @@ class VerifyingSolver:
         *,
         max_attempts: int = 3,
         safety_margin_s: float = 20.0,
-        max_budget_s: float = 600.0,
+        max_budget_s: float = 3600.0,
         cache_size: int = 256,
         second_opinion: bool = True,
     ):
@@ -516,8 +516,16 @@ class VerifyingSolver:
         try:
             conversation = await self._backend.open(avoid=avoid)
             provider = getattr(conversation, "provider", None)
+            # The budget is told to the MODEL, not just enforced against it.
+            # Everything above this line rations the clock on the model's
+            # behalf; nothing until now let the model ration it for itself, and
+            # a model rationing an unknown either hurries a generous budget
+            # away or explores a tight one until the reply is cut off. Both pay
+            # zero. Measured after the lease, so the number is the truth rather
+            # than what it was before opening a conversation cost anything.
             prompt = build_initial_prompt(
-                task.language, task.statement, task.entrypoint, task.public_examples
+                task.language, task.statement, task.entrypoint, task.public_examples,
+                budget_s=budget - (time.monotonic() - started),
             )
             for attempt in range(1, self._max_attempts + 1):
                 left = budget - (time.monotonic() - started)
@@ -621,6 +629,7 @@ class VerifyingSolver:
                     task.language,
                     task.entrypoint,
                     defect=candidate.defect,
+                    budget_s=budget - (time.monotonic() - started),
                 )
         except asyncio.CancelledError:
             raise

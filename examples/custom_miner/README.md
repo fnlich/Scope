@@ -1014,6 +1014,64 @@ ChatGPT tabs answered that same minute with the same selector, so that page was
 in a bad state rather than a new shape. The wire recovery covers both; the
 fallbacks are insurance against the shape changing under all of them at once.
 
+### The request's deadline is the only deadline
+
+`TaskRequest.deadline_s` is `Field(gt=0.0, le=3600.0)`, so every cap the miner
+keeps sits at **3600** — at the protocol ceiling, where it is structurally
+incapable of binding on a spec-compliant request. `min(deadline_s, 3600)` is
+`deadline_s`, always.
+
+Anything smaller is a second, *private* deadline, and a private deadline
+silently costs the difference the moment a validator advertises more than it.
+That has already happened twice here: `SOLVER_MAX_BUDGET_S=240` against a 300s
+deadline cut the first read from 238s to 191s, and `GLM_REQUEST_TIMEOUT_S=280`
+cut the whole solve by 20 seconds. Neither was visible as anything except
+answers that arrived unfinished.
+
+What remains is not a deadline but the **cost of delivering**:
+`SOLVER_SAFETY_MARGIN_S` covers `send`'s post-read phases (5 + 4 + 2 = 11s) plus
+grading, archiving, signing and transmission. The budget is the advertised
+deadline minus that, and nothing else.
+
+### The model is told how long it has
+
+The prompt had always talked about "the deadline" — `METHOD` says to spend it,
+`METHOD_CODA` says a reply it cuts off scores zero — and **never once said how
+long it was**. That asks a model to ration an unknown, and a model rationing an
+unknown does one of two things: hurries a 240-second budget away on a shallow
+answer, or explores a 40-second one until the reply is cut off mid-program.
+Both pay zero.
+
+`<budget>` now opens `<method>`, so step 2 (*"Write the program FIRST"*) is read
+knowing how long there is to write it in, and `METHOD_CODA` closes the same
+section — the budget holds both ends of the procedure. Two rules make a partial
+answer impossible:
+
+- **COMPLETE BEFORE CORRECT** — write the whole program out before testing any
+  of it. A program improved *into* existence is a program that may not exist
+  when the clock stops.
+- **SENDABLE AT EVERY MOMENT** — change it from one complete program into
+  another; never leave it half-rewritten. The dangerous state is not "wrong",
+  it is "half-rewritten".
+
+Then the testing depth scales to the number, because *"test it thoroughly"*
+cannot mean the same thing at 40 seconds and at 240:
+
+| budget | depth |
+|---|---|
+| ≥ 180s | every example, then **at least eight** invented cases, re-traced after every fix |
+| 60–180s | every example, then **at least five** the statement makes reachable |
+| < 60s | the safe implementation, every example, and the three that break implementations most often — empty/zero, single element, the stated bound |
+
+Counts rather than adverbs: a count can be checked against the work actually
+done. A repair round carries the remaining seconds too, appended at the single
+exit so a variant added later cannot forget it — *"enough to FIX this program,
+not to start again"*, because a model handed a fault list with no sense of the
+clock reconsiders an approach that was rarely the problem.
+
+A budget the caller cannot supply renders **nothing**. A number invented here
+would be worse than none, because the model would ration against it.
+
 ### How long the miner actually waits, and why it stops there
 
 **280 seconds — 4m40s.** Not five or six minutes, and that is not a setting.

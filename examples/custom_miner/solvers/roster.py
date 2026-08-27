@@ -95,12 +95,13 @@ def build_solver(browsers: Optional[Sequence[Browser]] = None) -> VerifyingSolve
         fleet,
         max_attempts=int(os.environ.get("SOLVER_MAX_ATTEMPTS", "3")),
         safety_margin_s=float(os.environ.get("SOLVER_SAFETY_MARGIN_S", "20")),
-        # Deliberately non-binding: the budget comes from the deadline the
-        # validator advertised, minus the margin. This is a runaway guard for a
-        # validator that advertises something absurd, not a policy. Capping it
-        # below the advertised deadline throws answers away that the validator
-        # would still have paid for -- see VerifyingSolver.solve_task.
-        max_budget_s=float(os.environ.get("SOLVER_MAX_BUDGET_S", "600")),
+        # The largest deadline the protocol allows (`TaskRequest.deadline_s` is
+        # `le=3600`), so it cannot bind on a spec-compliant request: the budget
+        # is the deadline the validator advertised, minus what delivering the
+        # answer costs, and nothing else. A smaller value here is a second,
+        # private deadline that throws away answers the validator would still
+        # have paid for -- see VerifyingSolver.solve_task.
+        max_budget_s=float(os.environ.get("SOLVER_MAX_BUDGET_S", "3600")),
         second_opinion=os.environ.get("SOLVER_SECOND_OPINION", "true").strip().lower()
         not in ("0", "false", "no"),
     )

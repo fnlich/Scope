@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import asyncio
 import shutil
 import subprocess
@@ -46,7 +47,13 @@ from solvers.browser_pool import (  # noqa: E402
 )
 from solvers.chatgpt_web import chatgpt_site  # noqa: E402
 from solvers.claude_web import claude_site  # noqa: E402
-from solvers.prompts import NO_CODE, extract_code, python_defect  # noqa: E402
+from solvers.prompts import (  # noqa: E402
+    NO_CODE,
+    build_initial_prompt,
+    build_repair_prompt,
+    extract_code,
+    python_defect,
+)
 from solvers.verify import (  # noqa: E402
     EMPTY_HANDED_FLOOR_S,
     MAX_PASSES,
@@ -7125,3 +7132,157 @@ def test_a_copy_that_differs_in_the_middle_still_wins():
     assert cut(["def g(n):\n    return 12"], ["def g(n):\n    return 1"]) == 0
     # Nothing to compare against.
     assert cut([], ["x"]) == 0 and cut(["x"], []) == 0
+
+
+# --------------------------------------------------------------------------- #
+# The request's deadline is the only deadline, and the model is told what it is.
+# --------------------------------------------------------------------------- #
+def test_no_miner_cap_can_bind_on_a_spec_compliant_request():
+    """`TaskRequest.deadline_s` is `Field(gt=0.0, le=3600.0)`. Every cap the
+    miner keeps must sit at or above that ceiling, or it is a second, PRIVATE
+    deadline — and a private deadline silently costs the difference the moment
+    a validator advertises more than it.
+
+    This has already happened twice on this branch: `SOLVER_MAX_BUDGET_S=240`
+    against a 300s deadline cut the first read from 238s to 191s, and
+    `GLM_REQUEST_TIMEOUT_S=280` cut the whole solve by 20s. Both were invisible
+    except as answers that arrived unfinished.
+    """
+    from solvers.config import DEFAULT_SOLVE_TIMEOUT_S
+
+    ceiling = next(
+        m.le for m in TaskRequest.model_fields["deadline_s"].metadata
+        if getattr(m, "le", None) is not None
+    )
+    caps = {
+        "GLM_REQUEST_TIMEOUT_S": float(DEFAULT_SOLVE_TIMEOUT_S),
+        "VerifyingSolver(max_budget_s=)": VerifyingSolver(object())._max_budget,
+        "SOLVER_MAX_BUDGET_S": float(
+            _roster_default("SOLVER_MAX_BUDGET_S")
+        ),
+    }
+    for name, value in caps.items():
+        assert value >= ceiling, (
+            f"{name} is {value:g} but a validator may legally advertise "
+            f"deadline_s={ceiling:g}. That gap is a private deadline, and every "
+            f"second of it is time the model is not given."
+        )
+
+
+def _roster_default(var: str) -> str:
+    """The default `roster.build_solver` uses for one env var, read from source
+    so the test cannot drift from the code it is checking."""
+    text = (Path(__file__).parent / "solvers" / "roster.py").read_text("utf-8")
+    m = re.search(rf'os\.environ\.get\("{var}",\s*"([\d.]+)"\)', text)
+    assert m, f"{var} is no longer read with a literal default"
+    return m.group(1)
+
+
+@pytest.mark.parametrize(
+    "budget, marker",
+    [(600, "generous budget"), (180, "generous budget"),
+     (179, "working budget"), (60, "working budget"),
+     (59, "tight budget"), (1, "tight budget")],
+)
+def test_the_prompt_states_the_budget_and_scales_the_testing_to_it(budget, marker):
+    """The prompt has always talked about "the deadline" — METHOD says to spend
+    it, METHOD_CODA says a reply it cuts off scores zero — and never once said
+    how long it was. A model rationing an unknown either hurries a generous
+    budget away on a shallow answer or explores a tight one until the reply is
+    cut off mid-program. Both pay zero.
+
+    The depth ladder is why the number is worth stating rather than merely
+    enforcing: "test it thoroughly" cannot mean the same thing at 40 seconds
+    and at 240, and a count can be checked against the work done where an
+    adverb cannot.
+    """
+    prompt = build_initial_prompt("python", "Sum the digits.", "g", [], budget_s=budget)
+    assert f"about {budget} seconds" in prompt, (
+        f"the budget is enforced but never stated: {budget}s"
+    )
+    assert marker in prompt, f"{budget}s did not select {marker!r}"
+    # The two rules that make a partial answer impossible.
+    assert "COMPLETE BEFORE CORRECT" in prompt
+    assert "SENDABLE AT EVERY MOMENT" in prompt
+
+
+def test_the_budget_opens_the_method_section():
+    """Placement is the argument. Step 2 of METHOD is "Write the program FIRST",
+    and it has to be read knowing how long there is to write it in — the whole
+    failure this fixes is a model that budgets wrong. METHOD_CODA closes the
+    same section, so the budget holds both ends of the procedure."""
+    prompt = build_initial_prompt("python", "s", "g", [], budget_s=200)
+    method = prompt.index("<method>")
+    assert method < prompt.index("<budget>") < prompt.index("Correctness is the only"), (
+        "the budget must sit between <method> and the numbered steps it shapes"
+    )
+
+
+def test_an_unknown_budget_invents_nothing():
+    """A number guessed here would be worse than none: the model would ration
+    against it. A backend that cannot report a deadline gets the prompt it
+    always got."""
+    from solvers.prompts import _budget_seconds
+
+    bare = build_initial_prompt("python", "s", "g", [])
+    assert "<budget>" not in bare and "seconds for this reply" not in bare
+    # Building a prompt must never raise on a bad number: that loses the whole
+    # solve, which is the one outcome worse than having no number at all.
+    # `int(float("inf"))` raises OverflowError where nan raises ValueError.
+    for junk in (None, 0, -1, -0.4, 0.9, "", "abc", [], float("nan"), float("inf")):
+        assert _budget_seconds(junk) == 0, junk
+    assert _budget_seconds(None) == 0
+    assert _budget_seconds(0) == 0
+    assert _budget_seconds(-30) == 0
+    assert _budget_seconds("abc") == 0
+    assert _budget_seconds(0.9) == 0, "sub-second budgets round to no budget"
+    assert _budget_seconds(240.7) == 240, "truncated, never rounded up"
+    assert _budget_seconds("120") == 120, "a numeric string is a number"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"defect": NO_CODE}, {"defect": "the program does not define `fn main()`"}, {}],
+)
+def test_every_repair_variant_says_how_much_time_is_left(kwargs):
+    """A repair round is always the shorter half of the budget, and the failure
+    it invites is a rewrite: a model handed a fault list with no sense of the
+    clock reconsiders its approach, and the approach was rarely the problem.
+
+    Parametrised over all three variants because the suffix is appended at the
+    single exit precisely so a variant added later cannot forget it."""
+    args = ([] if kwargs else ["g(1) returned 2, expected 3"], "rust", "main")
+    with_time = build_repair_prompt(*args, budget_s=32, **kwargs)
+    assert "about 32 seconds left" in with_time, with_time[-200:]
+    assert "not to start\nagain" in with_time or "not to start again" in with_time
+
+    without = build_repair_prompt(*args, **kwargs)
+    assert "seconds left" not in without, "invented a budget nobody supplied"
+
+
+def test_the_model_is_told_the_budget_the_solver_actually_has():
+    """End to end: the number in the prompt has to be the number the read will
+    really run for, or it is worse than silence. With a 300s deadline the solver
+    keeps 280 and the first read may use all of it."""
+    seen: list[str] = []
+
+    class _Chat:
+        provider = "claude"
+        async def send(self, text, timeout_s, extend_to_s=None):
+            seen.append(text)
+            return RIGHT
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    asyncio.run(VerifyingSolver(_Fleet()).solve_task(DIGITS, timeout_s=300.0))
+    stated = re.search(r"about (\d+) seconds for this reply", seen[0])
+    assert stated, f"the prompt carried no budget:\n{seen[0][:400]}"
+    said = int(stated.group(1))
+    assert 260 <= said <= 280, (
+        f"told the model {said}s of a 280s budget — a number that is not the "
+        f"truth is worse than no number, because it is rationed against"
+    )

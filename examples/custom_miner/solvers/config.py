@@ -34,14 +34,19 @@ from typing import Optional, Sequence
 # `min()` is what makes raising it safe. It can never overrun a validator that
 # advertises LESS; it only stops us giving up early on one that advertises more.
 #
-# So it is set ABOVE the deadline rather than exactly on it, and that is the
-# whole point of the value. Pinned at 300 it would sit exactly on today's
-# `solve_deadline_s` and bind the moment the subnet raised it -- the same bug
-# one level up, silently costing the difference on every solve. There is one
-# runaway guard for a validator advertising something absurd, and it is
-# SOLVER_MAX_BUDGET_S in the solver; a second one here only adds a way to be
-# wrong. At today's 300s deadline this is a no-op: `min(300, 600)` is 300.
-DEFAULT_SOLVE_TIMEOUT_S = "600"
+# So it is set to the largest deadline the PROTOCOL allows, and that choice is
+# the whole point of the value. `TaskRequest.deadline_s` is
+# `Field(gt=0.0, le=3600.0)`, so at 3600 this is structurally incapable of
+# binding on any spec-compliant request: `min(deadline_s, 3600)` is
+# `deadline_s`, always. The request's deadline is the only deadline.
+#
+# Anything smaller is a second, private deadline that silently costs the
+# difference the moment a validator advertises more than it. Pinned at 300 it
+# sat exactly on today's `solve_deadline_s` and would have bound the instant
+# the subnet raised it; pinned at 600 it merely moved the cliff. What remains
+# here is a bound on an OUT-OF-SPEC value, not a policy about how long a solve
+# may take.
+DEFAULT_SOLVE_TIMEOUT_S = "3600"
 
 
 def apply_solve_timeout_default() -> None:
