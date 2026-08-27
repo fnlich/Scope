@@ -131,16 +131,27 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 
 ### The prompt is one delimited document, and the order is the argument
 
+Above roughly a 100-second budget the solve takes **two turns** — the cases
+first, then the program — and both are laid out the same way:
+
 ```
-<output>       one fenced block, nothing else            ← first
-<problem>      the statement
-<examples>     labelled a floor, not the specification
-<contract>     what is TRUE: how it is run, compared, and
-               what the environment does silently
-<method>       what to DO: a numbered procedure           ← last
-  <edge_cases>  shapes of input that break a solution
-  <self_check>  reading the program back against itself
+TURN 1 (cases)                      TURN 2 (program)
+<output>   one json block           <output>   one code block          ← first
+<problem>  the statement            <problem>  the statement
+<examples> a floor to agree with    <examples> a floor, not the spec
+<task>     which cases, by class    <contract> what is TRUE: how it is
+                                               run, compared, and what
+                                               the environment does
+                                               silently
+                                    <must_pass> the model's OWN cases
+                                                from turn 1
+                                    <method>   what to DO: a numbered
+                                               procedure               ← last
+                                      <edge_cases>  input shapes that break
+                                      <self_check>  reading the program back
 ```
+Below that budget there is one turn, and it asks for both blocks at once — see
+*[The cases are written before the program exists](#the-cases-are-written-before-the-program-exists)*.
 …then the site's nudge, appended after everything, repeats the output rule.
 
 The output contract holds **both ends**. It is the only instruction whose
@@ -170,6 +181,15 @@ this prompt has fought hardest:
 5. Read the program back against itself.
 6. Send the code and nothing else.
 ```
+
+Step 6 — and the count of blocks in steps 4 and 5, and the bullet saying where
+the cases go — is **rendered per turn**, because `METHOD`, `SELF_CHECK` and
+`PYTHON_RULES` are shared by turns that ask for different replies. Reused
+verbatim under the two-turn contract they told the model *"the reply itself is
+only the two blocks"* directly beneath a contract saying ONE, and a model
+resolves a contradiction by obeying the more specific-sounding half. One test
+asserts the invariant over every turn: **no section may name a block its own
+contract did not ask for.**
 
 Three facts were missing that change decisions rather than decorate them.
 **There is no partial credit** — a program wrong on one hidden case scores what
@@ -1087,6 +1107,69 @@ block, and a reply carrying only cases, which still reports *"the reply
 contained no code"* exactly as before. `SOLVER_SELF_TESTS=0` turns the whole
 mechanism off.
 
+### The cases are written before the program exists
+
+Asking for both in one reply has a flaw that no amount of prompt wording fixes:
+a model writing cases **alongside** a program back-fills the `expected` values
+from what the program happens to do. Those cases then agree with the program's
+bugs, which is the one thing a test must not do. Cases written *first* cannot.
+
+So above `TWO_PHASE_FLOOR_S = 100` seconds of budget the solve spends a round
+trip on them:
+
+```
+turn 1  the cases, and explicitly NOT the program
+turn 2  the program, with those cases restated as <must_pass>
+turn 3+ repair, if the program disagrees with them
+```
+
+Turn 1 is asked for the shape the classes actually break on, with counts stated
+**per class** rather than as a total — a total invites a model to spend it all
+on the easy classes:
+
+```
+1. THREE ordinary cases         the common path, which an all-boundary
+                                suite never checks at all
+2. then 2–10 cases per class:   zero and the empty input · one and two ·
+                                every limit the statement names, at it,
+                                one below, one above · negatives ·
+                                largest/smallest, and i32 overflow ·
+                                ties and duplicates · degenerate shape ·
+                                each rule fired and NEARLY fired ·
+                                the case you are most likely to get wrong
+```
+
+Four things make the extra round trip safe rather than a second way to run out
+of time:
+
+- **It is hard-capped.** Turn 1 gets `min(25% of what is left, 60s)`, and it is
+  passed an `extend_to_s` *equal* to its own slice, which makes `send`'s
+  mid-answer extension a no-op. A model that rambles through its cases cannot
+  eat the read the program needs — measured, the program still opens on a 238s
+  slice out of a 300s deadline.
+- **It is skipped when it cannot pay.** A cases turn costs a second submit, a
+  second settle and a second tail. Below 100s that overhead comes out of the
+  only half that pays, so the solve stays single-turn, byte-for-byte the prompt
+  that shipped before.
+- **A turn 1 that produces nothing still gets a program.** No usable cases is
+  not a failure; it costs the time it took and turn 2 goes out regardless. A
+  turn 1 that could not be *read at all* is different — the tab has just proved
+  it cannot answer, so the task is handed to another model rather than queued
+  behind an answer that never arrived.
+- **A wrong case can still be corrected.** Turn 1 derives its `expected` values
+  by reasoning, so one of them can simply be wrong — and freezing them would
+  make a **correct** program fail the same bogus case on every repair round.
+  The repair prompt says outright to fix the case and leave the program alone,
+  and a repair reply carrying a corrected array replaces the frozen one for the
+  *next* round. Not the round that carried it: a reply is graded against the
+  cases agreed before it arrived, so a model cannot make its program pass by
+  rewriting the bar in the same breath.
+
+`MAX_SELF_TESTS = 20` is the cap the model is told about *and* the cap the miner
+enforces, and over-long arrays are thinned by keeping the first three and then
+striding — a head-slice would keep the three ordinary cases and throw away every
+boundary, discarding exactly what the mechanism exists to run.
+
 ### A short deadline must still get an answer
 
 `TaskRequest.deadline_s` is only `Field(gt=0.0, le=3600.0)`. Nothing in the
@@ -1130,19 +1213,32 @@ Three separate causes:
 Every deadline from 2 seconds to 3600 now returns an answer. One second does
 not, and cannot: `send` enforces a one-second minimum read.
 
-### The model is told how long it has
+### The model is NOT told how long it has, and that is the second answer
 
-The prompt had always talked about "the deadline" — `METHOD` says to spend it,
-`METHOD_CODA` says a reply it cuts off scores zero — and **never once said how
-long it was**. That asks a model to ration an unknown, and a model rationing an
-unknown does one of two things: hurries a 240-second budget away on a shallow
-answer, or explores a 40-second one until the reply is cut off mid-program.
-Both pay zero.
+For a while it was. `<budget>` opened `<method>` with a real number of seconds,
+on the reasoning that a model rationing an *unknown* deadline either hurries a
+generous budget away or explores a tight one until the reply is cut off.
 
-`<budget>` now opens `<method>`, so step 2 (*"Write the program FIRST"*) is read
-knowing how long there is to write it in, and `METHOD_CODA` closes the same
-section — the budget holds both ends of the procedure. Two rules make a partial
-answer impossible:
+The reasoning was sound and the mechanism was not, because **a model has no
+clock.** It cannot measure 260 seconds, cannot tell how many it has spent, and
+cannot tell how many a paragraph will cost. Handed a number it can only act on
+by guessing, and the only concrete behaviour the number ever drove was a depth
+ladder — *"at least eight invented cases above 180s, at least five between 60
+and 180"* — which is a count, not a duration. The count is what mattered; the
+seconds were scaffolding around it.
+
+So the number is gone from every prompt, and the counts are stated outright, by
+class, in the turn that asks for the cases. That is both more precise and
+checkable: a count can be compared against the work actually done, where a
+duration a model cannot perceive can only be hoped at. One test walks every
+prompt — both turns, both languages, both repair shapes — and fails on any
+digit followed by a unit of time, with a single exception for the per-test
+limit (`about 5 seconds`), which is a measured fact about the grader rather
+than a budget to ration.
+
+Two rules were filed under the budget and were never about time at all. They
+are what makes a *partial* program impossible, so they moved to the top of
+`<method>` and stayed:
 
 - **COMPLETE BEFORE CORRECT** — write the whole program out before testing any
   of it. A program improved *into* existence is a program that may not exist
@@ -1151,23 +1247,9 @@ answer impossible:
   another; never leave it half-rewritten. The dangerous state is not "wrong",
   it is "half-rewritten".
 
-Then the testing depth scales to the number, because *"test it thoroughly"*
-cannot mean the same thing at 40 seconds and at 240:
-
-| budget | depth |
-|---|---|
-| ≥ 180s | every example, then **at least eight** invented cases, re-traced after every fix |
-| 60–180s | every example, then **at least five** the statement makes reachable |
-| < 60s | the safe implementation, every example, and the three that break implementations most often — empty/zero, single element, the stated bound |
-
-Counts rather than adverbs: a count can be checked against the work actually
-done. A repair round carries the remaining seconds too, appended at the single
-exit so a variant added later cannot forget it — *"enough to FIX this program,
-not to start again"*, because a model handed a fault list with no sense of the
-clock reconsiders an approach that was rarely the problem.
-
-A budget the caller cannot supply renders **nothing**. A number invented here
-would be worse than none, because the model would ration against it.
+The miner still rations the deadline. It just does it in code, where there is a
+clock — see *[The request's deadline is the only
+deadline](#the-requests-deadline-is-the-only-deadline)*.
 
 ### How long the miner actually waits, and why it stops there
 

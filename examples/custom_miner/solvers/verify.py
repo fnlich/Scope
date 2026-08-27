@@ -40,8 +40,9 @@ from typing import Any, Optional, Protocol
 from rlvr.types import TestCase
 
 from .prompts import (
-    build_initial_prompt,
+    build_code_prompt,
     build_repair_prompt,
+    build_tests_prompt,
     extract_code,
     extract_self_tests,
     python_defect,
@@ -290,6 +291,28 @@ SECOND_OPINION_FLOOR_S = 20.0
 # long before this does.
 SECOND_OPINION_PASSES = 2
 MAX_PASSES = 4
+
+# Below this budget the solve stays single-turn: one prompt, program and cases
+# in one reply.
+#
+# A cases-first turn costs a second submit, a second settle and a second
+# post-read tail -- roughly 20 to 30 seconds of fixed overhead before the model
+# writes a character. Spending that out of a 40-second budget leaves no room for
+# the program, and the program is the only half that pays. It does NOT cost a
+# second deadline: `send` measures from its own start and `_attempt` recomputes
+# `left` afterwards, so turn 2 still stops at `attempt_start + budget` however
+# long turn 1 took -- verified, the worst case is unchanged at `budget + 11s`.
+#
+# 100 rather than 120 because 120 is exactly the budget a third of the test
+# suite drives (`max_budget_s=120` at `timeout_s=120`), and a gate sitting on a
+# value that many tests use is a gate that decides by rounding.
+TWO_PHASE_FLOOR_S = 100.0
+
+# What turn 1 may spend, as a share of the attempt and as an absolute ceiling.
+# The ceiling is what actually matters: it is the guarantee that the program
+# still gets the bulk of the budget when a model rambles through its cases.
+TESTS_SHARE = 0.25
+TESTS_CAP_S = 60.0
 
 
 # Which backends accept `extend_to_s`, by class, asked once each.
@@ -540,6 +563,43 @@ class VerifyingSolver:
             verified=best.verified, passed=best.passed, total=best.total,
         )
 
+    async def _ask_for_cases(self, conversation, task, left: float):
+        """Turn 1: the model's cases, before it has written the program.
+
+        Returns the cases, or ``[]`` when the reply carried none usable, or
+        ``None`` when the CONVERSATION is the problem -- unreadable, or still
+        writing -- in which case turn 2 must not be sent into it at all.
+
+        Hard-capped. `extend_to_s` is passed EQUAL to the slice, which makes
+        `send`'s mid-answer extension a no-op (`hard <= deadline` short-circuits
+        it), so a model that rambles through its cases cannot eat the budget the
+        program needs. That is the whole risk of a first turn: it produces
+        nothing that pays.
+        """
+        slice_s = max(1.0, min(left * TESTS_SHARE, TESTS_CAP_S))
+        prompt = build_tests_prompt(
+            task.language, task.statement, task.entrypoint, task.public_examples
+        )
+        if _reads_past_its_slice(conversation):
+            reply = await conversation.send(prompt, slice_s, extend_to_s=slice_s)
+        else:
+            reply = await conversation.send(prompt, slice_s)
+        if getattr(conversation, "still_writing", False) or getattr(
+            conversation, "empty_reason", None
+        ) in ("unreadable", "unfinished"):
+            print(
+                f"[verify] the cases turn came back "
+                f"{getattr(conversation, 'empty_reason', None) or 'unfinished'}; "
+                f"asking another model rather than sending the program request "
+                f"into a conversation that cannot answer"
+            )
+            return None
+        cases = extract_self_tests(reply, task.entrypoint, task.language)
+        if not cases:
+            print("[verify] the cases turn produced none usable; "
+                  "asking for the program without them")
+        return cases
+
     async def _attempt(
         self, task, remaining: float, avoid: Optional[str]
     ) -> tuple[Optional[Candidate], Optional[str]]:
@@ -561,17 +621,32 @@ class VerifyingSolver:
         try:
             conversation = await self._backend.open(avoid=avoid)
             provider = getattr(conversation, "provider", None)
-            # The budget is told to the MODEL, not just enforced against it.
-            # Everything above this line rations the clock on the model's
-            # behalf; nothing until now let the model ration it for itself, and
-            # a model rationing an unknown either hurries a generous budget
-            # away or explores a tight one until the reply is cut off. Both pay
-            # zero. Measured after the lease, so the number is the truth rather
-            # than what it was before opening a conversation cost anything.
-            prompt = build_initial_prompt(
-                task.language, task.statement, task.entrypoint, task.public_examples,
-                budget_s=budget - (time.monotonic() - started),
+            # Turn 1: the cases, before the program exists. Cases written
+            # ALONGSIDE a program can be back-filled from what the program
+            # happens to do, and then they agree with its bugs; cases written
+            # first cannot. That is the whole argument for spending a round
+            # trip here.
+            cases: Any = "ask"
+            if self._self_tests and budget >= TWO_PHASE_FLOOR_S:
+                cases = await self._ask_for_cases(
+                    conversation, task, budget - (time.monotonic() - started)
+                )
+                if cases is None:
+                    # The tab could not be read, or the model was still writing.
+                    # Sending turn 2 into it would queue behind an answer that
+                    # has not arrived; hand the whole task to another model.
+                    return best, provider
+            prompt = build_code_prompt(
+                task.language, task.statement, task.entrypoint,
+                task.public_examples, cases=cases,
             )
+            # `not cases` covers None as well as [], and it matters: the
+            # early return above is the only thing that keeps None out of here,
+            # so `list(cases)` was one edit away from a TypeError -- which this
+            # module CATCHES as a backend failure and reports as "provider=none"
+            # with no answer. A crash that looks like a dead tab is the worst
+            # kind, so the line does not depend on the guard above surviving.
+            agreed = [] if cases == "ask" or not cases else list(cases)
             for attempt in range(1, self._max_attempts + 1):
                 left = budget - (time.monotonic() - started)
                 if attempt > 1 and left < 12.0:
@@ -608,8 +683,16 @@ class VerifyingSolver:
                 else:
                     reply = await conversation.send(prompt, slice_s)
                 candidate = await self._graded(
-                    reply, task, budget - (time.monotonic() - started)
+                    reply, task, budget - (time.monotonic() - started), agreed
                 )
+                # A repair reply may carry a CORRECTED case array: the repair
+                # prompt says so outright ("if the case was wrong, fix the case
+                # and leave the program alone"). Freezing turn 1's cases would
+                # kill that escape hatch and let one wrong case break a correct
+                # program on every round.
+                revised = extract_self_tests(reply, task.entrypoint, task.language)
+                if revised:
+                    agreed = revised
                 if best is None or candidate.score > best.score:
                     best = candidate
                 if candidate.verified:
@@ -687,7 +770,6 @@ class VerifyingSolver:
                     task.language,
                     task.entrypoint,
                     defect=candidate.defect,
-                    budget_s=budget - (time.monotonic() - started),
                     from_self_tests=candidate.from_self_tests,
                 )
         except asyncio.CancelledError:
@@ -702,7 +784,9 @@ class VerifyingSolver:
                     pass
         return best, provider
 
-    async def _graded(self, reply: str, task, left: float) -> Candidate:
+    async def _graded(
+        self, reply: str, task, left: float, cases: Optional[list] = None
+    ) -> Candidate:
         """`_grade`, run OFF the event loop.
 
         Grading is blocking work wearing an async coat: `compile_defect` shells
@@ -729,7 +813,7 @@ class VerifyingSolver:
         running while it waits.
         """
         try:
-            return await asyncio.to_thread(self._grade, reply, task, left)
+            return await asyncio.to_thread(self._grade, reply, task, left, cases)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - never lose the answer to the check
@@ -748,7 +832,10 @@ class VerifyingSolver:
             row["verified"] += 1
 
     # ---------------------------------------------------------------------- #
-    def _run_self_tests(self, candidate: Candidate, reply: str, task) -> None:
+    def _run_self_tests(
+        self, candidate: Candidate, reply: str, task,
+        cases: Optional[list] = None,
+    ) -> None:
         """Grade a candidate against the cases the model sent with it.
 
         Never raises and never blocks the answer. A model wrote both halves of
@@ -756,7 +843,13 @@ class VerifyingSolver:
         here ends in "no self-tests ran", which is exactly where this code path
         started.
         """
-        cases = extract_self_tests(reply, task.entrypoint, task.language)
+        # The cases agreed in turn 1 win over anything in THIS reply: after
+        # the split the program arrives alone, and re-extracting from it
+        # would find nothing and silently stop grading -- the exact state
+        # this mechanism was built to end.
+        cases = list(cases or []) or extract_self_tests(
+            reply, task.entrypoint, task.language
+        )
         if not cases:
             return
         names = [case.get("name", "") for case in cases]
@@ -777,7 +870,10 @@ class VerifyingSolver:
         # that matters.
         candidate.failures = failures
 
-    def _grade(self, reply: str, task, left: Optional[float] = None) -> Candidate:
+    def _grade(
+        self, reply: str, task, left: Optional[float] = None,
+        cases: Optional[list] = None,
+    ) -> Candidate:
         code = extract_code(reply, task.entrypoint, task.language)
         candidate = Candidate(code=code, raw=reply)
         defect = (
@@ -821,7 +917,7 @@ class VerifyingSolver:
             # should be and coding it wrong, and that is objectively checkable
             # with the validator's own executor.
             if self._self_tests and not out_of_budget and code.strip():
-                self._run_self_tests(candidate, reply, task)
+                self._run_self_tests(candidate, reply, task, cases)
             return candidate
         if out_of_budget:
             # The budget is gone, so running the examples buys nothing that can
