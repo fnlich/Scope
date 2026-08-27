@@ -986,9 +986,33 @@ conversation. A working tab paints its assistant bubble within a second or two
 of the submit, empty, and fills it in after — so "has the reply appeared at
 all" is a different question from "has it finished", and only the first one
 separates an unreadable tab from a slow model. A tab that renders nothing for
-`BLIND_TAB_GRACE_S` (30s) is retired on the spot and the rest of the budget
-goes to another tab. A model that is merely thinking is never touched: its
-bubble is already on screen.
+`BLIND_TAB_GRACE_S` (30s) stops being polled and the rest of the budget goes to
+another tab. A model that is merely thinking is never touched: its bubble is
+already on screen.
+
+It stops being *polled*, not read. The copy control and the network stream run
+first, and only then is the tab retired — because both read the answer by other
+means than the selector that just failed. The stream especially: it is captured
+off the wire by CDP and has never touched the DOM, so a selector matching
+nothing says nothing at all about it. `_reconcile_stream` was written for
+exactly this case and names it — *"a selector that stopped matching, a render
+this tab cannot see"* — and nine bounded seconds there is the difference
+between a zero and the whole payment.
+
+`CHATGPT_ASSISTANT` also had exactly **one** candidate, which is one deploy
+away from the same failure across every tab at once. It now has three, and
+Claude has had three since it was written. This is the one role whose failure
+is total — a composer or copy control that stops matching degrades, an
+assistant selector that matches nothing reads no answer at all, for every task,
+until somebody notices. Every candidate on both sites is assistant-only *by
+construction*, and a test asserts none of them matches a user turn: a candidate
+that did would have the miner read its own prompt back and submit it, which is
+a silent permanent zero.
+
+What the fallbacks are *not* is a fix for tab 9227 specifically — five other
+ChatGPT tabs answered that same minute with the same selector, so that page was
+in a bad state rather than a new shape. The wire recovery covers both; the
+fallbacks are insurance against the shape changing under all of them at once.
 
 **An empty capture was repaired like a wrong answer.** They are
 indistinguishable at the point the decision is made — the structural checks

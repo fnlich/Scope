@@ -6640,3 +6640,114 @@ def test_a_send_that_never_starts_still_reports_why():
         f"a dead tab reported {reason!r} — the previous task's reason, which "
         f"would earn this one a repair round in a conversation that is gone"
     )
+
+
+def test_a_blind_tab_still_gets_its_answer_off_the_wire():
+    """Retiring an unreadable tab must not stop it being READ one last time.
+
+    The network stream is captured by CDP off the wire and has never touched the
+    DOM, so a selector matching nothing says nothing at all about it —
+    `_reconcile_stream`'s own docstring names this case: "a selector that
+    stopped matching, a render this tab cannot see". Clearing `alive` inside the
+    read loop skipped both the copy control and the stream, which is the
+    difference between a zero and the whole payment on the one tab that needed
+    them.
+
+    So the loop stops polling, the recovery phases run, and only then is the tab
+    retired.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    )
+    site = _site(assistant=("#nothing-matches-this",), stream=True)
+
+    async def go(grace):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+
+            async def wire():
+                return "here it is:\n\n```python\ndef pong():\n    return 4\n```\n"
+
+            tab._streamed_markdown = wire
+            real, _browser_pool.BLIND_TAB_GRACE_S = _browser_pool.BLIND_TAB_GRACE_S, grace
+            try:
+                reply = await tab.send("solve it", 60.0)
+            finally:
+                _browser_pool.BLIND_TAB_GRACE_S = real
+                await browser.close()
+            return reply, tab.alive, tab.empty_reason
+
+    reply, alive, reason = asyncio.run(go(1.0))
+    assert "return 4" in extract_code(reply, "pong"), (
+        f"the DOM was unreadable and the answer was on the wire, and the tab was "
+        f"retired before anything looked: {reply!r}"
+    )
+    assert alive is False, "the DOM is still unreadable; the tab is finished"
+    assert reason is None, "an answer came back, so there is no empty to explain"
+
+
+def test_no_assistant_candidate_can_match_a_user_turn():
+    """The one selector mistake that costs money silently.
+
+    An assistant candidate that also matched the user's turn would have the
+    miner read its own prompt back and submit it: no error, no empty reply, a
+    permanent zero. `_Tab.send`'s echo guard is the backstop and has caught it
+    in production — this is the check that stops it reaching the guard.
+
+    Every candidate on both sites is asserted against a page carrying only user
+    turns, in the shapes each site actually uses. A new fallback that is merely
+    *broad* fails here rather than in a live solve.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        # ChatGPT's user turn: the same attributes as an assistant turn, the
+        # other value.
+        '<article data-turn="user" class="group/conversation-turn">'
+        '  <div data-message-author-role="user" data-message-id="aaa">'
+        '    <div class="whitespace-pre-wrap">solve it</div>'
+        '  </div>'
+        '</article>'
+        # claude.ai's user turn.
+        '<div data-testid="user-message"><p>solve it</p></div>'
+        '<div class="font-user-message"><p>solve it</p></div>'
+    )
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            hits = {}
+            for site in (chatgpt_site(), claude_site()):
+                for candidate in site.assistant:
+                    n = await page.locator(candidate).count()
+                    if n:
+                        hits[f"{site.name}: {candidate}"] = n
+            await browser.close()
+            return hits
+
+    hits = asyncio.run(go())
+    assert not hits, (
+        f"these assistant candidates match a USER turn: {hits}. The miner would "
+        f"read its own prompt back and submit it as the answer."
+    )
+
+
+def test_the_assistant_role_has_more_than_one_candidate_on_every_site():
+    """The role whose failure is total is the role that must not be a single
+    point of failure. Every other role degrades when its selector stops
+    matching — the submit falls back, the copy falls back to scraping. An
+    assistant selector matching nothing reads no answer at all, for every task,
+    until somebody notices. A live run cost a whole task to exactly that, with
+    one candidate on the list."""
+    for site in (chatgpt_site(), claude_site()):
+        assert len(site.assistant) >= 2, (
+            f"{site.name} has {len(site.assistant)} assistant candidate(s); one "
+            f"deploy away from reading nothing at all"
+        )

@@ -917,10 +917,21 @@ class _Tab:
                 ):
                     # Nothing has rendered in the time a working tab needs to
                     # paint an empty bubble. Polling on is not patience, it is
-                    # the rest of the budget: stop, retire the tab, and let the
-                    # caller ask somebody else while there is still time to.
-                    # `_explain_empty` below says which of the causes it was.
-                    self.alive, blind = False, True
+                    # the rest of the budget: stop, and let the caller ask
+                    # somebody else while there is still time to.
+                    #
+                    # `alive` is NOT cleared here, and that is the whole point
+                    # of the distinction. Retiring the tab now would skip the
+                    # copy control and the network stream, and those are read by
+                    # other means than the selector that just failed -- the
+                    # stream especially, which is captured off the wire by CDP
+                    # and has never touched the DOM. `_reconcile_stream` exists
+                    # for exactly this case and says so: "a selector that
+                    # stopped matching, a render this tab cannot see". Nine
+                    # bounded seconds there can turn this zero into the whole
+                    # payment. The tab is retired at the single exit below,
+                    # after they have had their say.
+                    blind = True
                     print(
                         f"[{self.site.name}] tab {self.label} showed no reply at all "
                         f"in {BLIND_TAB_GRACE_S:.0f}s; giving up on it now rather "
@@ -998,6 +1009,13 @@ class _Tab:
                     f"checking the answer against the network stream in "
                     f"{STREAM_PHASE_TIMEOUT_S:.0f}s. Submitting what the page gave."
                 )
+        if blind:
+            # Now, and not before: the recovery phases above needed a tab that
+            # was still allowed to be read. Whatever they found, the DOM here is
+            # unreadable and the next task on this tab would spend another
+            # BLIND_TAB_GRACE_S discovering that. Retire it; the pool spawns a
+            # replacement in the background.
+            self.alive = False
         if best and self._is_our_own_prompt(best):
             # Last line of defence, at the ONE exit, because everything above
             # it can produce a submission and only one of them was guarded.
