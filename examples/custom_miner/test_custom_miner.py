@@ -3137,12 +3137,12 @@ def _solved_by(solver, request, directory):
             os.environ["SOLVER_SOLUTION_DIR"] = previous
 
 
-def _solver_returning(code):
+def _solver_returning(code, transcript="transcript"):
     from custom_miner import SolveResult
 
     class _S:
         async def solve_task(self, task, timeout_s):
-            return SolveResult(code=code, raw_response="transcript")
+            return SolveResult(code=code, raw_response=transcript)
 
     return _S()
 
@@ -5985,4 +5985,95 @@ def test_a_repair_asks_for_a_diagnosis_not_a_guess():
     )
     assert prompt.rstrip().endswith("ONLY ONE corrected code block and nothing else."), (
         "the repair prompt no longer ends on the output rule"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The archive is only evidence if it is EXACTLY what the validator received.
+# --------------------------------------------------------------------------- #
+def test_the_file_holds_the_exact_bytes_the_validator_was_sent(tmp_path, monkeypatch):
+    """Byte-for-byte, against the code decoded from the real signed HTTP
+    response — not against the variable that fed it, and not through
+    `read_text`, which applies universal-newline translation on READ and would
+    hide a CRLF answer being rewritten on the way to disk.
+
+    Every shape below is one the reader can actually produce: CRLF from a
+    Windows-flavoured paste, non-ASCII from a string literal, characters JSON
+    has to escape, and a transcript big enough to force `fit_response` to trim
+    (which must trim `raw_response` and never touch `code`)."""
+    from custom_miner import response_limit
+
+    shapes = {
+        "ordinary": "def solve(n):\n    return n + 1\n",
+        "no trailing newline": "def solve(n):\n    return n",
+        "trailing whitespace": "def solve(n):\n    return n   \n   \n",
+        "non-ascii": "def solve(n):\n    return '→ ✓ 日本語 🎯'\n",
+        "json metachars": 'def solve(n):\n    return "q\\" b\\\\s \\ttab"\n',
+        "CRLF": "def solve(n):\r\n    return n\r\n",
+        "control chars": "def solve(n):\n    return '\\x01\\x02'\n",
+        "huge transcript": "def solve(n):\n    return n\n",
+    }
+    for name, program in shapes.items():
+        transcript = "x" * (response_limit() * 2) if name == "huge transcript" else "t"
+        payload = _solved_by(
+            _solver_returning(program, transcript), _request("shape", "python"), tmp_path
+        )
+        assert payload.code == program, f"{name}: the graded field was rewritten"
+        written = tmp_path / "shape.py"
+        assert written.read_bytes() == program.encode("utf-8"), (
+            f"{name}: the file is not the bytes that were sent"
+        )
+        record = json.loads((tmp_path / "shape.json").read_text(encoding="utf-8"))
+        assert record["response"]["code"] == program, f"{name}: the exchange disagrees"
+
+
+def test_two_problem_ids_can_never_share_one_file(tmp_path):
+    """Sanitising is lossy in both directions — `abc/def` and `abc:def` both
+    became `abc_def`, and two over-long ids sharing a prefix truncated to the
+    same name. Either way the second solve overwrote the first and the file
+    then held an answer to a DIFFERENT problem than its name claimed, which is
+    the one promise this module makes."""
+    from solution_archive import save_solution
+
+    collide = [("abc/def", "abc:def"), ("z" * 120 + "X", "z" * 120 + "Y"),
+               ("p 1", "p_1"), ("../x", "x"), ("a.b", "a:b")]
+    for first, second in collide:
+        a = save_solution(first, "python", "x = 1", tmp_path)
+        b = save_solution(second, "python", "x = 2", tmp_path)
+        assert a != b, f"{first!r} and {second!r} share the file {a}"
+        assert a.read_text() == "x = 1", f"{second!r} overwrote {first!r}"
+        assert a.parent == b.parent == tmp_path
+
+
+def test_an_id_that_needs_no_sanitising_keeps_its_readable_name(tmp_path):
+    """The disambiguating digest is only for ids that were ALTERED. Real ones —
+    sha256 hex, or a slug like `extent-journal` — must stay exactly themselves,
+    or every filename an operator has learned changes for nothing."""
+    from solution_archive import save_solution
+
+    for readable in ("extent-journal", "rehearsal-python-1", "a" * 64, "req-1"):
+        written = save_solution(readable, "python", "x = 1", tmp_path)
+        assert written.name == f"{readable}.py", written.name
+
+
+def test_the_file_follows_the_payload_even_if_fit_response_rewrites_the_code(tmp_path, monkeypatch):
+    """`save_solution` is handed `payload.code`, not the variable that fed it.
+    Today those are identical — `fit_response` trims only `raw_response` — so
+    nothing observable distinguishes the two, and a refactor could quietly swap
+    them back. This forces the difference: a `fit_response` that DOES rewrite
+    the graded field must take the file with it, because the file is only worth
+    having if it is the submission rather than something that resembles it."""
+    import custom_miner
+
+    original = custom_miner.fit_response
+
+    def rewriting(payload, limit=None):
+        trimmed = original(payload, limit)
+        return trimmed.model_copy(update={"code": trimmed.code + "\n# rewritten\n"})
+
+    monkeypatch.setattr(custom_miner, "fit_response", rewriting)
+    payload = _solved_by(_solver_returning("x = 1\n"), _request("rw", "python"), tmp_path)
+    assert payload.code.endswith("# rewritten\n"), "the stand-in did not fire"
+    assert (tmp_path / "rw.py").read_bytes() == payload.code.encode("utf-8"), (
+        "the file kept the pre-fit_response code, not what was sent"
     )

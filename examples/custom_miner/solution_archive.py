@@ -20,6 +20,7 @@ swallowed after one line of explanation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -51,9 +52,26 @@ def archive_dir() -> Optional[Path]:
 
 
 def _stem(problem_id: str) -> str:
-    """A file name that cannot leave the archive directory."""
-    safe = _UNSAFE.sub("_", str(problem_id)).strip("._")
-    return (safe or "unknown")[:_MAX_STEM]
+    """A file name that cannot leave the archive directory, and cannot collide.
+
+    Sanitising is lossy in both directions: `abc/def` and `abc:def` both become
+    `abc_def`, and two ids longer than `_MAX_STEM` that share a prefix truncate
+    to the same thing. Either way the second solve overwrites the first, and the
+    file then holds an answer to a DIFFERENT problem than its name claims --
+    which quietly breaks the one promise this module makes.
+
+    So a name that survives sanitising untouched is kept exactly as it is (real
+    ids are sha256 hex or slugs like `extent-journal`, and those stay readable),
+    and only an id that was actually ALTERED carries a digest of the true id to
+    tell it apart from its neighbours. The `.json` beside it records the id in
+    full either way.
+    """
+    raw = str(problem_id)
+    safe = _UNSAFE.sub("_", raw).strip("._")
+    if safe == raw and 0 < len(safe) <= _MAX_STEM:
+        return safe
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{(safe or 'unknown')[:_MAX_STEM - 9]}-{digest}"
 
 
 def save_solution(
