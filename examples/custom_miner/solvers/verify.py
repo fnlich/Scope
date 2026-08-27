@@ -30,6 +30,7 @@ to use the container backend instead; Rust verification always requires it.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import threading
 import time
@@ -59,6 +60,11 @@ class Conversation(Protocol):
     model can see its own previous attempt alongside the failure report.
     """
 
+    # A backend MAY also accept ``extend_to_s`` -- the caller's real remaining
+    # budget, as opposed to the slice it allocated for this one read. One that
+    # does may read past its slice while the model is still writing rather than
+    # stop mid-answer. One that does not is simply never offered it; see
+    # ``_reads_past_its_slice``.
     async def send(self, text: str, timeout_s: float) -> str: ...
     async def close(self) -> None: ...
 
@@ -249,6 +255,29 @@ def _clip(value: Any, limit: int = 160) -> str:
 #
 # The ordering is the invariant, not the values: empty-handed must never be the
 # HARDER case to justify. It is the one with nothing to lose.
+# Which backends accept `extend_to_s`, by class, asked once each.
+#
+# The parameter is optional on purpose. `Conversation` is a Protocol, so a
+# backend written outside this package satisfies it with the two-argument
+# `send` that has always been the contract -- and calling it with a keyword it
+# does not take would be a TypeError inside the one call the whole solve
+# depends on. Catching that TypeError is not an option either: one raised from
+# INSIDE `send` is indistinguishable, and retrying would send the prompt twice.
+_EXTEND_SUPPORT: dict[type, bool] = {}
+
+
+def _reads_past_its_slice(conversation: Any) -> bool:
+    cls = type(conversation)
+    known = _EXTEND_SUPPORT.get(cls)
+    if known is None:
+        try:
+            known = "extend_to_s" in inspect.signature(cls.send).parameters
+        except (TypeError, ValueError):  # builtins, C callables, no signature
+            known = False
+        _EXTEND_SUPPORT[cls] = known
+    return known
+
+
 EMPTY_HANDED_FLOOR_S = 12.0
 SECOND_OPINION_FLOOR_S = 20.0
 
@@ -509,13 +538,48 @@ class VerifyingSolver:
                     left if attempt == self._max_attempts else left * first_share
                 )
 
-                reply = await conversation.send(prompt, slice_s)
+                # The slice is what this read is ALLOCATED; `left` is what the
+                # attempt actually still has. Handing over both lets the read
+                # spend the repair reserve on an answer that is still arriving,
+                # which is the only thing that can still produce one.
+                if _reads_past_its_slice(conversation):
+                    reply = await conversation.send(prompt, slice_s, extend_to_s=left)
+                else:
+                    reply = await conversation.send(prompt, slice_s)
                 candidate = await self._graded(
                     reply, task, budget - (time.monotonic() - started)
                 )
                 if best is None or candidate.score > best.score:
                     best = candidate
                 if candidate.verified:
+                    break
+                if getattr(conversation, "still_writing", False):
+                    # The model had not finished when the read stopped, so
+                    # whatever is in hand is a fragment of an answer rather than
+                    # a wrong one -- and there is nothing to say to a
+                    # conversation that is mid-sentence. The composer is
+                    # usually disabled while a reply streams; where it is not,
+                    # the prompt queues behind the answer it is asking about.
+                    #
+                    # Measured, with the site's busy selector dropped at startup
+                    # (which `usable_busy_selectors` does whenever a candidate
+                    # matches an idle page) and the model still writing:
+                    #
+                    #   captured=''             -> "your reply did not reach me
+                    #                              as code", sent to a model
+                    #                              that was still writing it
+                    #   captured='def g(n):\n    total = 0\n    while n > 0:'
+                    #                           -> "the code is not valid
+                    #                              Python", about a program the
+                    #                              model had not finished
+                    #
+                    # `send` already reads past its slice rather than stop here,
+                    # so reaching this means the whole budget is gone. Stop.
+                    print(
+                        f"[verify] {provider or 'this model'} was still writing when "
+                        f"the budget ran out; submitting what arrived rather than "
+                        f"interrupting it with a repair prompt"
+                    )
                     break
                 if not candidate.code.strip() and (
                     getattr(conversation, "empty_reason", None)

@@ -1014,6 +1014,53 @@ ChatGPT tabs answered that same minute with the same selector, so that page was
 in a bad state rather than a new shape. The wire recovery covers both; the
 fallbacks are insurance against the shape changing under all of them at once.
 
+### A model still writing is waited for, never interrupted
+
+The slice a read is given is an internal **allocation**, not a deadline: part of
+the budget is held back for a repair round. That reserve is well spent on an
+answer that arrived *wrong*. It is worth nothing at all on one that has not
+finished arriving — the composer is usually disabled while a reply streams, and
+where it is not the prompt simply queues behind the answer it is asking about.
+
+So when the slice runs out with the model still writing, the read extends once
+to the caller's real remaining budget rather than stopping to do something that
+cannot help. Measured on a page whose model finishes at 4.8s against a 3s slice:
+
+```
+slice only:      read 3.0s, code = 'def g(n):\n    t = 0\n    while n > 0:'
+slice + budget:  read 6.0s, the whole program
+```
+
+The truncated version is not merely worse, it is a certain zero **and** a wasted
+repair round: `python_defect` reports *"expected an indented block after 'while'
+statement"*, so the miner interrupts a model that is still writing to tell it
+about a syntax error in a program it has not finished. Both shapes of that
+mistake are now blocked outright — a conversation that comes back
+`still_writing` is never sent another prompt, whether it captured nothing or a
+fragment.
+
+Knowing that a model is still writing used to rest entirely on the site's stop
+control, and `usable_busy_selectors` **drops** any busy candidate that matches
+an idle page at startup — so a site legitimately runs with none, and then the
+signal reads False through the whole of an answer that is still arriving:
+
+```
+busy selector present:  empty_reason='unfinished'   (no repair)
+busy selector dropped:  empty_reason='no-code'      (REPAIRED, mid-answer)
+```
+
+A message longer than it was one poll ago is being written, whatever the DOM
+calls its stop button — so message growth is now the fallback, and it needs no
+selector at all. It does not rescue everything: with no busy selector, a reply
+whose *code* stops changing for two polls is still accepted as finished by the
+settle test, which is the documented cost of losing that selector. It covers the
+commoner shape by far — a model thinking in prose, where the read runs to its
+deadline.
+
+A reply that has **settled** still stops at its slice, because the reserve it
+would otherwise eat is exactly what pays for the repair round that turns a
+no-code reply into an answer.
+
 **An empty capture was repaired like a wrong answer.** They are
 indistinguishable at the point the decision is made — the structural checks
 reject empty source, so an empty candidate carries a `defect` exactly like a

@@ -623,6 +623,15 @@ class _Tab:
         # Callers that cannot see this attribute (any non-browser backend) get
         # the historic behaviour, because only the first two suppress a repair.
         self.empty_reason: Optional[str] = None
+        # Was the model STILL WRITING when the last send stopped reading?
+        #
+        # Separate from `empty_reason` because it is true whether or not
+        # anything was captured, and both cases matter: nothing captured, and a
+        # code block captured half-written. Prompting into a conversation that
+        # is mid-answer cannot help in either -- the composer is usually
+        # disabled, and if it is not the prompt queues behind the answer that
+        # has not arrived yet.
+        self.still_writing = False
         # True while this tab is known to be sitting in an EMPTY conversation.
         # It starts true because `_spawn` builds a tab only after loading
         # `site.url` — the site's own new-conversation URL — and seeing the
@@ -803,7 +812,25 @@ class _Tab:
         rendered = await self._dom_blocks(reply) if copied else None
         return copied, rendered
 
-    async def send(self, text: str, timeout_s: float) -> str:
+    async def send(
+        self, text: str, timeout_s: float, extend_to_s: Optional[float] = None
+    ) -> str:
+        """Ask, then read. ``timeout_s`` is the slice; ``extend_to_s`` the cap.
+
+        They differ because the slice is an internal ALLOCATION, not a
+        deadline. The caller holds back part of its budget for a repair round,
+        and that reserve is well spent on an answer that arrived wrong. It is
+        worth nothing at all on one that has not finished arriving: the composer
+        is usually disabled mid-stream, and where it is not the prompt simply
+        queues behind the answer it is asking about.
+
+        So when the slice runs out with the model still writing, the read
+        extends ONCE to ``extend_to_s`` -- the caller's real remaining budget --
+        rather than stopping to do something that cannot help. Waiting is the
+        only move that can still produce the answer, and the payment policy
+        agrees: a correct answer arriving late earns at least 95% of what the
+        fastest earns, and an unfinished one earns nothing.
+        """
         if not self.alive:
             # The pool has not recycled this tab yet. Retrying a known-dead tab
             # only burns the caller's budget one submit-timeout at a time.
@@ -814,6 +841,8 @@ class _Tab:
         # took — an overrun larger than the solver's whole safety margin.
         started = time.monotonic()
         deadline = started + max(1.0, timeout_s)
+        # Never before the slice, and never past the caller's own budget.
+        hard = started + max(max(1.0, timeout_s), float(extend_to_s or 0.0))
         self.uses += 1
         # Dirty from here on, whatever happens next: a submit that raises
         # part-way may still have left the prompt in the composer or even sent
@@ -880,20 +909,62 @@ class _Tab:
         # spends budget the healthy tabs could have had.
         submitted_at = time.monotonic()
         saw_reply = blind = False
-        # The last thing the page said about whether it was still generating.
-        # It is what separates "wrote prose and stopped" from "still writing",
-        # and a site with no usable busy selector reports False throughout --
-        # which lands on "no-code" and the historic repair, the safe default.
+        # Two independent readings of "is it still writing", because either
+        # alone is wrong often enough to matter.
+        #
+        # `last_busy` is the site's own stop control. It is authoritative when
+        # present and absent altogether when it is not: `usable_busy_selectors`
+        # DROPS any candidate that matches an idle page at startup, so a site
+        # can legitimately run with none, and then this reads False through the
+        # whole of an answer that is still arriving. Measured, with the busy
+        # selector dropped and the model mid-sentence at the deadline:
+        #
+        #     empty_reason='no-code'     <- and so a repair round fired, telling
+        #                                   a model still writing its first
+        #                                   answer that it had sent no code
+        #
+        # `grew` is the fallback and needs no selector at all: a message that
+        # is longer than it was one poll ago is being written, whatever the DOM
+        # calls its stop button.
+        #
+        # What it does NOT rescue, and neither did anything before it: with no
+        # busy selector, a reply whose CODE stops changing for two polls is
+        # accepted as finished by the settle test and the read exits early --
+        # so a model that pauses longer than 2x poll_s mid-block can still have
+        # a truncated answer taken as final. That is the known cost of losing
+        # the busy selector, documented on `usable_busy_selectors`, and the
+        # reason it says keeping one working is worth it. `grew` covers the
+        # commoner shape by far: a model thinking in prose, where `_read`
+        # returns None throughout and the read runs to its deadline.
         last_busy = False
+        grew = False
+        last_whole: Optional[str] = None
+        def out_of_time() -> bool:
+            """Stop reading? Extends once, and only mid-answer."""
+            nonlocal deadline
+            if time.monotonic() < deadline:
+                return False
+            # `hard <= deadline` is also what makes this happen at most once:
+            # the extension below sets them equal.
+            if hard <= deadline or not (last_busy or grew):
+                return True
+            deadline = hard
+            print(
+                f"[{self.site.name}] tab {self.label} is still writing at its "
+                f"{timeout_s:.0f}s slice; reading on to {hard - started:.0f}s rather "
+                f"than interrupting an answer that is still arriving."
+            )
+            return time.monotonic() >= deadline
+
         try:
             while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if out_of_time():
                     break
+                remaining = max(0.0, deadline - time.monotonic())
                 await asyncio.sleep(min(self.site.poll_s, remaining))
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if out_of_time():
                     break
+                remaining = max(0.0, deadline - time.monotonic())
                 # Every DOM call below auto-waits up to 30s on its own, which
                 # would sail past the deadline the loop just checked.
                 try:
@@ -909,6 +980,8 @@ class _Tab:
                     stable = None
                     continue
                 last_busy = busy
+                grew = last_whole is not None and whole != last_whole
+                last_whole = whole
                 if on_screen:
                     saw_reply = True
                 elif (
@@ -1031,11 +1104,12 @@ class _Tab:
         # One exit, one verdict. `best` non-empty clears it: the attribute
         # describes the LAST send, and a stale reason would suppress a repair
         # round on a later one.
+        self.still_writing = bool(last_busy or grew) and not blind
         if best:
             self.empty_reason = None
         elif blind or not self.alive:
             self.empty_reason = "unreadable"
-        elif last_busy:
+        elif self.still_writing:
             self.empty_reason = "unfinished"
         else:
             self.empty_reason = "no-code"

@@ -6751,3 +6751,274 @@ def test_the_assistant_role_has_more_than_one_candidate_on_every_site():
             f"{site.name} has {len(site.assistant)} assistant candidate(s); one "
             f"deploy away from reading nothing at all"
         )
+
+
+# --------------------------------------------------------------------------- #
+# A model still writing is waited for, never interrupted.
+#
+# The slice a read is given is an internal ALLOCATION -- part of the budget is
+# held back for a repair round. That reserve is well spent on an answer that
+# arrived WRONG and worth nothing at all on one that has not finished arriving.
+# --------------------------------------------------------------------------- #
+_STREAMING_PAGE = (
+    '<!doctype html><meta charset="utf-8">'
+    '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    '<button id="stop" style="display:none">stop</button>'
+    '<div id="host"></div><script>'
+    "const LINES = ['def g(n):','    t = 0','    while n > 0:',"
+    "               '        t += n % 10','        n //= 10','    return t'];"
+    "document.getElementById('send').onclick = () => {"
+    "  const stop = document.getElementById('stop'); stop.style.display = '';"
+    "  const d = document.createElement('div'); d.className='msg';"
+    "  const pre = document.createElement('pre'); const code = document.createElement('code');"
+    "  pre.appendChild(code); d.appendChild(pre);"
+    "  document.getElementById('host').appendChild(d);"
+    "  let i = 0;"
+    "  const t = setInterval(() => {"
+    "    if (i < LINES.length) { code.textContent += LINES[i++] + '\\n'; }"
+    "    else { clearInterval(t); stop.style.display='none'; }"
+    "  }, 800);"                                     # finishes at ~4.8s
+    "};</script>"
+)
+
+
+def _send_on_streaming_page(slice_s, extend_to, *, busy=("#stop:visible",)):
+    playwright, chrome = _chromium_or_skip()
+    url = _served(_STREAMING_PAGE)
+    site = _site(assistant=("div.msg",), busy=busy, poll_s=0.2)
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            started = time.monotonic()
+            reply = await tab.send("solve it", slice_s, extend_to_s=extend_to)
+            elapsed = time.monotonic() - started
+            await browser.close()
+            return reply, elapsed, tab.still_writing, tab.empty_reason
+
+    return asyncio.run(go())
+
+
+def test_a_read_waits_out_an_answer_that_is_still_arriving():
+    """The slice is not a deadline, and stopping at it threw away answers.
+
+    Measured on this page, whose model finishes at ~4.8s against a 3s slice:
+
+        slice only:      read 3.0s, code = 'def g(n):\\n    t = 0\\n    while n > 0:'
+        slice + budget:  read 6.0s, the whole program
+
+    The truncated version is not merely worse, it is a certain zero AND a wasted
+    repair round: `python_defect` reports "expected an indented block after
+    'while' statement", so the miner interrupts a model that is still writing to
+    tell it about a syntax error in a program it has not finished.
+    """
+    reply, elapsed, writing, _ = _send_on_streaming_page(3.0, 8.0)
+    code = extract_code(reply, "g", "python")
+    assert "return t" in code, f"stopped mid-answer and kept a fragment: {code!r}"
+    assert python_defect(code, "g") is None, "the program that came back must be whole"
+    assert elapsed > 3.0, "it cannot have waited without spending longer than the slice"
+    assert writing is False, "the model finished; nothing is still being written"
+
+
+def test_waiting_stops_at_the_budget_and_not_a_second_later():
+    """The extension is bounded by what the CALLER still has, not by the model.
+
+    `handle_request` answers 504 -- nothing at all -- past its own deadline, so
+    a read that waits for ever does not deliver a late answer, it throws away
+    the whole solve. `extend_to_s` is that bound.
+    """
+    _, elapsed, writing, _ = _send_on_streaming_page(1.0, 3.0)
+    assert elapsed < 8.0, (
+        f"read for {elapsed:.1f}s against a 3s cap; the model is still writing "
+        f"and would be waited for indefinitely"
+    )
+    assert writing is True, (
+        "the caller has to be told the answer was cut off rather than absent — "
+        "it is what stops a repair prompt going into a live conversation"
+    )
+
+
+def test_a_finished_reply_does_not_spend_the_repair_reserve():
+    """The other half of the bound. A reply that has SETTLED must stop at its
+    slice, because the reserve it would eat is exactly what pays for the repair
+    round that fixes it. Extending on everything would trade one bug for a
+    worse one: a no-code reply with no budget left to ask again."""
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<div id="host"></div><script>'
+        "document.getElementById('send').onclick = () => {"
+        "  const d = document.createElement('div'); d.className='msg';"
+        "  d.textContent = 'Sure! Here is the approach...';"   # settles at once
+        "  document.getElementById('host').appendChild(d);"
+        "};</script>"
+    )
+    site = _site(assistant=("div.msg",), poll_s=0.2)
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            started = time.monotonic()
+            await tab.send("solve it", 2.0, extend_to_s=30.0)
+            elapsed = time.monotonic() - started
+            await browser.close()
+            return elapsed, tab.still_writing, tab.empty_reason
+
+    elapsed, writing, reason = asyncio.run(go())
+    assert elapsed < 6.0, (
+        f"a settled reply held the read for {elapsed:.1f}s of a 30s budget. That "
+        f"time belongs to the repair round that turns it into an answer."
+    )
+    assert writing is False
+    assert reason == "no-code", "a finished reply with no code is the model's doing"
+
+
+def test_still_writing_is_detected_without_a_busy_selector():
+    """`usable_busy_selectors` DROPS any busy candidate that matches an idle
+    page at startup, so a site legitimately runs with none — and then the stop
+    control says False through the whole of an answer that is still arriving.
+    Measured before the fallback existed, with the model mid-sentence:
+
+        busy selector present:  empty_reason='unfinished'   (no repair)
+        busy selector dropped:  empty_reason='no-code'      (REPAIRED)
+
+    A message longer than it was one poll ago is being written, whatever the
+    DOM calls its stop button. That needs no selector at all.
+
+    The page here is the shape the live failure had: the model thinking out
+    loud, with no code block yet. `_read` returns None throughout, so the read
+    runs to its deadline rather than settling, and the growth of the message is
+    the only thing left that knows an answer is on its way.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<div id="host"></div><script>'
+        "document.getElementById('send').onclick = () => {"
+        "  const d = document.createElement('div'); d.className='msg';"
+        "  document.getElementById('host').appendChild(d);"
+        "  let n = 0;"
+        "  setInterval(() => { d.textContent += 'considering case ' + (++n) + '. '; }, 150);"
+        "};</script>"
+    )
+    site = _site(assistant=("div.msg",), busy=(), poll_s=0.2)   # no stop control
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            await tab.send("solve it", 2.0)
+            await browser.close()
+            return tab.still_writing, tab.empty_reason
+
+    writing, reason = asyncio.run(go())
+    assert writing is True, "the message was growing on every poll"
+    assert reason == "unfinished", (
+        f"reported {reason!r} with no busy selector, which buys a repair prompt "
+        f"in a conversation the model is still writing into"
+    )
+
+
+@pytest.mark.parametrize(
+    "captured, what",
+    [("", "nothing at all"), ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n```", "a half-written program")],
+)
+def test_a_model_still_writing_is_never_sent_a_repair_prompt(captured, what):
+    """The two shapes of the same mistake, both measured on a real page.
+
+    Nothing captured, the model mid-sentence:
+        -> "Your previous reply did not reach me as code..."
+    A code block half-rendered, the model mid-sentence:
+        -> "the code is not valid Python (expected an indented block after
+            'while' statement)"
+
+    Neither can help. The composer is usually disabled while a reply streams,
+    and where it is not the prompt queues behind the answer it is asking about.
+    The second is the worse of the two because nothing else catches it: the
+    candidate is non-empty, so the empty-capture guard does not apply, and a
+    truncated program looks exactly like a broken one to `python_defect`.
+    """
+    sends: list[str] = []
+
+    class _StillWriting(_Chat):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.still_writing = True
+            self.empty_reason = "unfinished" if not captured else None
+        async def send(self, text, timeout_s, extend_to_s=None):
+            sends.append(text)
+            return captured
+
+    class _Fleet:
+        async def open(self, avoid=None): return _StillWriting([""], "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(
+        _Fleet(), max_attempts=3, safety_margin_s=0, max_budget_s=120,
+        second_opinion=False,
+    )
+    asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert len(sends) == 1, (
+        f"captured {what} from a model that had not finished, and sent "
+        f"{len(sends) - 1} more prompt(s) into the conversation it was still "
+        f"writing in:\n{sends[1:2]}"
+    )
+
+
+def test_a_backend_that_cannot_wait_is_never_asked_to():
+    """`extend_to_s` is optional on the `Conversation` protocol.
+
+    A backend written outside this package satisfies the protocol with the
+    two-argument `send` that has always been the contract, and calling it with
+    a keyword it does not take would raise TypeError inside the single call the
+    whole solve depends on. Catching that TypeError is not an option either: one
+    raised from INSIDE `send` is indistinguishable, and retrying would send the
+    prompt twice.
+    """
+    from solvers.verify import _reads_past_its_slice
+
+    seen: list[tuple] = []
+
+    class _OldStyle:
+        provider = "claude"
+        async def send(self, text, timeout_s):      # the historic two-arg form
+            seen.append((timeout_s,))
+            return RIGHT
+        async def close(self): pass
+
+    class _NewStyle(_OldStyle):
+        async def send(self, text, timeout_s, extend_to_s=None):
+            seen.append((timeout_s, extend_to_s))
+            return RIGHT
+
+    assert _reads_past_its_slice(_OldStyle()) is False
+    assert _reads_past_its_slice(_NewStyle()) is True
+
+    for backend, arity in ((_OldStyle, 1), (_NewStyle, 2)):
+        seen.clear()
+
+        class _Fleet:
+            async def open(self, avoid=None): return backend()
+            async def aclose(self): pass
+            def stats(self): return {}
+
+        answer = asyncio.run(
+            VerifyingSolver(_Fleet(), safety_margin_s=0, max_budget_s=120)
+            .solve_task(DIGITS, timeout_s=120)
+        )
+        assert answer.verified, f"{backend.__name__} stopped producing answers"
+        assert len(seen[0]) == arity, (
+            f"{backend.__name__}.send was called with {len(seen[0])} budget "
+            f"argument(s); it takes {arity}"
+        )
