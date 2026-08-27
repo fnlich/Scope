@@ -130,6 +130,36 @@ COPY_TIMEOUT_MS = 1_500
 COPY_PHASE_TIMEOUT_S = 5.0
 STREAM_PHASE_TIMEOUT_S = 4.0
 POSTMORTEM_TIMEOUT_S = 2.0
+FULL_TAIL_S = COPY_PHASE_TIMEOUT_S + STREAM_PHASE_TIMEOUT_S + POSTMORTEM_TIMEOUT_S
+
+
+def tail_budget(timeout_s: float) -> float:
+    """How long the post-read phases may take, for a read of ``timeout_s``.
+
+    The eleven seconds above are sized against the solver's safety margin, and
+    that margin is sized against the deadlines this subnet usually advertises.
+    `TaskRequest.deadline_s` is only `Field(gt=0.0, le=3600.0)`, and at the
+    small end the arithmetic inverts: `solve_task` falls back to half the
+    timeout when the margin would leave nothing, and then a fixed eleven-second
+    tail is larger than the whole request. Measured, before this existed:
+
+        deadline  budget   read + tail   504 at
+            25     12.5        23.5        25    ok
+            15      7.5        18.5        15    504, NO ANSWER
+            10      5.0        16.0        10    504, NO ANSWER
+             5      5.0        16.0         5    504, NO ANSWER
+
+    Every one of those is a total loss with no log line to explain it: the
+    solve is cancelled mid-flight by `handle_request` and the validator gets an
+    error. A miner that cannot answer a short request at all is worse than one
+    that answers it badly.
+
+    Half the read, because a rescue that costs more than half again what the
+    attempt cost has stopped being a rescue. At any read of 22 seconds or more
+    this returns the full eleven and nothing changes, which is every read on
+    the deadlines actually seen in production.
+    """
+    return min(FULL_TAIL_S, max(0.0, float(timeout_s)) / 2.0)
 
 # How long a tab gets to put SOMETHING on screen before it is declared unreadable.
 #
@@ -843,6 +873,7 @@ class _Tab:
             # The pool has not recycled this tab yet. Retrying a known-dead tab
             # only burns the caller's budget one submit-timeout at a time.
             self.empty_reason = "unreadable"
+            self.still_writing = False
             return ""
         # Start the clock BEFORE the submit. Deriving the read deadline after it
         # would hand the read a fresh `timeout_s` on top of however long typing
@@ -868,7 +899,18 @@ class _Tab:
         self._reply_key = None
         # Reserve a slice of the caller's budget for getting the prompt in;
         # the rest is for waiting on the answer.
-        submit_budget_s = max(5.0, min(20.0, timeout_s * 0.3))
+        #
+        # Bounded by the read's own deadline, and that bound is the third place
+        # on this branch where a floor sat above what the caller could afford.
+        # `max(5.0, ...)` alone gave a one-second read a five-second submit --
+        # it does not buy a better submit, it buys an overrun, and on a short
+        # request `handle_request` answers 504 with nothing at all. A submit
+        # that fills the whole read is a read that finds nothing, which is bad;
+        # a submit that outlives it is a solve that is cancelled, which is
+        # worse.
+        submit_budget_s = min(
+            max(5.0, min(20.0, timeout_s * 0.3)), max(1.0, timeout_s)
+        )
         try:
             # The snapshot is inside the bound, not outside it. `_fingerprint`
             # ends in a `get_attribute` on the last message, and that is the
@@ -888,6 +930,7 @@ class _Tab:
             # the pool replaces it rather than failing the next request too.
             self.alive = False
             self.empty_reason = "unreadable"
+            self.still_writing = False
             print(f"[{self.site.name}] tab {self.label} failed to submit: {type(exc).__name__}")
             return ""
 
@@ -909,6 +952,10 @@ class _Tab:
         # matches an idle page -- so it is a guard, not the guarantee.
         # What the PAGE gave us, block by block, for the stream to be checked
         # against. None means "not looked at yet" and is not the same as [].
+        # Sized once per send: the three phases below share it in proportion,
+        # so the whole tail is what `tail_budget` says and no phase can quietly
+        # spend the deadline of a short request on its own.
+        tail = tail_budget(timeout_s) / FULL_TAIL_S
         page_blocks: Optional[list[str]] = None
         best, stable = "", None
         # Has the reply to THIS prompt ever appeared on screen? Not "has it
@@ -1048,7 +1095,7 @@ class _Tab:
             # WHAT was read, because it predates the syntax highlighter.
             try:
                 copied, rendered = await asyncio.wait_for(
-                    self._copy_phase(before), timeout=COPY_PHASE_TIMEOUT_S
+                    self._copy_phase(before), timeout=COPY_PHASE_TIMEOUT_S * tail
                 )
             except asyncio.CancelledError:
                 raise
@@ -1122,7 +1169,7 @@ class _Tab:
             try:
                 best = await asyncio.wait_for(
                     self._reconcile_stream(before, best, page_blocks),
-                    timeout=STREAM_PHASE_TIMEOUT_S,
+                    timeout=STREAM_PHASE_TIMEOUT_S * tail,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1154,7 +1201,13 @@ class _Tab:
         # One exit, one verdict. `best` non-empty clears it: the attribute
         # describes the LAST send, and a stale reason would suppress a repair
         # round on a later one.
-        self.still_writing = bool(last_busy or grew) and not blind
+        # `self.alive`, not `not blind`: the read also exits with the tab dead
+        # when the PAGE died mid-answer, and there `last_busy` can still be True
+        # from the last poll that worked. Reporting that as "still writing"
+        # sends the caller looking for a slow model instead of a dead tab --
+        # the same class of misdirection every other diagnostic here exists to
+        # remove. Blind already clears `alive` above, so this covers both.
+        self.still_writing = bool(last_busy or grew) and self.alive
         if best:
             self.empty_reason = None
         elif blind or not self.alive:
@@ -1166,7 +1219,7 @@ class _Tab:
         if not best and (self.alive or blind):
             try:
                 await asyncio.wait_for(
-                    self._explain_empty(before), timeout=POSTMORTEM_TIMEOUT_S
+                    self._explain_empty(before), timeout=POSTMORTEM_TIMEOUT_S * tail
                 )
             except asyncio.CancelledError:
                 raise

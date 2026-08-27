@@ -255,6 +255,23 @@ def _clip(value: Any, limit: int = 160) -> str:
 #
 # The ordering is the invariant, not the values: empty-handed must never be the
 # HARDER case to justify. It is the one with nothing to lose.
+EMPTY_HANDED_FLOOR_S = 12.0
+SECOND_OPINION_FLOOR_S = 20.0
+
+# How many models one task may be put to.
+#
+# `SECOND_OPINION_PASSES` is the policy for an answer that came back WRONG: ask
+# the other model once, and stop. There is something worth submitting either
+# way, and each further ask spends a real account's quota to improve on it.
+#
+# `MAX_PASSES` applies only while holding NOTHING, where that reasoning does not
+# apply at all -- there is no answer to improve on and an empty one pays zero.
+# Even so it is a runaway guard rather than a target: the clock stops the loop
+# long before this does.
+SECOND_OPINION_PASSES = 2
+MAX_PASSES = 4
+
+
 # Which backends accept `extend_to_s`, by class, asked once each.
 #
 # The parameter is optional on purpose. `Conversation` is a Protocol, so a
@@ -276,23 +293,6 @@ def _reads_past_its_slice(conversation: Any) -> bool:
             known = False
         _EXTEND_SUPPORT[cls] = known
     return known
-
-
-EMPTY_HANDED_FLOOR_S = 12.0
-SECOND_OPINION_FLOOR_S = 20.0
-
-# How many models one task may be put to.
-#
-# `SECOND_OPINION_PASSES` is the policy for an answer that came back WRONG: ask
-# the other model once, and stop. There is something worth submitting either
-# way, and each further ask spends a real account's quota to improve on it.
-#
-# `MAX_PASSES` applies only while holding NOTHING, where that reasoning does not
-# apply at all -- there is no answer to improve on and an empty one pays zero.
-# Even so it is a runaway guard rather than a target: the clock stops the loop
-# long before this does.
-SECOND_OPINION_PASSES = 2
-MAX_PASSES = 4
 
 
 class VerifyingSolver:
@@ -347,7 +347,18 @@ class VerifyingSolver:
         # six minutes. Correctness is worth 100%; speed is worth at most 5%.
         budget = min(float(timeout_s), self._max_budget) - self._margin
         if budget <= 5.0:
-            budget = max(5.0, float(timeout_s) * 0.5)
+            # Too short for the whole margin, so keep the SHAPE of the promise
+            # instead of its size: half the request, which leaves the other half
+            # for the post-read tail (itself scaled, see `tail_budget`) and for
+            # putting the answer on the wire.
+            #
+            # The floor used to be 5 seconds, and a floor is exactly the wrong
+            # instrument here: at a 5-second deadline it budgeted the entire
+            # request and `handle_request` cancelled the solve mid-flight. A
+            # 504 is indistinguishable from a dead miner, and `deadline_s` is
+            # only `Field(gt=0.0, ...)` -- nothing in the protocol promises the
+            # comfortable numbers this subnet happens to send today.
+            budget = max(1.0, float(timeout_s) * 0.5)
 
         advertised = float(getattr(task, "deadline_s", 0.0) or 0.0)
         if advertised - float(timeout_s) > 1.0 and not self._warned_short_deadline:
@@ -509,7 +520,11 @@ class VerifyingSolver:
         the best candidate it produced and which provider produced it.
         """
         started = time.monotonic()
-        budget = max(5.0, remaining)
+        # 1.0, not 5.0. A floor above what the caller can afford does not buy a
+        # longer read, it buys a cancelled solve: `solve_task` has already cut
+        # the request down to something deliverable, and raising it back here
+        # undoes that silently.
+        budget = max(1.0, remaining)
         best: Optional[Candidate] = None
         conversation = None
         provider: Optional[str] = None
@@ -529,8 +544,16 @@ class VerifyingSolver:
             )
             for attempt in range(1, self._max_attempts + 1):
                 left = budget - (time.monotonic() - started)
-                if left < 12.0:
-                    break  # not enough left to be worth another round trip
+                if attempt > 1 and left < 12.0:
+                    # Not enough left to be worth another ROUND TRIP -- which is
+                    # what this has always been about, and it never should have
+                    # gated the first one. It did: below a 32-second deadline
+                    # the budget lands under twelve seconds and the model was
+                    # never asked at all, so the miner returned an empty answer
+                    # without a single line of log to say why. The first attempt
+                    # always runs, however little there is, exactly as the first
+                    # pass does in `solve_task`.
+                    break
                 # Give the first attempt the larger share; repairs are cheaper.
                 #
                 # How much larger depends on whether a repair can even happen.
@@ -585,8 +608,13 @@ class VerifyingSolver:
                     # so reaching this means the whole budget is gone. Stop.
                     print(
                         f"[verify] {provider or 'this model'} was still writing when "
-                        f"the budget ran out; submitting what arrived rather than "
-                        f"interrupting it with a repair prompt"
+                        f"the budget ran out; "
+                        + (
+                            "submitting the part that arrived"
+                            if candidate.code.strip()
+                            else "nothing arrived to submit"
+                        )
+                        + " rather than interrupting it with a repair prompt"
                     )
                     break
                 if not candidate.code.strip() and (
@@ -697,7 +725,8 @@ class VerifyingSolver:
             if task.language == "rust"
             else python_defect(code, task.entrypoint)
         )
-        if defect is None and task.language == "rust":
+        out_of_budget = left is not None and left <= 0
+        if defect is None and task.language == "rust" and not out_of_budget:
             # Python's check PARSED that code; Rust's only grepped it for
             # `fn main`. Ask the compiler the same question the validator will,
             # which is the only check a Rust answer gets at all when no public
@@ -706,6 +735,16 @@ class VerifyingSolver:
             #
             # `left` caps it: a compile is allowed to be slow, but not slower
             # than the answer it is checking is worth. See `compile_defect`.
+            #
+            # And when `left` has gone NEGATIVE the compile is skipped outright,
+            # not merely capped. `compile_defect` floors its timeout at one
+            # second, so an overrun budget still bought a temp directory and a
+            # rustc process -- a whole second, spent past the deadline, on a
+            # verdict nothing can act on: there is no time left for a repair
+            # round and `defect` never reaches the validator. The read now
+            # extends into this reserve whenever the model is still writing, so
+            # arriving here with nothing left is the ordinary case rather than
+            # the strange one.
             defect = compile_defect(code, left)
         if defect is not None:
             # Structurally unusable: report it without paying for execution.
@@ -714,7 +753,7 @@ class VerifyingSolver:
             return candidate
         if not task.public_examples:
             return candidate  # nothing to verify against; take it as-is
-        if left is not None and left <= 0:
+        if out_of_budget:
             # The budget is gone, so running the examples buys nothing that can
             # still be acted on: there is no time for a repair round, and
             # `verified` never reaches the validator -- it feeds this process's

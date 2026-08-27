@@ -1033,6 +1033,49 @@ What remains is not a deadline but the **cost of delivering**:
 grading, archiving, signing and transmission. The budget is the advertised
 deadline minus that, and nothing else.
 
+### A short deadline must still get an answer
+
+`TaskRequest.deadline_s` is only `Field(gt=0.0, le=3600.0)`. Nothing in the
+protocol promises the comfortable numbers this subnet happens to send today,
+and at the small end the arithmetic used to invert — three separate floors,
+each sensible on its own, combined into a guaranteed total loss:
+
+```
+deadline  budget   asks?   read+tail   504 at   before
+     40    20.0     yes       28.5       40     ok
+     32    12.0     NO        --         32     empty answer, model never asked
+     20    10.0     NO        --         20     empty answer, model never asked
+     15     7.5     yes       18.5       15     504, NO ANSWER
+     10     5.0     yes       16.0       10     504, NO ANSWER
+      5     5.0     yes       16.0        5     504, NO ANSWER
+```
+
+Three separate causes:
+
+- **The post-read tail was a constant.** Eleven seconds is sized against the
+  safety margin, which is sized against a 300-second deadline. Below ~16s the
+  tail alone outlived the whole request. It is now `min(11s, read / 2)` — a
+  rescue that costs more than half again what the attempt cost has stopped
+  being a rescue — and at any read of 22s or more it is still the full eleven,
+  which is every read on the deadlines seen in production.
+- **`_attempt`'s "not worth another round trip" guard gated the FIRST trip.**
+  Below a 32-second deadline the budget lands under twelve seconds and the
+  model was never asked at all — an empty answer with no log line to say why.
+  The first attempt now always runs, exactly as the first pass does in
+  `solve_task`.
+- **Getting the prompt in had one too.** `max(5.0, …)` gave a one-second read a
+  five-second submit. A submit that fills the whole read is a read that finds
+  nothing, which is bad; a submit that outlives it is a solve that is
+  cancelled, which is worse.
+- **The short-deadline fallback had a five-second floor.** At a five-second
+  deadline it budgeted the entire request and `handle_request` cancelled the
+  solve mid-flight. A floor above what the caller can afford does not buy a
+  longer read, it buys a cancelled solve — and a 504 is indistinguishable from
+  a dead miner.
+
+Every deadline from 2 seconds to 3600 now returns an answer. One second does
+not, and cannot: `send` enforces a one-second minimum read.
+
 ### The model is told how long it has
 
 The prompt had always talked about "the deadline" — `METHOD` says to spend it,
@@ -1089,8 +1132,8 @@ Everything above 300s belongs to the validator:
 A model needing 300s misses by 20; one needing 360s misses by 80. The only
 thing that would change this is a validator advertising a longer `deadline_s`,
 which is its config and not the miner's — so the miner's own caps are set not
-to bind if it ever does: `min(deadline_s, GLM_REQUEST_TIMEOUT_S)` with the
-latter at 600, and `SOLVER_MAX_BUDGET_S` as the single runaway guard above it.
+to bind if it ever does: both sit at 3600, the protocol's own maximum for
+`deadline_s`, so `min(deadline_s, …)` is always `deadline_s`.
 
 ### The copy control wins on fidelity, never on completeness
 
@@ -1226,9 +1269,9 @@ fresh conversation.
 | Variable | Default | Meaning |
 |---|---|---|
 | `SOLVER_SAFETY_MARGIN_S` | `20` | Headroom kept before the cutoff, for `send`'s post-deadline phases and for grading, signing and transport |
-| `SOLVER_MAX_BUDGET_S` | `600` | Runaway guard, not a target. Deliberately does not bind at the advertised deadline — lowering it below the deadline throws away answers the validator would still pay for |
+| `SOLVER_MAX_BUDGET_S` | `3600` | The protocol's own maximum for `deadline_s`, so it cannot bind on a spec-compliant request. Lowering it below the advertised deadline throws away answers the validator would still pay for |
 | `SOLVER_VERIFY_EXECUTOR` | `subprocess` | Python grading backend; Rust always uses Docker |
-| `GLM_REQUEST_TIMEOUT_S` | `600` | The deadline `handle_request` answers **504** at, `min()`-ed with the validator's own. Named for the reference miner's GLM client but applied to whatever solver is plugged in. `docs/DEMO_MINER.md` documents `280` for that miner; leaving `280` in your `.env` costs the browser solver 20 seconds of every solve |
+| `GLM_REQUEST_TIMEOUT_S` | `3600` | The deadline `handle_request` answers **504** at, `min()`-ed with the validator's own. Named for the reference miner's GLM client but applied to whatever solver is plugged in. `docs/DEMO_MINER.md` documents `280` for that miner; leaving `280` in your `.env` costs the browser solver 20 seconds of every solve |
 
 `GET /solver-status` reports per-provider counters and fleet health. Watch it —
 a browser miner fails quietly, and silence looks identical to success.
