@@ -32,7 +32,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from custom_miner import TRUNCATED, CustomMiner, SolveTask, fit_response  # noqa: E402
+from solvers import browser_pool as _browser_pool  # noqa: E402
 from solvers.browser_pool import (  # noqa: E402
+    BLIND_TAB_GRACE_S,
     Browser,
     BrowserFleet,
     Site,
@@ -45,7 +47,14 @@ from solvers.browser_pool import (  # noqa: E402
 from solvers.chatgpt_web import chatgpt_site  # noqa: E402
 from solvers.claude_web import claude_site  # noqa: E402
 from solvers.prompts import NO_CODE, extract_code, python_defect  # noqa: E402
-from solvers.verify import Answer, VerifyingSolver  # noqa: E402
+from solvers.verify import (  # noqa: E402
+    EMPTY_HANDED_FLOOR_S,
+    MAX_PASSES,
+    SECOND_OPINION_FLOOR_S,
+    SECOND_OPINION_PASSES,
+    Answer,
+    VerifyingSolver,
+)
 
 from rlvr.config import Settings  # noqa: E402
 from rlvr.neurons.demo_miner import DemoMinerSettings, build_demo_miner_app  # noqa: E402
@@ -6076,4 +6085,558 @@ def test_the_file_follows_the_payload_even_if_fit_response_rewrites_the_code(tmp
     assert payload.code.endswith("# rewritten\n"), "the stand-in did not fire"
     assert (tmp_path / "rw.py").read_bytes() == payload.code.encode("utf-8"), (
         "the file kept the pre-fit_response code, not what was sent"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Never give up on a task while an answer is still obtainable.
+#
+# `all_passed` is a hard gate and speed is a multiplier floored at 0.95: the
+# slowest CORRECT answer earns 95% of what the fastest earns, and an empty one
+# earns nothing at all. Every test below pins one of the places the miner used
+# to stop early and hand the validator an empty response it would have paid for.
+# --------------------------------------------------------------------------- #
+def test_a_tab_that_never_renders_a_reply_is_dropped_in_seconds_not_at_the_deadline():
+    """Measured twice in one live run, on two different sites:
+
+        chatgpt tab 9227: no assistant selector matched anything
+        claude  tab 9222: matched 1 message(s), the same as before the prompt
+                          was sent -- the answer never rendered
+
+    Both polled a tab that could not be read for the whole 191s first slice,
+    then spent a 29s repair round on the same dead conversation, and ended the
+    task with 5s left -- fewer than the 20s a second opinion needs. Five healthy
+    tabs sat idle through both. The task scored zero.
+
+    The distinction that makes this fixable is `on_screen`: a model that is
+    merely slow has ALREADY painted its bubble, so it is never mistaken for
+    this. The tab here paints nothing, ever.
+    """
+    playwright, chrome = _chromium_or_skip()
+    # A composer and a send button, and a send that renders nothing at all.
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+    )
+    site = _site(assistant=("#assistant",))  # matches nothing, now and forever
+
+    async def go(grace):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            real, _browser_pool.BLIND_TAB_GRACE_S = _browser_pool.BLIND_TAB_GRACE_S, grace
+            try:
+                started = time.monotonic()
+                reply = await tab.send("solve it", 120.0)
+                elapsed = time.monotonic() - started
+            finally:
+                _browser_pool.BLIND_TAB_GRACE_S = real
+                await browser.close()
+            return reply, elapsed, tab.alive
+
+    reply, elapsed, alive = asyncio.run(go(2.0))
+    assert reply == "", f"there was nothing on the page to capture: {reply!r}"
+    assert elapsed < 30.0, (
+        f"the send spent {elapsed:.1f}s of a 120s budget on a tab that showed "
+        f"nothing. That time is the whole point: it belongs to another tab."
+    )
+    assert alive is False, "an unreadable tab must be retired, not handed back"
+
+
+def test_the_tab_says_WHY_a_send_came_back_empty():
+    """`""` is the same string for three different failures, and only one of
+    them is worth another prompt in the same conversation. The tab is the only
+    place that can tell them apart, so it records which it was.
+
+    Getting this wrong in either direction costs a task: treat a prose reply as
+    unreadable and the repair round that would have fixed it never happens;
+    treat an unreadable tab as prose and the repair goes into a conversation
+    that has already proved it cannot be read.
+    """
+    playwright, chrome = _chromium_or_skip()
+
+    BUBBLE = (
+        "  const d = document.createElement('div');"
+        "  d.className = 'msg';"
+        "  d.textContent = 'Sure! Here is the approach...';"
+        "  document.getElementById('host').appendChild(d);"
+    )
+    shell = (
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<div id="host"></div>__STOP__<script>'
+        "document.getElementById('send').onclick = () => {__BODY__};</script>"
+    )
+    cases = [
+        # A finished reply that simply has no code block in it.
+        ("no-code", _served(shell.replace("__STOP__", "").replace("__BODY__", BUBBLE)),
+         _site(assistant=("div.msg",))),
+        # The same reply, with the site still showing its stop control.
+        ("unfinished",
+         _served(shell.replace("__STOP__", '<button id="stop">stop</button>')
+                      .replace("__BODY__", BUBBLE)),
+         _site(assistant=("div.msg",), busy=("#stop",))),
+        # Nothing renders at all.
+        ("unreadable", _served(shell.replace("__STOP__", "").replace("__BODY__", "")),
+         _site(assistant=("div.msg",))),
+    ]
+
+    async def go(url, site, grace):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            real, _browser_pool.BLIND_TAB_GRACE_S = _browser_pool.BLIND_TAB_GRACE_S, grace
+            try:
+                await tab.send("solve it", 3.0)
+            finally:
+                _browser_pool.BLIND_TAB_GRACE_S = real
+                await browser.close()
+            return tab.empty_reason
+
+    for expected, url, site in cases:
+        got = asyncio.run(go(url, site, 1.0))
+        assert got == expected, f"expected {expected!r}, the tab said {got!r}"
+
+
+def test_the_grace_is_long_enough_that_a_thinking_model_is_never_dropped():
+    """The bound this fix must not break. A reply that has rendered -- even as
+    an empty bubble with a cursor in it -- keeps its whole slice, because the
+    check is 'did it EVER appear', not 'has it finished'. Getting this wrong
+    would trade two zeros a run for a zero on every slow answer."""
+    assert BLIND_TAB_GRACE_S >= 20.0, (
+        "a site under load can take seconds to paint the assistant bubble; "
+        "anything tighter starts killing tabs that were about to answer"
+    )
+
+
+@pytest.mark.parametrize("reason", ["unreadable", "unfinished"])
+def test_a_conversation_that_cannot_answer_is_not_asked_to_repair_itself(reason):
+    """Nothing captured, and the CONVERSATION is why.
+
+    "unreadable" is a tab that never rendered a reply or died; "unfinished" is a
+    model still writing when the budget ran out. A repair round goes straight
+    back into the first, and queues behind an answer that does not exist yet in
+    the second. Measured on a live miner, twice in one run: 191s for nothing,
+    then 29s more for nothing, ending the task with 5s left while five healthy
+    tabs sat idle.
+
+    The distinction cannot be made from the candidate -- an empty one always
+    carries a `defect`, because the structural checks reject empty source
+    exactly as they reject a broken program. Only the tab knows, and this is it
+    saying so.
+    """
+    sends: list[str] = []
+
+    class _Silent(_Chat):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.empty_reason = reason
+        async def send(self, text, timeout_s):
+            sends.append(text)
+            return ""
+
+    class _Fleet:
+        async def open(self, avoid=None):
+            return _Silent([""], "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(
+        _Fleet(), max_attempts=3, safety_margin_s=0, max_budget_s=120,
+        second_opinion=False,
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.code == "", "nothing was captured; nothing is the honest answer"
+    assert len(sends) == 1, (
+        f"sent {len(sends)} prompts into a conversation that returned nothing. "
+        f"Each one is a full slice of the budget spent to be told the same thing."
+    )
+
+
+def test_a_reply_that_arrived_without_code_is_still_repaired_in_place():
+    """The other side of the same guard, and the reason it is not simply
+    "empty means give up".
+
+    A FINISHED reply with no code block in it is the model breaking the output
+    contract, not a conversation that cannot be used -- and telling it so is
+    exactly what fixes it. `test_a_reply_with_no_code_is_rejected_and_retried`
+    pins the recovery; this pins that the fail-fast did not swallow it.
+    """
+    sends: list[str] = []
+
+    class _Prose(_Chat):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.empty_reason = "no-code"   # rendered, settled, simply no code
+        async def send(self, text, timeout_s):
+            sends.append(text)
+            return "Sure! Here is the approach..." if len(sends) == 1 else RIGHT
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Prose([""], "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(
+        _Fleet(), max_attempts=3, safety_margin_s=0, max_budget_s=120,
+        second_opinion=False,
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.verified, "the repair round recovers a reply that forgot the fence"
+    assert len(sends) == 2, f"expected one repair in place, sent {len(sends)}"
+
+
+def test_an_empty_answer_keeps_asking_while_the_clock_allows_it():
+    """Two passes was a policy for 'the first model was WRONG'. Empty is a
+    different state and has a different price: a wrong answer pays zero and so
+    does no answer, but an extra ask can only turn the second into a payment.
+    So while nothing is in hand, keep asking until the clock says stop.
+    """
+    seen: list[str] = []
+
+    class _Fleet:
+        def __init__(self, replies): self._replies = replies
+        async def open(self, avoid=None):
+            provider = "chatgpt" if avoid == "claude" else "claude"
+            seen.append(provider)
+            return _Chat(self._replies[min(len(seen) - 1, len(self._replies) - 1)], provider)
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    # Three tabs in a row capture nothing; the fourth answers.
+    solver = VerifyingSolver(
+        _Fleet([["nope"], ["nope"], ["nope"], [RIGHT]]),
+        max_attempts=1, safety_margin_s=0, max_budget_s=120,
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.verified, (
+        f"gave up after {len(seen)} model(s) with time still on the clock and "
+        f"submitted nothing. The answer was one ask away."
+    )
+    assert seen == ["claude", "chatgpt", "claude", "chatgpt"], seen
+
+
+def test_the_run_of_asks_is_capped_so_a_dead_fleet_cannot_spin():
+    """The other side of the same loop. Every tab failing must cost a bounded
+    number of asks, not one per poll until the deadline."""
+    seen: list[str] = []
+
+    class _Fleet:
+        async def open(self, avoid=None):
+            seen.append(avoid or "first")
+            return _Chat(["nothing here"], "chatgpt" if avoid == "claude" else "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(
+        _Fleet(), max_attempts=1, safety_margin_s=0, max_budget_s=120,
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.code == ""
+    assert len(seen) == MAX_PASSES, f"asked {len(seen)} times, cap is {MAX_PASSES}"
+
+
+def test_holding_nothing_lowers_the_bar_for_one_more_ask():
+    """The two floors encode what each state has to lose. Holding an unverified
+    answer, spending the tail of the budget on another model risks the time.
+    Holding nothing, there is nothing to risk -- what is in hand pays zero."""
+    assert EMPTY_HANDED_FLOOR_S <= SECOND_OPINION_FLOOR_S, (
+        f"empty-handed needs {EMPTY_HANDED_FLOOR_S}s to justify one more ask "
+        f"but holding an answer needs only {SECOND_OPINION_FLOOR_S}s. That is "
+        f"backwards: the state with nothing to lose is being made the harder "
+        f"one to act on."
+    )
+    assert EMPTY_HANDED_FLOOR_S > 0, "an ask still has to be able to happen"
+
+
+def test_the_first_read_gets_the_deadline_the_validator_actually_advertised():
+    """The self-imposed cap that produced both live zeros.
+
+    `SOLVER_MAX_BUDGET_S=240` against the 300s deadline this subnet advertises
+    made the budget 225s and the first read 191s. A model still writing at 191s
+    had its answer discarded HERE -- not by the validator, which pays ~96% for
+    the same answer arriving at six minutes, because the speed multiplier is
+    floored at 0.95 while correctness is a hard gate.
+
+    The cap stays as a runaway guard. It must not bind at the advertised
+    deadline.
+    """
+    slices: list[float] = []
+
+    class _Timed(_Chat):
+        async def send(self, text, timeout_s):
+            slices.append(timeout_s)
+            return RIGHT
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Timed([RIGHT], "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    # No public examples -- which is every task on live traffic.
+    task = SolveTask(
+        problem_id="live", language="python", statement=DIGITS.statement,
+        entrypoint="g", public_examples=[], deadline_s=300.0,
+    )
+    # Defaults on purpose: this is what an operator who has tuned nothing gets.
+    asyncio.run(VerifyingSolver(_Fleet()).solve_task(task, timeout_s=300.0))
+    assert slices[0] > 230.0, (
+        f"the first read got {slices[0]:.0f}s of a 300s deadline. The old cap "
+        f"gave it 191.2s and threw away answers the validator would have paid "
+        f"~96% for."
+    )
+
+
+def test_a_shorter_advertised_deadline_still_wins():
+    """The cap is a ceiling, and raising it must not let the miner overrun a
+    validator that advertises less. `min()` is the whole guarantee: a 60s
+    deadline stays a 60s deadline."""
+    slices: list[float] = []
+
+    class _Timed(_Chat):
+        async def send(self, text, timeout_s):
+            slices.append(timeout_s)
+            return RIGHT
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Timed([RIGHT], "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    asyncio.run(VerifyingSolver(_Fleet()).solve_task(DIGITS, timeout_s=60.0))
+    assert slices[0] < 60.0, (
+        f"the first read got {slices[0]:.0f}s of a 60s deadline; the whole solve "
+        f"has to be signed and on the wire before it expires"
+    )
+
+
+def test_a_reply_that_has_rendered_keeps_its_whole_slice_however_slow_it_is():
+    """The bound the fail-fast must not cross, and the one that would hurt most
+    if it did.
+
+    `BLIND_TAB_GRACE_S` retires a tab that renders NOTHING. Almost every real
+    answer takes longer than the grace to finish — so if the check ever asks
+    "has it finished" instead of "did it appear", it stops being a fix for two
+    zeros a run and becomes a zero on every answer slower than 30 seconds,
+    which is most of them.
+
+    The page here does exactly what a chat UI does: paints an empty assistant
+    bubble on submit, and fills the code in long after the grace has passed.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<div id="host"></div><script>'
+        "document.getElementById('send').onclick = () => {"
+        "  const d = document.createElement('div');"
+        "  d.className = 'msg';"                       # the bubble, empty
+        "  document.getElementById('host').appendChild(d);"
+        "  setTimeout(() => {"                          # ...the code, much later
+        "    const pre = document.createElement('pre');"
+        "    const code = document.createElement('code');"
+        "    code.textContent = 'def pong():\\n    return 4';"
+        "    pre.appendChild(code); d.appendChild(pre);"
+        "  }, 3000);"
+        "};</script>"
+    )
+    site = _site(assistant=("div.msg",))
+
+    async def go(grace):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            real, _browser_pool.BLIND_TAB_GRACE_S = _browser_pool.BLIND_TAB_GRACE_S, grace
+            try:
+                reply = await tab.send("solve it", 30.0)
+            finally:
+                _browser_pool.BLIND_TAB_GRACE_S = real
+                await browser.close()
+            return reply, tab.alive
+
+    # The grace expires at 1s; the code does not arrive until 3s.
+    reply, alive = asyncio.run(go(1.0))
+    assert "return 4" in extract_code(reply, "pong"), (
+        f"a reply that had already rendered was dropped for being slow: {reply!r}. "
+        f"The check is 'did it EVER appear', not 'has it finished'."
+    )
+    assert alive is True, "a tab that answered must not be retired"
+
+
+def test_a_wrong_answer_still_gets_exactly_one_second_opinion():
+    """`MAX_PASSES` is for the empty case only.
+
+    Letting it apply to a wrong-but-running answer would quietly double or
+    quadruple what every failing task costs a real account's quota — to improve
+    on something that was already worth submitting. The empty case is different
+    precisely because there is nothing there to improve on.
+    """
+    seen: list[str] = []
+
+    class _Fleet:
+        async def open(self, avoid=None):
+            seen.append(avoid or "first")
+            return _Chat([WRONG], "chatgpt" if avoid == "claude" else "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(
+        _Fleet(), max_attempts=1, safety_margin_s=0, max_budget_s=120,
+    )
+    answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
+    assert answer.code, "the wrong answer is still submitted; it may pass the hidden suite"
+    assert answer.verified is False
+    assert len(seen) == SECOND_OPINION_PASSES, (
+        f"asked {len(seen)} models about an answer that was already in hand; "
+        f"the policy for a wrong answer is one second opinion"
+    )
+
+
+def test_a_deadline_the_miner_shortens_itself_is_reported_once(capsys):
+    """`GLM_REQUEST_TIMEOUT_S` is named for the reference miner's model client,
+    but `handle_request` applies it to whatever solver is plugged in. Left at
+    the 280 that `docs/DEMO_MINER.md` documents, it silently cuts 20 seconds off
+    every solve against this subnet's 300s deadline — and nothing else in the
+    logs says so. That gap is worth more than it looks: a correct answer
+    arriving late still earns 95%+, an unfinished one earns nothing.
+    """
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat([RIGHT], "claude")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(_Fleet())
+    # deadline_s=300 (what the validator advertised) vs timeout_s=280 (ours).
+    asyncio.run(solver.solve_task(DIGITS, timeout_s=280.0))
+    said = capsys.readouterr().out
+    assert "300s" in said and "280s" in said, said
+    assert "GLM_REQUEST_TIMEOUT_S" in said, f"the fix has to be nameable: {said}"
+
+    # Once per run, not once per task: this is a configuration fact, and a
+    # miner answering hundreds of tasks would otherwise say it hundreds of times.
+    asyncio.run(solver.solve_task(DIGITS, timeout_s=280.0))
+    assert "GLM_REQUEST_TIMEOUT_S" not in capsys.readouterr().out
+
+    # And silent when nothing is being given up.
+    quiet = VerifyingSolver(_Fleet())
+    asyncio.run(quiet.solve_task(DIGITS, timeout_s=300.0))
+    assert "GLM_REQUEST_TIMEOUT_S" not in capsys.readouterr().out
+
+
+def test_a_reply_that_vanishes_mid_answer_is_waited_for_not_written_off():
+    """Why the fail-fast asks "did it EVER appear" and not "is it there now".
+
+    Sites stream a message under one attribute and drop it when the message is
+    finished, so the selector that found the answer can be the one that cannot
+    see it any more — `_messages` has a whole re-resolve path for exactly this,
+    and says so in the log. During that window the reply is off screen while
+    being written.
+
+    A tab in that window looks identical to one that never rendered at all:
+    both report nothing on screen. Only the memory that it was there ONCE
+    separates them — and getting it wrong means retiring tabs in the middle of
+    producing the answer, which is worse than the bug the fail-fast fixes.
+    """
+    playwright, chrome = _chromium_or_skip()
+    url = _served(
+        '<!doctype html><meta charset="utf-8">'
+        '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
+        '<div id="host"></div><script>'
+        "document.getElementById('send').onclick = () => {"
+        "  const d = document.createElement('div');"
+        "  d.className = 'msg';"                       # the bubble appears...
+        "  document.getElementById('host').appendChild(d);"
+        "  setTimeout(() => { d.className = 'gone'; }, 1200);"   # ...stops matching...
+        "  setTimeout(() => {"                                    # ...and comes back with the code
+        "    const pre = document.createElement('pre');"
+        "    const code = document.createElement('code');"
+        "    code.textContent = 'def pong():\\n    return 4';"
+        "    pre.appendChild(code); d.appendChild(pre);"
+        "    d.className = 'msg';"
+        "  }, 3000);"
+        "};</script>"
+    )
+    site = _site(assistant=("div.msg",))
+
+    async def go(grace):
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+            page = await (await browser.new_context()).new_page()
+            await page.goto(url)
+            tab = _tab(page, site)
+            real, _browser_pool.BLIND_TAB_GRACE_S = _browser_pool.BLIND_TAB_GRACE_S, grace
+            try:
+                reply = await tab.send("solve it", 30.0)
+            finally:
+                _browser_pool.BLIND_TAB_GRACE_S = real
+                await browser.close()
+            return reply, tab.alive
+
+    # The grace expires at 1s. The reply goes off screen at 1.2s -- after the
+    # grace, so every poll from then until 3s reports nothing on screen.
+    reply, alive = asyncio.run(go(1.0))
+    assert "return 4" in extract_code(reply, "pong"), (
+        f"the tab was written off while its answer was between selectors: "
+        f"{reply!r}. It had already rendered once; that is the whole test."
+    )
+    assert alive is True, "a tab that answered must not be retired"
+
+
+def test_the_solve_timeout_default_tracks_the_deadline_the_subnet_advertises(monkeypatch):
+    """`GLM_REQUEST_TIMEOUT_S` is the miner's own 504 deadline, and leaving it
+    below what validators advertise is a self-inflicted cut on every solve.
+
+    The assertion that matters is the last one: it ties the default to
+    `Settings.solve_deadline_s` rather than to a number someone typed, so if the
+    subnet moves its deadline this fails instead of quietly going back to
+    throwing answers away.
+    """
+    from solvers.config import DEFAULT_SOLVE_TIMEOUT_S, apply_solve_timeout_default
+
+    monkeypatch.delenv("GLM_REQUEST_TIMEOUT_S", raising=False)
+    apply_solve_timeout_default()
+    assert os.environ["GLM_REQUEST_TIMEOUT_S"] == DEFAULT_SOLVE_TIMEOUT_S
+
+    # An operator who set it keeps it, whether from the shell or from .env --
+    # `load_env_file` has already copied .env into the environment by now.
+    monkeypatch.setenv("GLM_REQUEST_TIMEOUT_S", "120")
+    apply_solve_timeout_default()
+    assert os.environ["GLM_REQUEST_TIMEOUT_S"] == "120", "the operator's value must win"
+
+    assert float(DEFAULT_SOLVE_TIMEOUT_S) >= Settings().solve_deadline_s, (
+        f"the miner caps solves at {DEFAULT_SOLVE_TIMEOUT_S}s while validators "
+        f"advertise {Settings().solve_deadline_s:g}s. Every solve gets less time "
+        f"than it was offered, and an unfinished answer earns nothing while a "
+        f"late correct one still earns 95%+."
+    )
+
+
+def test_a_send_that_never_starts_still_reports_why():
+    """Tabs are recycled across tasks, so `empty_reason` outlives the
+    conversation that set it. The two paths that return before the read loop
+    runs at all — a tab already known dead, and a prompt that never reached the
+    composer — would otherwise leave the PREVIOUS task's reason standing, and a
+    stale `no-code` buys a repair round in a conversation that was never opened.
+    """
+    site = _site()
+
+    async def go(prepare):
+        tab = _Tab(_SoloPool(site), None, None, "probe", site, composer="#composer")
+        tab.empty_reason = "no-code"          # left over from an earlier task
+        prepare(tab)
+        return await tab.send("solve it", 5.0), tab.empty_reason
+
+    def kill(tab): tab.alive = False
+
+    reply, reason = asyncio.run(go(kill))
+    assert reply == ""
+    assert reason == "unreadable", (
+        f"a dead tab reported {reason!r} — the previous task's reason, which "
+        f"would earn this one a repair round in a conversation that is gone"
     )

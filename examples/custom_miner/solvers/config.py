@@ -18,6 +18,36 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 
+# The deadline `handle_request` answers 504 at, when nothing in the environment
+# says otherwise.
+#
+# `DemoMinerSettings.glm_request_timeout_s` is named for the reference miner's
+# model client, but `handle_request` bounds the WHOLE solve with it --
+# `min(request.deadline_s, glm_request_timeout_s)` -- whatever solver is plugged
+# in, and answers 504 with NOTHING past it. Its 280s default sits below the 300s
+# deadline this subnet advertises, and the gap is not free: it cut the first
+# browser read to 191s, and a model still writing at 191s had its answer thrown
+# away here rather than by the validator -- which pays ~96% for the same answer
+# arriving at six minutes, because `all_passed` is a hard gate and the speed
+# multiplier is floored at 0.95.
+#
+# `min()` is what makes raising it safe. It can never overrun a validator that
+# advertises LESS; it only stops us giving up early on one that advertises more.
+DEFAULT_SOLVE_TIMEOUT_S = "300"
+
+
+def apply_solve_timeout_default() -> None:
+    """Fill in ``GLM_REQUEST_TIMEOUT_S`` when nothing else has.
+
+    Call this AFTER ``load_env_file`` and BEFORE building ``DemoMinerSettings``:
+    an operator's ``.env`` value has been copied into ``os.environ`` by then, so
+    ``setdefault`` leaves it alone, and pydantic-settings reads the environment
+    ahead of the file either way. The miner and the rehearsal both call it, so
+    a local run reproduces the budget the live miner actually uses.
+    """
+    os.environ.setdefault("GLM_REQUEST_TIMEOUT_S", DEFAULT_SOLVE_TIMEOUT_S)
+
+
 def selectors(env: str, default: Sequence[str]) -> tuple[str, ...]:
     """Candidate selectors for one role, overridable as ``a|b|c``.
 

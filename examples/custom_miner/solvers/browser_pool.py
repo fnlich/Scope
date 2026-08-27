@@ -121,15 +121,42 @@ COPY_TIMEOUT_MS = 1_500
 # nothing: copy falls back to what scraping saw, the stream leaves `best`
 # untouched, and the post-mortem is a log line whose absence costs no answer.
 #
-# The three together must stay inside VerifyingSolver's safety margin, which is
-# 15 seconds, and the reason is not tidiness either: `handle_request` wraps the
-# whole solve in an `asyncio.wait_for` and answers 504 -- NOTHING -- when it is
-# exceeded. Overrunning does not deliver the answer late; it throws away an
-# answer already in hand. 5 + 4 + 2 = 11 leaves the last grade and the tab
-# close the rest of it.
+# The three together must stay inside VerifyingSolver's safety margin
+# (`SOLVER_SAFETY_MARGIN_S`, 20 seconds), and the reason is not tidiness either:
+# `handle_request` wraps the whole solve in an `asyncio.wait_for` and answers
+# 504 -- NOTHING -- when it is exceeded. Overrunning does not deliver the answer
+# late; it throws away an answer already in hand. 5 + 4 + 2 = 11 leaves the last
+# grade, the tab close, and the archive-and-sign on the way out the rest of it.
 COPY_PHASE_TIMEOUT_S = 5.0
 STREAM_PHASE_TIMEOUT_S = 4.0
 POSTMORTEM_TIMEOUT_S = 2.0
+
+# How long a tab gets to put SOMETHING on screen before it is declared unreadable.
+#
+# A healthy chat UI paints the assistant bubble within a second or two of the
+# submit, empty, and fills it in afterwards. So "the reply element has still not
+# appeared" and "the model is thinking" are different states, and the read loop
+# used to treat them identically -- it polled a tab that could not be read at
+# all for the whole slice, then reported the same empty answer a slow model
+# would have produced.
+#
+# Measured on a live miner, both shapes of the failure:
+#
+#     chatgpt tab 9227: no assistant selector matched anything
+#     claude  tab 9222: matched 1 message(s), the same as before the prompt
+#                       was sent -- the answer never rendered
+#
+# Each burned 191 seconds of a 225 second budget and then a 29 second repair
+# round on the same dead conversation, leaving 5 seconds -- too few to ask
+# anyone else. Five healthy tabs sat idle through both. Detecting it here turns
+# a whole-task loss into a 30 second one, and hands the rest of the budget to a
+# tab that works.
+#
+# Generous on purpose: this must never fire on a model that is merely slow. A
+# reply that has rendered -- even as an empty bubble with a cursor in it --
+# resets nothing, because the check is "did it EVER appear", not "has it
+# finished".
+BLIND_TAB_GRACE_S = 30.0
 
 # Installed before the copy button is clicked. It makes the page hand the code
 # to US instead of to the operating system.
@@ -579,6 +606,23 @@ class _Tab:
         self._stream_before = 0
         self.uses = 0
         self.alive = True
+        # Why the last `send` came back empty, or None if it did not. Three
+        # causes look identical from "" and only one of them is worth another
+        # prompt in the same conversation:
+        #
+        #   "unreadable" -- no reply ever rendered, or the tab died. Prompting
+        #                   again sends the repair into a conversation that has
+        #                   just proved it cannot be read.
+        #   "unfinished" -- the model was still writing when the budget ran out.
+        #                   A second prompt queues behind an answer that has not
+        #                   been produced yet.
+        #   "no-code"    -- a FINISHED reply that simply had no code block in
+        #                   it. That is the model breaking the output contract,
+        #                   and telling it so is exactly what fixes it.
+        #
+        # Callers that cannot see this attribute (any non-browser backend) get
+        # the historic behaviour, because only the first two suppress a repair.
+        self.empty_reason: Optional[str] = None
         # True while this tab is known to be sitting in an EMPTY conversation.
         # It starts true because `_spawn` builds a tab only after loading
         # `site.url` — the site's own new-conversation URL — and seeing the
@@ -763,6 +807,7 @@ class _Tab:
         if not self.alive:
             # The pool has not recycled this tab yet. Retrying a known-dead tab
             # only burns the caller's budget one submit-timeout at a time.
+            self.empty_reason = "unreadable"
             return ""
         # Start the clock BEFORE the submit. Deriving the read deadline after it
         # would hand the read a fresh `timeout_s` on top of however long typing
@@ -805,6 +850,7 @@ class _Tab:
             # The prompt never reached the model. Treat the tab as unusable so
             # the pool replaces it rather than failing the next request too.
             self.alive = False
+            self.empty_reason = "unreadable"
             print(f"[{self.site.name}] tab {self.label} failed to submit: {type(exc).__name__}")
             return ""
 
@@ -828,6 +874,17 @@ class _Tab:
         # against. None means "not looked at yet" and is not the same as [].
         page_blocks: Optional[list[str]] = None
         best, stable = "", None
+        # Has the reply to THIS prompt ever appeared on screen? Not "has it
+        # finished" -- an empty bubble counts. A tab that never manages even
+        # that inside BLIND_TAB_GRACE_S cannot be read, and every further poll
+        # spends budget the healthy tabs could have had.
+        submitted_at = time.monotonic()
+        saw_reply = blind = False
+        # The last thing the page said about whether it was still generating.
+        # It is what separates "wrote prose and stopped" from "still writing",
+        # and a site with no usable busy selector reports False throughout --
+        # which lands on "no-code" and the historic repair, the safe default.
+        last_busy = False
         try:
             while True:
                 remaining = deadline - time.monotonic()
@@ -840,7 +897,7 @@ class _Tab:
                 # Every DOM call below auto-waits up to 30s on its own, which
                 # would sail past the deadline the loop just checked.
                 try:
-                    text_now, busy, whole = await asyncio.wait_for(
+                    text_now, busy, whole, on_screen = await asyncio.wait_for(
                         self._poll(before),
                         timeout=min(remaining, POLL_READ_TIMEOUT_S),
                     )
@@ -851,6 +908,26 @@ class _Tab:
                     # to the deadline costs the answer. See POLL_READ_TIMEOUT_S.
                     stable = None
                     continue
+                last_busy = busy
+                if on_screen:
+                    saw_reply = True
+                elif (
+                    not saw_reply
+                    and time.monotonic() - submitted_at >= BLIND_TAB_GRACE_S
+                ):
+                    # Nothing has rendered in the time a working tab needs to
+                    # paint an empty bubble. Polling on is not patience, it is
+                    # the rest of the budget: stop, retire the tab, and let the
+                    # caller ask somebody else while there is still time to.
+                    # `_explain_empty` below says which of the causes it was.
+                    self.alive, blind = False, True
+                    print(
+                        f"[{self.site.name}] tab {self.label} showed no reply at all "
+                        f"in {BLIND_TAB_GRACE_S:.0f}s; giving up on it now rather "
+                        f"than at the deadline, so the rest of the budget can go to "
+                        f"another tab."
+                    )
+                    break
                 if text_now is not None:
                     best = text_now  # keep it even mid-generation
                 if busy or text_now is None:
@@ -933,7 +1010,18 @@ class _Tab:
                 f"this tab is reconstructing the conversation rather than the reply."
             )
             best = ""
-        if not best and self.alive:
+        # One exit, one verdict. `best` non-empty clears it: the attribute
+        # describes the LAST send, and a stale reason would suppress a repair
+        # round on a later one.
+        if best:
+            self.empty_reason = None
+        elif blind or not self.alive:
+            self.empty_reason = "unreadable"
+        elif last_busy:
+            self.empty_reason = "unfinished"
+        else:
+            self.empty_reason = "no-code"
+        if not best and (self.alive or blind):
             try:
                 await asyncio.wait_for(
                     self._explain_empty(before), timeout=POSTMORTEM_TIMEOUT_S
@@ -1050,8 +1138,14 @@ class _Tab:
 
     async def _poll(
         self, before: tuple[int, Optional[str]]
-    ) -> tuple[Optional[str], bool, str]:
-        """One read round: ``(code_or_None, still_generating, whole_message)``.
+    ) -> tuple[Optional[str], bool, str, bool]:
+        """One round: ``(code_or_None, still_generating, whole_message, on_screen)``.
+
+        ``on_screen`` is the answer to "has this reply rendered at all", which
+        is not the same question as either of the first two and is the only one
+        that separates a tab that cannot be read from a model that is thinking.
+        ``code_or_None`` is None for both; ``still_generating`` is False for
+        both once the page settles. See BLIND_TAB_GRACE_S.
 
         The read happens whether or not the model is still typing. Checking busy
         first and returning early — the obvious shape — means a reply that never
@@ -1067,12 +1161,12 @@ class _Tab:
         busy = await self._busy_now()
         reply = await self._new_reply(before)
         if reply is None:
-            return None, busy, ""  # ours hasn't rendered yet
+            return None, busy, "", False  # ours hasn't rendered yet
         text_now = await self._read(reply)
         whole = await self._whole(reply)
         if text_now is None or self._echoes_prompt(whole or text_now):
-            return None, busy, whole
-        return text_now, busy, whole
+            return None, busy, whole, True
+        return text_now, busy, whole, True
 
     # -- DOM helpers -------------------------------------------------------- #
     async def _first_match(self, candidates: Sequence[str]) -> Optional[str]:

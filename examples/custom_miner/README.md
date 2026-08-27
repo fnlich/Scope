@@ -948,7 +948,71 @@ spent its whole 135-second slice while the remaining 90 seconds of a 225-second
 budget went unused, on the one attempt that had to succeed.
 
 The share now depends on whether a repair is even possible — 85% to the first
-attempt when nothing can be graded against, which turns 135 seconds into 191.
+attempt when nothing can be graded against.
+
+### Never give up on a task while an answer is still obtainable
+
+An empty answer and a wrong answer pay exactly the same: nothing. `all_passed`
+is a hard gate in `rlvr/scoring/payment.py`, checked *before* the speed
+multiplier is ever computed. Above that gate speed is worth almost nothing —
+the multiplier is `floor + (1 - floor) · 2^(-delay / half_life)` with
+`speed_floor = 0.95`, so the slowest correct answer still earns 95% of what the
+fastest earns, and one arriving at six minutes earns 96%. Correctness is worth
+100%. Speed is worth at most 5%.
+
+The miner used to give up long before the validator did, three ways, and a live
+run cost two whole tasks to the combination:
+
+**The budget cap bound below the advertised deadline.** `SOLVER_MAX_BUDGET_S`
+was 240 against the 300-second deadline this subnet advertises, so the budget
+was 225s and the first read got `225 × 0.85 = 191s`. A model still writing at
+191s had its answer discarded *here*, by this miner, not by the validator that
+would have paid 96% for it. The cap is now a runaway guard that does not bind:
+the budget comes from the deadline the validator actually advertised, minus the
+margin. `min()` is what makes raising it safe — a validator advertising 60
+seconds still gets 60 seconds.
+
+**A tab that could not be read was polled to the deadline.** Two shapes of the
+same failure, both from one run:
+
+```
+chatgpt tab 9227: no assistant selector matched anything
+claude  tab 9222: matched 1 message(s), the same as before the prompt was
+                  sent — the answer never rendered
+```
+
+Each burned the full first slice and then a repair round on the same dead
+conversation. A working tab paints its assistant bubble within a second or two
+of the submit, empty, and fills it in after — so "has the reply appeared at
+all" is a different question from "has it finished", and only the first one
+separates an unreadable tab from a slow model. A tab that renders nothing for
+`BLIND_TAB_GRACE_S` (30s) is retired on the spot and the rest of the budget
+goes to another tab. A model that is merely thinking is never touched: its
+bubble is already on screen.
+
+**An empty capture was repaired like a wrong answer.** They are
+indistinguishable at the point the decision is made — the structural checks
+reject empty source, so an empty candidate carries a `defect` exactly like a
+broken program does. So the tab now records *why* its last send came back
+empty, because `""` is the same string for three different failures and only
+one of them is worth another prompt in the same conversation:
+
+| `empty_reason` | what happened | repair in place? |
+|---|---|---|
+| `unreadable` | no reply ever rendered, or the tab died | **no** — the prompt goes into a conversation that has just proved it cannot be read |
+| `unfinished` | the model was still writing when the budget ran out | **no** — the prompt queues behind an answer that does not exist yet |
+| `no-code` | a *finished* reply that simply had no code block in it | **yes** — the model broke the output contract, and telling it so is what fixes it |
+
+Getting that distinction wrong costs a task in either direction, so it is not
+inferred from the empty string: only the tab can see it, and it says so. A
+backend that does not report one keeps the historic behaviour.
+
+Together those left the two failed tasks with 5 seconds against a 20-second
+second-opinion guard, while five healthy tabs sat idle. The pass loop now keeps
+asking while it is holding **nothing** and the clock allows one more round trip
+(`EMPTY_HANDED_FLOOR_S`, capped at `MAX_PASSES`). Holding an answer, the old
+policy stands: one second opinion, because there is then something worth
+submitting and each further ask spends a real account's quota.
 
 ## Self-verification: the part that earns the money
 
@@ -979,9 +1043,10 @@ fresh conversation.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SOLVER_SAFETY_MARGIN_S` | `15` | Headroom kept before the cutoff |
-| `SOLVER_MAX_BUDGET_S` | `240` | Hard cap on one solve |
+| `SOLVER_SAFETY_MARGIN_S` | `20` | Headroom kept before the cutoff, for `send`'s post-deadline phases and for grading, signing and transport |
+| `SOLVER_MAX_BUDGET_S` | `600` | Runaway guard, not a target. Deliberately does not bind at the advertised deadline — lowering it below the deadline throws away answers the validator would still pay for |
 | `SOLVER_VERIFY_EXECUTOR` | `subprocess` | Python grading backend; Rust always uses Docker |
+| `GLM_REQUEST_TIMEOUT_S` | `300` | The deadline `handle_request` answers **504** at, `min()`-ed with the validator's own. Named for the reference miner's GLM client but applied to whatever solver is plugged in. `docs/DEMO_MINER.md` documents `280` for that miner; leaving `280` in your `.env` costs the browser solver 20 seconds of every solve |
 
 `GET /solver-status` reports per-provider counters and fleet health. Watch it —
 a browser miner fails quietly, and silence looks identical to success.

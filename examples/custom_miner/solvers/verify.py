@@ -230,6 +230,42 @@ def _clip(value: Any, limit: int = 160) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+# How much budget must be left to ask ANOTHER model, by what is already in hand.
+#
+# The two numbers differ because what they risk differs, and the payment policy
+# is what sets the price. `all_passed` is a hard gate: an empty answer pays
+# exactly zero, and no amount of hurrying changes that. Above the gate, speed is
+# a multiplier floored at 0.95 -- the slowest correct answer still earns 95% of
+# what the fastest earns. So:
+#
+#   * Empty-handed, ANY time worth a round trip is worth spending. A failed
+#     extra ask costs nothing that was not already lost; a successful one is the
+#     whole payment. So the floor is the mechanical minimum and nothing more:
+#     12s is what `_attempt`'s own loop refuses to start a round below, which
+#     makes this "as long as an ask can happen at all".
+#   * Holding an unverified answer, the ask is speculative rather than free --
+#     it spends a real account's quota to improve on something that may already
+#     be right. That bar stays where it was.
+#
+# The ordering is the invariant, not the values: empty-handed must never be the
+# HARDER case to justify. It is the one with nothing to lose.
+EMPTY_HANDED_FLOOR_S = 12.0
+SECOND_OPINION_FLOOR_S = 20.0
+
+# How many models one task may be put to.
+#
+# `SECOND_OPINION_PASSES` is the policy for an answer that came back WRONG: ask
+# the other model once, and stop. There is something worth submitting either
+# way, and each further ask spends a real account's quota to improve on it.
+#
+# `MAX_PASSES` applies only while holding NOTHING, where that reasoning does not
+# apply at all -- there is no answer to improve on and an empty one pays zero.
+# Even so it is a runaway guard rather than a target: the clock stops the loop
+# long before this does.
+SECOND_OPINION_PASSES = 2
+MAX_PASSES = 4
+
+
 class VerifyingSolver:
     """Wrap any conversational backend in a self-check-and-repair loop.
 
@@ -244,8 +280,8 @@ class VerifyingSolver:
         backend: Backend,
         *,
         max_attempts: int = 3,
-        safety_margin_s: float = 15.0,
-        max_budget_s: float = 240.0,
+        safety_margin_s: float = 20.0,
+        max_budget_s: float = 600.0,
         cache_size: int = 256,
         second_opinion: bool = True,
     ):
@@ -261,15 +297,46 @@ class VerifyingSolver:
         self._by_provider: dict[str, dict[str, int]] = {}
         # The no-examples explanation is worth saying, but only once a run.
         self._warned_ungradeable = False
+        # ...and so is a deadline being cut short by our own configuration.
+        self._warned_short_deadline = False
 
     # -- the Solver interface custom_miner.py expects ---------------------- #
     async def solve_task(self, task, timeout_s: float) -> Answer:
         started = time.monotonic()
-        # The validator advertises one deadline but may enforce the problem
-        # server's shorter one, so never spend the full advertised budget.
+        # `timeout_s` is already `min(deadline_s, glm_request_timeout_s)` -- the
+        # deadline the miner's own `handle_request` will 504 at. The margin is
+        # what keeps this side of it: `send` runs its copy, stream and
+        # post-mortem phases AFTER its slice expires (5 + 4 + 2 = 11s), and the
+        # answer still has to be graded, archived, signed and put on the wire
+        # before the validator stops listening at `deadline_s + 10`.
+        #
+        # `_max_budget` is a ceiling, not a target, and it deliberately does not
+        # bind at the deadlines this subnet advertises. It used to: 240 against a
+        # 300s deadline capped the first attempt at 191s, and a model that needed
+        # longer had its answer thrown away by this miner rather than by the
+        # validator -- which would have paid 96% for the same answer arriving at
+        # six minutes. Correctness is worth 100%; speed is worth at most 5%.
         budget = min(float(timeout_s), self._max_budget) - self._margin
         if budget <= 5.0:
             budget = max(5.0, float(timeout_s) * 0.5)
+
+        advertised = float(getattr(task, "deadline_s", 0.0) or 0.0)
+        if advertised - float(timeout_s) > 1.0 and not self._warned_short_deadline:
+            # `timeout_s` is `min(deadline_s, glm_request_timeout_s)`. When it
+            # comes back SHORTER than what the validator advertised, the miner
+            # is giving up early on its own configuration -- and nothing else
+            # says so. The reference miner's docs put GLM_REQUEST_TIMEOUT_S at
+            # 280 against a 300s deadline, and a .env copied from there costs
+            # every solve 20 seconds it was offered. Once per run.
+            self._warned_short_deadline = True
+            print(
+                f"[verify] the validator offered {advertised:.0f}s but this miner "
+                f"caps the solve at {float(timeout_s):.0f}s, so every answer gets "
+                f"{advertised - float(timeout_s):.0f}s less than it could. Raise "
+                f"GLM_REQUEST_TIMEOUT_S to at least {advertised:.0f} to use it all "
+                f"— a correct answer arriving late still earns 95%+, an unfinished "
+                f"one earns nothing. Once per run."
+            )
 
         key = _cache_key(task)
         if key in self._cache:
@@ -292,14 +359,38 @@ class VerifyingSolver:
         # unattributable, which made "is one of these tabs doing worse than the
         # others" an unanswerable question.
         won_with: Optional[str] = None
-        passes = 2 if self._second_opinion else 1
-        for attempt_no in range(passes):
+        # A ceiling, not a plan. Every ordinary path breaks out after one or
+        # two: the loop only keeps going while it is holding NOTHING, which is
+        # the one state where another ask cannot make things worse.
+        passes = MAX_PASSES if self._second_opinion else 1
+        attempt_no = 0
+        while attempt_no < passes:
             remaining = budget - (time.monotonic() - started)
             # The first pass always runs, however little is left: bailing here
             # would return nothing having asked nobody.
-            if attempt_no and remaining < 20.0:
-                print(f"[verify] {remaining:.0f}s left; no time for a second opinion")
-                break
+            if attempt_no:
+                empty_handed = not best.code.strip()
+                if not empty_handed and attempt_no >= SECOND_OPINION_PASSES:
+                    # There is an answer in hand and it has already had its
+                    # second opinion. `MAX_PASSES` is for the empty case only:
+                    # spending it here would double or quadruple what every
+                    # failing task costs a real account's quota, to improve on
+                    # something already worth submitting.
+                    break
+                floor_s = (
+                    EMPTY_HANDED_FLOOR_S if empty_handed else SECOND_OPINION_FLOOR_S
+                )
+                if remaining < floor_s:
+                    print(
+                        f"[verify] {remaining:.0f}s left; "
+                        + (
+                            "not enough to ask anyone else, submitting empty"
+                            if empty_handed
+                            else "no time for a second opinion"
+                        )
+                    )
+                    break
+            attempt_no += 1
             candidate, provider = await self._attempt(
                 task, remaining, avoid=asked[-1] if asked else None
             )
@@ -338,8 +429,15 @@ class VerifyingSolver:
                 # whole payment.
                 if best.code.strip():
                     break
-            if attempt_no + 1 < passes:
-                print(f"[verify] {provider or 'first'} did not verify; asking another model")
+            if attempt_no < passes:
+                print(
+                    f"[verify] {provider or 'first'} "
+                    + (
+                        "returned nothing; asking another model"
+                        if not best.code.strip()
+                        else "did not verify; asking another model"
+                    )
+                )
         if asked:
             # `won_with`, not `asked[-1]`. They usually coincide -- a verified
             # answer ends the loop, so the winner is normally the last one asked
@@ -418,6 +516,36 @@ class VerifyingSolver:
                 if best is None or candidate.score > best.score:
                     best = candidate
                 if candidate.verified:
+                    break
+                if not candidate.code.strip() and (
+                    getattr(conversation, "empty_reason", None)
+                    in ("unreadable", "unfinished")
+                ):
+                    # Nothing was captured, and the conversation itself is why.
+                    # A repair round here sends the fix-this prompt into a tab
+                    # that just proved it cannot be read, or queues it behind an
+                    # answer the model has not finished writing. Measured on a
+                    # live miner, twice in one run: the first read spent 191s
+                    # and returned nothing, the repair spent another 29s on the
+                    # same dead conversation and returned nothing, and the task
+                    # ended with 5s left -- too few to ask any of the five
+                    # healthy tabs standing idle.
+                    #
+                    # A reply that RENDERED and simply had no code block in it
+                    # is the opposite case and deliberately not caught here:
+                    # that is the model breaking the output contract, telling it
+                    # so is what fixes it, and the conversation is fine.
+                    #
+                    # The distinction cannot be made from the candidate: an
+                    # empty one always carries a `defect`, because the
+                    # structural checks reject empty source exactly as they
+                    # reject a broken program. Only the tab knows.
+                    print(
+                        f"[verify] {provider or 'this model'} returned nothing and "
+                        f"the conversation is "
+                        f"{getattr(conversation, 'empty_reason', '?')}; asking "
+                        f"elsewhere rather than repairing it"
+                    )
                     break
                 if not candidate.defect and not candidate.failures:
                     break  # nothing actionable to report (no examples shipped)

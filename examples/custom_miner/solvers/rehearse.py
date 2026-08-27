@@ -50,7 +50,11 @@ if __package__ in (None, ""):  # `python solvers/rehearse.py` as well as `-m`
 from rlvr.protocol import TaskRequest, sign_message  # noqa: E402
 from rlvr.types import TestCase  # noqa: E402
 
-from solvers.config import find_env_file, load_env_file  # noqa: E402
+from solvers.config import (  # noqa: E402
+    apply_solve_timeout_default,
+    find_env_file,
+    load_env_file,
+)
 from solvers.roster import build_solver, describe, roster, warm_up  # noqa: E402
 from solvers.challenges import load_all, names as challenge_names  # noqa: E402
 from solvers.samples import SAMPLES  # noqa: E402
@@ -436,6 +440,9 @@ async def run(
     env_file = find_env_file()
     if load_env_file(env_file):
         print(f"[rehearse] loaded {env_file}")
+    # The same default the live miner applies, so a rehearsal reproduces the
+    # budget a real validator request would get rather than a tighter one.
+    apply_solve_timeout_default()
 
     if args.challenge:
         which = None if args.challenge == ["all"] else args.challenge
