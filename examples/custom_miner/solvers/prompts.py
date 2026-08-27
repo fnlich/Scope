@@ -158,33 +158,34 @@ def sanitize_code(text: str) -> str:
 # whose failure costs the whole answer rather than degrading it, so it gets both
 # the primacy and the recency slot and nothing else competes for either.
 OUTPUT_CONTRACT = """\
-Reply with ONE fenced {language} code block and nothing else. No preamble, no
-explanation before it or after it. Only the code inside the fence is ever read."""
+Reply with ONE fenced {language} code block written directly in the chat — not
+into an artifact or canvas — and nothing else. No preamble, no explanation
+before it or after it. Only the code inside the fence is ever read."""
 
 PYTHON_RULES = """\
-- There is no partial credit. A program wrong on ONE hidden case scores
-  exactly what no answer at all scores, so prefer the safe implementation
-  over the clever one every time.
+- There is no partial credit: a program wrong on ONE hidden case pays exactly
+  what no answer pays — zero — while the payment rule pays the slowest correct
+  answer at least 95% of what the fastest one earns.
 - Define exactly one top-level function named `{entrypoint}`. It is called
   directly as `{entrypoint}(*args, **kwargs)`.
 - RETURN the answer. Do not print it, do not read stdin, do not call input().
   Printed output is ignored by the grader.
 - Standard library only. No pip packages, no network, no file access.
-- Write no comments and no docstrings. Nothing reads them, and the answer is
-  scored partly on how fast it arrives.
+- Write no comments and no docstrings. Nothing reads them, and every
+  character you emit spends wall-clock inside the deadline.
 - Do not include tests, example calls, or `if __name__ == "__main__"`."""
 
 RUST_RULES = """\
-- There is no partial credit. A program wrong on ONE hidden case scores
-  exactly what no answer at all scores, so prefer the safe implementation
-  over the clever one every time.
+- There is no partial credit: a program wrong on ONE hidden case pays exactly
+  what no answer pays — zero — while the payment rule pays the slowest correct
+  answer at least 95% of what the fastest one earns.
 - Write ONE complete program with `fn main()`, compiled as a single file with
   `rustc --edition=2021 -C opt-level=2`. No Cargo, no crates, std only.
 - READ the input from stdin and WRITE only the requested answer to stdout.
 - Output is compared token-by-token after splitting on ASCII whitespace, so
   extra prose, labels or prompts make the answer wrong.
-- Write no comments and no docstrings. Nothing reads them, and the answer is
-  scored partly on how fast it arrives."""
+- Write no comments and no docstrings. Nothing reads them, and every
+  character you emit spends wall-clock inside the deadline."""
 
 # The public examples are the friendly ones. The hidden suite is where the
 # score comes from, and it is written to break a solution that only handles the
@@ -206,23 +207,47 @@ RUST_RULES = """\
 # ran out of time before the program existed. A numbered list leaves no room to
 # read the steps in a different order, and step 6 is the one that must be last.
 METHOD = """\
-Work in this order:
-1. Read the problem, then the examples. Where the statement is ambiguous, the
-   examples decide — they are the only disambiguation you are given.
-2. Write the program FIRST, complete and runnable.
-3. Trace every example by hand through the code you wrote. If one disagrees,
-   the code is wrong, not the example.
-4. Put the code through the edge cases below and fix what breaks.
+Correctness is the only thing worth optimising: a wrong answer pays zero and
+speed pays almost nothing, so prefer the safe implementation over the clever
+one, and spend the deadline where it buys correctness — in your reasoning,
+before the reply. Work in this order, all of it silently, in your reasoning;
+the reply itself is only the code block:
+1. Read the statement twice, then the examples. Every rule the statement
+   states and every bound and constant it names is the specification the
+   hidden tests are written from. Where the statement is ambiguous, the
+   examples decide — they are the only disambiguation you are given. Pick the
+   algorithm that fits the stated bounds and the types that survive the
+   extreme values.
+2. Write the program FIRST, complete and runnable — improving a program that
+   exists beats planning one that does not.
+3. Trace every example through the code you wrote, computing the real
+   intermediate values in your head — a skim that ends "looks right" catches
+   nothing. If one disagrees, the code is wrong, not the example.
+4. Invent inputs of your own and trace them the same way: the edge cases below
+   say which, and every rule the statement states gets one input that triggers
+   it and one that NEARLY does. After every fix, re-trace the cases that
+   already passed — repairs break earlier answers.
 5. Read the program back against itself, using the self-check below.
-6. Send the code and nothing else.
+6. Send the code and nothing else."""
 
-Steps 1 to 5 happen silently, in your reasoning. None of that work appears in
-the reply."""
+
+# The strongest sentence in the prompt, fired once, from the last slot before
+# generation begins — after the checklists it refers back to, where a coda
+# buried mid-<method> was read and forgotten 45 lines before the reply.
+METHOD_CODA = """\
+None of the work above appears in the reply, and none of it may be skipped: a
+reply the deadline cuts off scores the same zero as a wrong one, so keep every
+trace terse — but run every trace. The check you skip is the hidden test you
+fail."""
 
 EDGE_CASES = """\
 The hidden tests are adversarial; the examples are not. Each line below is a
 case with a right answer the statement implies and a wrong answer a plausible
 implementation produces:
+- THE STATEMENT'S OWN CONSTANTS: every limit, threshold and modulus the
+  statement names, tested AT that exact value, one below it, and one above.
+  The hidden suite always probes the boundary the statement bothered to write
+  down.
 - NOTHING: an empty list, an empty string, n = 0. Work out what the statement
   says the answer is, then make sure your code reaches it instead of crashing
   or dividing by a length of zero.
@@ -237,22 +262,40 @@ implementation produces:
   statement allows. If no bound is given, assume values up to 10^18 and n up to
   10^5, and pick an algorithm and a type that survive both.
 - DEGENERATE SHAPE: every element equal, every element a duplicate, already
-  sorted, sorted backwards, all zeros."""
+  sorted, sorted backwards, all zeros.
+- TIES: two candidates the statement ranks — lowest, oldest, first in input.
+  The right pick is the one the statement ranks first, not the one your data
+  structure happens to hand back.
+- TWO RULES AT ONCE: an input that trips two of the statement's rules
+  together. The statement's listed order decides which answer wins — an
+  implementation that tests them in another order survives every example that
+  trips only one.
+- WRAPAROUND: any circular index, range or clock — the range that wraps past
+  the end, the range that covers the whole circle, and every stored index
+  compared only after the same modular shift as the query.
+- A BATCH APPLIED AT ONCE: where the statement says simultaneous, every
+  comparison reads the pre-change snapshot and every write lands after all
+  reads — applying one element first and letting it change another element's
+  outcome is the plausible wrong implementation.
+- A REJECTED OPERATION: an input the statement says must be refused. Refusing
+  it must leave every piece of state exactly as it was — nothing
+  half-committed."""
 
 
 # Two of these are facts about THIS grader, not general advice, and both cost a
 # solve when guessed at: the comparison is structural and strict about bools,
 # and each test is on a five-second clock.
 PYTHON_ENVIRONMENT = """\
-- Python integers never overflow, but the default recursion limit is 1000, so a
+- Python integers never overflow — but when the statement says an operation
+  exceeding a named MAX must be rejected, that is a rule for you to implement,
+  not an error Python will raise for you. The default recursion limit is 1000, so a
   recursive answer dies at n = 10^4 with RecursionError. Write it iteratively,
   or raise the limit yourself at the top of the file.
 - Each test gets about 5 seconds. O(n^2) over n = 10^5 does not fit.
 - Iterating a `set` or `dict` of STRINGS gives a different order in every
-  process — `PYTHONHASHSEED` is random by default. Measured: four runs of
-  `list({'alpha','beta','gamma'})` gave four different orders, while a set of
-  small ints gave the same order every time. So a solution tested with integers
-  looks stable and is not. Sort before returning anything order-sensitive.
+  process — `PYTHONHASHSEED` is random by default, and a solution tested with
+  small ints looks stable and is not. Sort before returning anything
+  order-sensitive.
 - Return the exact shape the examples show. The comparison is structural:
   `True` is not `1`, so a boolean answer must be a real bool; a dict must have
   exactly the expected keys; two integers must match exactly. (A list and a
@@ -270,9 +313,12 @@ RUST_ENVIRONMENT = """\
   program exits normally with a wrong answer instead of panicking. Two `i32`
   values of 2_000_000_000 add up to -294967296. Use `i64` everywhere by
   default, `i128` for products, and reach for `i32` only where you have proved
-  the range cannot be exceeded.
-- Read to EOF. Tolerate trailing newlines, blank lines and repeated spaces, and
-  do not assume a fixed number of lines unless the statement fixes it.
+  the range cannot be exceeded. A running total overflows before any single
+  term does — accumulate sums of products in `i128`, and reduce modular
+  quantities at every step, never only at the end.
+- Read ALL of stdin and parse it as one stream of whitespace-separated tokens,
+  never line by line: counts may be zero, records may cross line boundaries,
+  and trailing newlines, blank lines and repeated spaces are all legal.
 - Deep recursion overflows the stack. Prefer iteration for n up to 10^5.
 - `HashMap` and `HashSet` iteration order is unspecified and differs run to run.
   Use `BTreeMap`/`BTreeSet`, or sort, before emitting anything order-sensitive.
@@ -293,13 +339,14 @@ RUST_ENVIRONMENT = """\
 # it needs to catch these and simply does not look again. So it is asked to,
 # once, against a list of exactly the things that have gone wrong.
 SELF_CHECK = """\
-Read the program back against itself and answer each of these about it. Every
-line is a bug that has reached this grader inside a program that looked
-finished:
+Read the program back against itself and verify each of these, silently — the
+reply is still only the code block. Every line is a bug that has reached this
+grader inside a program that looked finished:
 - Every function you CALL, you also wrote. A helper you meant to add and did not
   is a compile error sitting in a file that otherwise looks complete.
 - Every index is in range. Watch for two numberings of the same objects — an id
-  used where a position is meant — and for a sentinel value that later reaches a
+  used where a position is meant, an id the statement assigns to every event
+  including the ones you reject — and for a sentinel value that later reaches a
   subscript.
 - Every branch is reachable and every branch produces its answer. A condition
   already guaranteed by the arm it sits in is dead code; an arm that computes a
@@ -310,7 +357,11 @@ finished:
   four fields and forgets the fifth leaves the fifth silently stale.
 - State you commit before a branch, that branch can undo. A counter advanced and
   not rewound on the path that should not have advanced it is a wrong answer
-  that shows up under one ordering and not another."""
+  that shows up under one ordering and not another.
+- Every sentence of the statement has code you can point at. A rule read once
+  and carried in memory drifts — and the sentence with nothing behind it, a
+  fallback, a tie-break, a rejection the statement demands, is a feature the
+  hidden suite will exercise."""
 
 
 def _render_examples(language: str, examples: list[dict[str, Any]]) -> str:
@@ -377,7 +428,8 @@ def build_initial_prompt(
         "<contract>", rules, "", environment, "</contract>", "",
         "<method>", METHOD, "",
         "<edge_cases>", EDGE_CASES, "</edge_cases>", "",
-        "<self_check>", SELF_CHECK, "</self_check>",
+        "<self_check>", SELF_CHECK, "</self_check>", "",
+        METHOD_CODA,
         "</method>",
     ]
     return "\n".join(parts)
@@ -427,12 +479,14 @@ def build_repair_prompt(
     return (
         f"Your solution is WRONG. I ran {target} against the examples and got:\n"
         f"{detail}\n\n"
-        "Work out why, then reply with ONLY ONE corrected code block. "
-        "Before you send it, run the fix back through the edge-case checklist "
-        "from my first message — the empty case, n = 1, both ends, and the "
-        "largest values allowed — because a repair that fixes the example and "
-        "breaks a boundary scores the same zero. "
-        "Same rules as before. Do not explain outside the code block."
+        "In your reasoning — not in the reply — trace the failing call through "
+        "your code until you find the actual line where the computed value and "
+        "the expected one part company; do not guess at the fix from the shape "
+        "of the failure. Re-check the fix silently against the edge-case "
+        "checklist from my first message — the empty case, n = 1, both ends, "
+        "and the largest values allowed — because a repair that fixes the "
+        "example and breaks a boundary scores the same zero. Then reply with "
+        "ONLY ONE corrected code block and nothing else."
     )
 
 

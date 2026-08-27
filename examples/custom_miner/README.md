@@ -1320,12 +1320,38 @@ On Debian, replace `ubuntu` with `debian` in both URLs. The group change is not
 optional: the executor runs `docker info` as the user the miner runs as, and a
 daemon it cannot reach is reported exactly like a daemon that is not running.
 
-Then build the Rust sandbox image the validator uses:
+Then **pull** the sandbox image. Do not build it:
 
 ```bash
 cd /path/to/hone-subnet
-./scripts/build_rust_sandbox.sh          # or ./setup_validator.sh for everything
+docker pull "$(python -c 'from rlvr.policy import RELEASE_POLICY; print(RELEASE_POLICY.rust_image)')"
 ```
+
+`scripts/build_rust_sandbox.sh` builds a LOCAL tag, `hone-rust-sandbox:rustc-1.89.0`,
+and the executor never runs it. It runs `RELEASE_POLICY.rust_image` — a
+digest-pinned `ghcr.io` reference that nothing overrides, because a validator
+that graded on a locally-built image would not be grading what everyone else
+grades on. The build script says so on its last line: *"A local image ID is not
+a fleet identity."* It exists for publishing the image, not for using it.
+
+Pull it **before** the first Rust rehearsal, not during. `docker run` would pull
+it for you, and that pull happens inside the executor's own bounded subprocess —
+the 60s compile timeout plus the per-case timeout plus slack, about 80 seconds
+for three cases. A first pull is several hundred megabytes; over that budget the
+run is killed, every case comes back failed, and an unfinished download reads as
+`passed 0/3` — a wrong answer. The rehearsal now checks for the image first and
+says so instead, but pulling it up front is still the thing to do.
+
+Confirm it, the way the validator's own preflight does:
+
+```bash
+docker run --rm --pull=never --network=none --read-only \
+  "$(python -c 'from rlvr.policy import RELEASE_POLICY; print(RELEASE_POLICY.rust_image)')" \
+  sh -ec 'rustc --version; command -v python3; command -v timeout'
+```
+
+`./setup_validator.sh` does all of this and more, if you want the whole
+validator environment rather than just Rust grading.
 
 And a local compiler, which is a separate thing and cheap:
 

@@ -173,9 +173,18 @@ class _Grader:
             return executor
 
     def check(
-        self, code: str, language: str, entrypoint: str, examples: list[dict[str, Any]]
+        self, code: str, language: str, entrypoint: str,
+        examples: list[dict[str, Any]], names: Optional[list[str]] = None,
     ) -> tuple[int, int, list[str]]:
-        """Run ``code`` against the public examples. Returns (passed, total, failures)."""
+        """Run ``code`` against the public examples. Returns (passed, total, failures).
+
+        ``names`` labels each failure with the case it came from. Optional
+        because the repair prompt does not want it -- the model is being shown
+        concrete inputs and outputs, and an authored title is noise there. A
+        person reading a test report wants the opposite: `case 3 'resize in
+        place'` says which behaviour broke, where a wall of arguments has to be
+        decoded first.
+        """
         cases = [
             TestCase(
                 args=list(case.get("args", []) or []),
@@ -191,11 +200,14 @@ class _Grader:
         )
         failures: list[str] = []
         passed = 0
-        for result, case in zip(results, cases):
+        for index, (result, case) in enumerate(zip(results, cases)):
             if result.passed:
                 passed += 1
                 continue
-            failures.append(_describe(result, case, language, entrypoint))
+            label = ""
+            if names and index < len(names) and names[index]:
+                label = f"case {index + 1} {names[index]!r}: "
+            failures.append(label + _describe(result, case, language, entrypoint))
         return passed, len(cases), failures
 
 
