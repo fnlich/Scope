@@ -94,7 +94,7 @@ def drive(deadline: float, replies: list[str], **kw) -> None:
     print(f"  slices  {[round(s, 1) for _, s, _ in seen]}s"
           f"   what each read is allocated")
     print(f"  caps    {[None if c is None else round(c, 1) for _, _, c in seen]}s"
-          f"   turn 1's cap == its slice, so it cannot extend")
+          f"   None on turn 1: nothing is held back, so nothing to extend into")
     print(f"  asks    "
           f"{['ONE block' if 'ONE fenced block' in t else 'TWO blocks' for t, _, _ in seen]}")
     print(f"  answer  "
@@ -134,8 +134,8 @@ def main(argv: list[str] | None = None) -> int:
          300.0, [BAD_CASES, RIGHT, RIGHT + "\n\n" + CASES, RIGHT], {}),
         ("300s — turn 1 came back useless; turn 2 still goes out",
          300.0, ["Happy to help!", RIGHT], {}),
-        ("60s — below TWO_PHASE_FLOOR_S, stays single-turn",
-         60.0, [RIGHT + "\n\n" + CASES], {}),
+        ("60s — a short deadline splits too; turn 1 costs what it took",
+         60.0, [CASES, RIGHT], {}),
         ("300s — SOLVER_SELF_TESTS=0, no cases turn at all",
          300.0, [RIGHT], {"self_tests": False}),
     ):

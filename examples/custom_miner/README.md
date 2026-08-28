@@ -1114,8 +1114,7 @@ a model writing cases **alongside** a program back-fills the `expected` values
 from what the program happens to do. Those cases then agree with the program's
 bugs, which is the one thing a test must not do. Cases written *first* cannot.
 
-So above `TWO_PHASE_FLOOR_S = 100` seconds of budget the solve spends a round
-trip on them:
+So the solve spends a round trip on them, at every deadline:
 
 ```
 turn 1  the cases, and explicitly NOT the program
@@ -1142,20 +1141,47 @@ on the easy classes:
 Four things make the extra round trip safe rather than a second way to run out
 of time:
 
-- **It is hard-capped.** Turn 1 gets `min(25% of what is left, 60s)`, and it is
-  passed an `extend_to_s` *equal* to its own slice, which makes `send`'s
-  mid-answer extension a no-op. A model that rambles through its cases cannot
-  eat the read the program needs — measured, the program still opens on a 238s
-  slice out of a 300s deadline.
-- **It is skipped when it cannot pay.** A cases turn costs a second submit, a
-  second settle and a second tail. Below 100s that overhead comes out of the
-  only half that pays, so the solve stays single-turn, byte-for-byte the prompt
-  that shipped before.
+- **Turn 1 has no timeout of its own.** There is one clock on a solve — the
+  deadline the validator advertised — and turn 1 reads against it like every
+  other read here. It carried a private cap twice and both were wrong the same
+  way: the first set `extend_to_s` equal to the slice, which makes the extension
+  a no-op by construction; the second used a soft 60s slice and a hard 100s cap.
+  Both cut the model off **mid-think**, which is the one moment where stopping
+  cannot help — the reply does not exist yet, so the cap saves time that bought
+  nothing and costs the whole turn.
+
+  A cap *looks* like it protects the program's read and does not. `send` returns
+  the moment the model finishes, so the slice is a ceiling and never a wait: a
+  cases turn that takes 90 seconds hands the program the other 190 whether or
+  not a cap exists. The only case a cap changes is the one where the model has
+  not finished — and there it converts a slow answer into no answer, the one
+  trade the payment policy says never to make.
+
+  Live, on a hard Rust task: `Thought for 1m 17s` before a character appeared,
+  against a 60s cap. Turn 1 timed out, the conversation was unusable, the pass
+  was handed on — four times, 189 seconds, `provider=none`, the program never
+  asked for once. The same task before the split got one 238s read.
+- **A cases turn that costs a pass does not cost every pass.** Whatever makes
+  turn 1 unaffordable — a long thinking phase, a slow account, a hard problem —
+  belongs to the task and the site, not to one tab, so the next pass would
+  repeat it exactly. One pass may be spent finding that out; the rest go
+  straight to the program, which is the half that pays. That, plus the budget
+  itself, is what protects the program now that no cap does.
+- **There is no deadline below which it is skipped.** There was — a 100-second
+  floor, on the reasoning that a cases turn *costs* 20-30s of submit-and-settle
+  before the model writes anything, which a 40s budget cannot spare. That
+  priced the worst case into every solve: turn 1 is a ceiling, not a spend, so
+  a fast cases turn on a short deadline costs what it took and the program
+  gets the rest.
 - **A turn 1 that produces nothing still gets a program.** No usable cases is
-  not a failure; it costs the time it took and turn 2 goes out regardless. A
-  turn 1 that could not be *read at all* is different — the tab has just proved
-  it cannot answer, so the task is handed to another model rather than queued
-  behind an answer that never arrived.
+  not a failure; it costs the time it took and turn 2 goes out regardless.
+- **A turn 1 that could not be *read* is handed on; one that ran the deadline
+  out is not.** They are not the same failure, and the clock tells them apart.
+  A tab that dies leaves the budget intact and another tab can still spend it.
+  A turn that ran the deadline out leaves nothing — handing on would lease a
+  second tab, ask a second account for a whole program with seconds on the
+  clock, and reach the same empty answer having spent someone's quota to get
+  there. So that one stops.
 - **A wrong case can still be corrected.** Turn 1 derives its `expected` values
   by reasoning, so one of them can simply be wrong — and freezing them would
   make a **correct** program fail the same bogus case on every repair round.

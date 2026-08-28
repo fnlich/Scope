@@ -59,8 +59,6 @@ from solvers.prompts import (  # noqa: E402
 )
 from solvers.verify import (  # noqa: E402
     EMPTY_HANDED_FLOOR_S,
-    TESTS_CAP_S,
-    TWO_PHASE_FLOOR_S,
     MAX_PASSES,
     SECOND_OPINION_FLOOR_S,
     SECOND_OPINION_PASSES,
@@ -6429,11 +6427,12 @@ def test_the_first_read_gets_the_deadline_the_validator_actually_advertised():
     )
     # Defaults on purpose: this is what an operator who has tuned nothing gets.
     asyncio.run(VerifyingSolver(_Fleet()).solve_task(task, timeout_s=300.0))
-    # slices[0] is the cases turn now, capped well below the deadline on
-    # purpose; the program's read is slices[1] and it is what must get the bulk.
-    assert slices[0] <= TESTS_CAP_S + 1, (
-        f"the cases turn took {slices[0]:.0f}s; it is capped at {TESTS_CAP_S:.0f}s "
-        f"so a model that rambles cannot eat the program's read"
+    # slices[0] is the cases turn, and it reads against the SOLVE's clock like
+    # everything else -- no private cap. What it actually spends is decided by
+    # when the model finishes, not by an allocation.
+    assert slices[0] > 230.0, (
+        f"the cases turn was given {slices[0]:.0f}s of a 300s deadline; it is "
+        f"supposed to read against the whole budget"
     )
     slices = slices[1:]
     assert slices[0] > 230.0, (
@@ -7906,38 +7905,140 @@ def test_the_cases_are_asked_for_before_the_program_exists():
     assert "while n > 0" in answer.code
 
 
-def test_the_cases_turn_cannot_eat_the_read_the_program_needs():
-    """Turn 1 produces nothing that pays. It is hard-capped by passing
-    `extend_to_s` EQUAL to its slice, which makes `send`'s mid-answer extension
-    a no-op (`hard <= deadline` short-circuits it) — so a model that rambles
-    through its cases cannot starve the program."""
+def test_the_cases_turn_does_not_shrink_the_read_the_program_gets():
+    """What actually protects the program, now that turn 1 has no private cap.
+
+    A cap looks like the protection and is not: `send` returns the moment the
+    model finishes, so the slice is a ceiling and never a wait. A cases turn
+    that takes 90 seconds hands the program the other 190 either way. The only
+    case a cap changes is the one where the model has NOT finished, and there it
+    converts a slow answer into no answer.
+
+    So the guarantee is arithmetic, not allocation: turn 2 opens on what the
+    clock says is left, and the elapsed cases turn is the only thing that took
+    any of it."""
     _, slices, caps, _ = _two_turn(300.0, [_CASES_ONLY, _RIGHT_PROGRAM])
-    assert slices[0] <= TESTS_CAP_S + 0.01, f"cases turn got {slices[0]:.0f}s"
-    assert caps[0] == slices[0], (
-        f"cases turn may extend from {slices[0]:.0f}s to {caps[0]}s and eat the "
-        f"program's read"
+    assert slices[0] > 230.0, (
+        f"the cases turn was allocated {slices[0]:.0f}s of a 300s deadline — it "
+        f"is supposed to read against the whole budget, not a share of it"
     )
-    # The program keeps the bulk, and may still extend into the whole budget.
+    assert caps[0] is None or caps[0] <= slices[0] + 0.01, (
+        "nothing is held back from the cases turn, so there is nothing to "
+        "extend into"
+    )
+    # A fast cases turn costs the program almost nothing: these fakes reply
+    # instantly, so turn 2 still opens on essentially the whole budget.
     assert slices[1] > 200.0, f"the program only got {slices[1]:.0f}s"
     assert caps[1] > slices[1], "the program's read must still be extendable"
 
 
-def test_a_budget_too_small_for_two_turns_stays_on_one():
-    """A cases turn costs a second submit, a second settle and a second tail —
-    20-30s of fixed overhead before the model writes anything. Spending that out
-    of a 40s budget leaves no room for the program, and the program is the only
-    half that pays."""
-    small, _, _, answer = _two_turn(60.0, [_WRONG_WITH_CASES, _RIGHT_WITH_CASES])
-    assert "<task>" not in small[0], "spent a round trip on cases at a 60s deadline"
-    assert "<self_tests>" in small[0], "the single-turn prompt still asks for cases"
-    assert answer.code, "and it still answers"
+def test_every_deadline_asks_for_the_cases_first():
+    """There is no budget below which the split is skipped, and there was.
 
-    big, _, _, _ = _two_turn(300.0, [_CASES_ONLY, _RIGHT_PROGRAM])
-    assert "<task>" in big[0], "a 300s deadline has room for the cases turn"
-    assert 100.0 <= TWO_PHASE_FLOOR_S < 120.0, (
-        "the floor must not sit on 120, which is the budget a third of this "
-        "suite drives — a gate on a value that many tests use decides by rounding"
+    The floor existed because a cases turn was assumed to COST a fixed 20-30s of
+    submit-and-settle before the model writes anything, which a 40s budget
+    cannot spare. But turn 1 is a ceiling, not a spend: `send` returns the
+    moment the model finishes, so a fast cases turn on a short deadline costs
+    what it took and the program gets the rest. A floor priced the worst case
+    into every solve."""
+    for deadline in (30.0, 60.0, 300.0):
+        prompts, slices, _, answer = _two_turn(
+            deadline, [_CASES_ONLY, _RIGHT_PROGRAM]
+        )
+        assert "<task>" in prompts[0], (
+            f"a {deadline:.0f}s deadline skipped the cases turn"
+        )
+        assert "<must_pass" in prompts[1], "turn 2 must restate the cases"
+        assert answer.code, f"no program came back at a {deadline:.0f}s deadline"
+        # And turn 1 is allocated the whole budget at every size — the ceiling
+        # never scales down, only what the model actually spends does.
+        assert slices[0] > slices[1], (
+            f"turn 1 got {slices[0]:.0f}s and turn 2 {slices[1]:.0f}s at a "
+            f"{deadline:.0f}s deadline; turn 1 is allocated everything left"
+        )
+
+
+def _burning_backend(deadline, cases_burns_s):
+    """A backend on a REAL clock: turn 1 sleeps `cases_burns_s` and fails.
+
+    The clock has to be real. A fake that fails instantly leaves the budget
+    intact, so it cannot tell "the turn failed" from "the turn failed having
+    spent everything" — which is the whole distinction under test.
+    """
+    log: list[str] = []
+
+    class _Chat:
+        provider = "claude"
+        empty_reason = None
+        still_writing = False
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            turn = "CASES" if "<task>" in text else "CODE"
+            log.append(turn)
+            if turn == "CASES":
+                await asyncio.sleep(min(timeout_s, cases_burns_s))
+                self.empty_reason, self.still_writing = "unfinished", True
+                return ""
+            self.empty_reason, self.still_writing = None, False
+            return "```python\ndef g(n):\n    return n\n```"
+
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    task = SolveTask(
+        problem_id="p", language="python", statement="hard",
+        entrypoint="g", public_examples=[], deadline_s=deadline,
     )
+    answer = asyncio.run(
+        VerifyingSolver(_Fleet()).solve_task(task, timeout_s=deadline)
+    )
+    return log, answer
+
+
+def test_a_phase_that_runs_the_deadline_out_stops_instead_of_handing_on():
+    """The two ways turn 1 can fail are not the same failure, and the clock is
+    what tells them apart.
+
+    A tab that DIES leaves the budget intact, and another tab can still spend
+    it — that is worth doing. A turn that ran the DEADLINE out leaves nothing:
+    handing on would lease a second tab, ask a second account for a whole
+    program with seconds on the clock, and arrive at the same empty answer
+    having spent someone's quota to get there.
+
+    Real sleeps, because a fake that fails instantly cannot tell the two
+    apart — the budget would be intact in both.
+
+    Nothing new enforces this: `solve_task` has always refused to open a pass
+    with less than `EMPTY_HANDED_FLOOR_S` left. What changed is that the rule
+    now BINDS, because turn 1 reads against the real budget — while it was
+    capped at 60s the budget survived it and four tabs were spent in a row.
+    This test is what stops that floor being loosened back out from under it."""
+    # The floor has to be a real reserve. At zero the guarantee below still
+    # happens to hold, but only because `remaining` lands a hair NEGATIVE —
+    # which is luck, not a rule, and a lease that arrives a millisecond earlier
+    # would spend a tab on a solve with no time to use it.
+    assert EMPTY_HANDED_FLOOR_S >= 5.0, (
+        f"EMPTY_HANDED_FLOOR_S is {EMPTY_HANDED_FLOOR_S}; it is the only thing "
+        f"stopping a spent deadline being handed to another tab"
+    )
+
+    # 40s deadline -> 20s budget. Turn 1 burns all of it.
+    log, answer = _burning_backend(40.0, 999.0)
+    assert log == ["CASES"], (
+        f"the deadline was already gone and it still asked another tab: {log}"
+    )
+    assert not answer.code
+
+    # Same failure, 3s in, with the budget almost untouched: hand on, and the
+    # program still gets asked for.
+    log, answer = _burning_backend(40.0, 3.0)
+    assert log.count("CASES") == 1, f"asked for cases twice: {log}"
+    assert "CODE" in log, f"gave up while the budget was still there: {log}"
+    assert answer.code, "submitted nothing despite having the time to answer"
 
 
 def test_a_cases_turn_that_cannot_be_read_hands_the_task_on():
@@ -8058,6 +8159,99 @@ def test_the_cases_turn_asks_for_the_common_path_before_the_boundaries():
         # The cap the model is given is the cap the miner enforces, so a model
         # that obeys it never has cases silently thinned away.
         assert f"At most {MAX_SELF_TESTS} cases in total" in p
+
+
+def _thinking_backend(think_s, deadline=300.0, statement="Do a hard thing."):
+    """A tab whose model produces nothing at all for `think_s`, then answers.
+
+    Read off a live tab: `Thought for 1m 17s` before a single character
+    appeared. A read whose hard cap is below that comes back `unfinished`.
+    """
+    log: list[tuple] = []
+    program = "```python\ndef g(n):\n    return n\n```"
+
+    class _Chat:
+        provider = "claude"
+        empty_reason = None
+        still_writing = False
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            turn = "CASES" if "<task>" in text else "CODE"
+            hard = timeout_s if extend_to_s is None else extend_to_s
+            log.append((turn, timeout_s, hard))
+            if hard < think_s:
+                self.empty_reason, self.still_writing = "unfinished", True
+                return ""
+            self.empty_reason, self.still_writing = None, False
+            return program
+
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    task = SolveTask(
+        problem_id="p", language="python", statement=statement,
+        entrypoint="g", public_examples=[], deadline_s=deadline,
+    )
+    answer = asyncio.run(
+        VerifyingSolver(_Fleet()).solve_task(task, timeout_s=deadline)
+    )
+    return log, answer
+
+
+def test_the_cases_turn_can_wait_out_a_model_that_is_still_thinking():
+    """Turn 1 shipped with `extend_to_s` EQUAL to its slice, which makes send's
+    extension a no-op by construction — deliberately, so a rambling model could
+    not eat the program's read. It also made turn 1 the one read here that
+    cannot wait for a model that is still THINKING, and the one most likely to
+    need to: it goes first, on a cold hard problem.
+
+    Measured on a live tab: 77 seconds of thinking before a character appeared,
+    against a 60 second cap. Turn 1 timed out, the conversation was unusable,
+    and the pass was handed on."""
+    log, answer = _thinking_backend(77.0)
+
+    turns = [t for t, _, _ in log]
+    assert turns[:2] == ["CASES", "CODE"], turns
+    hard_s = log[0][2]
+    assert hard_s >= 77.0, (
+        f"the cases turn stops at {hard_s:.0f}s, under a measured think of 77s: "
+        f"a thinking model is cut off and the turn is lost"
+    )
+    # Not "a bigger cap" — no cap. Turn 1 reads against the solve's clock.
+    assert hard_s > 230.0, (
+        f"the cases turn is still capped at {hard_s:.0f}s of a 300s deadline"
+    )
+    assert answer.code, "no program was submitted"
+
+
+def test_a_cases_turn_that_costs_a_pass_does_not_cost_every_pass():
+    """The regression this pair exists for, and the expensive half.
+
+    `solve_task` retries `_attempt` up to MAX_PASSES while holding nothing, and
+    nothing remembered that turn 1 had already proved unaffordable — so whatever
+    made it time out, being a property of the TASK and the site rather than of
+    one tab, made it time out again on every pass. Live: four passes, four
+    timed-out cases turns, 189 seconds, `provider=none`, and the program never
+    asked for once. The same task before the split got a single 238s read.
+
+    One pass may be spent finding out. The rest go to the program."""
+    log, answer = _thinking_backend(150.0)   # beyond any cases cap
+
+    turns = [t for t, _, _ in log]
+    assert turns[0] == "CASES"
+    assert turns.count("CASES") == 1, (
+        f"spent {turns.count('CASES')} passes on a cases turn that had already "
+        f"failed once: {turns}"
+    )
+    assert "CODE" in turns, f"the program was never asked for: {turns}"
+    assert answer.code, "submitted nothing at all"
+    # The program's read is the full first-attempt slice, not a leftover.
+    code_slice = next(s for t, s, _ in log if t == "CODE")
+    assert code_slice > 200.0, f"the program only got {code_slice:.0f}s"
 
 
 def test_a_cases_turn_that_yields_nothing_still_gets_a_program():

@@ -292,27 +292,47 @@ SECOND_OPINION_FLOOR_S = 20.0
 SECOND_OPINION_PASSES = 2
 MAX_PASSES = 4
 
-# Below this budget the solve stays single-turn: one prompt, program and cases
-# in one reply.
-#
-# A cases-first turn costs a second submit, a second settle and a second
-# post-read tail -- roughly 20 to 30 seconds of fixed overhead before the model
-# writes a character. Spending that out of a 40-second budget leaves no room for
-# the program, and the program is the only half that pays. It does NOT cost a
-# second deadline: `send` measures from its own start and `_attempt` recomputes
-# `left` afterwards, so turn 2 still stops at `attempt_start + budget` however
-# long turn 1 took -- verified, the worst case is unchanged at `budget + 11s`.
-#
-# 100 rather than 120 because 120 is exactly the budget a third of the test
-# suite drives (`max_budget_s=120` at `timeout_s=120`), and a gate sitting on a
-# value that many tests use is a gate that decides by rounding.
-TWO_PHASE_FLOOR_S = 100.0
+@dataclass
+class _Plan:
+    """What the NEXT pass of one solve should do. One per `solve_task`.
 
-# What turn 1 may spend, as a share of the attempt and as an absolute ceiling.
-# The ceiling is what actually matters: it is the guarantee that the program
-# still gets the bulk of the budget when a model rambles through its cases.
-TESTS_SHARE = 0.25
-TESTS_CAP_S = 60.0
+    Only `two_phase` so far, and it exists because a cases turn that costs a
+    whole pass used to cost EVERY pass. `solve_task` retries `_attempt` up to
+    `MAX_PASSES` times while it is holding nothing, and nothing remembered that
+    turn 1 had already proved unaffordable here -- so a task whose cases turn
+    timed out burned all four passes on four more cases turns and submitted
+    nothing, having never once asked for a program.
+
+    Per-solve rather than per-solver: solves run concurrently on one instance,
+    and a flag on `self` would let one task's bad luck disable the split for
+    every other task in flight.
+    """
+
+    two_phase: bool = True
+
+# Turn 1 has NO timeout of its own. There is one clock on a solve -- the
+# deadline the validator advertised -- and turn 1 reads against that, exactly
+# like every other read here.
+#
+# It carried a private cap twice, and both were wrong in the same direction.
+# The first passed `extend_to_s` equal to the slice, which makes `send`'s
+# extension a no-op by construction; the second kept a soft 60s slice and a hard
+# 100s cap. Both cut the model off MID-THINK, and cutting a model off mid-think
+# is the one thing that cannot help: the reply does not exist yet, so what the
+# cap saves is time that bought nothing and what it costs is the whole turn.
+# Measured on a live tab: `Thought for 1m 17s` before a single character
+# appeared, against a 60 second cap.
+#
+# A cap LOOKS like it protects the program's read, and it does not. `send`
+# returns the moment the model finishes -- the slice is a ceiling, never a wait
+# -- so a cases turn that takes 90 seconds hands the program the other 190
+# whether or not a cap exists. The only case a cap changes is the one where the
+# model has NOT finished, and there it converts a slow answer into no answer,
+# which is the one trade the payment policy says never to make.
+#
+# What protects the program now is the budget itself and `_Plan`: turn 1 cannot
+# outlive the deadline, and a turn 1 that fails does not get a second chance in
+# the same solve.
 
 
 # Which backends accept `extend_to_s`, by class, asked once each.
@@ -444,6 +464,7 @@ class VerifyingSolver:
         # unattributable, which made "is one of these tabs doing worse than the
         # others" an unanswerable question.
         won_with: Optional[str] = None
+        plan = _Plan()
         # A ceiling, not a plan. Every ordinary path breaks out after one or
         # two: the loop only keeps going while it is holding NOTHING, which is
         # the one state where another ask cannot make things worse.
@@ -477,7 +498,7 @@ class VerifyingSolver:
                     break
             attempt_no += 1
             candidate, provider = await self._attempt(
-                task, remaining, avoid=asked[-1] if asked else None
+                task, remaining, avoid=asked[-1] if asked else None, plan=plan
             )
             if provider:
                 asked.append(provider)
@@ -570,28 +591,26 @@ class VerifyingSolver:
         ``None`` when the CONVERSATION is the problem -- unreadable, or still
         writing -- in which case turn 2 must not be sent into it at all.
 
-        Hard-capped. `extend_to_s` is passed EQUAL to the slice, which makes
-        `send`'s mid-answer extension a no-op (`hard <= deadline` short-circuits
-        it), so a model that rambles through its cases cannot eat the budget the
-        program needs. That is the whole risk of a first turn: it produces
-        nothing that pays.
+        Read against the SOLVE's clock and nothing else: turn 1 gets whatever
+        is left, the same ceiling the program turn gets. There is no partial
+        budget here to cut a thinking model off with -- see the note above
+        `_Plan` for why every version of that cap was a mistake.
         """
-        slice_s = max(1.0, min(left * TESTS_SHARE, TESTS_CAP_S))
+        slice_s = max(1.0, left)
         prompt = build_tests_prompt(
             task.language, task.statement, task.entrypoint, task.public_examples
         )
-        if _reads_past_its_slice(conversation):
-            reply = await conversation.send(prompt, slice_s, extend_to_s=slice_s)
-        else:
-            reply = await conversation.send(prompt, slice_s)
+        # No `extend_to_s`: the slice already IS everything left, so there is
+        # nothing to extend to and nothing being held back to extend into.
+        reply = await conversation.send(prompt, slice_s)
         if getattr(conversation, "still_writing", False) or getattr(
             conversation, "empty_reason", None
         ) in ("unreadable", "unfinished"):
             print(
                 f"[verify] the cases turn came back "
                 f"{getattr(conversation, 'empty_reason', None) or 'unfinished'}; "
-                f"asking another model rather than sending the program request "
-                f"into a conversation that cannot answer"
+                f"the program request cannot go into a conversation that has "
+                f"not answered the last one"
             )
             return None
         cases = extract_self_tests(reply, task.entrypoint, task.language)
@@ -601,7 +620,11 @@ class VerifyingSolver:
         return cases
 
     async def _attempt(
-        self, task, remaining: float, avoid: Optional[str]
+        self,
+        task,
+        remaining: float,
+        avoid: Optional[str],
+        plan: Optional["_Plan"] = None,
     ) -> tuple[Optional[Candidate], Optional[str]]:
         """One model, one conversation: initial answer plus repair rounds.
 
@@ -627,14 +650,49 @@ class VerifyingSolver:
             # first cannot. That is the whole argument for spending a round
             # trip here.
             cases: Any = "ask"
-            if self._self_tests and budget >= TWO_PHASE_FLOOR_S:
+            two_phase = plan is None or plan.two_phase
+            if self._self_tests and two_phase:
                 cases = await self._ask_for_cases(
                     conversation, task, budget - (time.monotonic() - started)
                 )
                 if cases is None:
                     # The tab could not be read, or the model was still writing.
                     # Sending turn 2 into it would queue behind an answer that
-                    # has not arrived; hand the whole task to another model.
+                    # has not arrived, so this conversation is finished either
+                    # way. What differs is whether anything else is worth doing,
+                    # and the clock decides it.
+                    #
+                    # Whether anything ELSE happens is already decided, by the
+                    # clock, in `solve_task`: it will not open another pass with
+                    # less than `EMPTY_HANDED_FLOOR_S` left. That is the whole
+                    # guarantee "a turn that ran the deadline out is never
+                    # retried on another tab" rests on, and it holds only
+                    # because turn 1 now reads against the real budget -- when
+                    # it was capped at 60s the budget survived it and four tabs
+                    # were spent in a row. Deciding it a second time here would
+                    # be a duplicate of that floor, and a duplicate that drifts.
+                    #
+                    # So the only job left is to say which failure this was,
+                    # because "asking another model" was printed even when
+                    # nothing else would be asked.
+                    left_after = budget - (time.monotonic() - started)
+                    if plan is not None:
+                        # Not the same way twice. Whatever made turn 1 fail -- a
+                        # long thinking phase, a slow account, a hard problem --
+                        # belongs to the task and the site, not to this tab, so
+                        # the next pass would repeat it exactly. It did: four
+                        # passes, four timed-out cases turns, nothing submitted.
+                        plan.two_phase = False
+                    if left_after < EMPTY_HANDED_FLOOR_S:
+                        print(
+                            f"[verify] the cases turn used the whole "
+                            f"{budget:.0f}s budget; nothing left to ask anyone "
+                            f"else with"
+                        )
+                    else:
+                        print(f"[verify] {left_after:.0f}s left; not asking for "
+                              f"cases again this task, the remaining attempts "
+                              f"go straight to the program")
                     return best, provider
             prompt = build_code_prompt(
                 task.language, task.statement, task.entrypoint,
