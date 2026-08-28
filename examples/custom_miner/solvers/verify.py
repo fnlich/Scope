@@ -308,11 +308,50 @@ MAX_PASSES = 4
 # value that many tests use is a gate that decides by rounding.
 TWO_PHASE_FLOOR_S = 100.0
 
-# What turn 1 may spend, as a share of the attempt and as an absolute ceiling.
-# The ceiling is what actually matters: it is the guarantee that the program
-# still gets the bulk of the budget when a model rambles through its cases.
+
+@dataclass
+class _Plan:
+    """What the NEXT pass of one solve should do. One per `solve_task`.
+
+    Only `two_phase` so far, and it exists because a cases turn that costs a
+    whole pass used to cost EVERY pass. `solve_task` retries `_attempt` up to
+    `MAX_PASSES` times while it is holding nothing, and nothing remembered that
+    turn 1 had already proved unaffordable here -- so a task whose cases turn
+    timed out burned all four passes on four more cases turns and submitted
+    nothing, having never once asked for a program.
+
+    Per-solve rather than per-solver: solves run concurrently on one instance,
+    and a flag on `self` would let one task's bad luck disable the split for
+    every other task in flight.
+    """
+
+    two_phase: bool = True
+
+# What turn 1 may spend: a soft slice, and a hard cap it may read on to when
+# the model is STILL WORKING at the slice.
+#
+# The soft/hard pair is not a refinement, it is the difference between an answer
+# and a zero. Turn 1 first shipped with `extend_to_s` equal to its slice, which
+# makes `send`'s extension a no-op by construction -- deliberately, to stop a
+# rambling model eating the program's read. It also made turn 1 the ONE read in
+# this miner that cannot wait for a model that is still thinking, and it is the
+# read most likely to need to: it goes first, on a cold hard problem, before any
+# reasoning is cached.
+#
+# Measured from a live tab on a hard Rust task: `Thought for 1m 17s` before a
+# single character appeared. 77s against a 60s cap, so turn 1 timed out; the
+# conversation was then unusable, the pass was handed to another model, and the
+# next pass did exactly the same thing. Four passes, 189 seconds, `provider=none`
+# -- the program was never asked for once. The same task before the split got a
+# single 238s read.
+#
+# So the slice stays 60s and the CAP is what protects the program: at 100s out
+# of a 280s budget the program still opens on ~150s, and a normal thinking phase
+# fits inside turn 1 instead of destroying the solve.
 TESTS_SHARE = 0.25
 TESTS_CAP_S = 60.0
+TESTS_HARD_SHARE = 0.4
+TESTS_HARD_CAP_S = 100.0
 
 
 # Which backends accept `extend_to_s`, by class, asked once each.
@@ -444,6 +483,7 @@ class VerifyingSolver:
         # unattributable, which made "is one of these tabs doing worse than the
         # others" an unanswerable question.
         won_with: Optional[str] = None
+        plan = _Plan()
         # A ceiling, not a plan. Every ordinary path breaks out after one or
         # two: the loop only keeps going while it is holding NOTHING, which is
         # the one state where another ask cannot make things worse.
@@ -477,7 +517,7 @@ class VerifyingSolver:
                     break
             attempt_no += 1
             candidate, provider = await self._attempt(
-                task, remaining, avoid=asked[-1] if asked else None
+                task, remaining, avoid=asked[-1] if asked else None, plan=plan
             )
             if provider:
                 asked.append(provider)
@@ -570,18 +610,19 @@ class VerifyingSolver:
         ``None`` when the CONVERSATION is the problem -- unreadable, or still
         writing -- in which case turn 2 must not be sent into it at all.
 
-        Hard-capped. `extend_to_s` is passed EQUAL to the slice, which makes
-        `send`'s mid-answer extension a no-op (`hard <= deadline` short-circuits
-        it), so a model that rambles through its cases cannot eat the budget the
-        program needs. That is the whole risk of a first turn: it produces
-        nothing that pays.
+Bounded at both ends. The slice is what turn 1 is allocated; the cap is
+        how far it may read on while the model is still working, and it is
+        strictly smaller than the attempt so the program keeps the bulk. A model
+        that rambles cannot eat the program's read; a model that THINKS for
+        longer than the slice no longer destroys the solve.
         """
         slice_s = max(1.0, min(left * TESTS_SHARE, TESTS_CAP_S))
+        hard_s = max(slice_s, min(left * TESTS_HARD_SHARE, TESTS_HARD_CAP_S))
         prompt = build_tests_prompt(
             task.language, task.statement, task.entrypoint, task.public_examples
         )
         if _reads_past_its_slice(conversation):
-            reply = await conversation.send(prompt, slice_s, extend_to_s=slice_s)
+            reply = await conversation.send(prompt, slice_s, extend_to_s=hard_s)
         else:
             reply = await conversation.send(prompt, slice_s)
         if getattr(conversation, "still_writing", False) or getattr(
@@ -601,7 +642,11 @@ class VerifyingSolver:
         return cases
 
     async def _attempt(
-        self, task, remaining: float, avoid: Optional[str]
+        self,
+        task,
+        remaining: float,
+        avoid: Optional[str],
+        plan: Optional["_Plan"] = None,
     ) -> tuple[Optional[Candidate], Optional[str]]:
         """One model, one conversation: initial answer plus repair rounds.
 
@@ -627,7 +672,8 @@ class VerifyingSolver:
             # first cannot. That is the whole argument for spending a round
             # trip here.
             cases: Any = "ask"
-            if self._self_tests and budget >= TWO_PHASE_FLOOR_S:
+            two_phase = plan is None or plan.two_phase
+            if self._self_tests and two_phase and budget >= TWO_PHASE_FLOOR_S:
                 cases = await self._ask_for_cases(
                     conversation, task, budget - (time.monotonic() - started)
                 )
@@ -635,6 +681,18 @@ class VerifyingSolver:
                     # The tab could not be read, or the model was still writing.
                     # Sending turn 2 into it would queue behind an answer that
                     # has not arrived; hand the whole task to another model.
+                    #
+                    # And do not spend the NEXT pass the same way. Whatever made
+                    # turn 1 unaffordable here -- a long thinking phase, a slow
+                    # account, a hard problem -- is a property of the task and
+                    # the site, not of this tab, so the next pass would repeat it
+                    # exactly. It did: four passes, four timed-out cases turns,
+                    # nothing submitted. One pass may be spent finding that out;
+                    # the rest go to the program, which is the half that pays.
+                    if plan is not None:
+                        plan.two_phase = False
+                        print("[verify] not asking for cases again this task; "
+                              "the remaining attempts go straight to the program")
                     return best, provider
             prompt = build_code_prompt(
                 task.language, task.statement, task.entrypoint,

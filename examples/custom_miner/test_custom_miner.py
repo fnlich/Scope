@@ -60,6 +60,7 @@ from solvers.prompts import (  # noqa: E402
 from solvers.verify import (  # noqa: E402
     EMPTY_HANDED_FLOOR_S,
     TESTS_CAP_S,
+    TESTS_HARD_CAP_S,
     TWO_PHASE_FLOOR_S,
     MAX_PASSES,
     SECOND_OPINION_FLOOR_S,
@@ -7907,15 +7908,21 @@ def test_the_cases_are_asked_for_before_the_program_exists():
 
 
 def test_the_cases_turn_cannot_eat_the_read_the_program_needs():
-    """Turn 1 produces nothing that pays. It is hard-capped by passing
-    `extend_to_s` EQUAL to its slice, which makes `send`'s mid-answer extension
-    a no-op (`hard <= deadline` short-circuits it) — so a model that rambles
-    through its cases cannot starve the program."""
+    """Turn 1 produces nothing that pays, so it is bounded at both ends.
+
+    It may read PAST its slice — a model still thinking at 60s is the common
+    case on a hard problem, and refusing to wait there cost whole solves, see
+    `test_the_cases_turn_can_wait_out_a_model_that_is_still_thinking`. What it
+    may never do is read far enough to starve the program, so the cap is a
+    fraction of the attempt and stays well under the program's own slice."""
     _, slices, caps, _ = _two_turn(300.0, [_CASES_ONLY, _RIGHT_PROGRAM])
     assert slices[0] <= TESTS_CAP_S + 0.01, f"cases turn got {slices[0]:.0f}s"
-    assert caps[0] == slices[0], (
-        f"cases turn may extend from {slices[0]:.0f}s to {caps[0]}s and eat the "
-        f"program's read"
+    assert caps[0] <= TESTS_HARD_CAP_S + 0.01, (
+        f"cases turn may read on to {caps[0]:.0f}s"
+    )
+    assert caps[0] < slices[1], (
+        f"cases turn may read to {caps[0]:.0f}s but the program only gets "
+        f"{slices[1]:.0f}s — turn 1 can starve the half that pays"
     )
     # The program keeps the bulk, and may still extend into the whole budget.
     assert slices[1] > 200.0, f"the program only got {slices[1]:.0f}s"
@@ -8058,6 +8065,102 @@ def test_the_cases_turn_asks_for_the_common_path_before_the_boundaries():
         # The cap the model is given is the cap the miner enforces, so a model
         # that obeys it never has cases silently thinned away.
         assert f"At most {MAX_SELF_TESTS} cases in total" in p
+
+
+def _thinking_backend(think_s, deadline=300.0, statement="Do a hard thing."):
+    """A tab whose model produces nothing at all for `think_s`, then answers.
+
+    Read off a live tab: `Thought for 1m 17s` before a single character
+    appeared. A read whose hard cap is below that comes back `unfinished`.
+    """
+    log: list[tuple] = []
+    program = "```python\ndef g(n):\n    return n\n```"
+
+    class _Chat:
+        provider = "claude"
+        empty_reason = None
+        still_writing = False
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            turn = "CASES" if "<task>" in text else "CODE"
+            hard = timeout_s if extend_to_s is None else extend_to_s
+            log.append((turn, timeout_s, hard))
+            if hard < think_s:
+                self.empty_reason, self.still_writing = "unfinished", True
+                return ""
+            self.empty_reason, self.still_writing = None, False
+            return program
+
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    task = SolveTask(
+        problem_id="p", language="python", statement=statement,
+        entrypoint="g", public_examples=[], deadline_s=deadline,
+    )
+    answer = asyncio.run(
+        VerifyingSolver(_Fleet()).solve_task(task, timeout_s=deadline)
+    )
+    return log, answer
+
+
+def test_the_cases_turn_can_wait_out_a_model_that_is_still_thinking():
+    """Turn 1 shipped with `extend_to_s` EQUAL to its slice, which makes send's
+    extension a no-op by construction — deliberately, so a rambling model could
+    not eat the program's read. It also made turn 1 the one read here that
+    cannot wait for a model that is still THINKING, and the one most likely to
+    need to: it goes first, on a cold hard problem.
+
+    Measured on a live tab: 77 seconds of thinking before a character appeared,
+    against a 60 second cap. Turn 1 timed out, the conversation was unusable,
+    and the pass was handed on."""
+    log, answer = _thinking_backend(77.0)
+
+    turns = [t for t, _, _ in log]
+    assert turns[:2] == ["CASES", "CODE"], turns
+    slice_s, hard_s = log[0][1], log[0][2]
+    assert hard_s > slice_s, (
+        f"the cases turn may not extend at all ({slice_s:.0f}s slice, "
+        f"{hard_s:.0f}s cap): a thinking model kills it"
+    )
+    assert hard_s >= 77.0, f"cap of {hard_s:.0f}s is under a measured think"
+    # And the program still keeps the bulk: the cap is a fraction of the
+    # attempt, never the whole of it.
+    assert hard_s < log[1][1], (
+        f"the cases turn may read to {hard_s:.0f}s but the program only gets "
+        f"{log[1][1]:.0f}s"
+    )
+    assert answer.code, "no program was submitted"
+
+
+def test_a_cases_turn_that_costs_a_pass_does_not_cost_every_pass():
+    """The regression this pair exists for, and the expensive half.
+
+    `solve_task` retries `_attempt` up to MAX_PASSES while holding nothing, and
+    nothing remembered that turn 1 had already proved unaffordable — so whatever
+    made it time out, being a property of the TASK and the site rather than of
+    one tab, made it time out again on every pass. Live: four passes, four
+    timed-out cases turns, 189 seconds, `provider=none`, and the program never
+    asked for once. The same task before the split got a single 238s read.
+
+    One pass may be spent finding out. The rest go to the program."""
+    log, answer = _thinking_backend(150.0)   # beyond any cases cap
+
+    turns = [t for t, _, _ in log]
+    assert turns[0] == "CASES"
+    assert turns.count("CASES") == 1, (
+        f"spent {turns.count('CASES')} passes on a cases turn that had already "
+        f"failed once: {turns}"
+    )
+    assert "CODE" in turns, f"the program was never asked for: {turns}"
+    assert answer.code, "submitted nothing at all"
+    # The program's read is the full first-attempt slice, not a leftover.
+    code_slice = next(s for t, s, _ in log if t == "CODE")
+    assert code_slice > 200.0, f"the program only got {code_slice:.0f}s"
 
 
 def test_a_cases_turn_that_yields_nothing_still_gets_a_program():
