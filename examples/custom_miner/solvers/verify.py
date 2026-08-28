@@ -306,6 +306,11 @@ class _Plan:
     Per-solve rather than per-solver: solves run concurrently on one instance,
     and a flag on `self` would let one task's bad luck disable the split for
     every other task in flight.
+
+    It answers "was turn 1 unaffordable HERE", so only a failure that belongs to
+    the task and the site clears it. A tab that went blind is retired on the
+    spot and the next pass is served by another one, so its failure says nothing
+    about the task -- see `_attempt`, where the two are told apart.
     """
 
     two_phase: bool = True
@@ -331,8 +336,8 @@ class _Plan:
 # which is the one trade the payment policy says never to make.
 #
 # What protects the program now is the budget itself and `_Plan`: turn 1 cannot
-# outlive the deadline, and a turn 1 that fails does not get a second chance in
-# the same solve.
+# outlive the deadline, and a turn 1 that fails the TASK's way does not get a
+# second chance in the same solve.
 
 
 # Which backends accept `extend_to_s`, by class, asked once each.
@@ -676,12 +681,32 @@ class VerifyingSolver:
                     # because "asking another model" was printed even when
                     # nothing else would be asked.
                     left_after = budget - (time.monotonic() - started)
-                    if plan is not None:
-                        # Not the same way twice. Whatever made turn 1 fail -- a
-                        # long thinking phase, a slow account, a hard problem --
-                        # belongs to the task and the site, not to this tab, so
-                        # the next pass would repeat it exactly. It did: four
-                        # passes, four timed-out cases turns, nothing submitted.
+                    # WHOSE failure was it, though. `unreadable` is set by
+                    # `_read` only when the tab went blind or the page died,
+                    # and it retires that tab at the same moment -- so the next
+                    # pass is served by a different one and the reason cannot
+                    # follow it there. Every other way this returns None is a
+                    # model that had not finished writing, which belongs to the
+                    # task and the site and WOULD repeat exactly.
+                    tab_side = (
+                        getattr(conversation, "empty_reason", None) == "unreadable"
+                    )
+                    if plan is not None and not tab_side:
+                        # Not the same way twice. A long thinking phase, a slow
+                        # account, a hard problem: the next pass would repeat
+                        # it. It did: four passes, four timed-out cases turns,
+                        # nothing submitted.
+                        #
+                        # Clearing this for a DEAD TAB was the same mistake
+                        # pointed the other way. It cost the rest of the solve
+                        # the split -- and on live traffic, which ships no
+                        # public examples, the model's own cases are the only
+                        # grading there is. Turn 2 alone falls back to the
+                        # combined prompt, where the cases are written beside
+                        # the program and can be back-filled from whatever it
+                        # happens to do. One blind tab is not evidence about
+                        # the task, and `BLIND_TAB_GRACE_S` bounds what finding
+                        # that out costs.
                         plan.two_phase = False
                     if left_after < EMPTY_HANDED_FLOOR_S:
                         print(
@@ -689,6 +714,10 @@ class VerifyingSolver:
                             f"{budget:.0f}s budget; nothing left to ask anyone "
                             f"else with"
                         )
+                    elif tab_side:
+                        print(f"[verify] {left_after:.0f}s left; that tab is gone, "
+                              f"not the cases turn — the next pass asks another "
+                              f"one for cases as usual")
                     else:
                         print(f"[verify] {left_after:.0f}s left; not asking for "
                               f"cases again this task, the remaining attempts "

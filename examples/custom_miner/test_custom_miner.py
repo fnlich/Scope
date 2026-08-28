@@ -8254,6 +8254,73 @@ def test_a_cases_turn_that_costs_a_pass_does_not_cost_every_pass():
     assert code_slice > 200.0, f"the program only got {code_slice:.0f}s"
 
 
+def test_a_blind_tab_does_not_cost_the_task_its_cases_turn():
+    """The other half of `_Plan`, and the expensive half on live traffic.
+
+    A cases turn that TIMES OUT is evidence about the task: the model is slow
+    on this problem and would be slow again, so the split is dropped for the
+    rest of the solve. A tab that goes BLIND is evidence about the tab, which
+    `_read` retires at that same moment -- the next pass is served by another
+    one. Dropping the split there cost every later pass the model's own cases,
+    and with no public examples shipped (which is live traffic) those cases are
+    the only grading there is: the combined prompt writes them beside the
+    program, where they can be back-filled from whatever it does."""
+    log: list[str] = []
+    program = "```python\ndef g(n):\n    return n\n```"
+    cases = '```json\n[{"args": [1], "kwargs": {}, "expected": 1}]\n```'
+
+    class _Blind:
+        provider = "claude"
+        still_writing = False
+        empty_reason = "unreadable"
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            log.append("CASES-blind" if "<task>" in text else "CODE-blind")
+            return ""
+
+        async def close(self): pass
+
+    class _Healthy:
+        provider = "chatgpt"
+        still_writing = False
+        empty_reason = None
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            turn = "CASES" if "<task>" in text else "CODE"
+            log.append(turn)
+            return cases if turn == "CASES" else program
+
+        async def close(self): pass
+
+    class _Fleet:
+        def __init__(self): self.opened = 0
+        async def open(self, avoid=None):
+            self.opened += 1
+            return _Blind() if self.opened == 1 else _Healthy()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    task = SolveTask(
+        problem_id="p", language="python", statement="s", entrypoint="g",
+        public_examples=[], deadline_s=300.0,
+    )
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        answer = asyncio.run(
+            VerifyingSolver(_Fleet()).solve_task(task, timeout_s=300.0)
+        )
+
+    assert log[0] == "CASES-blind", log
+    assert "CODE-blind" not in log, f"sent the program into the dead tab: {log}"
+    assert log[1] == "CASES", (
+        f"the second pass skipped the cases turn because the FIRST pass's tab "
+        f"died: {log}"
+    )
+    assert "CODE" in log, f"the program was never asked for: {log}"
+    assert answer.code.strip(), "submitted nothing"
+    assert "that tab is gone" in chatter.getvalue(), chatter.getvalue()
+
+
 def test_a_cases_turn_that_yields_nothing_still_gets_a_program():
     """Turn 1 is an improvement, not a gate. A reply with no usable cases must
     cost the time it took and nothing else."""
