@@ -59,7 +59,6 @@ from solvers.prompts import (  # noqa: E402
 )
 from solvers.verify import (  # noqa: E402
     EMPTY_HANDED_FLOOR_S,
-    TWO_PHASE_FLOOR_S,
     MAX_PASSES,
     SECOND_OPINION_FLOOR_S,
     SECOND_OPINION_PASSES,
@@ -7933,22 +7932,113 @@ def test_the_cases_turn_does_not_shrink_the_read_the_program_gets():
     assert caps[1] > slices[1], "the program's read must still be extendable"
 
 
-def test_a_budget_too_small_for_two_turns_stays_on_one():
-    """A cases turn costs a second submit, a second settle and a second tail —
-    20-30s of fixed overhead before the model writes anything. Spending that out
-    of a 40s budget leaves no room for the program, and the program is the only
-    half that pays."""
-    small, _, _, answer = _two_turn(60.0, [_WRONG_WITH_CASES, _RIGHT_WITH_CASES])
-    assert "<task>" not in small[0], "spent a round trip on cases at a 60s deadline"
-    assert "<self_tests>" in small[0], "the single-turn prompt still asks for cases"
-    assert answer.code, "and it still answers"
+def test_every_deadline_asks_for_the_cases_first():
+    """There is no budget below which the split is skipped, and there was.
 
-    big, _, _, _ = _two_turn(300.0, [_CASES_ONLY, _RIGHT_PROGRAM])
-    assert "<task>" in big[0], "a 300s deadline has room for the cases turn"
-    assert 100.0 <= TWO_PHASE_FLOOR_S < 120.0, (
-        "the floor must not sit on 120, which is the budget a third of this "
-        "suite drives — a gate on a value that many tests use decides by rounding"
+    The floor existed because a cases turn was assumed to COST a fixed 20-30s of
+    submit-and-settle before the model writes anything, which a 40s budget
+    cannot spare. But turn 1 is a ceiling, not a spend: `send` returns the
+    moment the model finishes, so a fast cases turn on a short deadline costs
+    what it took and the program gets the rest. A floor priced the worst case
+    into every solve."""
+    for deadline in (30.0, 60.0, 300.0):
+        prompts, slices, _, answer = _two_turn(
+            deadline, [_CASES_ONLY, _RIGHT_PROGRAM]
+        )
+        assert "<task>" in prompts[0], (
+            f"a {deadline:.0f}s deadline skipped the cases turn"
+        )
+        assert "<must_pass" in prompts[1], "turn 2 must restate the cases"
+        assert answer.code, f"no program came back at a {deadline:.0f}s deadline"
+        # And turn 1 is allocated the whole budget at every size — the ceiling
+        # never scales down, only what the model actually spends does.
+        assert slices[0] > slices[1], (
+            f"turn 1 got {slices[0]:.0f}s and turn 2 {slices[1]:.0f}s at a "
+            f"{deadline:.0f}s deadline; turn 1 is allocated everything left"
+        )
+
+
+def _burning_backend(deadline, cases_burns_s):
+    """A backend on a REAL clock: turn 1 sleeps `cases_burns_s` and fails.
+
+    The clock has to be real. A fake that fails instantly leaves the budget
+    intact, so it cannot tell "the turn failed" from "the turn failed having
+    spent everything" — which is the whole distinction under test.
+    """
+    log: list[str] = []
+
+    class _Chat:
+        provider = "claude"
+        empty_reason = None
+        still_writing = False
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            turn = "CASES" if "<task>" in text else "CODE"
+            log.append(turn)
+            if turn == "CASES":
+                await asyncio.sleep(min(timeout_s, cases_burns_s))
+                self.empty_reason, self.still_writing = "unfinished", True
+                return ""
+            self.empty_reason, self.still_writing = None, False
+            return "```python\ndef g(n):\n    return n\n```"
+
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    task = SolveTask(
+        problem_id="p", language="python", statement="hard",
+        entrypoint="g", public_examples=[], deadline_s=deadline,
     )
+    answer = asyncio.run(
+        VerifyingSolver(_Fleet()).solve_task(task, timeout_s=deadline)
+    )
+    return log, answer
+
+
+def test_a_phase_that_runs_the_deadline_out_stops_instead_of_handing_on():
+    """The two ways turn 1 can fail are not the same failure, and the clock is
+    what tells them apart.
+
+    A tab that DIES leaves the budget intact, and another tab can still spend
+    it — that is worth doing. A turn that ran the DEADLINE out leaves nothing:
+    handing on would lease a second tab, ask a second account for a whole
+    program with seconds on the clock, and arrive at the same empty answer
+    having spent someone's quota to get there.
+
+    Real sleeps, because a fake that fails instantly cannot tell the two
+    apart — the budget would be intact in both.
+
+    Nothing new enforces this: `solve_task` has always refused to open a pass
+    with less than `EMPTY_HANDED_FLOOR_S` left. What changed is that the rule
+    now BINDS, because turn 1 reads against the real budget — while it was
+    capped at 60s the budget survived it and four tabs were spent in a row.
+    This test is what stops that floor being loosened back out from under it."""
+    # The floor has to be a real reserve. At zero the guarantee below still
+    # happens to hold, but only because `remaining` lands a hair NEGATIVE —
+    # which is luck, not a rule, and a lease that arrives a millisecond earlier
+    # would spend a tab on a solve with no time to use it.
+    assert EMPTY_HANDED_FLOOR_S >= 5.0, (
+        f"EMPTY_HANDED_FLOOR_S is {EMPTY_HANDED_FLOOR_S}; it is the only thing "
+        f"stopping a spent deadline being handed to another tab"
+    )
+
+    # 40s deadline -> 20s budget. Turn 1 burns all of it.
+    log, answer = _burning_backend(40.0, 999.0)
+    assert log == ["CASES"], (
+        f"the deadline was already gone and it still asked another tab: {log}"
+    )
+    assert not answer.code
+
+    # Same failure, 3s in, with the budget almost untouched: hand on, and the
+    # program still gets asked for.
+    log, answer = _burning_backend(40.0, 3.0)
+    assert log.count("CASES") == 1, f"asked for cases twice: {log}"
+    assert "CODE" in log, f"gave up while the budget was still there: {log}"
+    assert answer.code, "submitted nothing despite having the time to answer"
 
 
 def test_a_cases_turn_that_cannot_be_read_hands_the_task_on():

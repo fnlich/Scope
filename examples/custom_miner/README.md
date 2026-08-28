@@ -1114,8 +1114,7 @@ a model writing cases **alongside** a program back-fills the `expected` values
 from what the program happens to do. Those cases then agree with the program's
 bugs, which is the one thing a test must not do. Cases written *first* cannot.
 
-So above `TWO_PHASE_FLOOR_S = 100` seconds of budget the solve spends a round
-trip on them:
+So the solve spends a round trip on them, at every deadline:
 
 ```
 turn 1  the cases, and explicitly NOT the program
@@ -1168,15 +1167,21 @@ of time:
   repeat it exactly. One pass may be spent finding that out; the rest go
   straight to the program, which is the half that pays. That, plus the budget
   itself, is what protects the program now that no cap does.
-- **It is skipped when it cannot pay.** A cases turn costs a second submit, a
-  second settle and a second tail. Below 100s that overhead comes out of the
-  only half that pays, so the solve stays single-turn, byte-for-byte the prompt
-  that shipped before.
+- **There is no deadline below which it is skipped.** There was — a 100-second
+  floor, on the reasoning that a cases turn *costs* 20-30s of submit-and-settle
+  before the model writes anything, which a 40s budget cannot spare. That
+  priced the worst case into every solve: turn 1 is a ceiling, not a spend, so
+  a fast cases turn on a short deadline costs what it took and the program
+  gets the rest.
 - **A turn 1 that produces nothing still gets a program.** No usable cases is
-  not a failure; it costs the time it took and turn 2 goes out regardless. A
-  turn 1 that could not be *read at all* is different — the tab has just proved
-  it cannot answer, so the task is handed to another model rather than queued
-  behind an answer that never arrived.
+  not a failure; it costs the time it took and turn 2 goes out regardless.
+- **A turn 1 that could not be *read* is handed on; one that ran the deadline
+  out is not.** They are not the same failure, and the clock tells them apart.
+  A tab that dies leaves the budget intact and another tab can still spend it.
+  A turn that ran the deadline out leaves nothing — handing on would lease a
+  second tab, ask a second account for a whole program with seconds on the
+  clock, and reach the same empty answer having spent someone's quota to get
+  there. So that one stops.
 - **A wrong case can still be corrected.** Turn 1 derives its `expected` values
   by reasoning, so one of them can simply be wrong — and freezing them would
   make a **correct** program fail the same bogus case on every repair round.

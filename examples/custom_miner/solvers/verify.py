@@ -292,23 +292,6 @@ SECOND_OPINION_FLOOR_S = 20.0
 SECOND_OPINION_PASSES = 2
 MAX_PASSES = 4
 
-# Below this budget the solve stays single-turn: one prompt, program and cases
-# in one reply.
-#
-# A cases-first turn costs a second submit, a second settle and a second
-# post-read tail -- roughly 20 to 30 seconds of fixed overhead before the model
-# writes a character. Spending that out of a 40-second budget leaves no room for
-# the program, and the program is the only half that pays. It does NOT cost a
-# second deadline: `send` measures from its own start and `_attempt` recomputes
-# `left` afterwards, so turn 2 still stops at `attempt_start + budget` however
-# long turn 1 took -- verified, the worst case is unchanged at `budget + 11s`.
-#
-# 100 rather than 120 because 120 is exactly the budget a third of the test
-# suite drives (`max_budget_s=120` at `timeout_s=120`), and a gate sitting on a
-# value that many tests use is a gate that decides by rounding.
-TWO_PHASE_FLOOR_S = 100.0
-
-
 @dataclass
 class _Plan:
     """What the NEXT pass of one solve should do. One per `solve_task`.
@@ -626,8 +609,8 @@ class VerifyingSolver:
             print(
                 f"[verify] the cases turn came back "
                 f"{getattr(conversation, 'empty_reason', None) or 'unfinished'}; "
-                f"asking another model rather than sending the program request "
-                f"into a conversation that cannot answer"
+                f"the program request cannot go into a conversation that has "
+                f"not answered the last one"
             )
             return None
         cases = extract_self_tests(reply, task.entrypoint, task.language)
@@ -668,26 +651,48 @@ class VerifyingSolver:
             # trip here.
             cases: Any = "ask"
             two_phase = plan is None or plan.two_phase
-            if self._self_tests and two_phase and budget >= TWO_PHASE_FLOOR_S:
+            if self._self_tests and two_phase:
                 cases = await self._ask_for_cases(
                     conversation, task, budget - (time.monotonic() - started)
                 )
                 if cases is None:
                     # The tab could not be read, or the model was still writing.
                     # Sending turn 2 into it would queue behind an answer that
-                    # has not arrived; hand the whole task to another model.
+                    # has not arrived, so this conversation is finished either
+                    # way. What differs is whether anything else is worth doing,
+                    # and the clock decides it.
                     #
-                    # And do not spend the NEXT pass the same way. Whatever made
-                    # turn 1 unaffordable here -- a long thinking phase, a slow
-                    # account, a hard problem -- is a property of the task and
-                    # the site, not of this tab, so the next pass would repeat it
-                    # exactly. It did: four passes, four timed-out cases turns,
-                    # nothing submitted. One pass may be spent finding that out;
-                    # the rest go to the program, which is the half that pays.
+                    # Whether anything ELSE happens is already decided, by the
+                    # clock, in `solve_task`: it will not open another pass with
+                    # less than `EMPTY_HANDED_FLOOR_S` left. That is the whole
+                    # guarantee "a turn that ran the deadline out is never
+                    # retried on another tab" rests on, and it holds only
+                    # because turn 1 now reads against the real budget -- when
+                    # it was capped at 60s the budget survived it and four tabs
+                    # were spent in a row. Deciding it a second time here would
+                    # be a duplicate of that floor, and a duplicate that drifts.
+                    #
+                    # So the only job left is to say which failure this was,
+                    # because "asking another model" was printed even when
+                    # nothing else would be asked.
+                    left_after = budget - (time.monotonic() - started)
                     if plan is not None:
+                        # Not the same way twice. Whatever made turn 1 fail -- a
+                        # long thinking phase, a slow account, a hard problem --
+                        # belongs to the task and the site, not to this tab, so
+                        # the next pass would repeat it exactly. It did: four
+                        # passes, four timed-out cases turns, nothing submitted.
                         plan.two_phase = False
-                        print("[verify] not asking for cases again this task; "
-                              "the remaining attempts go straight to the program")
+                    if left_after < EMPTY_HANDED_FLOOR_S:
+                        print(
+                            f"[verify] the cases turn used the whole "
+                            f"{budget:.0f}s budget; nothing left to ask anyone "
+                            f"else with"
+                        )
+                    else:
+                        print(f"[verify] {left_after:.0f}s left; not asking for "
+                              f"cases again this task, the remaining attempts "
+                              f"go straight to the program")
                     return best, provider
             prompt = build_code_prompt(
                 task.language, task.statement, task.entrypoint,
