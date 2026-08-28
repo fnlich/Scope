@@ -48,11 +48,21 @@ from .prompts import (
     python_defect,
     rust_defect,
 )
-from .rust_compile import compile_defect
+from .rust_compile import compile_defect, rustc_path
 
 # Per-example wall clock when checking our own candidate. Kept small: this is
 # a smoke test against tiny public examples, not the real grading run.
 VERIFY_TIMEOUT_S = float(os.environ.get("SOLVER_VERIFY_TIMEOUT_S", "5"))
+
+# How long an executor that could not be built stays unavailable before the
+# next solve is allowed to try again.
+#
+# A hold, not a verdict: a Docker daemon started after the miner is the
+# ordinary case, and a permanent answer would mean grading nothing in that
+# language until someone restarted the process. Long enough that Rust tasks
+# stop paying for the probe, short enough that a box the operator has just
+# fixed heals on its own.
+EXECUTOR_RETRY_S = float(os.environ.get("SOLVER_EXECUTOR_RETRY_S", "300"))
 
 
 class Conversation(Protocol):
@@ -166,6 +176,17 @@ class _Grader:
         # that is a container's worth of startup thrown away -- on the one code
         # path whose entire reason for caching is that Docker startup is slow.
         self._lock = threading.Lock()
+        # An executor that could not be BUILT, by language: (when, why).
+        #
+        # `self._cache` is written after `get_executor` returns, so a
+        # constructor that raises leaves nothing behind and every later solve
+        # repeats it. For Rust without Docker that is
+        # `DockerExecutor._resolve_docker` shelling out to `docker info` --
+        # 60ms when the socket is simply absent, and up to its own 20 second
+        # timeout when the daemon is hung or still starting. Per Rust task,
+        # inside the solve's budget, for the life of the process.
+        self._broken: dict[str, tuple[float, str]] = {}
+        self._reported: set[str] = set()
 
     @staticmethod
     def _build_settings():
@@ -183,21 +204,75 @@ class _Grader:
             cached = self._cache.get(language)
             if cached is not None:
                 return cached
-            from rlvr.execution.executor import get_executor
-
-            settings = self._settings
-            if language == "rust" and settings.executor != "docker":
-                # Rust needs rustc in the pinned image; no subprocess path.
-                from rlvr.config import Settings
-
-                settings = Settings(
-                    _env_file=None,
-                    executor="docker",
-                    per_test_timeout_s=VERIFY_TIMEOUT_S,
-                )
-            executor = get_executor(settings, language=language)
+            held = self._broken.get(language)
+            if held is not None and time.monotonic() - held[0] < EXECUTOR_RETRY_S:
+                # Remembered, not re-probed. The message is the original one
+                # verbatim: the caller prints it per solve and an operator
+                # counts those lines, so it must not change shape here.
+                raise RuntimeError(held[1])
+            try:
+                executor = self._build(language)
+            except Exception as exc:  # noqa: BLE001 - remembered, then re-raised
+                self._broken[language] = (time.monotonic(), f"{exc}")
+                self._report_unavailable(language, exc)
+                raise
+            self._broken.pop(language, None)
             self._cache[language] = executor
             return executor
+
+    def state(self, language: str) -> str:
+        """What grading this language would do right now. Never probes.
+
+        Read from `/solver-status`, so it must not shell out: a `docker info`
+        against a hung daemon blocks for twenty seconds, and the endpoint an
+        operator polls to find out whether the miner is healthy is the last
+        place to put that.
+        """
+        if language in self._cache:
+            return "ready"
+        held = self._broken.get(language)
+        if held is not None:
+            return f"unavailable: {held[1]}"
+        return "not checked yet"
+
+    def _build(self, language: str):
+        """Construct the executor for ``language``. Assumes the lock is held."""
+        from rlvr.execution.executor import get_executor
+
+        settings = self._settings
+        if language == "rust" and settings.executor != "docker":
+            # Rust needs rustc in the pinned image; no subprocess path.
+            from rlvr.config import Settings
+
+            settings = Settings(
+                _env_file=None,
+                executor="docker",
+                per_test_timeout_s=VERIFY_TIMEOUT_S,
+            )
+        return get_executor(settings, language=language)
+
+    def _report_unavailable(self, language: str, exc: BaseException) -> None:
+        """Say what a missing executor costs, once per language per run.
+
+        The per-solve line names the exception and nothing else, which reads as
+        a hiccup. This is the part an operator has to act on: everything in
+        this language is now ungraded, and no repair round can fire on it.
+        """
+        if language in self._reported:
+            return
+        self._reported.add(language)
+        fix = ""
+        if language == "rust":
+            fix = (
+                " Rust has no subprocess path — grading it at all needs a Docker "
+                "daemon; see the README's \"Rust needs Docker\" section."
+            )
+        print(
+            f"[verify] the {language} executor could not be built, so no {language} "
+            f"answer can be graded here: no repair rounds, and verified=False "
+            f"however good the answer is. {type(exc).__name__}: {exc}{fix} Not "
+            f"probing again for {EXECUTOR_RETRY_S:.0f}s. Once per run."
+        )
 
     def check(
         self, code: str, language: str, entrypoint: str,
@@ -306,6 +381,19 @@ class _Plan:
     Per-solve rather than per-solver: solves run concurrently on one instance,
     and a flag on `self` would let one task's bad luck disable the split for
     every other task in flight.
+
+    It answers "was turn 1 unaffordable HERE", so only a failure that belongs to
+    the task and the site clears it. A tab that went blind is retired on the
+    spot and the next pass is served by another one, so its failure says nothing
+    about the task -- see `_attempt`, where the two are told apart.
+
+    Cleared, the next pass asks for the program ALONE. There is no combined
+    turn to fall back to: cases written beside a program are back-filled from
+    what it happens to do and agree with its bugs, which is the whole argument
+    for splitting the turns, and a prompt that asks for a second block the
+    grader will not trust spends output tokens inside the deadline. The cost is
+    real and it is the right one: that task goes out ungraded rather than
+    graded against evidence worth nothing.
     """
 
     two_phase: bool = True
@@ -331,8 +419,8 @@ class _Plan:
 # which is the one trade the payment policy says never to make.
 #
 # What protects the program now is the budget itself and `_Plan`: turn 1 cannot
-# outlive the deadline, and a turn 1 that fails does not get a second chance in
-# the same solve.
+# outlive the deadline, and a turn 1 that fails the TASK's way does not get a
+# second chance in the same solve.
 
 
 # Which backends accept `extend_to_s`, by class, asked once each.
@@ -649,7 +737,7 @@ class VerifyingSolver:
             # happens to do, and then they agree with its bugs; cases written
             # first cannot. That is the whole argument for spending a round
             # trip here.
-            cases: Any = "ask"
+            cases: Optional[list] = None
             two_phase = plan is None or plan.two_phase
             if self._self_tests and two_phase:
                 cases = await self._ask_for_cases(
@@ -676,12 +764,33 @@ class VerifyingSolver:
                     # because "asking another model" was printed even when
                     # nothing else would be asked.
                     left_after = budget - (time.monotonic() - started)
-                    if plan is not None:
-                        # Not the same way twice. Whatever made turn 1 fail -- a
-                        # long thinking phase, a slow account, a hard problem --
-                        # belongs to the task and the site, not to this tab, so
-                        # the next pass would repeat it exactly. It did: four
-                        # passes, four timed-out cases turns, nothing submitted.
+                    # WHOSE failure was it, though. `unreadable` is set by
+                    # `_read` only when the tab went blind or the page died,
+                    # and it retires that tab at the same moment -- so the next
+                    # pass is served by a different one and the reason cannot
+                    # follow it there. Every other way this returns None is a
+                    # model that had not finished writing, which belongs to the
+                    # task and the site and WOULD repeat exactly.
+                    tab_side = (
+                        getattr(conversation, "empty_reason", None) == "unreadable"
+                    )
+                    if plan is not None and not tab_side:
+                        # Not the same way twice. A long thinking phase, a slow
+                        # account, a hard problem: the next pass would repeat
+                        # it. It did: four passes, four timed-out cases turns,
+                        # nothing submitted. The remaining passes ask for the
+                        # program alone, and that task is submitted ungraded.
+                        #
+                        # Clearing this for a DEAD TAB was the same mistake
+                        # pointed the other way. It cost the rest of the solve
+                        # the split -- and on live traffic, which ships no
+                        # public examples, the model's own cases are the only
+                        # grading there is. Turn 2 alone falls back to the
+                        # combined prompt, where the cases are written beside
+                        # the program and can be back-filled from whatever it
+                        # happens to do. One blind tab is not evidence about
+                        # the task, and `BLIND_TAB_GRACE_S` bounds what finding
+                        # that out costs.
                         plan.two_phase = False
                     if left_after < EMPTY_HANDED_FLOOR_S:
                         print(
@@ -689,6 +798,10 @@ class VerifyingSolver:
                             f"{budget:.0f}s budget; nothing left to ask anyone "
                             f"else with"
                         )
+                    elif tab_side:
+                        print(f"[verify] {left_after:.0f}s left; that tab is gone, "
+                              f"not the cases turn — the next pass asks another "
+                              f"one for cases as usual")
                     else:
                         print(f"[verify] {left_after:.0f}s left; not asking for "
                               f"cases again this task, the remaining attempts "
@@ -698,13 +811,13 @@ class VerifyingSolver:
                 task.language, task.statement, task.entrypoint,
                 task.public_examples, cases=cases,
             )
-            # `not cases` covers None as well as [], and it matters: the
+            # `cases or []` covers None as well as [], and it matters: the
             # early return above is the only thing that keeps None out of here,
             # so `list(cases)` was one edit away from a TypeError -- which this
             # module CATCHES as a backend failure and reports as "provider=none"
             # with no answer. A crash that looks like a dead tab is the worst
             # kind, so the line does not depend on the guard above surviving.
-            agreed = [] if cases == "ask" or not cases else list(cases)
+            agreed = list(cases or [])
             for attempt in range(1, self._max_attempts + 1):
                 left = budget - (time.monotonic() - started)
                 if attempt > 1 and left < 12.0:
@@ -891,23 +1004,23 @@ class VerifyingSolver:
 
     # ---------------------------------------------------------------------- #
     def _run_self_tests(
-        self, candidate: Candidate, reply: str, task,
-        cases: Optional[list] = None,
+        self, candidate: Candidate, task, cases: Optional[list] = None,
     ) -> None:
-        """Grade a candidate against the cases the model sent with it.
+        """Grade a candidate against the cases turn 1 obtained.
 
         Never raises and never blocks the answer. A model wrote both halves of
         this -- the cases and the JSON they arrived in -- so every failure mode
         here ends in "no self-tests ran", which is exactly where this code path
         started.
+
+        It does not read the reply. The program turn asks for ONE block, so
+        there is nothing to extract from it -- and mining it for cases anyway
+        would mean grading a program against whatever it volunteered about
+        itself, which is the back-filling the split exists to prevent. A repair
+        reply that CORRECTS a case is handled where it belongs, in `_attempt`,
+        which feeds the corrected array to the next round.
         """
-        # The cases agreed in turn 1 win over anything in THIS reply: after
-        # the split the program arrives alone, and re-extracting from it
-        # would find nothing and silently stop grading -- the exact state
-        # this mechanism was built to end.
-        cases = list(cases or []) or extract_self_tests(
-            reply, task.entrypoint, task.language
-        )
+        cases = list(cases or [])
         if not cases:
             return
         names = [case.get("name", "") for case in cases]
@@ -916,8 +1029,14 @@ class VerifyingSolver:
                 candidate.code, task.language, task.entrypoint, cases, names
             )
         except Exception as exc:  # noqa: BLE001 - a broken executor loses no answer
-            print(f"[verify] could not run the model's own cases: "
-                  f"{type(exc).__name__}: {exc}")
+            # Same four words as the public-examples path below, deliberately.
+            # They are what an operator counts to decide whether a missing
+            # executor is costing anything -- and on live traffic, which ships
+            # no public examples, THIS is the only path that can print it. The
+            # other wording made that count read zero while every answer in the
+            # language went out ungraded.
+            print(f"[verify] local grading unavailable, so the model's own cases "
+                  f"could not be run: {type(exc).__name__}: {exc}")
             return
         if not total:
             return
@@ -975,7 +1094,7 @@ class VerifyingSolver:
             # should be and coding it wrong, and that is objectively checkable
             # with the validator's own executor.
             if self._self_tests and not out_of_budget and code.strip():
-                self._run_self_tests(candidate, reply, task, cases)
+                self._run_self_tests(candidate, task, cases)
             return candidate
         if out_of_budget:
             # The budget is gone, so running the examples buys nothing that can
@@ -1002,11 +1121,69 @@ class VerifyingSolver:
         candidate.passed, candidate.total, candidate.failures = passed, total, failures
         return candidate
 
+    # -- what a Rust answer is actually checked with ----------------------- #
+    def rust_support(self) -> dict[str, str]:
+        """The two independent checks a Rust answer gets, and their state.
+
+        Both can be off at once, and on a box with neither the only thing
+        standing between a model's reply and the validator is `rust_defect`,
+        which greps a fenced block for `fn main`. Measured over 45 archived
+        submissions: 6 of 18 Rust answers would not build, and among them were
+        a prompt echo, a tool call and a program truncated mid-identifier --
+        all three of which carry those characters.
+
+        Cheap on purpose: `rustc_path` is memoised after its first lookup and
+        `_Grader.state` never probes, so `/solver-status` can report this.
+        """
+        compiler = rustc_path()
+        return {
+            "compile_gate": f"rustc at {compiler}" if compiler else "off: no local rustc",
+            "grading": self._grader.state("rust"),
+        }
+
+    async def check_rust_support(self) -> dict[str, str]:
+        """Probe both now, at startup, and say what is missing.
+
+        Neither is looked at until the first Rust task arrives otherwise, so a
+        box with no toolchain and no daemon looks perfectly healthy -- the
+        fleet is up, the doctor is clean, `/health` answers -- right until a
+        Rust challenge is graded by nobody. That is the failure this miner is
+        least able to see and the operator most able to fix, so it is worth one
+        `which` and one `docker info` before serving.
+        """
+        await asyncio.to_thread(self._probe_rust)
+        support = self.rust_support()
+        blind = support["compile_gate"].startswith("off") and support[
+            "grading"
+        ].startswith("unavailable")
+        if blind:
+            print(
+                "[verify] WARN: no local rustc and no working Rust executor, so a "
+                "Rust answer is checked only by a grep for `fn main` before it is "
+                "submitted. Installing a toolchain restores the compile gate "
+                "without Docker; grading Rust needs the daemon."
+            )
+        else:
+            print(
+                f"[verify] rust: compile gate {support['compile_gate']}, "
+                f"grading {support['grading']}"
+            )
+        return support
+
+    def _probe_rust(self) -> None:
+        """Both lookups, in a worker thread. Neither is allowed to raise."""
+        rustc_path()
+        try:
+            self._grader.executor("rust")
+        except Exception:  # noqa: BLE001 - `_Grader` has already said why
+            pass
+
     def stats(self) -> dict[str, Any]:
         return {
             "solver": dict(self._counts),
             "providers": {k: dict(v) for k, v in self._by_provider.items()},
             "fleet": self._backend.stats(),
+            "rust": self.rust_support(),
         }
 
     async def aclose(self) -> None:

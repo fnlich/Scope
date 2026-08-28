@@ -27,7 +27,7 @@ import ast
 import builtins
 import json
 import re
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 # ChatGPT wraps code in ``` fences; the DOM reader already returns the inner
 # text of a <pre><code> block, but a reply that arrived as plain text (or a
@@ -154,141 +154,25 @@ def sanitize_code(text: str) -> str:
     return _LANG_LABEL_RE.sub("", text, count=1)
 
 
-# Stated first, and again last by the site's nudge. It is the only instruction
-# whose failure costs the whole answer rather than degrading it, so it gets both
-# the primacy and the recency slot and nothing else competes for either.
-OUTPUT_CONTRACT = """\
-Reply with EXACTLY TWO fenced blocks written directly in the chat — not into an
-artifact or canvas — and nothing else. No preamble, no explanation before them,
-between them or after them. Never a third block.
-
-1. The {language} program. This block alone is graded.
-2. A `json` block holding the cases you checked it against — see <self_tests>.
-
-Only what is inside those two fences is ever read."""
-
-
-# The second block, and why it is worth relaxing a rule that was ONE block for
-# good reasons.
-#
-# Production ships no `public_examples`: 56 solves in a row on a live run
-# reported `examples=0/0`. The repair loop -- the one mechanism here that turns
-# a nearly-right answer into a right one -- therefore never had anything to
-# run, and `verified` was False on every answer because nothing COULD be
-# checked, not because anything was wrong. The model is the only source of
-# cases there is.
-#
-# The relaxation is safe because `extract_code` picks the block that DEFINES
-# the entrypoint rather than the first or the last one. Measured against four
-# adversarial layouts -- tests only, tests first, a misnamed function, an
-# untagged JSON block -- the JSON never reached the submission, and a reply
-# carrying only tests reported `the reply contained no code` exactly as before.
-SELF_TESTS_PYTHON = """\
-The second block is a JSON array of the cases you traced, so I can RUN them
-against your program before it goes anywhere. No tests ship with this task, so
-a case you do not write is a case nobody runs.
-
-[{{"name": "empty input",  "args": [[]],        "expected": 0}},
- {{"name": "single item",  "args": [[5]],       "expected": 5}},
- {{"name": "stated bound", "args": [[1000000]], "expected": 1000000}}]
-
-- `args` is the argument list for `{entrypoint}(*args)`; `kwargs` is optional.
-- `expected` is the exact value your program must RETURN, written as JSON.
-- Every value must be JSON: no tuples, no sets, no `inf`, no `NaN`, no code.
-- Six to twelve cases, and BOUNDARIES before anything else. Whenever the
-  statement makes them reachable, include: the empty input, one element, the
-  smallest and largest values the statement names, one below and one above each
-  stated bound, a tie, and the case your own implementation is most likely to
-  get wrong.
-- Derive every `expected` from the STATEMENT, not by running your code again in
-  your head. A case that agrees with the bug is worse than no case at all."""
-
-
-RUST_SELF_TESTS = """\
-The second block is a JSON array of the cases you traced, so I can RUN them
-against your program before it goes anywhere. No tests ship with this task, so
-a case you do not write is a case nobody runs.
-
-[{{"name": "empty input",  "args": ["0\\n"],     "expected": "0"}},
- {{"name": "single item",  "args": ["1\\n5\\n"],  "expected": "5"}}]
-
-- `args` holds exactly ONE string: the complete stdin your program reads.
-- `expected` is the complete stdout it must write, as a string.
-- Both are compared after splitting on whitespace, so spacing is forgiving but
-  extra or missing tokens are not.
-- Six to twelve cases, and BOUNDARIES before anything else. Whenever the
-  statement makes them reachable, include: the smallest legal input, one
-  element, the largest values the statement names, one below and one above each
-  stated bound, a tie, and the case your own implementation is most likely to
-  get wrong.
-- Derive every `expected` from the STATEMENT, not by running your code again in
-  your head. A case that agrees with the bug is worse than no case at all."""
-
 PYTHON_RULES = """\
-- There is no partial credit: a program wrong on ONE hidden case pays exactly
-  what no answer pays — zero — while the payment rule pays the slowest correct
-  answer at least 95% of what the fastest one earns.
+- There is no partial credit: a program wrong on ONE hidden case scores
+  exactly what no answer scores. Correctness is the whole of it.
 - Define exactly one top-level function named `{entrypoint}`. It is called
   directly as `{entrypoint}(*args, **kwargs)`.
 - RETURN the answer. Do not print it, do not read stdin, do not call input().
   Printed output is ignored by the grader.
 - Standard library only. No pip packages, no network, no file access.
-- Write no comments and no docstrings. Nothing reads them, and every
-  character you emit spends wall-clock inside the deadline.
 - Put no tests, example calls or `if __name__ == "__main__"` INSIDE the
-  program block. {cases_home}"""
+  program block. Nothing but the function and whatever it needs to run."""
 
 RUST_RULES = """\
-- There is no partial credit: a program wrong on ONE hidden case pays exactly
-  what no answer pays — zero — while the payment rule pays the slowest correct
-  answer at least 95% of what the fastest one earns.
+- There is no partial credit: a program wrong on ONE hidden case scores
+  exactly what no answer scores. Correctness is the whole of it.
 - Write ONE complete program with `fn main()`, compiled as a single file with
   `rustc --edition=2021 -C opt-level=2`. No Cargo, no crates, std only.
 - READ the input from stdin and WRITE only the requested answer to stdout.
 - Output is compared token-by-token after splitting on ASCII whitespace, so
-  extra prose, labels or prompts make the answer wrong.
-- Write no comments and no docstrings. Nothing reads them, and every
-  character you emit spends wall-clock inside the deadline."""
-
-# The public examples are the friendly ones. The hidden suite is where the
-# score comes from, and it is written to break a solution that only handles the
-# shape it was shown -- so the cases below are named one at a time rather than
-# summarised as "handle edge cases", which every model agrees to and none acts
-# on. Each line is a case that has a right answer the statement implies and a
-# wrong answer a plausible implementation produces.
-#
-# The ORDER of the first sentence is the expensive part. It used to read "walk
-# your solution through every one of these before you answer", and a model does
-# what it is told: it narrated the walkthrough, at length, and only then began
-# the program. Reported from a live tab, and the reason it costs a solve is not
-# style -- the first attempt has about 135 seconds of a 225 second budget, and
-# prose spent before the code is time the code does not get. Written the other
-# way round the artifact exists first, so a reply cut short loses the checking
-# pass rather than the whole answer.
-# What the time budget was actually carrying.
-#
-# The number itself is gone: a model has no clock, cannot measure "260 seconds",
-# and the only concrete behaviour it drove was a depth ladder that said how many
-# cases to trace. Under the two-turn split the case counts are stated outright,
-# by class, in the turn that asks for them -- which is both more precise and
-# checkable, where a number the model cannot perceive is neither.
-#
-# These two rules were filed under it and are not about time at all. They are
-# what makes a PARTIAL program impossible, so they belong with the request for a
-# program.
-WHOLE_PROGRAM = """\
-Two rules, and neither bends.
-
-COMPLETE BEFORE CORRECT. Write the whole program out -- every function, every
-branch, nothing elided, nothing deferred to a comment or an ellipsis -- before
-you check any of it. Checking a program that does not yet exist in full is how
-a deadline turns a nearly-finished answer into a zero.
-
-SENDABLE AT EVERY MOMENT. When you improve it, change it from one complete
-program into another complete program; never leave it half-rewritten. If you
-must choose, send the complete version you have rather than the better version
-you do not."""
-
+  extra prose, labels or prompts make the answer wrong."""
 
 # The two output contracts, and why they share an opening.
 #
@@ -339,34 +223,26 @@ runs.
 - Every value must be JSON: no tuples, no sets, no `inf`, no `NaN`, no code.
 - `name` is a short label so a failure report can say which case broke.
 
-Cover, in this order:
+Write, in this order:
 
 1. THREE ordinary cases. Typical inputs, nothing special about them. These are
    the common path, and a suite that tests only boundaries never checks it.
+2. THE EMPTY VALUE, or zero: an empty list, an empty string, `0`, `{{}}` —
+   whichever of them this statement allows.
+3. ONE: a single element, `n = 1`, the smallest legal input.
+4. THE BOUNDARY: every limit, threshold and modulus the statement names, tested
+   AT that exact value, and the largest value it allows.
+5. THE CASES THIS PROBLEM IS LIKELY TO BE GOT WRONG ON: inputs where a
+   plausible implementation returns something the statement does not — ties and
+   duplicates, every element equal, already sorted, exactly reversed, a rule the
+   statement states given one input that makes it fire and one that NEARLY does,
+   and whatever else this particular problem makes easy to get wrong.
 
-2. Then, for EACH class below that this statement makes reachable, between TWO
-   and TEN cases. Skip a class only when the statement makes it impossible, and
-   spend the most cases on the classes this problem actually turns on:
-   - ZERO, and the empty input: 0, [], "", {{}}, an empty line of stdin.
-   - ONE and TWO: a single element, exactly two, and the step from one to two.
-   - EVERY LIMIT AND BOUND THE STATEMENT NAMES: at the value, one below it, and
-     one above it. The hidden tests always probe the boundary the statement
-     bothered to write down.
-   - NEGATIVE VALUES and zero-crossings, wherever the statement allows them.
-   - THE LARGEST AND SMALLEST values allowed, and the value that overflows a
-     32-bit accumulator if one is reachable.
-   - TIES AND DUPLICATES: equal keys, repeated elements, two answers with an
-     equal claim, and whatever the statement says breaks the tie.
-   - DEGENERATE SHAPE: everything identical, everything distinct, already
-     sorted, exactly reversed, one element repeated throughout.
-   - EACH RULE THE STATEMENT STATES: one input that makes it fire, and one that
-     NEARLY does and must not.
-   - THE CASE YOU ARE MOST LIKELY TO GET WRONG when you write the program.
-
-At most {limit} cases in total. Derive every `expected` from the STATEMENT by
-reasoning it out. You have not written the program yet, and that is deliberate:
-a case computed from code agrees with the code's bugs, which is exactly what a
-test is supposed to catch."""
+Skip a class only when the statement makes it impossible. At most {limit} cases
+in total. Derive every `expected` from the STATEMENT by reasoning it out.
+You have not written the program yet, and that is deliberate: a case computed
+from code agrees with the code's bugs, which is exactly what a test is supposed
+to catch."""
 
 
 TESTS_TASK_RUST = """\
@@ -384,30 +260,25 @@ runs.
   an extra or missing token is not.
 - `name` is a short label so a failure report can say which case broke.
 
-Cover, in this order:
+Write, in this order:
 
-1. THREE ordinary cases. Typical inputs, nothing special about them.
+1. THREE ordinary cases. Typical inputs, nothing special about them. These are
+   the common path, and a suite that tests only boundaries never checks it.
+2. THE EMPTY VALUE, or zero: the smallest legal input, a count of zero, and an
+   empty payload after the count if the format allows one.
+3. ONE: a single element, `n = 1`.
+4. THE BOUNDARY: every limit, threshold and modulus the statement names, tested
+   AT that exact value, and the largest value it allows.
+5. THE CASES THIS PROBLEM IS LIKELY TO BE GOT WRONG ON: inputs where a
+   plausible implementation writes something the statement does not — ties and
+   duplicates, every element equal, already sorted, exactly reversed, a rule the
+   statement states given one input that makes it fire and one that NEARLY does,
+   and whatever else this particular problem makes easy to get wrong.
 
-2. Then, for EACH class below that this statement makes reachable, between TWO
-   and TEN cases. Skip a class only when the statement makes it impossible:
-   - ZERO and the smallest legal input, including an empty payload after the
-     count if the format allows one.
-   - ONE and TWO items, and the step from one to two.
-   - EVERY LIMIT AND BOUND THE STATEMENT NAMES: at the value, one below, one
-     above.
-   - NEGATIVE VALUES and zero-crossings, wherever allowed.
-   - THE LARGEST AND SMALLEST values allowed, and anything that overflows `i32`
-     — Rust wraps silently in release, so a sum that fits `i64` and not `i32` is
-     a wrong answer with no error.
-   - TIES AND DUPLICATES, and whatever the statement says breaks the tie.
-   - DEGENERATE SHAPE: all identical, all distinct, already sorted, reversed.
-   - EACH RULE THE STATEMENT STATES: one input that makes it fire, one that
-     NEARLY does.
-   - THE CASE YOU ARE MOST LIKELY TO GET WRONG when you write the program.
-
-At most {limit} cases in total. Derive every `expected` from the STATEMENT by
-reasoning it out. You have not written the program yet, and that is deliberate:
-a case computed from code agrees with the code's bugs."""
+Skip a class only when the statement makes it impossible. At most {limit} cases
+in total. Derive every `expected` from the STATEMENT by reasoning it out.
+You have not written the program yet, and that is deliberate: a case computed
+from code agrees with the code's bugs."""
 
 
 def build_tests_prompt(
@@ -461,122 +332,6 @@ def _render_cases(cases: list[dict[str, Any]], language: str, entrypoint: str) -
     return "\n".join(lines)
 
 
-# An ordered procedure, not advice. Ordering is the thing this prompt has had to
-# fight hardest: told to check "before you answer", models narrated the check and
-# ran out of time before the program existed. A numbered list leaves no room to
-# read the steps in a different order, and step 6 is the one that must be last.
-#
-# The three fields exist because METHOD is shared by turns that ask for
-# different replies, and a shared instruction that names the WRONG reply is
-# worse than no instruction at all. Under the two-turn split the code turn's
-# contract says ONE block; a method that then says "the reply itself is only the
-# two blocks" and "send the program, then the cases" is a flat contradiction,
-# and a model resolves a contradiction by obeying the more specific-sounding
-# half -- it emits a second JSON block, which `extract_code` has to step over
-# and which spends output tokens inside the deadline for nothing.
-METHOD = """\
-Correctness is the only thing worth optimising: a wrong answer pays zero and
-speed pays almost nothing, so prefer the safe implementation over the clever
-one, and spend the deadline where it buys correctness — in your reasoning,
-before the reply. Work in this order, all of it silently, in your reasoning;
-the reply itself is only {reply}:
-1. Read the statement twice, then the examples. Every rule the statement
-   states and every bound and constant it names is the specification the
-   hidden tests are written from. Where the statement is ambiguous, the
-   examples decide — they are the only disambiguation you are given. Pick the
-   algorithm that fits the stated bounds and the types that survive the
-   extreme values.
-2. Write the program FIRST, complete and runnable — improving a program that
-   exists beats planning one that does not.
-3. Trace every example through the code you wrote, computing the real
-   intermediate values in your head — a skim that ends "looks right" catches
-   nothing. If one disagrees, the code is wrong, not the example.
-4. Invent inputs of your own and trace them the same way: the edge cases below
-   say which, and every rule the statement states gets one input that triggers
-   it and one that NEARLY does. After every fix, re-trace the cases that
-   already passed — repairs break earlier answers.{step4}
-5. Read the program back against itself, using the self-check below.
-6. Send {send}, and nothing else."""
-
-
-# What each turn puts in those three slots.
-_METHOD_SLOTS = {
-    # Single turn: program and cases together, exactly as before the split.
-    "combined": {
-        "reply": "the two blocks",
-        "step4": (
-            "\n   These are the cases that go in the second block, so write down"
-            " the expected\n   value as you trace it."
-        ),
-        "send": "the program, then the cases",
-    },
-    # Turn 2 with cases agreed in turn 1: the bar is already written down, so
-    # the tracing has somewhere concrete to point instead of a block to fill.
-    "given": {
-        "reply": "the program",
-        "step4": (
-            "\n   Every case in <must_pass> above has to come out right; those"
-            " are the ones\n   that will actually be run against this program."
-        ),
-        "send": "the program",
-    },
-    # Turn 2 after a cases turn that produced nothing usable. No second block,
-    # and nothing to point at either.
-    "bare": {"reply": "the program", "step4": "", "send": "the program"},
-}
-
-
-# The strongest sentence in the prompt, fired once, from the last slot before
-# generation begins — after the checklists it refers back to, where a coda
-# buried mid-<method> was read and forgotten 45 lines before the reply.
-METHOD_CODA = """\
-None of the work above appears in the reply, and none of it may be skipped: a
-reply the deadline cuts off scores the same zero as a wrong one, so keep every
-trace terse — but run every trace. The check you skip is the hidden test you
-fail."""
-
-EDGE_CASES = """\
-The hidden tests are adversarial; the examples are not. Each line below is a
-case with a right answer the statement implies and a wrong answer a plausible
-implementation produces:
-- THE STATEMENT'S OWN CONSTANTS: every limit, threshold and modulus the
-  statement names, tested AT that exact value, one below it, and one above.
-  The hidden suite always probes the boundary the statement bothered to write
-  down.
-- NOTHING: an empty list, an empty string, n = 0. Work out what the statement
-  says the answer is, then make sure your code reaches it instead of crashing
-  or dividing by a length of zero.
-- ONE: n = 1, a single element, a one-character string. Almost every
-  off-by-one bug is visible here and nowhere else.
-- TWO: the smallest case where "first" and "last" are different elements, and
-  where adjacent-pair logic stops agreeing with the general case.
-- BOTH ENDS: the first element and the last, an empty range, and an inclusive
-  bound against an exclusive one. Check the far end explicitly — a loop that is
-  right at the start and short by one at the finish passes every example.
-- EXTREME VALUES: 0, 1, -1, negative numbers, and the largest magnitude the
-  statement allows. If no bound is given, assume values up to 10^18 and n up to
-  10^5, and pick an algorithm and a type that survive both.
-- DEGENERATE SHAPE: every element equal, every element a duplicate, already
-  sorted, sorted backwards, all zeros.
-- TIES: two candidates the statement ranks — lowest, oldest, first in input.
-  The right pick is the one the statement ranks first, not the one your data
-  structure happens to hand back.
-- TWO RULES AT ONCE: an input that trips two of the statement's rules
-  together. The statement's listed order decides which answer wins — an
-  implementation that tests them in another order survives every example that
-  trips only one.
-- WRAPAROUND: any circular index, range or clock — the range that wraps past
-  the end, the range that covers the whole circle, and every stored index
-  compared only after the same modular shift as the query.
-- A BATCH APPLIED AT ONCE: where the statement says simultaneous, every
-  comparison reads the pre-change snapshot and every write lands after all
-  reads — applying one element first and letting it change another element's
-  outcome is the plausible wrong implementation.
-- A REJECTED OPERATION: an input the statement says must be refused. Refusing
-  it must leave every piece of state exactly as it was — nothing
-  half-committed."""
-
-
 # Two of these are facts about THIS grader, not general advice, and both cost a
 # solve when guessed at: the comparison is structural and strict about bools,
 # and each test is on a five-second clock.
@@ -621,44 +376,6 @@ RUST_ENVIRONMENT = """\
   BufWriter rather than printing in a loop."""
 
 
-# Read off 43 answers a live miner submitted. Ten were the model's own bugs, and
-# EIGHT of those ten were visible on a careful re-read of the program itself --
-# no test, no execution, no cleverness required. A helper called but never
-# written. A `[-1]` on a list the program's own parser can empty. A sentinel of
-# 255 pushed into a list and later used to index five buckets. An id used where
-# a position was meant. A condition already guaranteed by the match arm it sat
-# in, so the arm was dead. An index of 16 into a length-16 string.
-#
-# None of that is a hard-problem failure. It is a re-reading failure, and it is
-# the one kind of mistake a prompt can actually reach: the model has everything
-# it needs to catch these and simply does not look again. So it is asked to,
-# once, against a list of exactly the things that have gone wrong.
-SELF_CHECK = """\
-Read the program back against itself and verify each of these, silently — the
-reply is still only {reply}. Every line is a bug that has reached this
-grader inside a program that looked finished:
-- Every function you CALL, you also wrote. A helper you meant to add and did not
-  is a compile error sitting in a file that otherwise looks complete.
-- Every index is in range. Watch for two numberings of the same objects — an id
-  used where a position is meant, an id the statement assigns to every event
-  including the ones you reject — and for a sentinel value that later reaches a
-  subscript.
-- Every branch is reachable and every branch produces its answer. A condition
-  already guaranteed by the arm it sits in is dead code; an arm that computes a
-  value and then discards it emits nothing at all.
-- Every `[0]`, `[-1]`, `.pop()`, `.first()`, `.last()` has an answer for the
-  empty case — including the empty case your OWN code can produce.
-- When you rebuild derived state, you rebuild ALL of it. A refresh that updates
-  four fields and forgets the fifth leaves the fifth silently stale.
-- State you commit before a branch, that branch can undo. A counter advanced and
-  not rewound on the path that should not have advanced it is a wrong answer
-  that shows up under one ordering and not another.
-- Every sentence of the statement has code you can point at. A rule read once
-  and carried in memory drifts — and the sentence with nothing behind it, a
-  fallback, a tie-break, a rejection the statement demands, is a feature the
-  hidden suite will exercise."""
-
-
 def _render_examples(language: str, examples: list[dict[str, Any]]) -> str:
     """Render public examples in the shape the grader will actually use."""
     if not examples:
@@ -686,21 +403,21 @@ def build_code_prompt(
     statement: str,
     entrypoint: str,
     examples: list[dict[str, Any]],
-    cases: Any = "ask",
+    cases: Optional[Sequence[dict[str, Any]]] = None,
 ) -> str:
-    """Ask for the program.
+    """Turn 2: ask for the program, and only the program.
 
-    ``cases`` has three values and they are three different conversations:
+    ``cases`` is what turn 1 obtained, and it decides one thing:
 
-    * ``"ask"``   -- the single-turn prompt: program AND cases in one reply, two
-                     fenced blocks. Used when the budget is too small to spend a
-                     round trip on cases alone, and byte-for-byte what this
-                     builder produced before the split.
-    * a list      -- turn 2 of a two-turn solve. The cases already exist, so the
-                     contract is ONE block and they are restated as the bar the
+    * a list      -- the cases exist, so they are restated as the bar this
                      program has to clear.
-    * ``None``/[] -- turn 2 after turn 1 produced nothing usable. One block, no
-                     cases, and the answer still goes out.
+    * ``None``/[] -- turn 1 produced nothing usable, or was never asked. No bar
+                     to point at, and the answer still goes out.
+
+    Either way the contract is ONE block. A reply carrying a second one is a
+    reply that spent output tokens inside the deadline on something nothing
+    reads: the cases were settled a turn ago, and `extract_code` would have to
+    step over whatever else arrived.
 
     Laid out in delimited sections, and the order is the argument. The output
     contract goes FIRST because it is the only instruction whose failure costs
@@ -716,21 +433,10 @@ def build_code_prompt(
 
     """
     is_rust = language == "rust"
-    combined = cases == "ask"
-    given = [] if combined or not cases else list(cases)
-    slots = _METHOD_SLOTS["combined" if combined else "given" if given else "bare"]
-    rules = (RUST_RULES if is_rust else PYTHON_RULES).format(
-        entrypoint=entrypoint,
-        cases_home=(
-            "Your cases go in the second block, as JSON."
-            if combined
-            else "Nothing but the function and whatever it needs to run."
-        ),
-    )
+    given = list(cases or [])
+    rules = (RUST_RULES if is_rust else PYTHON_RULES).format(entrypoint=entrypoint)
     environment = RUST_ENVIRONMENT if is_rust else PYTHON_ENVIRONMENT
-    contract = (OUTPUT_CONTRACT if combined else CODE_OUTPUT_CONTRACT).format(
-        language="Rust" if is_rust else "Python"
-    )
+    contract = CODE_OUTPUT_CONTRACT.format(language="Rust" if is_rust else "Python")
 
     parts = [
         "<output>", contract, "</output>", "",
@@ -742,43 +448,29 @@ def build_code_prompt(
     rendered = _render_examples(language, examples)
     if rendered:
         parts += [
-            "<examples note=\"PUBLIC EXAMPLES — a floor, not the specification. "
-            "Your code must reproduce these exactly AND survive the cases below.\">",
+            "<examples note=\"PUBLIC EXAMPLES — a floor, not the specification, "
+            "and already known to be right. Your program must reproduce these "
+            "exactly, and where the statement is ambiguous they decide.\">",
             rendered,
             "</examples>", "",
         ]
-    parts += ["<contract>", rules, "", environment, "</contract>", ""]
-    if combined:
-        # Immediately after the contract that asks for two blocks and before the
-        # method that produces them, so "write the cases" is read as part of
-        # answering rather than as an afterthought.
-        parts += [
-            "<self_tests>",
-            (RUST_SELF_TESTS if is_rust else SELF_TESTS_PYTHON).format(
-                entrypoint=entrypoint
-            ),
-            "</self_tests>", "",
-        ]
-    elif given:
+    parts += ["<contract>", rules, "", environment, "</contract>"]
+    if given:
         # The bar, stated as the calls the grader will actually make. These are
         # the model's OWN cases from the previous turn, echoed rather than
         # referred to: a model asked to honour "the cases you sent" has to
         # scroll back past its own JSON to find them, and what it half-
         # remembers is what the program gets checked against.
+        #
+        # Last in the message, which is where it belongs: it is what the
+        # program has to clear, read immediately before the program is written.
         parts += [
+            "",
             '<must_pass note="YOUR OWN cases from the previous message. Every '
             'one of these is RUN against your program before it is submitted.">',
             _render_cases(given, language, entrypoint),
-            "</must_pass>", "",
+            "</must_pass>",
         ]
-    parts += ["<method>", WHOLE_PROGRAM, ""]
-    parts += [
-        METHOD.format(**slots), "",
-        "<edge_cases>", EDGE_CASES, "</edge_cases>", "",
-        "<self_check>", SELF_CHECK.format(reply=slots["reply"]), "</self_check>", "",
-        METHOD_CODA,
-        "</method>",
-    ]
     return "\n".join(parts)
 
 
@@ -840,10 +532,9 @@ def build_repair_prompt(
             "work out what it says the answer for that input is. If the case is "
             "right, fix the program; if the case was wrong, fix the case and "
             "leave the program alone. Do not change both to make them agree.\n\n"
-            "Then re-check the fix silently against the boundaries from my first "
-            "message — the empty case, n = 1, both ends, and the largest values "
-            "allowed — because a repair that fixes one case and breaks a "
-            "boundary scores the same zero. Reply with the corrected program block. "
+            "Then re-check the fix against every OTHER case you were sent, "
+            "silently: a repair that fixes one case and breaks another is still "
+            "wrong. Reply with the corrected program block. "
             "If it was the CASE that was wrong, add a second `json` block "
             "holding the corrected cases; otherwise send the program alone."
         )
@@ -856,10 +547,9 @@ def build_repair_prompt(
             "In your reasoning — not in the reply — trace the failing call through "
             "your code until you find the actual line where the computed value and "
             "the expected one part company; do not guess at the fix from the shape "
-            "of the failure. Re-check the fix silently against the edge-case "
-            "checklist from my first message — the empty case, n = 1, both ends, "
-            "and the largest values allowed — because a repair that fixes the "
-            "example and breaks a boundary scores the same zero. Then reply with "
+            "of the failure. Re-check the fix against every OTHER case you were "
+            "sent, silently: a repair that fixes this one and breaks another is "
+            "still wrong. Then reply with "
             "ONLY ONE corrected code block and nothing else."
         )
     return body

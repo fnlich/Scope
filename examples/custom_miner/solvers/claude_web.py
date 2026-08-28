@@ -59,13 +59,11 @@ from .config import selectors
 # artifacts panel, which lives outside the message the reader scrapes. One
 # sentence is cheaper than trying to scrape the panel.
 NUDGE = (
-    "START your reply with the fenced block. No preamble and no explanation — "
-    "an answer that arrives after a paragraph of prose may not arrive at all. "
-    "Reply directly in the chat with exactly the ordinary fenced block or "
-    "blocks the output contract above asks for and nothing else, however long "
-    "they are. Do not create an artifact. Do not use the analysis "
-    "tool and do not try to compile, run or test anything — there is no "
-    "toolchain here and every tool call is time the answer does not get."
+    "START your reply with the fenced block: no preamble and no explanation. "
+    "Reply directly in the chat with exactly the ONE ordinary fenced block the "
+    "output contract above asks for and nothing else, however long it is. Do "
+    "not create an artifact. Do not use the analysis tool and do not try to "
+    "compile, run or test anything — there is no toolchain here."
 )
 
 

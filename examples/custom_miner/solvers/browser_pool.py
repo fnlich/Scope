@@ -412,6 +412,26 @@ _STREAM_READ = r"""(since) => {
 }"""
 
 
+# What the composer holds, read back before anything is submitted. Both sites
+# put a contenteditable div behind the composer selector rather than a real
+# input, so `input_value()` does not apply; `value ?? innerText` covers a plain
+# textarea too without asking the page which it is.
+_COMPOSER_TEXT_JS = (
+    "el => (el.value === undefined || el.value === null ? el.innerText : el.value)"
+)
+
+
+def _same_message(typed: str, seen: str) -> bool:
+    """Is the box holding the message we typed, and nothing else?
+
+    Compared on collapsed whitespace, because a contenteditable turns our
+    newlines into block elements and hands them back as its own arrangement of
+    them -- an exact comparison would fail on every send. What this still
+    catches is the only thing it has to: text in the box that we did not type.
+    """
+    return " ".join(typed.split()) == " ".join(seen.split())
+
+
 @dataclass(frozen=True)
 class Site:
     """Everything that differs between one chat UI and another."""
@@ -791,8 +811,57 @@ class _Tab:
             raise
         self._fresh = True
 
+    async def _composer_holds(self) -> str:
+        """What the composer contains right now.
+
+        Both sites put a contenteditable ProseMirror div behind the composer
+        selector rather than a real input, so `input_value()` does not apply to
+        either. Reading `value ?? innerText` in the page covers a plain textarea
+        too, without having to ask which one this is.
+
+        Deliberately not guarded: a composer we cannot read is a composer we
+        cannot vouch for, and `_submit`'s caller already turns a raise into a
+        retired tab and a solve that goes elsewhere.
+        """
+        composer = self._page.locator(self._composer).first
+        return await composer.evaluate(_COMPOSER_TEXT_JS) or ""
+
+    async def _clear_composer(self, ui_ms: int) -> None:
+        """Empty the composer, and prove it emptied. Raises when it will not.
+
+        This is not housekeeping. These accounts are shared with people, so the
+        box can already hold somebody's half-typed message -- and `insert_text`
+        inserts at the CARET, which the click above it has just placed at the
+        element's centre. The prompt is spliced INTO that draft and the whole
+        thing is sent as one message: their text, our prompt, the rest of their
+        text. Nothing downstream would notice it. `_is_our_own_prompt` inspects
+        the REPLY for our prompt's head, and in a contaminated send that head is
+        still there, intact. The only symptom is a model answering a mangled
+        question, which looks exactly like a hard task.
+        """
+        composer = self._page.locator(self._composer).first
+        await composer.click(timeout=ui_ms)
+        # Control, not Meta: every entrypoint here refuses to start anywhere but
+        # Linux (`preflight.require_linux`), and `fill` below covers a composer
+        # that swallows the shortcut anyway.
+        await self._page.keyboard.press("Control+A")
+        await self._page.keyboard.press("Delete")
+        if not (await self._composer_holds()).strip():
+            return
+        # The shortcut did not reach it -- an editor with its own key handling,
+        # or a selection that never landed. `fill` goes through the element
+        # instead of the keyboard, and the click restores the caret it moves.
+        await composer.fill("", timeout=ui_ms)
+        await composer.click(timeout=ui_ms)
+        left = (await self._composer_holds()).strip()
+        if left:
+            raise RuntimeError(
+                f"the composer still holds {len(left)} character(s) we did not "
+                f"type and would not clear"
+            )
+
     async def _submit(self, text: str, ui_ms: int) -> None:
-        """Type the prompt and press send, with every step bounded.
+        """Put the prompt in the composer ALONE, then press send.
 
         Playwright's default auto-wait is 30s PER action, so an unbounded
         click/insert/click can burn ~90s that the solver's budget never
@@ -804,11 +873,26 @@ class _Tab:
         lists deliberately end in broad fallbacks that can. Without it a page
         with two matching nodes fails every submit, and since a failed submit
         retires the tab, the pool would churn tabs forever and never answer.
+
+        Nothing is ever sent unread. The box is emptied, the prompt is typed,
+        and the box is read BACK and compared before the send button is touched
+        -- because the one thing this method must never do is hand a validator's
+        problem to a model wrapped in somebody else's sentence.
         """
-        composer = self._page.locator(self._composer).first
-        await composer.click(timeout=ui_ms)
-        # insert_text handles newlines safely — typing them would submit early.
-        await self._page.keyboard.insert_text(text)
+        for attempt in (1, 2):
+            await self._clear_composer(ui_ms)
+            # insert_text handles newlines safely — typing them would submit early.
+            await self._page.keyboard.insert_text(text)
+            if _same_message(text, await self._composer_holds()):
+                break
+            if attempt == 2:
+                raise RuntimeError(
+                    "the composer does not hold the prompt as typed, twice over"
+                )
+            print(
+                f"[{self.site.name}] tab {self.label}: the composer did not hold the "
+                f"prompt as typed; clearing it and typing it again, once"
+            )
         button = await self._first_match(self.site.send)
         if button is None:
             # No send button matched. Every one of these composers also submits
@@ -931,7 +1015,10 @@ class _Tab:
             self.alive = False
             self.empty_reason = "unreadable"
             self.still_writing = False
-            print(f"[{self.site.name}] tab {self.label} failed to submit: {type(exc).__name__}")
+            print(
+                f"[{self.site.name}] tab {self.label} failed to submit: "
+                f"{type(exc).__name__}: {exc}"
+            )
             return ""
 
         # `stable` drives the completion test and is reset whenever the model is

@@ -106,8 +106,12 @@ def build_solver(browsers: Optional[Sequence[Browser]] = None) -> VerifyingSolve
         not in ("0", "false", "no"),
         # The model's own cases, run with the validator's executor. Live traffic
         # ships no `public_examples` at all, so without these there is nothing to
-        # grade and the repair loop never fires. `SOLVER_SELF_TESTS=0` turns
-        # them off and restores exactly the behaviour that preceded them.
+        # grade and the repair loop never fires. `SOLVER_SELF_TESTS=0` turns the
+        # cases turn off: one round trip per solve instead of two, and every
+        # answer submitted ungraded. It no longer ASKS for cases either -- the
+        # combined prompt requested a second block that this switch then told
+        # the grader to ignore, so the model spent output tokens inside the
+        # deadline writing something nothing read.
         self_tests=os.environ.get("SOLVER_SELF_TESTS", "true").strip().lower()
         not in ("0", "false", "no"),
     )

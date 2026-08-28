@@ -10,13 +10,14 @@ that, `try_solver.py` and `solvers.rehearse --examples 0`.
     python3 scripts/two_turn_demo.py                    # every branch
     python3 scripts/two_turn_demo.py --show cases       # turn 1, verbatim
     python3 scripts/two_turn_demo.py --show code        # turn 2, with <must_pass>
-    python3 scripts/two_turn_demo.py --show code-single # the below-the-floor prompt
+    python3 scripts/two_turn_demo.py --show code-bare   # turn 2 with no cases to clear
     python3 scripts/two_turn_demo.py --lang rust --show cases
 
 Reading the two prompts by eye is the half no test can do for you. Turn 1 must
 ask for ONE json block and no program; turn 2 for ONE code block, with the
 model's own cases echoed under <must_pass> and no mention of a second block
-anywhere in it.
+anywhere in it. Every turn this miner sends asks for exactly one block --
+there is no combined prompt to fall back to.
 """
 
 from __future__ import annotations
@@ -86,17 +87,23 @@ def drive(deadline: float, replies: list[str], **kw) -> None:
     )
 
     def kind(text: str) -> str:
+        # `<task>` is turn 1's; `<contract>` is turn 2's. A repair has neither:
+        # it carries the failure and nothing else, because it is sent into the
+        # conversation that already holds both.
         if "<task>" in text:
             return "CASES"
-        return "CODE" if "<method>" in text else "REPAIR"
+        return "CODE" if "<contract>" in text else "REPAIR"
 
     print(f"  turns   {[kind(t) for t, _, _ in seen]}")
     print(f"  slices  {[round(s, 1) for _, s, _ in seen]}s"
           f"   what each read is allocated")
     print(f"  caps    {[None if c is None else round(c, 1) for _, _, c in seen]}s"
           f"   None on turn 1: nothing is held back, so nothing to extend into")
+    # What each turn ASKED for, which is the half no test can check for you: a
+    # repair may legitimately ask for a corrected `json` block beside the
+    # program, and nothing else here ever may.
     print(f"  asks    "
-          f"{['ONE block' if 'ONE fenced block' in t else 'TWO blocks' for t, _, _ in seen]}")
+          f"{['ONE block' if 'second `json` block' not in t else 'program + fixed cases' for t, _, _ in seen]}")
     print(f"  answer  "
           f"{'CORRECT' if 'while n > 0' in (answer.code or '') else 'WRONG or EMPTY'}")
 
@@ -104,7 +111,7 @@ def drive(deadline: float, replies: list[str], **kw) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="two_turn_demo.py")
     parser.add_argument(
-        "--show", choices=["cases", "code", "code-single"],
+        "--show", choices=["cases", "code", "code-bare"],
         help="print one prompt verbatim instead of running the scenarios",
     )
     parser.add_argument("--lang", default="python", choices=["python", "rust"])
@@ -121,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
                    {"name": "carry", "args": [12345], "expected": 15}],
         ))
         return 0
-    if args.show == "code-single":
+    if args.show == "code-bare":
         print(build_code_prompt(args.lang, STATEMENT, entry, []))
         return 0
 
@@ -136,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
          300.0, ["Happy to help!", RIGHT], {}),
         ("60s — a short deadline splits too; turn 1 costs what it took",
          60.0, [CASES, RIGHT], {}),
-        ("300s — SOLVER_SELF_TESTS=0, no cases turn at all",
+        ("300s — SOLVER_SELF_TESTS=0: one turn, and the answer goes out ungraded",
          300.0, [RIGHT], {"self_tests": False}),
     ):
         print(f"\n{title}")
