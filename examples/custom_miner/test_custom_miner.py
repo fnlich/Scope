@@ -437,7 +437,16 @@ def test_the_submit_phase_is_bounded_so_playwright_cannot_overrun_the_budget():
     # Playwright auto-waits 30s per action by default; unbounded that is ~90s
     # of overrun on a budget the solver carefully computed.
     assert "asyncio.wait_for" in send
-    assert submit.count("timeout=ui_ms") == 2
+    # Every DOM action on the way to a send carries the bound: two clicks and a
+    # fill while clearing the box, one click to send. Clearing moved into its
+    # own method, so the whole path is checked rather than `_submit` alone.
+    clear = inspect.getsource(_Tab._clear_composer)
+    assert submit.count("timeout=ui_ms") == 1, submit
+    assert clear.count("timeout=ui_ms") == 3, clear
+    for line in (submit + clear).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("await") and (".click(" in stripped or ".fill(" in stripped):
+            assert "timeout=ui_ms" in stripped, f"unbounded DOM action: {stripped}"
 
 
 def test_the_pool_starts_lazily_so_any_host_can_serve_it():
@@ -585,13 +594,33 @@ class _Loc:
         if self._page.on_click:
             self._page.on_click(self._selector)
 
+    async def evaluate(self, expression):
+        """Only ever asked one thing: what does the composer hold."""
+        if self._page.composer_unreadable:
+            raise RuntimeError("the page will not say what the composer holds")
+        return self._page.composer
+
+    async def fill(self, value, timeout=None):
+        self._page.filled.append(value)
+        if not self._page.composer_unclearable:
+            self._page.composer = value
+
 
 class _FakePage:
     """A page whose DOM is `{selector: [nodes]}` and can change on submit."""
 
-    def __init__(self, dom, on_click=None):
+    def __init__(self, dom, on_click=None, composer=""):
         self.dom, self.on_click = dom, on_click
         self.typed, self.pressed, self.clicked = [], [], []
+        # What the composer BOX holds, as opposed to what we tried to type into
+        # it. A shared account can arrive with somebody's draft already there.
+        self.composer = composer
+        self.filled = []
+        self.composer_unclearable = False
+        self.composer_unreadable = False
+        # Set to mangle what lands in the box, to stand in for an editor that
+        # does not take the text verbatim.
+        self.on_insert = None
         # Every navigation and close, so "did this reload?" and "did this throw
         # the tab away?" are assertable rather than inferred.
         self.navigated, self.closed = [], False
@@ -602,10 +631,22 @@ class _FakePage:
         class _Keyboard:
             async def insert_text(self, text):
                 page.typed.append(text)
+                # At the caret, which is what makes a leftover draft dangerous:
+                # the fake appends, the real thing can splice into the middle.
+                page.composer += text
+                if page.on_insert:
+                    page.composer = page.on_insert(page.composer)
 
             async def press(self, key):
                 page.pressed.append(key)
-                if page.on_click:
+                if key == "Delete" and "Control+A" in page.pressed:
+                    if not page.composer_unclearable:
+                        page.composer = ""
+                # Only a key that SUBMITS moves the conversation on. Control+A
+                # and Delete are the composer being cleared, and firing the
+                # page's on_click for them would have the reply arrive before
+                # the prompt was sent.
+                if key == "Enter" and page.on_click:
                     page.on_click(key)
 
         self.keyboard = _Keyboard()
@@ -1553,11 +1594,117 @@ def test_a_reply_that_echoes_the_prompt_is_refused():
     assert asyncio.run(_tab(page, _site()).send(prompt, 1.0)) == ""
 
 
+def test_a_draft_left_in_the_composer_never_reaches_a_validator():
+    """The failure this exists for, and it is silent from end to end.
+
+    These chat accounts are shared with people, so the box can already hold
+    somebody's half-typed message. `insert_text` inserts at the CARET, which the
+    click before it just put at the element's centre — so the prompt is spliced
+    INTO that draft and the whole thing goes as one message. Nothing downstream
+    catches it: `_is_our_own_prompt` inspects the REPLY for our prompt's head,
+    and in a contaminated send that head is still there, intact. The only
+    symptom is a model answering a mangled question, which looks exactly like a
+    hard task."""
+    page = _FakePage(
+        {"#composer": [_Node()], "#send": [], "#assistant": []},
+        composer="hey, quick question about my mortgage",
+    )
+    asyncio.run(_tab(page, _site()).send("SOLVE THIS", 1.0))
+
+    assert page.composer == "SOLVE THIS", (
+        f"what was sent was not the prompt alone: {page.composer!r}"
+    )
+    assert "mortgage" not in page.composer
+    assert page.pressed[:2] == ["Control+A", "Delete"], page.pressed
+
+
+def test_a_composer_that_will_not_empty_is_never_sent_to():
+    """A box we cannot empty is a box whose contents we cannot vouch for, so the
+    tab is thrown away rather than the prompt sent into it. `send` already turns
+    a raise here into a retired tab reporting `unreadable`, and the solver takes
+    that to another tab — so this needs no plumbing of its own, only the raise."""
+    page = _FakePage(
+        {"#composer": [_Node()], "#send": [], "#assistant": []},
+        composer="somebody else's draft",
+    )
+    page.composer_unclearable = True
+    tab = _tab(page, _site())
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        reply = asyncio.run(tab.send("SOLVE THIS", 1.0))
+
+    assert reply == ""
+    assert tab.alive is False, "a tab that cannot be cleared was kept"
+    assert tab.empty_reason == "unreadable"
+    assert page.pressed.count("Enter") == 0, "sent anyway"
+    assert "failed to submit" in chatter.getvalue()
+    assert "would not clear" in chatter.getvalue(), chatter.getvalue()
+
+
+def test_the_prompt_is_read_back_before_it_is_sent():
+    """Clearing is not proof. An editor that mangles, truncates or autocompletes
+    what was inserted would otherwise send whatever it happened to keep, so the
+    box is read BACK and compared before the send control is touched. One
+    retype, then the tab goes."""
+    mangled = []
+
+    def eat_the_end(text):
+        mangled.append(text)
+        return text[:4]                      # the editor kept only a fragment
+
+    page = _FakePage({"#composer": [_Node()], "#send": [], "#assistant": []})
+    page.on_insert = eat_the_end
+    tab = _tab(page, _site())
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        reply = asyncio.run(tab.send("SOLVE THIS", 1.0))
+
+    assert reply == ""
+    assert tab.alive is False
+    assert len(mangled) == 2, f"did not retype once before giving up: {mangled}"
+    assert page.pressed.count("Enter") == 0, "sent a prompt it could not read back"
+    assert "did not hold the prompt as typed" in chatter.getvalue()
+
+
+def test_a_composer_that_matches_after_a_retype_is_sent():
+    """The retype is worth having: a transient mangle costs one round trip, not
+    the tab."""
+    state = {"n": 0}
+
+    def once(text):
+        state["n"] += 1
+        return text if state["n"] > 1 else "junk" + text
+
+    page = _FakePage({"#composer": [_Node()], "#send": [], "#assistant": []})
+    page.on_insert = once
+    with contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(_tab(page, _site()).send("SOLVE THIS", 1.0))
+
+    assert page.composer == "SOLVE THIS"
+    assert page.pressed.count("Enter") == 1, "the retyped prompt was not sent"
+
+
+def test_the_read_back_tolerates_the_editors_own_whitespace():
+    """A contenteditable turns our newlines into block elements and hands them
+    back as its own arrangement of them. Comparing exactly would fail on every
+    send; comparing on collapsed whitespace still catches the only thing that
+    matters, which is text we did not type."""
+    from solvers.browser_pool import _same_message
+
+    assert _same_message("a\n\nb", "a\nb")
+    assert _same_message("a b", " a  b ")
+    assert not _same_message("a b", "hi a b")
+    assert not _same_message("a b", "a b bye")
+
+
 def test_pressing_enter_is_the_fallback_when_no_send_button_matches():
     """Safe only because insert_text already put the whole multi-line prompt in."""
     page = _FakePage({"#composer": [_Node()], "#send": [], "#assistant": []})
     asyncio.run(_tab(page, _site()).send("line one\nline two", 1.0))
-    assert page.typed == ["line one\nline two"] and page.pressed == ["Enter"]
+    assert page.typed == ["line one\nline two"]
+    # The clear comes first and the submit last: a send that did not empty the
+    # box first is a send that may carry somebody else's draft.
+    assert page.pressed == ["Control+A", "Delete", "Enter"], page.pressed
 
 
 def test_a_selector_a_page_cannot_evaluate_is_dropped_at_startup():
@@ -2802,20 +2949,6 @@ def test_a_round_that_captured_nothing_never_replaces_a_flawed_program():
 # false is worse than one that says nothing, because the model acts on it.
 
 
-def test_the_edge_case_checklist_names_the_cases_rather_than_gesturing_at_them():
-    """"Handle edge cases" is a line every model agrees to and none acts on.
-    What earns its place in the prompt is a case with a right answer the
-    statement implies and a wrong answer a plausible implementation gives."""
-    from solvers.prompts import build_code_prompt
-
-    for language, entry in (("python", "solve"), ("rust", "main")):
-        prompt = build_code_prompt(language, "Do a thing.", entry, [])
-        for case in ("n = 0", "n = 1", "empty", "BOTH ENDS", "EXTREME VALUES",
-                     "DEGENERATE SHAPE", "-1"):
-            assert case in prompt, f"{language} prompt never mentions {case!r}"
-        assert "off-by-one" in prompt, f"{language} prompt omits the boundary case"
-
-
 def test_each_language_is_warned_about_its_own_way_of_losing_a_large_number():
     """The large-number failure is not the same failure in both languages, and
     telling either one the other's story wastes the only prompt there is:
@@ -2935,24 +3068,10 @@ def test_the_examples_are_framed_as_a_floor_not_the_specification():
         [{"args": [[1]], "kwargs": {}, "expected": 1}],
     )
     assert "a floor, not the specification" in prompt
-    assert "survive the cases below" in prompt, "the label does not point forward"
+    assert "already known to be right" in prompt, "the label drops their standing"
     assert prompt.index("<problem") < prompt.index("<examples"), (
         "the examples are separated from the problem they belong to"
     )
-
-
-def test_how_to_answer_comes_last_where_it_is_most_likely_to_be_obeyed():
-    """Everything that shapes HOW to answer sits closest to where generation
-    begins. The problem and its examples come first, because that is the thing
-    being reasoned about; the method comes last, because that is the thing being
-    obeyed."""
-    from solvers.prompts import build_code_prompt
-
-    for language, entry in (("rust", "main"), ("python", "solve")):
-        prompt = build_code_prompt(language, "Do a thing.", entry, [])
-        assert prompt.index("<problem") < prompt.index("<method>")
-        assert prompt.index("<contract>") < prompt.index("<method>")
-        assert prompt.rstrip().endswith("</method>"), prompt[-80:]
 
 
 def test_the_output_contract_holds_the_first_word_and_the_nudge_the_last():
@@ -2980,44 +3099,6 @@ def test_the_output_contract_holds_the_first_word_and_the_nudge_the_last():
         ), site.nudge[:70]
 
 
-def test_the_section_that_asks_for_a_check_does_not_say_before_you_answer():
-    """The phrase itself is what caused the narration. A model told to do
-    something "before you answer" writes it down, at length, and only then
-    starts the program — so the section is not named that either."""
-    from solvers.prompts import build_code_prompt
-
-    prompt = build_code_prompt("rust", "Do a thing.", "main", [])
-    assert "before_you_answer" not in prompt, "the tag name reintroduces the phrase"
-    assert "Write the program FIRST" in prompt
-    assert "silently" in prompt
-
-
-def test_the_self_check_names_the_bugs_that_actually_reached_the_grader():
-    """Read off 43 real submissions. Ten were the model's own bugs and EIGHT of
-    those were visible on a careful re-read of the program itself — a helper
-    called but never written, a `[-1]` on a list the program's own parser can
-    empty, a sentinel of 255 used to index five buckets, an id used where a
-    position was meant, a condition already guaranteed by the arm it sat in.
-
-    Generic advice does not reach any of that. Each line below is one of them.
-    """
-    from solvers.prompts import SELF_CHECK, build_code_prompt
-
-    for phrase in (
-        "you also wrote",          # helper called but never defined
-        "index is in range",       # sentinel-as-index, id-as-position
-        "branch is reachable",     # dead arm, arm that discards its result
-        "empty case",              # [-1] on a list its own code can empty
-        "rebuild ALL of it",       # refresh that forgets one field
-        "that branch can undo",    # counter committed before the wrong path
-    ):
-        assert phrase in SELF_CHECK, f"the self-check dropped {phrase!r}"
-    for language, entry in (("rust", "main"), ("python", "solve")):
-        for cases in ([{"name": "n", "args": [[]], "expected": 0}], [], None):
-            prompt = build_code_prompt(language, "Do a thing.", entry, [], cases=cases)
-            assert SELF_CHECK.format(reply="the program") in prompt
-
-
 def test_a_repair_round_is_sent_back_through_the_checklist():
     """Repairs go into the SAME conversation, so the checklist is still above
     them — and a repair that fixes the failing example while breaking a
@@ -3025,12 +3106,16 @@ def test_a_repair_round_is_sent_back_through_the_checklist():
     from solvers.prompts import build_repair_prompt
 
     prompt = build_repair_prompt(["solve([]) raised IndexError"], "python", "solve")
-    assert "edge-case checklist" in prompt
-    assert "n = 1" in prompt and "largest values" in prompt
+    # It points at the cases the model was actually sent. It used to point at
+    # "the edge-case checklist from my first message", and that message no
+    # longer carries one -- a repair prompt referring to a section that is not
+    # there is an instruction the model cannot follow.
+    assert "every OTHER case you were sent" in prompt, prompt
+    assert "breaks another is still wrong" in prompt
     # ...but a DEFECT is not a logic problem, and must not be answered with it.
     for defect in ("the program does not define fn main()", NO_CODE):
         repair = build_repair_prompt([], "rust", "main", defect=defect)
-        assert "edge-case checklist" not in repair, (
+        assert "every OTHER case you were sent" not in repair, (
             f"answered a delivery failure with logic advice: {defect!r}"
         )
 
@@ -3993,30 +4078,6 @@ def test_a_preamble_before_the_code_is_extracted_correctly():
     assert rust_defect(code) is None
 
 
-def test_the_checklist_asks_for_the_program_first_not_a_walkthrough():
-    """The order of one sentence, and it cost solves. It used to read "walk
-    your solution through every one of these BEFORE YOU ANSWER" — and a model
-    does what it is told, so it narrated the walkthrough at length and only
-    then started the program. Written the other way round the artifact exists
-    first, so a reply cut short loses the checking pass rather than the answer.
-    """
-    from solvers.prompts import EDGE_CASES, METHOD, build_code_prompt
-
-    # The instruction lives in METHOD now — `<edge_cases>` is a list of input
-    # shapes and says nothing about when to write anything.
-    assert "Write the program FIRST" in METHOD, METHOD[:120]
-    assert "silently" in METHOD
-    for text in (METHOD, EDGE_CASES):
-        assert "before you answer" not in text.lower(), (
-            "the prompt still asks the model to narrate before answering"
-        )
-    for language, entry in (("rust", "main"), ("python", "solve")):
-        prompt = build_code_prompt(language, "Do a thing.", entry, [])
-        # ...inside <method>, which comes last on purpose — see
-        # test_how_to_answer_comes_last_where_it_is_most_likely_to_be_obeyed.
-        assert "Write the program FIRST" in prompt.split("<method>")[1]
-
-
 def test_both_nudges_use_the_last_word_to_demand_code_first():
     """The nudge is appended after everything else, so it is the last thing the
     model reads before it starts generating. That slot is worth the strongest
@@ -4025,14 +4086,21 @@ def test_both_nudges_use_the_last_word_to_demand_code_first():
         assert site.nudge.startswith(
             "START your reply with the fenced block"
         ), site.nudge[:70]
-        # The nudge holds the recency slot AND is appended to every send, so it
-        # must not name a layout: the cases turn asks for one block, the
-        # combined prompt asks for two, and a nudge that picks one contradicts
-        # the other from the slot that wins.
-        for layout in ("two ordinary fenced blocks", "program first",
+        # The nudge holds the recency slot AND is appended to every send, so a
+        # layout named here overrides the contract that named a different one.
+        # Both turns ask for ONE block, so that is what it may say -- and it
+        # said "the ordinary fenced block or blocks", which is the softer half
+        # of the contradiction a model resolves by emitting a second block.
+        assert "ONE ordinary fenced block" in site.nudge, site.nudge
+        for layout in ("or blocks", "two ordinary fenced blocks", "program first",
                        "JSON cases second"):
             assert layout not in site.nudge, f"{site.name}: nudge pins {layout!r}"
-        assert "may not arrive at all" in site.nudge
+        # And it does not hurry the model. Correctness is the whole payment;
+        # "an answer that arrives after a paragraph of prose may not arrive at
+        # all" traded the thing being paid for against a thing that is not.
+        for rush in ("may not arrive at all", "time the answer does not get",
+                     "deadline", "quickly"):
+            assert rush not in site.nudge, f"{site.name}: nudge still rushes: {rush!r}"
 
 
 def test_the_first_attempt_gets_the_budget_when_no_repair_can_happen():
@@ -4058,27 +4126,6 @@ def test_the_first_attempt_gets_the_budget_when_no_repair_can_happen():
     )
 
 
-def test_the_method_is_a_numbered_procedure_ending_in_send_the_code():
-    """Ordering is what this prompt has had to fight hardest. Told to check
-    "before you answer", models narrated the check and ran out of time before
-    the program existed. A numbered list leaves no room to read the steps in a
-    different order, and the last step is the one that must be last."""
-    from solvers.prompts import METHOD, build_code_prompt
-
-    steps = [line for line in METHOD.splitlines() if line[:2] in
-             ("1.", "2.", "3.", "4.", "5.", "6.")]
-    assert len(steps) == 6, steps
-    assert "Write the program FIRST" in steps[1], steps[1]
-    assert "silently" in METHOD
-    # The last step is still the send, and it still names everything the
-    # contract of that turn asked for -- which, since the split, is the program
-    # and nothing else, whether or not turn 1 left cases to clear.
-    for cases in (None, [{"name": "n", "args": ["1\n"], "expected": "1"}]):
-        prompt = build_code_prompt("rust", "Do a thing.", "main", [], cases=cases)
-        assert "Send the program, and nothing else." in prompt
-        assert "then the cases" not in prompt
-
-
 def test_the_examples_decide_when_the_statement_is_ambiguous():
     """The examples are the only disambiguation a solver is given — the README
     says so and nothing in the prompt used to. Without the rule the model has
@@ -4090,10 +4137,18 @@ def test_the_examples_decide_when_the_statement_is_ambiguous():
         # spans a line break and an indent, and asserting on the raw text would
         # fail on formatting rather than on meaning.
         prompt = " ".join(
-            build_code_prompt(language, "Do a thing.", entry, []).split()
+            build_code_prompt(
+                language, "Do a thing.", entry,
+                [{"args": [1], "kwargs": {}, "expected": 1}],
+            ).split()
         )
-        assert "the examples decide" in prompt, "no disambiguation rule"
-        assert "the code is wrong, not the example" in prompt
+        # It lives on the <examples> label now, which is the one place it can
+        # be read at the moment it applies -- and the only place it survives
+        # deleting the procedure that used to carry it.
+        assert "where the statement is ambiguous they decide" in prompt, (
+            "no disambiguation rule"
+        )
+        assert "already known to be right" in prompt
 
 
 def test_both_contracts_say_there_is_no_partial_credit():
@@ -4105,7 +4160,13 @@ def test_both_contracts_say_there_is_no_partial_credit():
     for language, entry in (("rust", "main"), ("python", "solve")):
         prompt = build_code_prompt(language, "Do a thing.", entry, [])
         assert "no partial credit" in prompt
-        assert "prefer the safe implementation" in prompt
+        assert "Correctness is the whole of it" in prompt
+        # The stake, not the tariff. What follows "no partial credit" used to be
+        # the payment curve -- 95% for the slowest correct answer -- which tells
+        # a model that speed is worth something. It is worth at most 5%, and
+        # there is no per-turn deadline to spend it against.
+        for tariff in ("95%", "fastest", "slowest correct"):
+            assert tariff not in prompt, f"the payment curve is back: {tariff!r}"
 
 
 def test_each_language_is_warned_that_hash_order_is_not_stable():
@@ -4134,28 +4195,6 @@ def test_each_language_is_warned_that_hash_order_is_not_stable():
         "string set order was stable across 8 processes; the prompt's claim "
         "about PYTHONHASHSEED no longer holds on this interpreter"
     )
-
-
-def test_the_environment_facts_are_not_filed_as_edge_cases():
-    """They were, and it was a category error: `<edge_cases>` is about the
-    INPUT, `<contract>` is about the machine. Silent overflow and a five-second
-    limit are facts about how the grader runs the code, not shapes of data, and
-    reading them in a list of "try n = 0" made both lists harder to act on."""
-    from solvers.prompts import EDGE_CASES, build_code_prompt
-
-    for banned in ("OVERFLOW", "5 seconds", "recursion", "PYTHONHASHSEED"):
-        assert banned not in EDGE_CASES, f"{banned!r} is not an edge case"
-
-    prompt = build_code_prompt("rust", "Do a thing.", "main", [])
-    contract = prompt.split("<contract>")[1].split("</contract>")[0]
-    assert "OVERFLOW IS SILENT" in contract
-    assert "5 seconds" in contract
-
-
-# --- the question, beside the answer -------------------------------------- #
-# The code alone answers "what did we submit". It cannot answer "was that a
-# reasonable thing to submit" — the statement, the entrypoint, the examples and
-# the model's own reply all lived somewhere the archive could not see.
 
 
 def _archived(pid, solver, tmp_path, language="rust"):
@@ -6122,108 +6161,6 @@ def test_the_image_check_only_speaks_when_docker_actually_said_no_such_image(mon
 # Quality over speed: the prompt must tell the model the truth about what the
 # payment rule actually rewards.
 # --------------------------------------------------------------------------- #
-def test_the_prompt_tells_the_truth_about_how_little_speed_is_worth():
-    """The prompt used to say the answer is "scored partly on how fast it
-    arrives" — technically true, catastrophically miscalibrated. The payment
-    rule gates everything on all-pass correctness and caps the speed spread at
-    the floor: fastest correct earns at most (1 - floor) more than slowest
-    correct, 5% under this release, with a 180s half-life. A model told speed
-    matters trades checks for pace, which is exactly the trade the rule
-    punishes. The claim in the prompt is DERIVED here from the payment module's
-    own constants, so a policy change fails this test rather than leaving the
-    prompt asserting something that stopped being true."""
-    from rlvr.policy import RELEASE_POLICY
-    from rlvr.scoring.payment import DEFAULT_SPEED_FLOOR
-    from solvers.prompts import PYTHON_RULES, RUST_RULES, build_code_prompt
-
-    # Production reads ValidatorPolicy.payment_speed_floor, a constant
-    # DUPLICATED from payment.py's default. The prompt's claim is derived from
-    # the production one; this assertion is what keeps the duplicate honest,
-    # because editing policy.py alone would otherwise leave the prompt
-    # test-green and wrong on chain.
-    assert RELEASE_POLICY.payment_speed_floor == DEFAULT_SPEED_FLOOR
-    floor = f"{round(RELEASE_POLICY.payment_speed_floor * 100)}%"
-    for rules in (PYTHON_RULES, RUST_RULES):
-        assert f"at least {floor} of what the fastest" in rules, (
-            f"the prompt's speed floor does not match the payment policy "
-            f"({floor} from RELEASE_POLICY.payment_speed_floor)"
-        )
-        assert "how fast it arrives" not in rules, (
-            "the prompt still tells the model that speed is scored"
-        )
-    for language, entry in (("python", "solve"), ("rust", "main")):
-        prompt = build_code_prompt(language, "Do a thing.", entry, [])
-        assert "no partial credit" in prompt
-        assert "prefer the safe implementation" in prompt
-
-
-def test_the_method_licenses_depth_and_forbids_trading_checks_for_speed():
-    """The other half of the same correction. Telling the model speed is
-    nearly worthless only helps if the method then says what to spend the
-    time ON: real traces with computed values, not a skim that ends "looks
-    right", and a closing line that makes skipping a check for speed a named
-    mistake rather than a judgement call."""
-    from solvers.prompts import METHOD, METHOD_CODA, build_code_prompt
-
-    # The license is an ALLOCATION rule, not a claim that reasoning is free —
-    # on a UI with little or no hidden reasoning channel, "invisible and free"
-    # invites the model to reason visibly in the reply.
-    assert "spend the deadline where it buys correctness" in " ".join(METHOD.split())
-    assert "invisible and free" not in METHOD
-    # Silence is declared ABOVE the numbered steps, so every step is read
-    # under it rather than discovering it forty lines later.
-    steps_start = METHOD.index("1.")
-    assert "silently" in METHOD[:steps_start]
-    assert "computing the real" in METHOD and "intermediate values" in METHOD
-    assert "in your head" in METHOD, "the trace is not anchored to reasoning"
-    assert '"looks right" catches nothing' in " ".join(METHOD.split())
-    # The verbs that could be obeyed as artifacts are gone: no building tests
-    # (test code in the block), no listing rules (a visible bulleted list).
-    assert "Build tests" not in METHOD and "List for yourself" not in METHOD
-    assert "Invent inputs of your own" in METHOD
-    # The strongest sentence fires once, from the last slot in <method>.
-    assert "The check you skip is the hidden test you fail" in " ".join(METHOD_CODA.split())
-    assert "the deadline cuts off scores the same zero" in " ".join(METHOD_CODA.split())
-    prompt = build_code_prompt("python", "Do a thing.", "solve", [])
-    tail = prompt.split("</self_check>")[1]
-    assert "The check you skip" in tail, "the coda is not in the final slot"
-    # The protective invariants that earlier cost solves must survive the
-    # rewrite: program before checking, silence, code-only close.
-    steps = [line for line in METHOD.splitlines()
-             if line[:2] in ("1.", "2.", "3.", "4.", "5.", "6.")]
-    assert len(steps) == 6
-    assert "Write the program FIRST" in steps[1]
-    assert steps[5].startswith("6. Send ") and steps[5].endswith("nothing else.")
-    assert "Send the program, and nothing else." in prompt
-    assert "before you answer" not in METHOD.lower()
-
-
-def test_the_model_is_told_to_build_its_own_tests_from_the_statement():
-    """The generic checklist catches generic bugs. Both graded failures on the
-    real challenges were problem-specific boundaries: extent-journal's resize
-    rule (a statement sentence with no code behind it) and the thresholds the
-    statement itself named. The method now makes the model derive its battery
-    from the statement — every named bound at, below and above; counts at 0,
-    1, 2; every rule triggered and NEARLY triggered — and re-trace after
-    every fix."""
-    from solvers.prompts import EDGE_CASES, METHOD, SELF_CHECK
-
-    normalised_method = " ".join(METHOD.split())
-    assert "one input that triggers it and one that NEARLY does" in normalised_method
-    assert "re-trace the cases that already passed" in normalised_method
-    assert "THE STATEMENT'S OWN CONSTANTS" in EDGE_CASES
-    assert "AT that exact value, one below it, and one above" in EDGE_CASES
-    for case in ("TIES", "A REJECTED OPERATION", "TWO RULES AT ONCE",
-                 "WRAPAROUND", "A BATCH APPLIED AT ONCE"):
-        assert case in EDGE_CASES, f"the checklist dropped {case}"
-    assert "nothing half-committed" in " ".join(EDGE_CASES.split())
-    # The seventh self-check line: a statement sentence with no code behind it.
-    assert "code you can point at" in SELF_CHECK
-    assert "verify each of these, silently" in " ".join(SELF_CHECK.split()), (
-        "the self-check header invites a visible Q&A again"
-    )
-
-
 def test_a_repair_asks_for_a_diagnosis_not_a_guess():
     """A repair that edits from the shape of the failure fixes the symptom the
     failure happened to show. The prompt now demands the model find the actual
@@ -8349,30 +8286,32 @@ def test_a_repair_may_correct_a_case_the_first_turn_got_wrong():
 
 
 def test_the_cases_turn_asks_for_the_common_path_before_the_boundaries():
-    """Three ordinary cases FIRST, then the boundary classes. A suite that is
-    all boundaries never checks the common path, and a program that is wrong
-    down the middle passes every one of them.
+    """Three ordinary cases FIRST, then the special values. A suite that is all
+    boundaries never checks the common path, and a program that is wrong down
+    the middle passes every one of them.
 
-    The counts are stated PER CLASS rather than as a total, because a total
-    invites a model to spend it all on the easy classes -- and a total is still
-    stated on top, because `MAX_SELF_TESTS` is what the miner will actually
-    run."""
+    Five classes, in order, and no catalogue: the nine-class list this replaced
+    was restated almost verbatim as turn 2's edge cases, so the model was told
+    the same thing twice across two turns and neither telling was the one it
+    was graded against."""
     from solvers.prompts import MAX_SELF_TESTS, build_tests_prompt
 
     for language, entry in (("python", "g"), ("rust", "main")):
         p = build_tests_prompt(language, "Sum the digits of n.", entry, [])
-        assert "THREE ordinary cases" in p, p
-        assert "between TWO\n   and TEN cases" in p or "between TWO" in p
-        # Order is the instruction: ordinary, then the classes.
-        ordinary = p.index("THREE ordinary cases")
-        for later in ("ZERO", "EVERY LIMIT AND BOUND", "NEGATIVE VALUES",
-                      "TIES AND DUPLICATES", "DEGENERATE SHAPE",
-                      "MOST LIKELY TO GET WRONG"):
-            assert p.index(later) > ordinary, f"{later} comes before the common path"
-        # The cap the model is given is the cap the miner enforces, so a model
-        # that obeys it never has cases silently thinned away.
-        assert f"At most {MAX_SELF_TESTS} cases in total" in p
-
+        classes = ["THREE ordinary cases", "THE EMPTY VALUE", "ONE:",
+                   "THE BOUNDARY", "LIKELY TO BE GOT WRONG"]
+        at = []
+        for name in classes:
+            assert name in p, f"{language}: the cases turn dropped {name!r}"
+            at.append(p.index(name))
+        assert at == sorted(at), f"{language}: the classes are out of order: {at}"
+        # The cap the model is given is the cap the miner enforces.
+        assert f"At most {MAX_SELF_TESTS} cases" in p
+        # And nothing else is asked for. The old list spent nine bullets on
+        # classes the fifth now covers by naming the failure instead.
+        for gone in ("NEGATIVE VALUES", "TIES AND DUPLICATES", "DEGENERATE SHAPE",
+                     "between TWO", "EACH RULE THE STATEMENT STATES"):
+            assert gone not in p, f"{language}: the old catalogue is back: {gone!r}"
 
 def _thinking_backend(think_s, deadline=300.0, statement="Do a hard thing."):
     """A tab whose model produces nothing at all for `think_s`, then answers.
@@ -8577,12 +8516,25 @@ def test_the_time_budget_is_gone_from_every_prompt():
         ):
             assert hit == "5 seconds", f"a time budget is back: {hit!r}"
         assert "budget" not in p.lower(), "a budget is back in the prompt"
-    # The two rules filed under it were never about time and must survive.
-    code = build_code_prompt("python", "s", "g", [])
-    assert "COMPLETE BEFORE CORRECT" in code and "SENDABLE AT EVERY MOMENT" in code
-    assert "COMPLETE BEFORE CORRECT" not in prompts[0], (
-        "the cases turn produces no program to keep sendable"
-    )
+        # And no vocabulary of hurry either. There is no per-turn deadline --
+        # only the request's own -- and correctness is the entire payment, so a
+        # sentence that trades thoroughness for speed trades the thing being
+        # paid for against a thing that is not. Each of these shipped in some
+        # prompt before: "spends wall-clock inside the deadline", "keep every
+        # trace terse", "the slowest correct answer earns 95%".
+        lowered = p.lower()
+        for rush in ("deadline", "wall-clock", "wall clock", "terse", "hurry",
+                     "as fast as", "quickly", "95%", "fastest", "latency"):
+            assert rush not in lowered, f"a hurry word is back: {rush!r} in {p[:60]!r}"
+        # ...nor any instruction to do work that never appears in the reply.
+        # The one licensed exception is the repair round, which has to say where
+        # the diagnosis goes or it arrives as prose instead of a program.
+        if "corrected" not in lowered and "previous reply" not in lowered:
+            for silent in ("silently", "in your reasoning", "trace every",
+                           "checklist", "read the program back"):
+                assert silent not in lowered, (
+                    f"work that never reaches the reply is back: {silent!r}"
+                )
 
 
 def test_no_prompt_contradicts_its_own_output_contract():
@@ -8593,9 +8545,10 @@ def test_no_prompt_contradicts_its_own_output_contract():
     ever one turn, so all three said "the two blocks" and one of them said the
     cases go in the second. Reused verbatim under the two-turn contract --
     which says ONE block -- the turn-2 prompt told the model both things at
-    once. A model resolves that by obeying the more specific half: it emits a
-    JSON block `extract_code` then has to step over, and pays for it in output
-    tokens spent inside the deadline.
+    once, and a model resolves that by obeying the more specific half: it emits
+    a JSON block `extract_code` then has to step over. The first two are gone
+    with the rest of the procedure; the invariant outlives them, because the
+    next section written for one turn and reused in another would do it again.
 
     So: whatever a turn's contract asks for is what every other section of
     THAT turn asks for, and no section names a block the contract did not.

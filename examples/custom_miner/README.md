@@ -139,16 +139,12 @@ TURN 1 (cases)                      TURN 2 (program)
 <output>   one json block           <output>   one code block          ← first
 <problem>  the statement            <problem>  the statement
 <examples> a floor to agree with    <examples> a floor, not the spec
-<task>     which cases, by class    <contract> what is TRUE: how it is
+<task>     which cases, in order    <contract> what is TRUE: how it is
                                                run, compared, and what
                                                the environment does
                                                silently
                                     <must_pass> the model's OWN cases
-                                                from turn 1
-                                    <method>   what to DO: a numbered
-                                               procedure               ← last
-                                      <edge_cases>  input shapes that break
-                                      <self_check>  reading the program back
+                                                from turn 1          ← last
 ```
 Both turns ask for **one** block, and there is no third shape: the single-turn
 prompt that asked for a program and its cases together is gone — see
@@ -159,38 +155,32 @@ The output contract holds **both ends**. It is the only instruction whose
 failure costs the entire answer rather than degrading it, so it gets primacy and
 recency and nothing else competes for either. The problem comes next, because
 instructions about how to solve something are unreadable before you know what it
-is. Everything shaping *how* to answer comes last, closest to where generation
-begins — and the section is called `<method>`, not `<before_you_answer>`, because
-that phrase is exactly what used to make models narrate a walkthrough instead of
-writing the program.
+is. What the program has to clear comes last, immediately before it is written.
 
-`<contract>` and `<method>` answer different questions — what is *true* versus
-what to *do* — and four items used to be filed under the wrong one. Silent
-overflow, the recursion limit, the five-second budget and hash ordering are
-facts about the machine, not shapes of input, and reading them in a list that
-began "try n = 0" made both lists harder to act on.
+**Everything else has been deleted, and the deletion is the design.** Turn 2
+used to carry a `<method>` — a six-step numbered procedure — wrapping an
+`<edge_cases>` checklist of twelve input shapes, a `<self_check>` of seven
+re-reads, and a closing coda. Inside that one message *"a wrong answer pays
+zero"* was stated four times, *"work silently, not in the reply"* three times,
+and *"send only the program"* three times over plus the nudge; turn 1's case
+classes were then restated almost verbatim as turn 2's edge cases, so the model
+was told the same thing twice across two turns and neither telling was the one
+it was graded against.
 
-`<method>` is a numbered procedure rather than advice, because ordering is what
-this prompt has fought hardest:
+None of that was free. Every sentence is an instruction a model can obey
+*instead of* answering, and a procedure that says how to think competes with the
+task for the same attention. The prompts now state **what is true** — how the
+code is invoked, compared and timed — and **what it must clear**, and stop.
 
-```
-1. Read the problem, then the examples. Where the statement is ambiguous,
-   the examples decide.
-2. Write the program FIRST, complete and runnable.
-3. Trace every example by hand. If one disagrees, the code is wrong.
-4. Put it through the edge cases.
-5. Read the program back against itself.
-6. Send the code and nothing else.
-```
-
-Step 6 — and the count of blocks in steps 4 and 5, and the bullet saying where
-the cases go — is **rendered per turn**, because `METHOD`, `SELF_CHECK` and
-`PYTHON_RULES` are shared by turns that ask for different replies. Reused
-verbatim under the two-turn contract they told the model *"the reply itself is
-only the two blocks"* directly beneath a contract saying ONE, and a model
-resolves a contradiction by obeying the more specific-sounding half. One test
-asserts the invariant over every turn: **no section may name a block its own
-contract did not ask for** — and no prompt constant anywhere may ask for two.
+The hurrying went with it. `"every character you emit spends wall-clock inside
+the deadline"`, `"keep every trace terse"`, `"the payment rule pays the slowest
+correct answer at least 95% of what the fastest one earns"`, and a nudge warning
+that `"an answer that arrives after a paragraph of prose may not arrive at all"`
+all traded thoroughness for speed — on a subnet where a correct answer pays
+everything, a wrong one pays nothing, and speed is worth at most 5%. There is no
+per-turn deadline to spend either: only the request's own. A test now fails on
+the vocabulary — *deadline, wall-clock, terse, fastest, 95%* — in any prompt,
+and on any instruction to do work that never reaches the reply.
 
 Three facts were missing that change decisions rather than decorate them.
 **There is no partial credit** — a program wrong on one hidden case scores what
@@ -203,41 +193,36 @@ so. And **hash order is not stable across processes**: measured, four runs of
 order every time — so a solution tested with integers looks stable and is not.
 Rust randomises `HashMap`/`HashSet` iteration for the same reason.
 
-### The hidden suite is where the score is, so the prompt is written for it
+### The hidden suite is where the score is, so turn 1 is written for it
 
-The public examples are the friendly ones. Grading is on the **complete hidden
-suite**, which is written to break a solution that only handles the shape it was
-shown — so the prompt names the cases one at a time instead of saying "handle
-edge cases", which every model agrees to and none acts on:
+The public examples are the friendly ones, and on live traffic there are usually
+none at all. Grading is on the **complete hidden suite**, written to break a
+solution that only handles the shape it was shown — so the cases the program
+will be checked against are asked for *first, in their own turn*, before the
+program exists to back-fill them from. Turn 1 names five classes and their
+order is the instruction:
 
-    NOTHING          empty list, empty string, n = 0
-    ONE              n = 1, one element, one character
-    TWO              where "first" and "last" stop being the same element
-    BOTH ENDS        first and last, empty range, inclusive vs exclusive
-    EXTREME VALUES   0, 1, -1, negatives, the largest magnitude allowed
-    DEGENERATE       all equal, all duplicates, sorted, reverse sorted
+    THREE ORDINARY   typical inputs — the common path an all-boundary suite
+                     never checks, and where a program wrong down the middle
+                     passes every other case
+    EMPTY OR ZERO    empty list, empty string, 0, an empty payload
+    ONE              a single element, n = 1, the smallest legal input
+    BOUNDARY         every limit, threshold and modulus the statement names,
+                     AT that value, and the largest it allows
+    LIKELY WRONG     what this particular problem makes easy to get wrong —
+                     ties, duplicates, all-equal, sorted, reversed, a rule
+                     that fires beside an input that NEARLY makes it fire
 
-The checklist opens by saying **write the program first, then check it** — and
-that order cost solves before it was fixed. It used to read *"walk your solution
-through every one of these before you answer"*, and a model does what it is told:
-it narrated the walkthrough at length and only then started the program.
-Reported from a live Claude tab. The reason it matters is not style — the first
-attempt gets a fixed slice of the budget, and prose spent before the code is time
-the code does not get. Written this way the artifact exists first, so a reply cut
-short loses the checking pass rather than the whole answer. The nudge, which is
-appended last and so is the final thing the model reads, says the same thing in
-its strongest form: start the reply with the code block.
+That list used to be nine classes with a per-class count, and it was restated
+almost verbatim in turn 2 as an `<edge_cases>` checklist the model was asked to
+walk before answering. Both are gone: the classes belong to the turn that
+produces cases, and turn 2 is handed the cases themselves under `<must_pass>`,
+which is the same information as something the grader will actually run.
 
-The examples are rendered *after* that list and labelled a floor rather than the
-specification, because read first they become the spec and the checklist reads
-as an afterthought. Repair rounds are sent back through the same checklist,
-since they share the conversation and a repair that fixes the failing example
-while breaking a boundary scores the same zero.
-
-The code itself is asked for **unexplained** — no comments, no docstrings. The
-grader imports the source and calls it; nothing ever reads a comment, so the
-only thing one costs is output the model spends before the answer is finished,
-on a subnet that tiebreaks on latency.
+The examples are rendered *with* the problem and labelled a floor rather than
+the specification — and, since the statement is the spec, the label carries the
+one disambiguation rule a solver gets: where the statement is ambiguous, the
+examples decide.
 
 Each language is then warned about its own way of losing a large number, because
 they are not the same failure:
@@ -257,11 +242,12 @@ they are not the same failure:
   exactly the expected keys — and a list and a tuple *are* interchangeable, so
   no repair round need be spent converting one.
 
-### Then the program is read back against itself
+### What was removed, and what it cost
 
-Read off 43 answers a live miner submitted: ten were the model's own bugs, and
-**eight of those ten were visible on a careful re-read of the program itself** —
-no test, no execution, no cleverness required.
+Turn 2 used to end with a `<self_check>`: seven things to re-read the program
+for, drawn from real submissions. Read off 43 answers a live miner sent, ten
+were the model's own bugs and **eight of those ten were visible on a careful
+re-read** — no test, no execution, no cleverness required:
 
 | what shipped | what a re-read would have caught |
 | --- | --- |
@@ -273,23 +259,18 @@ no test, no execution, no cleverness required.
 | rebuild of `fcnt/first/last/rcnt` | forgot `size`, so every rank descent ran on 1 |
 | `pc[jid] = pos + 1` | committed before a branch that must not commit it |
 
-That is not a hard-problem failure. It is a re-reading failure — the model had
-everything it needed and did not look again. So `<method>` ends by asking it to,
-once, against a list of exactly those things. Generic advice reaches none of
-them; naming them is the whole point.
+The evidence is kept here because it is worth knowing what these models get
+wrong. The *section* is gone, deliberately: it was the third place in one
+message telling the model to work silently before replying, it competed with the
+task for attention, and the cases from turn 1 catch the same class of bug by
+running the program rather than by asking it to look again. That is the trade —
+a mechanism that sometimes caught a bug, exchanged for a prompt with one job in
+it. If a future run shows those bugs coming back, the answer is a better case
+turn, not another checklist.
 
-The check is explicitly silent — it happens in reasoning, never in the reply.
-
-Both are told the real per-test budget (5 seconds), because a budget quoted
-generously invites an algorithm that does not fit.
-
-Every one of those claims is about somebody else's code, and claims like that
-rot without anyone noticing — the prompt keeps saying them long after the policy
-that made them true has moved. So each is pinned by a test: the overflow test
-compiles with `RELEASE_POLICY.rustc_flags` rather than a copy of them, the
-comparison claims are asserted against `rlvr.execution.compare.values_equal`,
-and the timeout is read from the validator's own config. Change the policy and
-the tests fail, instead of the prompt quietly starting to lie.
+The code is no longer asked for **unexplained**, either. That bullet — no
+comments, no docstrings — existed because output costs wall-clock, and
+wall-clock is not what this subnet pays for.
 
 ## How it works: you run the browsers, the miner uses them
 
@@ -780,6 +761,38 @@ the scrape guard uses, because by that stage the text has been through fencing,
 a copy control or a wire reconstruction and the prompt need not be at the front
 any more.
 
+### And nothing is sent that we did not type
+
+The mirror image, and it went the other way through the same box.
+
+These accounts are shared — a person signs the browser in and may use it — so
+the composer can already hold somebody's half-typed message. The submit path
+clicked the composer and called `insert_text`, which inserts **at the caret**,
+and the click had just put the caret at the element's centre. The prompt was
+therefore spliced *into* that draft and the whole thing sent as one message:
+their text, our prompt, the rest of their text.
+
+Nothing downstream could catch it. `_is_our_own_prompt` inspects the **reply**
+for our prompt's head, and in a contaminated send that head is still there,
+intact; the stream capture is the one place the submitted text is visible at
+all, and it deliberately discards the user's turn. The only symptom is a model
+answering a mangled question, which is indistinguishable from a hard task.
+
+So `_submit` now guarantees the box holds our prompt and nothing else:
+
+1. clear it — `Control+A`, `Delete`, then a `fill("")` if the shortcut did not
+   reach it — and **read it back** to confirm it emptied;
+2. type the prompt, and read the box back **again**, comparing on collapsed
+   whitespace (a contenteditable renders our newlines as its own block
+   elements, so an exact comparison would fail on every send; what the
+   comparison still catches is text we did not type);
+3. only then touch the send control.
+
+A box that will not empty, or that does not hold the prompt after one retype, is
+not sent to at all: the tab raises, and `send` already treats a raise there as a
+dead tab reporting `unreadable`, which sends the solve to another tab. Two extra
+DOM round-trips, inside the submit slice the budget already allowed for.
+
 ### When nothing is captured at all, the tab says why
 
 `the reply contained no code` is what the grader reports afterwards, and it
@@ -1263,25 +1276,23 @@ ladder — *"at least eight invented cases above 180s, at least five between 60
 and 180"* — which is a count, not a duration. The count is what mattered; the
 seconds were scaffolding around it.
 
-So the number is gone from every prompt, and the counts are stated outright, by
-class, in the turn that asks for the cases. That is both more precise and
-checkable: a count can be compared against the work actually done, where a
+So the number is gone from every prompt, and the classes of case are stated
+outright in the turn that asks for them. That is both more precise and
+checkable: a class can be compared against the work actually done, where a
 duration a model cannot perceive can only be hoped at. One test walks every
-prompt — both turns, both languages, both repair shapes — and fails on any
-digit followed by a unit of time, with a single exception for the per-test
-limit (`about 5 seconds`), which is a measured fact about the grader rather
-than a budget to ration.
+prompt — both turns, both languages, both repair shapes, and the nudge — and
+fails on any digit followed by a unit of time, with a single exception for the
+per-test limit (`about 5 seconds`), which is a measured fact about the grader
+rather than a budget to ration.
 
-Two rules were filed under the budget and were never about time at all. They
-are what makes a *partial* program impossible, so they moved to the top of
-`<method>` and stayed:
-
-- **COMPLETE BEFORE CORRECT** — write the whole program out before testing any
-  of it. A program improved *into* existence is a program that may not exist
-  when the clock stops.
-- **SENDABLE AT EVERY MOMENT** — change it from one complete program into
-  another; never leave it half-rewritten. The dangerous state is not "wrong",
-  it is "half-rewritten".
+The same test now fails on the *vocabulary* of hurry as well — *deadline,
+wall-clock, terse, fastest, 95%, latency* — because the number was only half of
+it. Sentences like `"every character you emit spends wall-clock inside the
+deadline"` and `"the payment rule pays the slowest correct answer at least 95%
+of what the fastest one earns"` said the same thing without a digit in them, and
+carried it into the one decision that matters: whether to reach for the safe
+implementation or the clever one. Correctness pays everything here and speed
+pays at most 5%, so the prompts say the first and no longer mention the second.
 
 The miner still rations the deadline. It just does it in code, where there is a
 clock — see *[The request's deadline is the only

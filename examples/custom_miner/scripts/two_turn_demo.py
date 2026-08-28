@@ -87,17 +87,23 @@ def drive(deadline: float, replies: list[str], **kw) -> None:
     )
 
     def kind(text: str) -> str:
+        # `<task>` is turn 1's; `<contract>` is turn 2's. A repair has neither:
+        # it carries the failure and nothing else, because it is sent into the
+        # conversation that already holds both.
         if "<task>" in text:
             return "CASES"
-        return "CODE" if "<method>" in text else "REPAIR"
+        return "CODE" if "<contract>" in text else "REPAIR"
 
     print(f"  turns   {[kind(t) for t, _, _ in seen]}")
     print(f"  slices  {[round(s, 1) for _, s, _ in seen]}s"
           f"   what each read is allocated")
     print(f"  caps    {[None if c is None else round(c, 1) for _, _, c in seen]}s"
           f"   None on turn 1: nothing is held back, so nothing to extend into")
+    # What each turn ASKED for, which is the half no test can check for you: a
+    # repair may legitimately ask for a corrected `json` block beside the
+    # program, and nothing else here ever may.
     print(f"  asks    "
-          f"{['ONE block' if 'ONE fenced block' in t else 'TWO blocks' for t, _, _ in seen]}")
+          f"{['ONE block' if 'second `json` block' not in t else 'program + fixed cases' for t, _, _ in seen]}")
     print(f"  answer  "
           f"{'CORRECT' if 'while n > 0' in (answer.code or '') else 'WRONG or EMPTY'}")
 
