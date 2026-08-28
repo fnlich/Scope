@@ -94,7 +94,7 @@ def drive(deadline: float, replies: list[str], **kw) -> None:
     print(f"  slices  {[round(s, 1) for _, s, _ in seen]}s"
           f"   what each read is allocated")
     print(f"  caps    {[None if c is None else round(c, 1) for _, _, c in seen]}s"
-          f"   turn 1's cap == its slice, so it cannot extend")
+          f"   None on turn 1: nothing is held back, so nothing to extend into")
     print(f"  asks    "
           f"{['ONE block' if 'ONE fenced block' in t else 'TWO blocks' for t, _, _ in seen]}")
     print(f"  answer  "

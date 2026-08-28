@@ -1142,23 +1142,32 @@ on the easy classes:
 Four things make the extra round trip safe rather than a second way to run out
 of time:
 
-- **It is bounded at both ends.** Turn 1 is allocated
-  `min(25% of what is left, 60s)` and may read on to `min(40%, 100s)` while the
-  model is still working. A model that rambles cannot eat the read the program
-  needs — the program still opens on a 238s slice out of a 300s deadline — and
-  a model that *thinks* for longer than the slice no longer destroys the solve.
-  Turn 1 first shipped with the cap equal to the slice, which makes `send`'s
-  extension a no-op by construction, and that was wrong: it made turn 1 the one
-  read here that cannot wait for a thinking model, and the one most likely to
-  need to. Live, on a hard Rust task: `Thought for 1m 17s` before a character
-  appeared, against a 60s cap. Turn 1 timed out, the conversation was unusable,
-  and the pass was handed on — four times, 189 seconds, `provider=none`, the
-  program never asked for once. The same task before the split got one 238s read.
+- **Turn 1 has no timeout of its own.** There is one clock on a solve — the
+  deadline the validator advertised — and turn 1 reads against it like every
+  other read here. It carried a private cap twice and both were wrong the same
+  way: the first set `extend_to_s` equal to the slice, which makes the extension
+  a no-op by construction; the second used a soft 60s slice and a hard 100s cap.
+  Both cut the model off **mid-think**, which is the one moment where stopping
+  cannot help — the reply does not exist yet, so the cap saves time that bought
+  nothing and costs the whole turn.
+
+  A cap *looks* like it protects the program's read and does not. `send` returns
+  the moment the model finishes, so the slice is a ceiling and never a wait: a
+  cases turn that takes 90 seconds hands the program the other 190 whether or
+  not a cap exists. The only case a cap changes is the one where the model has
+  not finished — and there it converts a slow answer into no answer, the one
+  trade the payment policy says never to make.
+
+  Live, on a hard Rust task: `Thought for 1m 17s` before a character appeared,
+  against a 60s cap. Turn 1 timed out, the conversation was unusable, the pass
+  was handed on — four times, 189 seconds, `provider=none`, the program never
+  asked for once. The same task before the split got one 238s read.
 - **A cases turn that costs a pass does not cost every pass.** Whatever makes
   turn 1 unaffordable — a long thinking phase, a slow account, a hard problem —
   belongs to the task and the site, not to one tab, so the next pass would
   repeat it exactly. One pass may be spent finding that out; the rest go
-  straight to the program, which is the half that pays.
+  straight to the program, which is the half that pays. That, plus the budget
+  itself, is what protects the program now that no cap does.
 - **It is skipped when it cannot pay.** A cases turn costs a second submit, a
   second settle and a second tail. Below 100s that overhead comes out of the
   only half that pays, so the solve stays single-turn, byte-for-byte the prompt

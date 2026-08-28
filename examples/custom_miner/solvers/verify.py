@@ -327,31 +327,29 @@ class _Plan:
 
     two_phase: bool = True
 
-# What turn 1 may spend: a soft slice, and a hard cap it may read on to when
-# the model is STILL WORKING at the slice.
+# Turn 1 has NO timeout of its own. There is one clock on a solve -- the
+# deadline the validator advertised -- and turn 1 reads against that, exactly
+# like every other read here.
 #
-# The soft/hard pair is not a refinement, it is the difference between an answer
-# and a zero. Turn 1 first shipped with `extend_to_s` equal to its slice, which
-# makes `send`'s extension a no-op by construction -- deliberately, to stop a
-# rambling model eating the program's read. It also made turn 1 the ONE read in
-# this miner that cannot wait for a model that is still thinking, and it is the
-# read most likely to need to: it goes first, on a cold hard problem, before any
-# reasoning is cached.
+# It carried a private cap twice, and both were wrong in the same direction.
+# The first passed `extend_to_s` equal to the slice, which makes `send`'s
+# extension a no-op by construction; the second kept a soft 60s slice and a hard
+# 100s cap. Both cut the model off MID-THINK, and cutting a model off mid-think
+# is the one thing that cannot help: the reply does not exist yet, so what the
+# cap saves is time that bought nothing and what it costs is the whole turn.
+# Measured on a live tab: `Thought for 1m 17s` before a single character
+# appeared, against a 60 second cap.
 #
-# Measured from a live tab on a hard Rust task: `Thought for 1m 17s` before a
-# single character appeared. 77s against a 60s cap, so turn 1 timed out; the
-# conversation was then unusable, the pass was handed to another model, and the
-# next pass did exactly the same thing. Four passes, 189 seconds, `provider=none`
-# -- the program was never asked for once. The same task before the split got a
-# single 238s read.
+# A cap LOOKS like it protects the program's read, and it does not. `send`
+# returns the moment the model finishes -- the slice is a ceiling, never a wait
+# -- so a cases turn that takes 90 seconds hands the program the other 190
+# whether or not a cap exists. The only case a cap changes is the one where the
+# model has NOT finished, and there it converts a slow answer into no answer,
+# which is the one trade the payment policy says never to make.
 #
-# So the slice stays 60s and the CAP is what protects the program: at 100s out
-# of a 280s budget the program still opens on ~150s, and a normal thinking phase
-# fits inside turn 1 instead of destroying the solve.
-TESTS_SHARE = 0.25
-TESTS_CAP_S = 60.0
-TESTS_HARD_SHARE = 0.4
-TESTS_HARD_CAP_S = 100.0
+# What protects the program now is the budget itself and `_Plan`: turn 1 cannot
+# outlive the deadline, and a turn 1 that fails does not get a second chance in
+# the same solve.
 
 
 # Which backends accept `extend_to_s`, by class, asked once each.
@@ -610,21 +608,18 @@ class VerifyingSolver:
         ``None`` when the CONVERSATION is the problem -- unreadable, or still
         writing -- in which case turn 2 must not be sent into it at all.
 
-Bounded at both ends. The slice is what turn 1 is allocated; the cap is
-        how far it may read on while the model is still working, and it is
-        strictly smaller than the attempt so the program keeps the bulk. A model
-        that rambles cannot eat the program's read; a model that THINKS for
-        longer than the slice no longer destroys the solve.
+        Read against the SOLVE's clock and nothing else: turn 1 gets whatever
+        is left, the same ceiling the program turn gets. There is no partial
+        budget here to cut a thinking model off with -- see the note above
+        `_Plan` for why every version of that cap was a mistake.
         """
-        slice_s = max(1.0, min(left * TESTS_SHARE, TESTS_CAP_S))
-        hard_s = max(slice_s, min(left * TESTS_HARD_SHARE, TESTS_HARD_CAP_S))
+        slice_s = max(1.0, left)
         prompt = build_tests_prompt(
             task.language, task.statement, task.entrypoint, task.public_examples
         )
-        if _reads_past_its_slice(conversation):
-            reply = await conversation.send(prompt, slice_s, extend_to_s=hard_s)
-        else:
-            reply = await conversation.send(prompt, slice_s)
+        # No `extend_to_s`: the slice already IS everything left, so there is
+        # nothing to extend to and nothing being held back to extend into.
+        reply = await conversation.send(prompt, slice_s)
         if getattr(conversation, "still_writing", False) or getattr(
             conversation, "empty_reason", None
         ) in ("unreadable", "unfinished"):

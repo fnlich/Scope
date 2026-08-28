@@ -59,8 +59,6 @@ from solvers.prompts import (  # noqa: E402
 )
 from solvers.verify import (  # noqa: E402
     EMPTY_HANDED_FLOOR_S,
-    TESTS_CAP_S,
-    TESTS_HARD_CAP_S,
     TWO_PHASE_FLOOR_S,
     MAX_PASSES,
     SECOND_OPINION_FLOOR_S,
@@ -6430,11 +6428,12 @@ def test_the_first_read_gets_the_deadline_the_validator_actually_advertised():
     )
     # Defaults on purpose: this is what an operator who has tuned nothing gets.
     asyncio.run(VerifyingSolver(_Fleet()).solve_task(task, timeout_s=300.0))
-    # slices[0] is the cases turn now, capped well below the deadline on
-    # purpose; the program's read is slices[1] and it is what must get the bulk.
-    assert slices[0] <= TESTS_CAP_S + 1, (
-        f"the cases turn took {slices[0]:.0f}s; it is capped at {TESTS_CAP_S:.0f}s "
-        f"so a model that rambles cannot eat the program's read"
+    # slices[0] is the cases turn, and it reads against the SOLVE's clock like
+    # everything else -- no private cap. What it actually spends is decided by
+    # when the model finishes, not by an allocation.
+    assert slices[0] > 230.0, (
+        f"the cases turn was given {slices[0]:.0f}s of a 300s deadline; it is "
+        f"supposed to read against the whole budget"
     )
     slices = slices[1:]
     assert slices[0] > 230.0, (
@@ -7907,24 +7906,29 @@ def test_the_cases_are_asked_for_before_the_program_exists():
     assert "while n > 0" in answer.code
 
 
-def test_the_cases_turn_cannot_eat_the_read_the_program_needs():
-    """Turn 1 produces nothing that pays, so it is bounded at both ends.
+def test_the_cases_turn_does_not_shrink_the_read_the_program_gets():
+    """What actually protects the program, now that turn 1 has no private cap.
 
-    It may read PAST its slice — a model still thinking at 60s is the common
-    case on a hard problem, and refusing to wait there cost whole solves, see
-    `test_the_cases_turn_can_wait_out_a_model_that_is_still_thinking`. What it
-    may never do is read far enough to starve the program, so the cap is a
-    fraction of the attempt and stays well under the program's own slice."""
+    A cap looks like the protection and is not: `send` returns the moment the
+    model finishes, so the slice is a ceiling and never a wait. A cases turn
+    that takes 90 seconds hands the program the other 190 either way. The only
+    case a cap changes is the one where the model has NOT finished, and there it
+    converts a slow answer into no answer.
+
+    So the guarantee is arithmetic, not allocation: turn 2 opens on what the
+    clock says is left, and the elapsed cases turn is the only thing that took
+    any of it."""
     _, slices, caps, _ = _two_turn(300.0, [_CASES_ONLY, _RIGHT_PROGRAM])
-    assert slices[0] <= TESTS_CAP_S + 0.01, f"cases turn got {slices[0]:.0f}s"
-    assert caps[0] <= TESTS_HARD_CAP_S + 0.01, (
-        f"cases turn may read on to {caps[0]:.0f}s"
+    assert slices[0] > 230.0, (
+        f"the cases turn was allocated {slices[0]:.0f}s of a 300s deadline — it "
+        f"is supposed to read against the whole budget, not a share of it"
     )
-    assert caps[0] < slices[1], (
-        f"cases turn may read to {caps[0]:.0f}s but the program only gets "
-        f"{slices[1]:.0f}s — turn 1 can starve the half that pays"
+    assert caps[0] is None or caps[0] <= slices[0] + 0.01, (
+        "nothing is held back from the cases turn, so there is nothing to "
+        "extend into"
     )
-    # The program keeps the bulk, and may still extend into the whole budget.
+    # A fast cases turn costs the program almost nothing: these fakes reply
+    # instantly, so turn 2 still opens on essentially the whole budget.
     assert slices[1] > 200.0, f"the program only got {slices[1]:.0f}s"
     assert caps[1] > slices[1], "the program's read must still be extendable"
 
@@ -8122,17 +8126,14 @@ def test_the_cases_turn_can_wait_out_a_model_that_is_still_thinking():
 
     turns = [t for t, _, _ in log]
     assert turns[:2] == ["CASES", "CODE"], turns
-    slice_s, hard_s = log[0][1], log[0][2]
-    assert hard_s > slice_s, (
-        f"the cases turn may not extend at all ({slice_s:.0f}s slice, "
-        f"{hard_s:.0f}s cap): a thinking model kills it"
+    hard_s = log[0][2]
+    assert hard_s >= 77.0, (
+        f"the cases turn stops at {hard_s:.0f}s, under a measured think of 77s: "
+        f"a thinking model is cut off and the turn is lost"
     )
-    assert hard_s >= 77.0, f"cap of {hard_s:.0f}s is under a measured think"
-    # And the program still keeps the bulk: the cap is a fraction of the
-    # attempt, never the whole of it.
-    assert hard_s < log[1][1], (
-        f"the cases turn may read to {hard_s:.0f}s but the program only gets "
-        f"{log[1][1]:.0f}s"
+    # Not "a bigger cap" — no cap. Turn 1 reads against the solve's clock.
+    assert hard_s > 230.0, (
+        f"the cases turn is still capped at {hard_s:.0f}s of a 300s deadline"
     )
     assert answer.code, "no program was submitted"
 
