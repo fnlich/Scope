@@ -27,7 +27,7 @@ import ast
 import builtins
 import json
 import re
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 # ChatGPT wraps code in ``` fences; the DOM reader already returns the inner
 # text of a <pre><code> block, but a reply that arrived as plain text (or a
@@ -154,76 +154,6 @@ def sanitize_code(text: str) -> str:
     return _LANG_LABEL_RE.sub("", text, count=1)
 
 
-# Stated first, and again last by the site's nudge. It is the only instruction
-# whose failure costs the whole answer rather than degrading it, so it gets both
-# the primacy and the recency slot and nothing else competes for either.
-OUTPUT_CONTRACT = """\
-Reply with EXACTLY TWO fenced blocks written directly in the chat — not into an
-artifact or canvas — and nothing else. No preamble, no explanation before them,
-between them or after them. Never a third block.
-
-1. The {language} program. This block alone is graded.
-2. A `json` block holding the cases you checked it against — see <self_tests>.
-
-Only what is inside those two fences is ever read."""
-
-
-# The second block, and why it is worth relaxing a rule that was ONE block for
-# good reasons.
-#
-# Production ships no `public_examples`: 56 solves in a row on a live run
-# reported `examples=0/0`. The repair loop -- the one mechanism here that turns
-# a nearly-right answer into a right one -- therefore never had anything to
-# run, and `verified` was False on every answer because nothing COULD be
-# checked, not because anything was wrong. The model is the only source of
-# cases there is.
-#
-# The relaxation is safe because `extract_code` picks the block that DEFINES
-# the entrypoint rather than the first or the last one. Measured against four
-# adversarial layouts -- tests only, tests first, a misnamed function, an
-# untagged JSON block -- the JSON never reached the submission, and a reply
-# carrying only tests reported `the reply contained no code` exactly as before.
-SELF_TESTS_PYTHON = """\
-The second block is a JSON array of the cases you traced, so I can RUN them
-against your program before it goes anywhere. No tests ship with this task, so
-a case you do not write is a case nobody runs.
-
-[{{"name": "empty input",  "args": [[]],        "expected": 0}},
- {{"name": "single item",  "args": [[5]],       "expected": 5}},
- {{"name": "stated bound", "args": [[1000000]], "expected": 1000000}}]
-
-- `args` is the argument list for `{entrypoint}(*args)`; `kwargs` is optional.
-- `expected` is the exact value your program must RETURN, written as JSON.
-- Every value must be JSON: no tuples, no sets, no `inf`, no `NaN`, no code.
-- Six to twelve cases, and BOUNDARIES before anything else. Whenever the
-  statement makes them reachable, include: the empty input, one element, the
-  smallest and largest values the statement names, one below and one above each
-  stated bound, a tie, and the case your own implementation is most likely to
-  get wrong.
-- Derive every `expected` from the STATEMENT, not by running your code again in
-  your head. A case that agrees with the bug is worse than no case at all."""
-
-
-RUST_SELF_TESTS = """\
-The second block is a JSON array of the cases you traced, so I can RUN them
-against your program before it goes anywhere. No tests ship with this task, so
-a case you do not write is a case nobody runs.
-
-[{{"name": "empty input",  "args": ["0\\n"],     "expected": "0"}},
- {{"name": "single item",  "args": ["1\\n5\\n"],  "expected": "5"}}]
-
-- `args` holds exactly ONE string: the complete stdin your program reads.
-- `expected` is the complete stdout it must write, as a string.
-- Both are compared after splitting on whitespace, so spacing is forgiving but
-  extra or missing tokens are not.
-- Six to twelve cases, and BOUNDARIES before anything else. Whenever the
-  statement makes them reachable, include: the smallest legal input, one
-  element, the largest values the statement names, one below and one above each
-  stated bound, a tie, and the case your own implementation is most likely to
-  get wrong.
-- Derive every `expected` from the STATEMENT, not by running your code again in
-  your head. A case that agrees with the bug is worse than no case at all."""
-
 PYTHON_RULES = """\
 - There is no partial credit: a program wrong on ONE hidden case pays exactly
   what no answer pays — zero — while the payment rule pays the slowest correct
@@ -236,7 +166,7 @@ PYTHON_RULES = """\
 - Write no comments and no docstrings. Nothing reads them, and every
   character you emit spends wall-clock inside the deadline.
 - Put no tests, example calls or `if __name__ == "__main__"` INSIDE the
-  program block. {cases_home}"""
+  program block. Nothing but the function and whatever it needs to run."""
 
 RUST_RULES = """\
 - There is no partial credit: a program wrong on ONE hidden case pays exactly
@@ -499,17 +429,10 @@ the reply itself is only {reply}:
 6. Send {send}, and nothing else."""
 
 
-# What each turn puts in those three slots.
+# What each turn puts in those three slots. Both are turn 2: the program turn
+# asks for a program and nothing else, and the only question is whether turn 1
+# left it a bar to clear.
 _METHOD_SLOTS = {
-    # Single turn: program and cases together, exactly as before the split.
-    "combined": {
-        "reply": "the two blocks",
-        "step4": (
-            "\n   These are the cases that go in the second block, so write down"
-            " the expected\n   value as you trace it."
-        ),
-        "send": "the program, then the cases",
-    },
     # Turn 2 with cases agreed in turn 1: the bar is already written down, so
     # the tracing has somewhere concrete to point instead of a block to fill.
     "given": {
@@ -686,21 +609,21 @@ def build_code_prompt(
     statement: str,
     entrypoint: str,
     examples: list[dict[str, Any]],
-    cases: Any = "ask",
+    cases: Optional[Sequence[dict[str, Any]]] = None,
 ) -> str:
-    """Ask for the program.
+    """Turn 2: ask for the program, and only the program.
 
-    ``cases`` has three values and they are three different conversations:
+    ``cases`` is what turn 1 obtained, and it decides one thing:
 
-    * ``"ask"``   -- the single-turn prompt: program AND cases in one reply, two
-                     fenced blocks. Used when the budget is too small to spend a
-                     round trip on cases alone, and byte-for-byte what this
-                     builder produced before the split.
-    * a list      -- turn 2 of a two-turn solve. The cases already exist, so the
-                     contract is ONE block and they are restated as the bar the
+    * a list      -- the cases exist, so they are restated as the bar this
                      program has to clear.
-    * ``None``/[] -- turn 2 after turn 1 produced nothing usable. One block, no
-                     cases, and the answer still goes out.
+    * ``None``/[] -- turn 1 produced nothing usable, or was never asked. No bar
+                     to point at, and the answer still goes out.
+
+    Either way the contract is ONE block. A reply carrying a second one is a
+    reply that spent output tokens inside the deadline on something nothing
+    reads: the cases were settled a turn ago, and `extract_code` would have to
+    step over whatever else arrived.
 
     Laid out in delimited sections, and the order is the argument. The output
     contract goes FIRST because it is the only instruction whose failure costs
@@ -716,21 +639,11 @@ def build_code_prompt(
 
     """
     is_rust = language == "rust"
-    combined = cases == "ask"
-    given = [] if combined or not cases else list(cases)
-    slots = _METHOD_SLOTS["combined" if combined else "given" if given else "bare"]
-    rules = (RUST_RULES if is_rust else PYTHON_RULES).format(
-        entrypoint=entrypoint,
-        cases_home=(
-            "Your cases go in the second block, as JSON."
-            if combined
-            else "Nothing but the function and whatever it needs to run."
-        ),
-    )
+    given = list(cases or [])
+    slots = _METHOD_SLOTS["given" if given else "bare"]
+    rules = (RUST_RULES if is_rust else PYTHON_RULES).format(entrypoint=entrypoint)
     environment = RUST_ENVIRONMENT if is_rust else PYTHON_ENVIRONMENT
-    contract = (OUTPUT_CONTRACT if combined else CODE_OUTPUT_CONTRACT).format(
-        language="Rust" if is_rust else "Python"
-    )
+    contract = CODE_OUTPUT_CONTRACT.format(language="Rust" if is_rust else "Python")
 
     parts = [
         "<output>", contract, "</output>", "",
@@ -748,18 +661,7 @@ def build_code_prompt(
             "</examples>", "",
         ]
     parts += ["<contract>", rules, "", environment, "</contract>", ""]
-    if combined:
-        # Immediately after the contract that asks for two blocks and before the
-        # method that produces them, so "write the cases" is read as part of
-        # answering rather than as an afterthought.
-        parts += [
-            "<self_tests>",
-            (RUST_SELF_TESTS if is_rust else SELF_TESTS_PYTHON).format(
-                entrypoint=entrypoint
-            ),
-            "</self_tests>", "",
-        ]
-    elif given:
+    if given:
         # The bar, stated as the calls the grader will actually make. These are
         # the model's OWN cases from the previous turn, echoed rather than
         # referred to: a model asked to honour "the cases you sent" has to

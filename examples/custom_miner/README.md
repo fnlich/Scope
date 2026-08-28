@@ -131,8 +131,8 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 
 ### The prompt is one delimited document, and the order is the argument
 
-Above roughly a 100-second budget the solve takes **two turns** — the cases
-first, then the program — and both are laid out the same way:
+Every solve takes **two turns** — the cases first, then the program — and both
+are laid out the same way:
 
 ```
 TURN 1 (cases)                      TURN 2 (program)
@@ -150,7 +150,8 @@ TURN 1 (cases)                      TURN 2 (program)
                                       <edge_cases>  input shapes that break
                                       <self_check>  reading the program back
 ```
-Below that budget there is one turn, and it asks for both blocks at once — see
+Both turns ask for **one** block, and there is no third shape: the single-turn
+prompt that asked for a program and its cases together is gone — see
 *[The cases are written before the program exists](#the-cases-are-written-before-the-program-exists)*.
 …then the site's nudge, appended after everything, repeats the output rule.
 
@@ -189,7 +190,7 @@ verbatim under the two-turn contract they told the model *"the reply itself is
 only the two blocks"* directly beneath a contract saying ONE, and a model
 resolves a contradiction by obeying the more specific-sounding half. One test
 asserts the invariant over every turn: **no section may name a block its own
-contract did not ask for.**
+contract did not ask for** — and no prompt constant anywhere may ask for two.
 
 Three facts were missing that change decisions rather than decorate them.
 **There is no partial credit** — a program wrong on one hidden case scores what
@@ -1100,12 +1101,14 @@ repair round breaks a correct program:
 > wrong, and which one is the question. … If the case is right, fix the program;
 > if the case was wrong, fix the case and leave the program alone.
 
-Relaxing the one-block contract is safe because `extract_code` picks the block
-that **defines the entrypoint**, not the first or last one. Verified against the
-layouts models actually produce — program first, cases first, an untagged JSON
-block, and a reply carrying only cases, which still reports *"the reply
-contained no code"* exactly as before. `SOLVER_SELF_TESTS=0` turns the whole
-mechanism off.
+A repair reply may carry a corrected `json` block beside the program, and that
+is safe because `extract_code` picks the block that **defines the entrypoint**,
+not the first or last one. Verified against the layouts models actually produce
+— program first, cases first, an untagged JSON block, and a reply carrying only
+cases, which still reports *"the reply contained no code"* exactly as before.
+
+`SOLVER_SELF_TESTS=0` turns the whole mechanism off: one turn, no cases asked
+for, and every answer submitted ungraded.
 
 ### The cases are written before the program exists
 
@@ -1113,6 +1116,13 @@ Asking for both in one reply has a flaw that no amount of prompt wording fixes:
 a model writing cases **alongside** a program back-fills the `expected` values
 from what the program happens to do. Those cases then agree with the program's
 bugs, which is the one thing a test must not do. Cases written *first* cannot.
+
+That is why the combined prompt is not kept as a fallback. It looked free — one
+round trip instead of two, and cases where there would otherwise be none — but
+what it produced was evidence the grader could not trust, paid for in output
+tokens spent inside the deadline. When turn 1 fails in a way that belongs to the
+task, the remaining passes ask for the program **alone** and the answer goes out
+ungraded, which is the honest version of the same outcome.
 
 So the solve spends a round trip on them, at every deadline:
 

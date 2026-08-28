@@ -2958,18 +2958,22 @@ def test_how_to_answer_comes_last_where_it_is_most_likely_to_be_obeyed():
 def test_the_output_contract_holds_the_first_word_and_the_nudge_the_last():
     """The only instruction whose failure costs the ENTIRE answer rather than
     degrading it, so it gets both ends and nothing competes for either."""
-    from solvers.prompts import build_code_prompt
+    from solvers.prompts import build_code_prompt, build_tests_prompt
 
     for site, language, entry in ((claude_site(), "rust", "main"),
                                   (chatgpt_site(), "python", "solve")):
-        prompt = build_code_prompt(language, "Do a thing.", entry, [])
-        assert prompt.startswith("<output>"), prompt[:40]
-        head = prompt.split("</output>")[0]
-        # TWO blocks now, and the count is the load-bearing part: `extract_code`
-        # picks the block that DEFINES the entrypoint, so a third one is the
-        # thing that could still confuse it.
-        assert "EXACTLY TWO fenced blocks" in head, head[:200]
-        assert "Never a third block" in head, head[:200]
+        for prompt in (
+            build_code_prompt(language, "Do a thing.", entry, []),
+            build_tests_prompt(language, "Do a thing.", entry, []),
+        ):
+            assert prompt.startswith("<output>"), prompt[:40]
+            head = prompt.split("</output>")[0]
+            # ONE block, and in BOTH turns. The count is the load-bearing part:
+            # `extract_code` picks the block that DEFINES the entrypoint, so a
+            # second one is what could still confuse it — and since the split
+            # there is no turn that wants two.
+            assert "ONE fenced block" in head, head[:200]
+            assert "TWO fenced blocks" not in head, head[:200]
         # ...and the site's nudge, appended after everything, repeats it.
         assert site.nudge.startswith(
             "START your reply with the fenced block"
@@ -3009,10 +3013,9 @@ def test_the_self_check_names_the_bugs_that_actually_reached_the_grader():
     ):
         assert phrase in SELF_CHECK, f"the self-check dropped {phrase!r}"
     for language, entry in (("rust", "main"), ("python", "solve")):
-        for cases in ("ask", [{"name": "n", "args": [[]], "expected": 0}], []):
+        for cases in ([{"name": "n", "args": [[]], "expected": 0}], [], None):
             prompt = build_code_prompt(language, "Do a thing.", entry, [], cases=cases)
-            reply = "the two blocks" if cases == "ask" else "the program"
-            assert SELF_CHECK.format(reply=reply) in prompt
+            assert SELF_CHECK.format(reply="the program") in prompt
 
 
 def test_a_repair_round_is_sent_back_through_the_checklist():
@@ -4068,16 +4071,12 @@ def test_the_method_is_a_numbered_procedure_ending_in_send_the_code():
     assert "Write the program FIRST" in steps[1], steps[1]
     assert "silently" in METHOD
     # The last step is still the send, and it still names everything the
-    # contract of that turn asked for -- both blocks on the single-turn
-    # prompt, the program alone once the cases already exist.
-    single = build_code_prompt("rust", "Do a thing.", "main", [])
-    assert "Send the program, then the cases, and nothing else." in single
-    two_turn = build_code_prompt(
-        "rust", "Do a thing.", "main", [],
-        cases=[{"name": "n", "args": ["1\n"], "expected": "1"}],
-    )
-    assert "Send the program, and nothing else." in two_turn
-    assert "then the cases" not in two_turn
+    # contract of that turn asked for -- which, since the split, is the program
+    # and nothing else, whether or not turn 1 left cases to clear.
+    for cases in (None, [{"name": "n", "args": ["1\n"], "expected": "1"}]):
+        prompt = build_code_prompt("rust", "Do a thing.", "main", [], cases=cases)
+        assert "Send the program, and nothing else." in prompt
+        assert "then the cases" not in prompt
 
 
 def test_the_examples_decide_when_the_statement_is_ambiguous():
@@ -6195,7 +6194,7 @@ def test_the_method_licenses_depth_and_forbids_trading_checks_for_speed():
     assert len(steps) == 6
     assert "Write the program FIRST" in steps[1]
     assert steps[5].startswith("6. Send ") and steps[5].endswith("nothing else.")
-    assert "Send the program, then the cases, and nothing else." in prompt
+    assert "Send the program, and nothing else." in prompt
     assert "before you answer" not in METHOD.lower()
 
 
@@ -7920,13 +7919,24 @@ def test_a_disagreement_is_not_reported_as_the_program_being_wrong():
 
 
 def test_self_tests_can_be_turned_off_completely():
-    """`SOLVER_SELF_TESTS=0` has to restore exactly the behaviour that preceded
-    them — a new mechanism on the path that decides what gets submitted needs a
-    way back."""
+    """`SOLVER_SELF_TESTS=0` is the way back off a mechanism that sits on the
+    path deciding what gets submitted: one turn, no grading, whatever the model
+    said.
+
+    And it no longer ASKS for cases either. The single-turn prompt requested a
+    second JSON block that this same switch then told the grader to ignore, so
+    the model spent output tokens inside the deadline writing something nothing
+    read — and a reply that obeyed it gave `extract_code` a block to step
+    over."""
     solver, sent = _solver_seeing([_WRONG_WITH_CASES], self_tests=False)
     answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
     assert len(sent) == 1, "graded anyway with self-tests switched off"
     assert "while n > 9" in answer.code, "the buggy program is submitted, as before"
+    assert "ONE fenced block" in sent[0], sent[0][:200]
+    for phrase in ("TWO fenced blocks", "second block", "<self_tests>"):
+        assert phrase not in sent[0], (
+            f"asked for cases it will not read: {phrase!r}"
+        )
 
 
 def test_the_case_parser_survives_whatever_a_model_writes():
@@ -8580,12 +8590,12 @@ def test_no_prompt_contradicts_its_own_output_contract():
     are shared by turns that ask for different replies.
 
     `METHOD`, `SELF_CHECK` and `PYTHON_RULES` were written when there was only
-    ever one turn, so all three say "the two blocks" and one of them says the
-    cases go in the second. Reuse them verbatim under the two-turn contract --
-    which says ONE block -- and the turn-2 prompt tells the model both things
-    at once. A model resolves that by obeying the more specific half: it emits
-    a JSON block `extract_code` then has to step over, and pays for it in
-    output tokens spent inside the deadline.
+    ever one turn, so all three said "the two blocks" and one of them said the
+    cases go in the second. Reused verbatim under the two-turn contract --
+    which says ONE block -- the turn-2 prompt told the model both things at
+    once. A model resolves that by obeying the more specific half: it emits a
+    JSON block `extract_code` then has to step over, and pays for it in output
+    tokens spent inside the deadline.
 
     So: whatever a turn's contract asks for is what every other section of
     THAT turn asks for, and no section names a block the contract did not.
@@ -8613,21 +8623,19 @@ def test_no_prompt_contradicts_its_own_output_contract():
                 )
             assert "<self_tests>" not in prompt
 
-        # The single-turn prompt is the other way round and stays that way.
-        single = build_code_prompt(language, "Do a thing.", entry, [])
-        assert "EXACTLY TWO fenced blocks" in single
-        assert "ONE fenced block" not in single
-        assert "Send the program, then the cases, and nothing else." in single
-        assert "<self_tests>" in single
+    # And there is no builder left that can ask for two. The single-turn
+    # prompt -- program and cases in one reply -- was the fallback for a cases
+    # turn that failed and for `SOLVER_SELF_TESTS=0`, and it is gone: cases
+    # written beside a program are back-filled from what it happens to do, so
+    # what it bought was evidence the grader could not trust, paid for in
+    # output tokens spent inside the deadline. Nothing may reintroduce it by
+    # default.
+    import solvers.prompts as prompts_mod
 
-    # And the one bullet that names where the cases live is only in the turn
-    # that has somewhere to put them.
-    assert "second block, as JSON" in build_code_prompt(
-        "python", "Do a thing.", "solve", []
-    )
-    assert "second block, as JSON" not in build_code_prompt(
-        "python", "Do a thing.", "solve", [], cases=[]
-    )
+    for name in dir(prompts_mod):
+        value = getattr(prompts_mod, name)
+        if isinstance(value, str) and name.isupper():
+            assert "TWO fenced blocks" not in value, f"{name} still asks for two"
 
 
 def test_both_turns_open_with_the_same_words():

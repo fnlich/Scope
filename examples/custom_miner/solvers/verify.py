@@ -386,6 +386,14 @@ class _Plan:
     the task and the site clears it. A tab that went blind is retired on the
     spot and the next pass is served by another one, so its failure says nothing
     about the task -- see `_attempt`, where the two are told apart.
+
+    Cleared, the next pass asks for the program ALONE. There is no combined
+    turn to fall back to: cases written beside a program are back-filled from
+    what it happens to do and agree with its bugs, which is the whole argument
+    for splitting the turns, and a prompt that asks for a second block the
+    grader will not trust spends output tokens inside the deadline. The cost is
+    real and it is the right one: that task goes out ungraded rather than
+    graded against evidence worth nothing.
     """
 
     two_phase: bool = True
@@ -729,7 +737,7 @@ class VerifyingSolver:
             # happens to do, and then they agree with its bugs; cases written
             # first cannot. That is the whole argument for spending a round
             # trip here.
-            cases: Any = "ask"
+            cases: Optional[list] = None
             two_phase = plan is None or plan.two_phase
             if self._self_tests and two_phase:
                 cases = await self._ask_for_cases(
@@ -770,7 +778,8 @@ class VerifyingSolver:
                         # Not the same way twice. A long thinking phase, a slow
                         # account, a hard problem: the next pass would repeat
                         # it. It did: four passes, four timed-out cases turns,
-                        # nothing submitted.
+                        # nothing submitted. The remaining passes ask for the
+                        # program alone, and that task is submitted ungraded.
                         #
                         # Clearing this for a DEAD TAB was the same mistake
                         # pointed the other way. It cost the rest of the solve
@@ -802,13 +811,13 @@ class VerifyingSolver:
                 task.language, task.statement, task.entrypoint,
                 task.public_examples, cases=cases,
             )
-            # `not cases` covers None as well as [], and it matters: the
+            # `cases or []` covers None as well as [], and it matters: the
             # early return above is the only thing that keeps None out of here,
             # so `list(cases)` was one edit away from a TypeError -- which this
             # module CATCHES as a backend failure and reports as "provider=none"
             # with no answer. A crash that looks like a dead tab is the worst
             # kind, so the line does not depend on the guard above surviving.
-            agreed = [] if cases == "ask" or not cases else list(cases)
+            agreed = list(cases or [])
             for attempt in range(1, self._max_attempts + 1):
                 left = budget - (time.monotonic() - started)
                 if attempt > 1 and left < 12.0:
@@ -995,23 +1004,23 @@ class VerifyingSolver:
 
     # ---------------------------------------------------------------------- #
     def _run_self_tests(
-        self, candidate: Candidate, reply: str, task,
-        cases: Optional[list] = None,
+        self, candidate: Candidate, task, cases: Optional[list] = None,
     ) -> None:
-        """Grade a candidate against the cases the model sent with it.
+        """Grade a candidate against the cases turn 1 obtained.
 
         Never raises and never blocks the answer. A model wrote both halves of
         this -- the cases and the JSON they arrived in -- so every failure mode
         here ends in "no self-tests ran", which is exactly where this code path
         started.
+
+        It does not read the reply. The program turn asks for ONE block, so
+        there is nothing to extract from it -- and mining it for cases anyway
+        would mean grading a program against whatever it volunteered about
+        itself, which is the back-filling the split exists to prevent. A repair
+        reply that CORRECTS a case is handled where it belongs, in `_attempt`,
+        which feeds the corrected array to the next round.
         """
-        # The cases agreed in turn 1 win over anything in THIS reply: after
-        # the split the program arrives alone, and re-extracting from it
-        # would find nothing and silently stop grading -- the exact state
-        # this mechanism was built to end.
-        cases = list(cases or []) or extract_self_tests(
-            reply, task.entrypoint, task.language
-        )
+        cases = list(cases or [])
         if not cases:
             return
         names = [case.get("name", "") for case in cases]
@@ -1085,7 +1094,7 @@ class VerifyingSolver:
             # should be and coding it wrong, and that is objectively checkable
             # with the validator's own executor.
             if self._self_tests and not out_of_budget and code.strip():
-                self._run_self_tests(candidate, reply, task, cases)
+                self._run_self_tests(candidate, task, cases)
             return candidate
         if out_of_budget:
             # The budget is gone, so running the examples buys nothing that can
