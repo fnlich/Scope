@@ -48,11 +48,21 @@ from .prompts import (
     python_defect,
     rust_defect,
 )
-from .rust_compile import compile_defect
+from .rust_compile import compile_defect, rustc_path
 
 # Per-example wall clock when checking our own candidate. Kept small: this is
 # a smoke test against tiny public examples, not the real grading run.
 VERIFY_TIMEOUT_S = float(os.environ.get("SOLVER_VERIFY_TIMEOUT_S", "5"))
+
+# How long an executor that could not be built stays unavailable before the
+# next solve is allowed to try again.
+#
+# A hold, not a verdict: a Docker daemon started after the miner is the
+# ordinary case, and a permanent answer would mean grading nothing in that
+# language until someone restarted the process. Long enough that Rust tasks
+# stop paying for the probe, short enough that a box the operator has just
+# fixed heals on its own.
+EXECUTOR_RETRY_S = float(os.environ.get("SOLVER_EXECUTOR_RETRY_S", "300"))
 
 
 class Conversation(Protocol):
@@ -166,6 +176,17 @@ class _Grader:
         # that is a container's worth of startup thrown away -- on the one code
         # path whose entire reason for caching is that Docker startup is slow.
         self._lock = threading.Lock()
+        # An executor that could not be BUILT, by language: (when, why).
+        #
+        # `self._cache` is written after `get_executor` returns, so a
+        # constructor that raises leaves nothing behind and every later solve
+        # repeats it. For Rust without Docker that is
+        # `DockerExecutor._resolve_docker` shelling out to `docker info` --
+        # 60ms when the socket is simply absent, and up to its own 20 second
+        # timeout when the daemon is hung or still starting. Per Rust task,
+        # inside the solve's budget, for the life of the process.
+        self._broken: dict[str, tuple[float, str]] = {}
+        self._reported: set[str] = set()
 
     @staticmethod
     def _build_settings():
@@ -183,21 +204,75 @@ class _Grader:
             cached = self._cache.get(language)
             if cached is not None:
                 return cached
-            from rlvr.execution.executor import get_executor
-
-            settings = self._settings
-            if language == "rust" and settings.executor != "docker":
-                # Rust needs rustc in the pinned image; no subprocess path.
-                from rlvr.config import Settings
-
-                settings = Settings(
-                    _env_file=None,
-                    executor="docker",
-                    per_test_timeout_s=VERIFY_TIMEOUT_S,
-                )
-            executor = get_executor(settings, language=language)
+            held = self._broken.get(language)
+            if held is not None and time.monotonic() - held[0] < EXECUTOR_RETRY_S:
+                # Remembered, not re-probed. The message is the original one
+                # verbatim: the caller prints it per solve and an operator
+                # counts those lines, so it must not change shape here.
+                raise RuntimeError(held[1])
+            try:
+                executor = self._build(language)
+            except Exception as exc:  # noqa: BLE001 - remembered, then re-raised
+                self._broken[language] = (time.monotonic(), f"{exc}")
+                self._report_unavailable(language, exc)
+                raise
+            self._broken.pop(language, None)
             self._cache[language] = executor
             return executor
+
+    def state(self, language: str) -> str:
+        """What grading this language would do right now. Never probes.
+
+        Read from `/solver-status`, so it must not shell out: a `docker info`
+        against a hung daemon blocks for twenty seconds, and the endpoint an
+        operator polls to find out whether the miner is healthy is the last
+        place to put that.
+        """
+        if language in self._cache:
+            return "ready"
+        held = self._broken.get(language)
+        if held is not None:
+            return f"unavailable: {held[1]}"
+        return "not checked yet"
+
+    def _build(self, language: str):
+        """Construct the executor for ``language``. Assumes the lock is held."""
+        from rlvr.execution.executor import get_executor
+
+        settings = self._settings
+        if language == "rust" and settings.executor != "docker":
+            # Rust needs rustc in the pinned image; no subprocess path.
+            from rlvr.config import Settings
+
+            settings = Settings(
+                _env_file=None,
+                executor="docker",
+                per_test_timeout_s=VERIFY_TIMEOUT_S,
+            )
+        return get_executor(settings, language=language)
+
+    def _report_unavailable(self, language: str, exc: BaseException) -> None:
+        """Say what a missing executor costs, once per language per run.
+
+        The per-solve line names the exception and nothing else, which reads as
+        a hiccup. This is the part an operator has to act on: everything in
+        this language is now ungraded, and no repair round can fire on it.
+        """
+        if language in self._reported:
+            return
+        self._reported.add(language)
+        fix = ""
+        if language == "rust":
+            fix = (
+                " Rust has no subprocess path — grading it at all needs a Docker "
+                "daemon; see the README's \"Rust needs Docker\" section."
+            )
+        print(
+            f"[verify] the {language} executor could not be built, so no {language} "
+            f"answer can be graded here: no repair rounds, and verified=False "
+            f"however good the answer is. {type(exc).__name__}: {exc}{fix} Not "
+            f"probing again for {EXECUTOR_RETRY_S:.0f}s. Once per run."
+        )
 
     def check(
         self, code: str, language: str, entrypoint: str,
@@ -945,8 +1020,14 @@ class VerifyingSolver:
                 candidate.code, task.language, task.entrypoint, cases, names
             )
         except Exception as exc:  # noqa: BLE001 - a broken executor loses no answer
-            print(f"[verify] could not run the model's own cases: "
-                  f"{type(exc).__name__}: {exc}")
+            # Same four words as the public-examples path below, deliberately.
+            # They are what an operator counts to decide whether a missing
+            # executor is costing anything -- and on live traffic, which ships
+            # no public examples, THIS is the only path that can print it. The
+            # other wording made that count read zero while every answer in the
+            # language went out ungraded.
+            print(f"[verify] local grading unavailable, so the model's own cases "
+                  f"could not be run: {type(exc).__name__}: {exc}")
             return
         if not total:
             return
@@ -1031,11 +1112,69 @@ class VerifyingSolver:
         candidate.passed, candidate.total, candidate.failures = passed, total, failures
         return candidate
 
+    # -- what a Rust answer is actually checked with ----------------------- #
+    def rust_support(self) -> dict[str, str]:
+        """The two independent checks a Rust answer gets, and their state.
+
+        Both can be off at once, and on a box with neither the only thing
+        standing between a model's reply and the validator is `rust_defect`,
+        which greps a fenced block for `fn main`. Measured over 45 archived
+        submissions: 6 of 18 Rust answers would not build, and among them were
+        a prompt echo, a tool call and a program truncated mid-identifier --
+        all three of which carry those characters.
+
+        Cheap on purpose: `rustc_path` is memoised after its first lookup and
+        `_Grader.state` never probes, so `/solver-status` can report this.
+        """
+        compiler = rustc_path()
+        return {
+            "compile_gate": f"rustc at {compiler}" if compiler else "off: no local rustc",
+            "grading": self._grader.state("rust"),
+        }
+
+    async def check_rust_support(self) -> dict[str, str]:
+        """Probe both now, at startup, and say what is missing.
+
+        Neither is looked at until the first Rust task arrives otherwise, so a
+        box with no toolchain and no daemon looks perfectly healthy -- the
+        fleet is up, the doctor is clean, `/health` answers -- right until a
+        Rust challenge is graded by nobody. That is the failure this miner is
+        least able to see and the operator most able to fix, so it is worth one
+        `which` and one `docker info` before serving.
+        """
+        await asyncio.to_thread(self._probe_rust)
+        support = self.rust_support()
+        blind = support["compile_gate"].startswith("off") and support[
+            "grading"
+        ].startswith("unavailable")
+        if blind:
+            print(
+                "[verify] WARN: no local rustc and no working Rust executor, so a "
+                "Rust answer is checked only by a grep for `fn main` before it is "
+                "submitted. Installing a toolchain restores the compile gate "
+                "without Docker; grading Rust needs the daemon."
+            )
+        else:
+            print(
+                f"[verify] rust: compile gate {support['compile_gate']}, "
+                f"grading {support['grading']}"
+            )
+        return support
+
+    def _probe_rust(self) -> None:
+        """Both lookups, in a worker thread. Neither is allowed to raise."""
+        rustc_path()
+        try:
+            self._grader.executor("rust")
+        except Exception:  # noqa: BLE001 - `_Grader` has already said why
+            pass
+
     def stats(self) -> dict[str, Any]:
         return {
             "solver": dict(self._counts),
             "providers": {k: dict(v) for k, v in self._by_provider.items()},
             "fleet": self._backend.stats(),
+            "rust": self.rust_support(),
         }
 
     async def aclose(self) -> None:

@@ -4662,6 +4662,209 @@ def test_the_executor_cache_is_built_once_even_under_concurrent_grades():
     assert len(set(map(id, seen))) == 1, "different threads got different executors"
 
 
+def test_an_executor_that_cannot_be_built_is_not_rebuilt_on_every_solve(capsys):
+    """The cache is written after `get_executor` RETURNS, so a constructor that
+    raises left nothing behind and every later solve repeated it.
+
+    For Rust without Docker that constructor is
+    `DockerExecutor._resolve_docker`, which shells out to `docker info`: 60ms
+    against a missing socket, and up to its own 20 second timeout against a
+    daemon that is hung or still starting — inside the solve's budget, per Rust
+    task, for the life of the process."""
+    from solvers.verify import _Grader
+
+    grader = _Grader()
+    tried: list[int] = []
+
+    def unavailable(settings, language):
+        tried.append(1)
+        raise RuntimeError("DockerExecutor could not contact the Docker daemon")
+
+    import rlvr.execution.executor as ex_mod
+    original = ex_mod.get_executor
+    ex_mod.get_executor = unavailable
+    try:
+        for _ in range(3):
+            with pytest.raises(RuntimeError, match="Docker daemon"):
+                grader.executor("rust")
+    finally:
+        ex_mod.get_executor = original
+
+    assert len(tried) == 1, f"probed the daemon {len(tried)} times, once per solve"
+    out = capsys.readouterr().out
+    assert out.count("could not be built") == 1, (
+        f"the once-per-run explanation was printed {out.count('could not be built')} "
+        f"times: {out}"
+    )
+    # And it says what it COSTS, not merely what failed: an operator reading
+    # one exception per solve has no way to tell that everything in the
+    # language is now going out ungraded.
+    assert "verified=False" in out and "repair rounds" in out, out
+
+
+def test_a_docker_daemon_started_after_the_miner_is_picked_up():
+    """The hold is a hold, not a verdict. Starting Docker after the miner is the
+    ordinary case, and a permanent answer would mean grading no Rust at all
+    until someone restarted the process."""
+    from solvers import verify as verify_mod
+    from solvers.verify import _Grader
+
+    grader = _Grader()
+    built = object()
+    calls: list[int] = []
+
+    def flaky(settings, language):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("no daemon yet")
+        return built
+
+    import rlvr.execution.executor as ex_mod
+    original, hold = ex_mod.get_executor, verify_mod.EXECUTOR_RETRY_S
+    ex_mod.get_executor = flaky
+    verify_mod.EXECUTOR_RETRY_S = 0.0     # the hold has elapsed
+    try:
+        with pytest.raises(RuntimeError):
+            grader.executor("rust")
+        assert grader.executor("rust") is built, "never tried again"
+        assert grader.executor("rust") is built, "the working executor is cached"
+    finally:
+        ex_mod.get_executor = original
+        verify_mod.EXECUTOR_RETRY_S = hold
+
+    assert len(calls) == 2, f"built {len(calls)} times; the second must be cached"
+
+
+def test_a_missing_executor_says_the_same_thing_on_live_traffic(capsys):
+    """Both grading paths print the same four words on purpose.
+
+    An operator counts those lines to decide whether a missing executor is
+    costing anything. Live traffic ships no public examples, so the only path
+    that can print is the model's-own-cases one — and while it said something
+    else, that count read zero while every answer in the language went out
+    ungraded."""
+    class _Unused:
+        async def open(self, avoid=None): raise AssertionError("not needed")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(_Unused(), max_attempts=1, safety_margin_s=0)
+
+    def unavailable(*a, **kw):
+        raise RuntimeError("DockerExecutor could not contact the Docker daemon")
+
+    solver._grader.check = unavailable
+    bare = SolveTask(
+        problem_id="p", language="python", statement="s", entrypoint="g",
+        public_examples=[], deadline_s=60.0,
+    )
+    candidate = solver._grade(
+        RIGHT, bare, 30.0, [{"args": [1], "kwargs": {}, "expected": 1}]
+    )
+    out = capsys.readouterr().out
+    assert candidate.code.strip(), "the answer was lost with the grading"
+    assert "local grading unavailable" in out, out
+
+
+def _stub_solver():
+    class _Unused:
+        async def open(self, avoid=None): raise AssertionError("not needed")
+        async def aclose(self): pass
+        def stats(self): return {"tabs": 1}
+
+    return VerifyingSolver(_Unused(), max_attempts=1, safety_margin_s=0)
+
+
+def test_a_box_with_neither_rust_check_says_so_before_it_costs_anything(capsys):
+    """Both Rust checks can be off at once, and nothing said so until a Rust
+    challenge had already been answered.
+
+    Without a local toolchain `compile_defect` returns None — which means
+    "could not tell", not "fine" — and without a daemon nothing grades. What is
+    left is `rust_defect`, a grep of a fenced block for `fn main`: a prompt
+    echo, a tool call and a program truncated mid-identifier all carry those
+    characters, and all three have been submitted."""
+    from solvers import verify as verify_mod
+
+    solver = _stub_solver()
+
+    def no_daemon(settings, language):
+        raise RuntimeError("could not contact the Docker daemon")
+
+    import rlvr.execution.executor as ex_mod
+    original, had_rustc = ex_mod.get_executor, verify_mod.rustc_path
+    ex_mod.get_executor = no_daemon
+    verify_mod.rustc_path = lambda: None
+    try:
+        support = asyncio.run(solver.check_rust_support())
+    finally:
+        ex_mod.get_executor = original
+        verify_mod.rustc_path = had_rustc
+
+    assert support["compile_gate"].startswith("off"), support
+    assert support["grading"].startswith("unavailable"), support
+    out = capsys.readouterr().out
+    assert "WARN" in out and "fn main" in out, out
+
+
+def test_a_working_toolchain_is_reported_rather_than_warned_about(capsys):
+    from solvers import verify as verify_mod
+
+    solver = _stub_solver()
+
+    import rlvr.execution.executor as ex_mod
+    original, had_rustc = ex_mod.get_executor, verify_mod.rustc_path
+    ex_mod.get_executor = lambda settings, language: object()
+    verify_mod.rustc_path = lambda: "/usr/bin/rustc"
+    try:
+        support = asyncio.run(solver.check_rust_support())
+    finally:
+        ex_mod.get_executor = original
+        verify_mod.rustc_path = had_rustc
+
+    assert support == {"compile_gate": "rustc at /usr/bin/rustc", "grading": "ready"}
+    out = capsys.readouterr().out
+    assert "WARN" not in out, out
+
+
+def test_solver_status_reports_the_rust_checks_without_probing_for_them():
+    """`/solver-status` is what an operator polls to find out whether the miner
+    is healthy. A `docker info` against a hung daemon blocks for twenty seconds,
+    so the endpoint must report what is already known and probe nothing."""
+    from solvers import verify as verify_mod
+
+    solver = _stub_solver()
+
+    def never(settings, language):
+        raise AssertionError("/solver-status probed the daemon")
+
+    import rlvr.execution.executor as ex_mod
+    original, had_rustc = ex_mod.get_executor, verify_mod.rustc_path
+    ex_mod.get_executor = never
+    verify_mod.rustc_path = lambda: None
+    try:
+        rust = solver.stats()["rust"]
+    finally:
+        ex_mod.get_executor = original
+        verify_mod.rustc_path = had_rustc
+
+    assert rust["grading"] == "not checked yet", rust
+    assert rust["compile_gate"].startswith("off"), rust
+
+
+def test_the_rust_checks_are_probed_before_serving_not_on_the_first_rust_task():
+    """At launch, beside the fleet's own warm-up, where someone is watching."""
+    from pathlib import Path
+
+    serve = Path(__file__).resolve().parent.joinpath("run_miner.py").read_text()
+    body = serve[serve.index("async def serve()"):serve.index("asyncio.run(serve())")]
+    assert "check_rust_support" in body, "the Rust checks are never probed"
+    assert body.index("await warm_up(") < body.index("check_rust_support"), (
+        "probe after the fleet: a browser that will not attach is the more "
+        "urgent failure and should print first"
+    )
+
+
 def test_a_compile_check_cannot_outlive_the_answer_it_is_checking():
     """`COMPILE_TIMEOUT_S` defaults to 25s — a hang guard sized for a compiler,
     not for a deadline. The solver's whole safety margin is 15s, and overrunning

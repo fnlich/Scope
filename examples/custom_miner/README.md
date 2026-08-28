@@ -1433,10 +1433,31 @@ fresh conversation.
 | `SOLVER_SAFETY_MARGIN_S` | `20` | Headroom kept before the cutoff, for `send`'s post-deadline phases and for grading, signing and transport |
 | `SOLVER_MAX_BUDGET_S` | `3600` | The protocol's own maximum for `deadline_s`, so it cannot bind on a spec-compliant request. Lowering it below the advertised deadline throws away answers the validator would still pay for |
 | `SOLVER_VERIFY_EXECUTOR` | `subprocess` | Python grading backend; Rust always uses Docker |
+| `SOLVER_EXECUTOR_RETRY_S` | `300` | How long an executor that could not be BUILT stays unavailable before a solve tries again. Without a daemon, building the Rust executor runs `docker info` — 60ms against a missing socket, up to 20s against a hung one — and it used to run once per Rust task, inside the solve's budget. A hold rather than a verdict: a daemon started after the miner is picked up on its own |
 | `GLM_REQUEST_TIMEOUT_S` | `3600` | The deadline `handle_request` answers **504** at, `min()`-ed with the validator's own. Named for the reference miner's GLM client but applied to whatever solver is plugged in. `docs/DEMO_MINER.md` documents `280` for that miner; leaving `280` in your `.env` costs the browser solver 20 seconds of every solve |
 
-`GET /solver-status` reports per-provider counters and fleet health. Watch it —
-a browser miner fails quietly, and silence looks identical to success.
+`GET /solver-status` reports per-provider counters, fleet health, and a `rust`
+section naming the two checks a Rust answer gets before it is submitted — the
+local compile gate and the grading executor. It reports what is already known
+and probes nothing, so polling it is cheap even when the Docker daemon is hung.
+Watch it — a browser miner fails quietly, and silence looks identical to
+success.
+
+Both Rust checks are also probed once at startup, right after the fleet warms
+up, because neither is otherwise looked at until a Rust challenge has already
+been answered:
+
+```text
+[verify] rust: compile gate rustc at /usr/bin/rustc, grading ready
+[verify] WARN: no local rustc and no working Rust executor, so a Rust answer is
+         checked only by a grep for `fn main` before it is submitted.
+```
+
+The second line is the one to act on. Without a toolchain `compile_defect`
+returns `None`, which means *could not tell* rather than *fine*, and without a
+daemon nothing grades — so what is left is `rust_defect` looking for `fn main`
+in a fenced block. Installing `rustc` restores the compile gate on its own and
+needs no Docker; grading Rust needs the daemon.
 
 ## Running under pm2
 

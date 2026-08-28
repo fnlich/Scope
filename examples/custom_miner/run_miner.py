@@ -148,6 +148,12 @@ def main() -> None:
         # Attach here, where a failure is visible, rather than lazily on the
         # first validator request.
         await warm_up(solver, settings.miner_max_concurrent_requests)
+        # Same argument, for the other half of a solve. Neither Rust check is
+        # looked at until a Rust challenge arrives, and a box with no toolchain
+        # and no Docker daemon has none of them: the answer would go out
+        # checked by a grep. One `which` and one `docker info`, here, where
+        # someone is watching.
+        await solver.check_rust_support()
         try:
             await server.serve()
         finally:
