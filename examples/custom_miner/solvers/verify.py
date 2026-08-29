@@ -598,7 +598,7 @@ class VerifyingSolver:
             if candidate is not None and candidate.score > best.score:
                 best = candidate
                 won_with = provider
-            if best.verified:
+            if best.verified and not best.failures:
                 break
             # Nothing RAN, whether or not anything was shipped to run. The
             # distinction used to be `not task.public_examples`, and that missed
@@ -657,7 +657,12 @@ class VerifyingSolver:
             self._counts["verified"] += 1
         if best.code.strip():
             self._counts["solved"] += 1
-            if best.verified and self._cache_size:
+            # `not best.failures` as well as `verified`: with both suites run,
+            # an answer can clear the validator's examples and still disagree
+            # with the model's own cases. Caching that re-serves one wrong
+            # answer for every later task with the same statement, which is the
+            # exact harm the cache gate exists to prevent.
+            if best.verified and not best.failures and self._cache_size:
                 if len(self._cache) >= self._cache_size:
                     self._cache.pop(next(iter(self._cache)))
                 self._cache[key] = (best.code, best.raw)
@@ -953,8 +958,9 @@ class VerifyingSolver:
                     # revision of one, and a fragment that happens to parse and
                     # tie must not displace the finished program above it.
                     best = candidate
-                if candidate.verified:
+                if candidate.verified and not candidate.failures:
                     break
+
                 if getattr(conversation, "still_writing", False):
                     # The model had not finished when the read stopped, so
                     # whatever is in hand is a fragment of an answer rather than
@@ -1216,20 +1222,8 @@ class VerifyingSolver:
             candidate.defect = defect
             candidate.code = "" if not code.strip() else code
             return candidate
-        if not task.public_examples:
-            # Nothing SHIPPED to verify against -- which is every task on live
-            # traffic -- so the only cases that can exist are the ones the model
-            # wrote for its own program. Running them is not verification and is
-            # never recorded as any: `passed`/`total` stay at zero, so `verified`
-            # stays False and the answer is never cached. What it does catch is
-            # the commonest failure by far, the model knowing what the answer
-            # should be and coding it wrong, and that is objectively checkable
-            # with the validator's own executor.
-            if self._self_tests and not out_of_budget and code.strip():
-                self._run_self_tests(candidate, task, cases)
-            return candidate
         if out_of_budget:
-            # The budget is gone, so running the examples buys nothing that can
+            # The budget is gone, so running anything buys nothing that can
             # still be acted on: there is no time for a repair round, and
             # `verified` never reaches the validator -- it feeds this process's
             # cache and its stats and nothing else. It is not free, either:
@@ -1238,19 +1232,52 @@ class VerifyingSolver:
             # rather than late. The check would be paid for with the answer it
             # was checking. The structural checks above already ran; they cost
             # microseconds and are what ranks this candidate.
-            print(
-                "[verify] out of budget before the examples could be run; "
-                "submitting the answer unverified"
-            )
+            if task.public_examples:
+                print(
+                    "[verify] out of budget before the examples could be run; "
+                    "submitting the answer unverified"
+                )
             return candidate
-        try:
-            passed, total, failures = self._grader.check(
-                code, task.language, task.entrypoint, task.public_examples
+
+        # BOTH suites, in this order, because turn 2 was asked to pass both:
+        # the validator's examples (in `<examples>`) and the model's own cases
+        # from turn 1 (in `<must_pass>`). Only one of them used to run. With
+        # examples shipped the own cases were quoted in the prompt and never
+        # executed, so a program right on the one example and wrong on its own
+        # boundary case verified, ended the loop and shipped -- the repair round
+        # that exists to catch exactly that never fired. Live traffic ships no
+        # examples, which is why it went unnoticed rather than why it was fine.
+        #
+        # The ORDER is the whole of the precedence. The validator's examples are
+        # ground truth: when they fail, the program is wrong, there is nothing
+        # to weigh, and the own cases are not run at all -- a second opinion
+        # from the same model on a program already known wrong tells us nothing
+        # and costs an executor run per case. Only once they are all green does
+        # a disagreement with the model's OWN cases become the open question,
+        # and `failures` then carries that instead. So `failures` names one
+        # suite at a time and `from_self_tests` says which, which is what lets
+        # the repair prompt ask for the right thing.
+        if task.public_examples:
+            try:
+                passed, total, failures = self._grader.check(
+                    code, task.language, task.entrypoint, task.public_examples
+                )
+            except Exception as exc:  # noqa: BLE001 - a broken grader loses no answer
+                print(f"[verify] local grading unavailable: {type(exc).__name__}: {exc}")
+                return candidate
+            candidate.passed, candidate.total, candidate.failures = (
+                passed, total, failures
             )
-        except Exception as exc:  # noqa: BLE001 - a broken grader must not lose the answer
-            print(f"[verify] local grading unavailable: {type(exc).__name__}: {exc}")
-            return candidate
-        candidate.passed, candidate.total, candidate.failures = passed, total, failures
+            if failures:
+                return candidate
+        # Running these is not verification and is never recorded as any:
+        # `passed`/`total` are the validator's examples alone, so `verified`
+        # cannot be earned by a model agreeing with itself. What they catch is
+        # the commonest failure by far -- the model knowing what the answer
+        # should be and coding it wrong -- and that is objectively checkable
+        # with the validator's own executor.
+        if self._self_tests and code.strip():
+            self._run_self_tests(candidate, task, cases)
         return candidate
 
     # -- what a Rust answer is actually checked with ----------------------- #

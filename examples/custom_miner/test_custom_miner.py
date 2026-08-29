@@ -7922,6 +7922,90 @@ def test_the_models_own_boundary_case_catches_a_wrong_program(capsys):
     assert "self=3/3" in capsys.readouterr().out
 
 
+# --------------------------------------------------------------------------- #
+# Turn 2 is asked to pass BOTH suites, so both have to be run.
+# --------------------------------------------------------------------------- #
+# The validator's examples and the model's own cases from turn 1 are both in
+# the turn-2 prompt -- `<examples>` and `<must_pass>`. Only one of them used to
+# be executed: the self-test path sat under `if not task.public_examples`, so a
+# task that SHIPPED examples had its own cases quoted and never run. Live
+# traffic ships none, which is why this went unnoticed rather than why it was
+# harmless.
+_WITH_EXAMPLES = SolveTask(
+    problem_id="both", language="python", statement="Sum the digits of n.",
+    entrypoint="g",
+    public_examples=[{"args": [12345], "kwargs": {}, "expected": 15}],
+    deadline_s=300.0,
+)
+# Right on the ONE example that shipped, wrong on the boundary cases the model
+# wrote for itself. Exactly the answer the two-phase split exists to catch.
+_PASSES_THE_EXAMPLE_ONLY = (
+    "```python\ndef g(n):\n    return 15 if n == 12345 else 99\n```"
+)
+
+
+def test_the_examples_and_the_models_own_cases_are_both_run(capsys):
+    """A program right on the shipped example and wrong on its own boundary
+    cases used to VERIFY, end the loop and ship. The repair round that exists
+    to catch precisely that never fired, because the cases were never run."""
+    solver, sent = _solver_seeing(
+        [_CASES_ONLY, _PASSES_THE_EXAMPLE_ONLY, _RIGHT_PROGRAM]
+    )
+    answer = asyncio.run(solver.solve_task(_WITH_EXAMPLES, timeout_s=300.0))
+
+    assert "while n > 0" in answer.code, f"shipped the half-right program: {answer.code!r}"
+    assert len(sent) == 3, f"the repair round never fired: {[t[:40] for t in sent]}"
+    assert "the test cases you sent" in sent[2], sent[2][:200]
+    out = capsys.readouterr().out
+    assert "examples=1/1" in out and "self=3/3" in out, out
+
+
+def test_the_validators_examples_are_settled_before_the_models_own_cases():
+    """Precedence, and it is not a detail. The examples shipped with the task
+    and are ground truth: when they fail the program is wrong, there is nothing
+    to weigh, and asking the model's own cases about it buys an executor run per
+    case to learn nothing.
+
+    It is also what keeps `failures` unambiguous. One suite at a time, with
+    `from_self_tests` saying which — that is what lets the repair prompt offer a
+    corrected `json` array where a case may be wrong, and refuse to where the
+    examples are ground truth."""
+    from types import SimpleNamespace
+
+    task = SimpleNamespace(
+        language="python", entrypoint="g", statement="s",
+        public_examples=[{"args": [12345], "kwargs": {}, "expected": 15}],
+    )
+    cases = [{"name": "zero", "args": [0], "expected": 0}]
+    solver, _ = _solver_seeing([])  # nothing is asked; only `_grade` is used
+
+    wrong = solver._grade("```python\ndef g(n):\n    return 0\n```", task, 300.0, cases)
+    assert wrong.passed == 0 and wrong.total == 1
+    assert wrong.self_total == 0, "ran the own cases on a program already known wrong"
+    assert wrong.from_self_tests is False, "a repair would have offered to fix a case"
+    assert "expected 15" in wrong.failures[0], wrong.failures
+
+    half = solver._grade(_PASSES_THE_EXAMPLE_ONLY, task, 300.0, cases)
+    assert half.verified, "the example did pass"
+    assert half.self_passed == 0 and half.self_total == 1
+    assert half.from_self_tests is True
+    assert "expected 0" in half.failures[0], half.failures
+
+
+def test_an_answer_that_fails_its_own_cases_is_never_cached():
+    """`verified` means the validator's examples were reproduced, and it gates
+    the answer cache. With both suites run it can now be True on an answer that
+    still disagrees with the model's own cases — and caching that re-serves one
+    wrong answer for every later task with the same statement, which is the
+    exact harm the gate exists to prevent."""
+    solver, _ = _solver_seeing([_CASES_ONLY, _PASSES_THE_EXAMPLE_ONLY])  # repeats
+    answer = asyncio.run(solver.solve_task(_WITH_EXAMPLES, timeout_s=300.0))
+
+    assert answer.code, "the answer still goes out — it is the best thing in hand"
+    assert answer.verified, "the shipped example really did pass"
+    assert solver._cache == {}, "cached an answer that fails its own cases"
+
+
 def test_correction_keeps_going_past_the_round_that_used_to_be_the_last():
     """`SOLVER_MAX_ATTEMPTS` was 3, so a solve got the cases turn, the program
     turn and exactly ONE repair. A count is a second, private deadline layered

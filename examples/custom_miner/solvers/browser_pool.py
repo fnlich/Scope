@@ -1013,19 +1013,21 @@ class _Tab:
     ) -> str:
         """Ask, then read. ``timeout_s`` is the slice; ``extend_to_s`` the cap.
 
-        They differ because the slice is an internal ALLOCATION, not a
-        deadline. The caller holds back part of its budget for a repair round,
-        and that reserve is well spent on an answer that arrived wrong. It is
-        worth nothing at all on one that has not finished arriving: the composer
-        is usually disabled mid-stream, and where it is not the prompt simply
-        queues behind the answer it is asking about.
-
-        So when the slice runs out with the model still writing, the read
+        They differ because a slice is an internal ALLOCATION rather than a
+        deadline. When the slice runs out with the model still writing, the read
         extends ONCE to ``extend_to_s`` -- the caller's real remaining budget --
-        rather than stopping to do something that cannot help. Waiting is the
-        only move that can still produce the answer, and the payment policy
-        agrees: a correct answer arriving late earns at least 95% of what the
-        fastest earns, and an unfinished one earns nothing.
+        rather than stopping to do something that cannot help: the composer is
+        usually disabled mid-stream, and where it is not the prompt simply
+        queues behind the answer it is asking about. Waiting is the only move
+        that can still produce the answer, and the payment policy agrees: a
+        correct answer arriving late earns at least 95% of what the fastest
+        earns, and an unfinished one earns nothing.
+
+        ``VerifyingSolver`` no longer slices. Every read it makes is given the
+        whole remaining budget, so it passes no ``extend_to_s`` and there is
+        nothing here to extend into -- ``timeout_s`` IS the request's deadline,
+        less what delivering the answer costs. The parameter stays for a caller
+        that does hand out less than everything.
         """
         if not self.alive:
             # The pool has not recycled this tab yet. Retrying a known-dead tab
@@ -1163,14 +1165,15 @@ class _Tab:
             # `hard <= deadline` is also what makes this happen at most once:
             # the extension below sets them equal.
             #
-            # `not saw_reply` extends too, and it is the case the slice serves
-            # worst. The slice holds part of the budget back for a repair round
-            # -- worth having when there is an answer to repair, worth nothing
-            # when nothing has arrived at all. A model that thinks before it
-            # writes renders nothing while it thinks (77 seconds, measured on a
-            # live tab), so stopping at the slice with an empty page trades an
-            # answer that was still coming for a reserve there is nothing to
-            # spend.
+            # `not saw_reply` extends too, and it is the case a slice serves
+            # worst: a model that thinks before it writes renders nothing while
+            # it thinks (77 seconds, measured on a live tab), so stopping at the
+            # slice with an empty page trades an answer that was still coming
+            # for time there is nothing left to spend it on.
+            #
+            # With no slice -- which is every read `VerifyingSolver` makes now
+            # -- `hard` equals `deadline` and none of this runs: the first test
+            # returns True and the read has already had the whole budget.
             if hard <= deadline or not (last_busy or grew or not saw_reply):
                 return True
             deadline = hard

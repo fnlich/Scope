@@ -1140,6 +1140,36 @@ code. That class stays uncaught. What it catches is the commoner one by far —
 the model knowing what the answer should be and coding it wrong — and that is
 objectively checkable.
 
+### Turn 2 is asked to pass both suites, so both are run
+
+The validator's examples and the model's own cases are both in the turn-2
+prompt — `<examples>` and `<must_pass>`. Only one of them used to be executed:
+the self-test path sat under `if not task.public_examples`, so a task that
+**shipped** examples had its own cases quoted and never run. A program right on
+the one example and wrong on its own boundary cases verified, ended the loop and
+shipped, and the repair round that exists to catch precisely that never fired.
+Live traffic ships no examples, which is why it went unnoticed rather than why
+it was harmless.
+
+The **order** is the whole of the precedence:
+
+1. The validator's examples first. They shipped with the task and are ground
+   truth — when they fail, the program is wrong, there is nothing to weigh, and
+   the own cases are not run at all. A second opinion from the same model on a
+   program already known wrong tells you nothing and costs an executor run per
+   case.
+2. Only once those are all green does a disagreement with the model's **own**
+   cases become the open question, and `failures` carries that instead.
+
+So `failures` names one suite at a time and `from_self_tests` says which — which
+is exactly what lets the repair prompt offer a corrected `json` array where a
+case may be wrong, and refuse to where the examples are ground truth.
+
+`verified` still means what it always meant: every public example reproduced. It
+can now be True on an answer that still disagrees with the model's own cases, so
+the answer **cache** is gated on `not failures` as well — caching one of those
+re-serves a wrong answer for every later task with the same statement.
+
 So `self_passed` is kept in its own field. It never touches `passed`/`total`,
 `verified` stays False, and the answer is never cached: one wrong answer that
 matched its own wrong cases must not be re-served for every later task with the
