@@ -42,6 +42,7 @@ from rlvr.types import TestCase
 from .prompts import (
     build_code_prompt,
     build_repair_prompt,
+    build_resume_prompt,
     build_tests_prompt,
     extract_code,
     extract_self_tests,
@@ -63,6 +64,12 @@ VERIFY_TIMEOUT_S = float(os.environ.get("SOLVER_VERIFY_TIMEOUT_S", "5"))
 # stop paying for the probe, short enough that a box the operator has just
 # fixed heals on its own.
 EXECUTOR_RETRY_S = float(os.environ.get("SOLVER_EXECUTOR_RETRY_S", "300"))
+
+# What a repair needs to be worth carrying to a FRESH conversation: a tab, a
+# prompt that restates the whole problem, and a read long enough to answer it.
+# More than the 12s an in-conversation round trip needs, because none of that
+# is warm.
+RESUME_FLOOR_S = 40.0
 
 
 class Conversation(Protocol):
@@ -261,8 +268,15 @@ class _Grader:
         if language in self._reported:
             return
         self._reported.add(language)
-        fix = ""
-        if language == "rust":
+        # The hint, not just the error. A daemon that is UP and unreachable
+        # reports exactly like one that is not running -- read off a production
+        # run, where every Rust answer went out ungraded behind "permission
+        # denied ... /var/run/docker.sock", which is a group membership and not
+        # a broken install.
+        from .rehearse import _executor_hint
+
+        fix = _executor_hint(exc) or ""
+        if not fix and language == "rust":
             fix = (
                 " Rust has no subprocess path — grading it at all needs a Docker "
                 "daemon; see the README's \"Rust needs Docker\" section."
@@ -270,8 +284,9 @@ class _Grader:
         print(
             f"[verify] the {language} executor could not be built, so no {language} "
             f"answer can be graded here: no repair rounds, and verified=False "
-            f"however good the answer is. {type(exc).__name__}: {exc}{fix} Not "
-            f"probing again for {EXECUTOR_RETRY_S:.0f}s. Once per run."
+            f"however good the answer is. Not probing again for "
+            f"{EXECUTOR_RETRY_S:.0f}s. Once per run.\n"
+            f"           {type(exc).__name__}: {exc}{fix}"
         )
 
     def check(
@@ -821,6 +836,8 @@ class VerifyingSolver:
             # The program the LAST round produced, so a repair that corrects a
             # case can be told apart from one that rewrites both.
             last_code: Optional[str] = None
+            # A repair may be carried to a fresh conversation ONCE per pass.
+            resumed = False
             for attempt in range(1, self._max_attempts + 1):
                 left = budget - (time.monotonic() - started)
                 if attempt > 1 and left < 12.0:
@@ -989,11 +1006,56 @@ class VerifyingSolver:
                     # empty one always carries a `defect`, because the
                     # structural checks reject empty source exactly as they
                     # reject a broken program. Only the tab knows.
+                    reason = getattr(conversation, "empty_reason", "?")
+                    left_now = budget - (time.monotonic() - started)
+                    if (
+                        reason == "unreadable"
+                        and not resumed
+                        and best is not None
+                        and best.code.strip()
+                        and (best.failures or best.defect)
+                        and left_now >= RESUME_FLOOR_S
+                    ):
+                        # The conversation is gone; the REPAIR is not. Carry it
+                        # to a fresh tab rather than submitting an answer whose
+                        # failures nobody asked the model to fix. Measured over
+                        # a production run: fifteen solves ended exactly here,
+                        # each holding a candidate that failed its own cases,
+                        # with an average of 129 seconds still on the clock.
+                        #
+                        # Once per pass. A tab that dies on the resume too is a
+                        # fleet problem, not something to keep paying for.
+                        resumed = True
+                        print(
+                            f"[verify] {provider or 'this model'} returned nothing "
+                            f"and that conversation is unreadable; carrying the "
+                            f"repair to a fresh one with {left_now:.0f}s left"
+                        )
+                        try:
+                            await conversation.close()
+                        except Exception:  # noqa: BLE001 - it is already broken
+                            pass
+                        conversation = await self._backend.open(avoid=None)
+                        provider = getattr(conversation, "provider", provider)
+                        prompt = build_resume_prompt(
+                            task.language, task.statement, task.entrypoint,
+                            task.public_examples, agreed, best.code,
+                            best.failures, defect=best.defect,
+                            from_self_tests=best.from_self_tests,
+                        )
+                        continue
+                    # No repair to carry, or nothing left to carry it with. Say
+                    # which -- this line used to promise that somebody else
+                    # would be asked, and when an answer was already in hand
+                    # `solve_task` submitted it instead and asked nobody.
                     print(
                         f"[verify] {provider or 'this model'} returned nothing and "
-                        f"the conversation is "
-                        f"{getattr(conversation, 'empty_reason', '?')}; asking "
-                        f"elsewhere rather than repairing it"
+                        f"the conversation is {reason}; "
+                        + (
+                            f"submitting the answer already in hand"
+                            if best is not None and best.code.strip()
+                            else "asking elsewhere"
+                        )
                     )
                     break
                 if not candidate.defect and not candidate.failures:

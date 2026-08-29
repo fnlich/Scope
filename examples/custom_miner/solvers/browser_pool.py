@@ -1082,19 +1082,34 @@ class _Tab:
         grew = False
         last_whole: Optional[str] = None
         def out_of_time() -> bool:
-            """Stop reading? Extends once, and only mid-answer."""
+            """Stop reading? Extends once, while the answer may still arrive."""
             nonlocal deadline
             if time.monotonic() < deadline:
                 return False
             # `hard <= deadline` is also what makes this happen at most once:
             # the extension below sets them equal.
-            if hard <= deadline or not (last_busy or grew):
+            #
+            # `not saw_reply` extends too, and it is the case the slice serves
+            # worst. The slice holds part of the budget back for a repair round
+            # -- worth having when there is an answer to repair, worth nothing
+            # when nothing has arrived at all. A model that thinks before it
+            # writes renders nothing while it thinks (77 seconds, measured on a
+            # live tab), so stopping at the slice with an empty page trades an
+            # answer that was still coming for a reserve there is nothing to
+            # spend.
+            if hard <= deadline or not (last_busy or grew or not saw_reply):
                 return True
             deadline = hard
             print(
-                f"[{self.site.name}] tab {self.label} is still writing at its "
-                f"{timeout_s:.0f}s slice; reading on to {hard - started:.0f}s rather "
-                f"than interrupting an answer that is still arriving."
+                f"[{self.site.name}] tab {self.label} "
+                + ("is still writing at" if saw_reply else "has rendered nothing by")
+                + f" its {timeout_s:.0f}s slice; reading on to "
+                f"{hard - started:.0f}s rather than "
+                + (
+                    "interrupting an answer that is still arriving."
+                    if saw_reply
+                    else "abandoning an answer that may still arrive."
+                )
             )
             return time.monotonic() >= deadline
 
@@ -1127,33 +1142,34 @@ class _Tab:
                 if on_screen:
                     saw_reply = True
                 elif (
-                    not saw_reply
+                    not blind
                     and time.monotonic() - submitted_at >= BLIND_TAB_GRACE_S
                 ):
                     # Nothing has rendered in the time a working tab needs to
-                    # paint an empty bubble. Polling on is not patience, it is
-                    # the rest of the budget: stop, and let the caller ask
-                    # somebody else while there is still time to.
+                    # paint an empty bubble. That is worth SAYING and it is not
+                    # worth acting on, and the difference cost a run.
                     #
-                    # `alive` is NOT cleared here, and that is the whole point
-                    # of the distinction. Retiring the tab now would skip the
-                    # copy control and the network stream, and those are read by
-                    # other means than the selector that just failed -- the
-                    # stream especially, which is captured off the wire by CDP
-                    # and has never touched the DOM. `_reconcile_stream` exists
-                    # for exactly this case and says so: "a selector that
-                    # stopped matching, a render this tab cannot see". Nine
-                    # bounded seconds there can turn this zero into the whole
-                    # payment. The tab is retired at the single exit below,
-                    # after they have had their say.
+                    # It used to stop the read here and retire the tab, on the
+                    # reasoning that the budget was better spent elsewhere.
+                    # Measured over a live run: every one of eighteen tabs this
+                    # fired on had its answer recovered off the wire moments
+                    # later -- the model was not silent, the DOM was late. So
+                    # the answer was never what the bail saved; what it threw
+                    # away was the CONVERSATION, and with it every repair round
+                    # that solve could still have run. Fifteen answers went out
+                    # with failing cases and an average of 129 unused seconds.
+                    #
+                    # A model that thinks before it writes renders nothing for
+                    # as long as it thinks -- 77 seconds, measured on a live
+                    # tab. There is no per-turn deadline to protect here, only
+                    # the request's own, so the read waits for the answer.
                     blind = True
                     print(
-                        f"[{self.site.name}] tab {self.label} showed no reply at all "
-                        f"in {BLIND_TAB_GRACE_S:.0f}s; giving up on it now rather "
-                        f"than at the deadline, so the rest of the budget can go to "
-                        f"another tab."
+                        f"[{self.site.name}] tab {self.label} has shown no reply yet "
+                        f"after {BLIND_TAB_GRACE_S:.0f}s — still waiting. A model "
+                        f"that thinks before it writes renders nothing while it "
+                        f"thinks, and the answer may also arrive off the wire."
                     )
-                    break
                 if text_now is not None:
                     best = text_now  # keep it even mid-generation
                 if busy or text_now is None:
@@ -1266,13 +1282,13 @@ class _Tab:
                     f"checking the answer against the network stream in "
                     f"{STREAM_PHASE_TIMEOUT_S:.0f}s. Submitting what the page gave."
                 )
-        if blind:
-            # Now, and not before: the recovery phases above needed a tab that
-            # was still allowed to be read. Whatever they found, the DOM here is
-            # unreadable and the next task on this tab would spend another
-            # BLIND_TAB_GRACE_S discovering that. Retire it; the pool spawns a
-            # replacement in the background.
-            self.alive = False
+        # A tab that showed no reply is NOT retired here, and that is the
+        # point. Retiring it threw away the conversation the repair loop needs
+        # -- and the tab was usually fine: the page rendered late, or not at
+        # all, while the answer came off the wire. A tab is dead when the PAGE
+        # dies (the read above clears `alive`) or when the prompt cannot be put
+        # into it (`send` clears it on a failed submit). Being slow to paint is
+        # neither.
         if best and self._is_our_own_prompt(best):
             # Last line of defence, at the ONE exit, because everything above
             # it can produce a submission and only one of them was guarded.

@@ -6280,54 +6280,60 @@ def test_the_file_follows_the_payload_even_if_fit_response_rewrites_the_code(tmp
 # earns nothing at all. Every test below pins one of the places the miner used
 # to stop early and hand the validator an empty response it would have paid for.
 # --------------------------------------------------------------------------- #
-def test_a_tab_that_never_renders_a_reply_is_dropped_in_seconds_not_at_the_deadline():
-    """Measured twice in one live run, on two different sites:
+def test_a_tab_that_renders_nothing_is_waited_for_and_kept():
+    """The reverse of what this file used to assert, and a live run is why.
 
-        chatgpt tab 9227: no assistant selector matched anything
-        claude  tab 9222: matched 1 message(s), the same as before the prompt
-                          was sent -- the answer never rendered
+    Giving up on a tab that had painted nothing after a grace period looked
+    free: the recovery phases still ran, so the ANSWER was not lost. What was
+    lost was the CONVERSATION. Over one production run the bail fired eighteen
+    times, the wire produced the answer in nearly every one — the model was not
+    silent, the DOM was late — and each of those solves then had its repair
+    round sent into a tab that had just been retired. Fifteen answers went out
+    with failing cases and an average of 129 unused seconds behind them.
 
-    Both polled a tab that could not be read for the whole 191s first slice,
-    then spent a 29s repair round on the same dead conversation, and ended the
-    task with 5s left -- fewer than the 20s a second opinion needs. Five healthy
-    tabs sat idle through both. The task scored zero.
+    A model that thinks before it writes renders nothing for as long as it
+    thinks: 77 seconds, measured on a live tab. There is no per-turn deadline
+    to protect, only the request's own. So the read waits, and the tab stays.
 
-    The distinction that makes this fixable is `on_screen`: a model that is
-    merely slow has ALREADY painted its bubble, so it is never mistaken for
-    this. The tab here paints nothing, ever.
+    A tab is dead when the PAGE dies or the prompt cannot be submitted into it.
+    Being slow to paint is neither.
     """
     playwright, chrome = _chromium_or_skip()
-    # A composer and a send button, and a send that renders nothing at all.
     url = _served(
         '<!doctype html><meta charset="utf-8">'
         '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
     )
     site = _site(assistant=("#assistant",))  # matches nothing, now and forever
 
-    async def go(grace):
+    async def go(grace, budget):
         async with playwright.async_playwright() as p:
             browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
             page = await (await browser.new_context()).new_page()
             await page.goto(url)
             tab = _tab(page, site)
             real, _browser_pool.BLIND_TAB_GRACE_S = _browser_pool.BLIND_TAB_GRACE_S, grace
+            chatter = io.StringIO()
             try:
                 started = time.monotonic()
-                reply = await tab.send("solve it", 120.0)
+                with contextlib.redirect_stdout(chatter):
+                    reply = await tab.send("solve it", budget)
                 elapsed = time.monotonic() - started
             finally:
                 _browser_pool.BLIND_TAB_GRACE_S = real
                 await browser.close()
-            return reply, elapsed, tab.alive
+            return reply, elapsed, tab.alive, chatter.getvalue()
 
-    reply, elapsed, alive = asyncio.run(go(2.0))
+    reply, elapsed, alive, log = asyncio.run(go(1.0, 6.0))
     assert reply == "", f"there was nothing on the page to capture: {reply!r}"
-    assert elapsed < 30.0, (
-        f"the send spent {elapsed:.1f}s of a 120s budget on a tab that showed "
-        f"nothing. That time is the whole point: it belongs to another tab."
+    assert elapsed >= 5.0, (
+        f"stopped after {elapsed:.1f}s of a 6s budget instead of waiting for an "
+        f"answer that may still have been on its way"
     )
-    assert alive is False, "an unreadable tab must be retired, not handed back"
-
+    assert alive is True, (
+        "a tab that is merely slow to paint was retired; the conversation the "
+        "repair loop needs went with it"
+    )
+    assert "still waiting" in log, log
 
 def test_the_tab_says_WHY_a_send_came_back_empty():
     """`""` is the same string for three different failures, and only one of
@@ -6885,10 +6891,13 @@ def test_a_blind_tab_still_gets_its_answer_off_the_wire():
 
     reply, alive, reason = asyncio.run(go(1.0))
     assert "return 4" in extract_code(reply, "pong"), (
-        f"the DOM was unreadable and the answer was on the wire, and the tab was "
-        f"retired before anything looked: {reply!r}"
+        f"the DOM was unreadable and the answer was on the wire, and nothing "
+        f"looked: {reply!r}"
     )
-    assert alive is False, "the DOM is still unreadable; the tab is finished"
+    assert alive is True, (
+        "the tab was retired after the wire had just proved the model was "
+        "answering it — and the repair round for this solve dies with it"
+    )
     assert reason is None, "an answer came back, so there is no empty to explain"
 
 
@@ -8374,6 +8383,121 @@ def test_a_fragment_never_displaces_the_finished_program_it_ties_with():
     assert "v = 1" in answer.code, (
         f"a fragment displaced the finished program: {answer.code!r}"
     )
+
+
+def test_a_repair_survives_the_conversation_that_produced_it():
+    """Read off a production run, fifteen times in one log.
+
+    A tab paints nothing, the answer is recovered off the wire, the tab is
+    finished — and the repair round is then sent into it and comes straight
+    back empty, because a dead conversation answers instantly. The solve ended
+    there, submitting a program that failed its own cases, with an average of
+    129 seconds still on the clock. `simplify_dataflow` went out at 0/20 with
+    118 seconds unspent.
+
+    The conversation is gone; the repair is not. It moves to a fresh one,
+    carrying the problem and the program with it, because a new tab has no
+    history to refer back to."""
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "sum", "args": [12345], "expected": 15}]\n```')
+    wrong = "```python\ndef g(n):\n    return 0\n```"
+    right = "```python\ndef g(n):\n    return sum(int(c) for c in str(abs(n)))\n```"
+
+    sent, opened = [], []
+
+    class _Chat:
+        """Dies after answering, exactly as a tab does once its page is gone."""
+        provider = "claude"
+        still_writing = False
+
+        def __init__(self, replies):
+            self.replies, self.n, self.alive = replies, -1, True
+            self.empty_reason = None
+            opened.append(self)
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            sent.append(text)
+            if not self.alive:                    # what a retired tab returns
+                self.empty_reason = "unreadable"
+                return ""
+            self.n += 1
+            reply = self.replies[min(self.n, len(self.replies) - 1)]
+            if self.n >= 1:
+                self.alive = False                # the page died on the answer
+            return reply
+
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None):
+            return _Chat([cases, wrong] if not opened else [right])
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        answer = asyncio.run(
+            VerifyingSolver(_Fleet(), second_opinion=False).solve_task(
+                SolveTask(problem_id="p", language="python",
+                          statement="Sum the decimal digits of n.", entrypoint="g",
+                          public_examples=[], deadline_s=300.0),
+                timeout_s=300.0,
+            )
+        )
+    log = chatter.getvalue()
+
+    assert len(opened) == 2, f"never opened a fresh conversation: {len(opened)}"
+    assert "carrying the repair to a fresh one" in log, log
+    # The fresh tab has no history, so the message must carry the problem AND
+    # the program it is being asked to fix.
+    resume = sent[-1]
+    assert "<previous_attempt" in resume, resume[:200]
+    assert "return 0" in resume, "the program to be fixed was not carried over"
+    assert "Sum the decimal digits" in resume, "a fresh tab was sent no problem"
+    # ...and the repaired answer is the one that goes out.
+    assert "self=2/2" in log, log
+    assert "int(c) for c in" in answer.code, answer.code
+
+
+def test_a_dead_conversation_with_nothing_to_repair_says_what_it_does():
+    """The line that used to promise a second opinion it never asked for.
+
+    With an answer already in hand and nothing gradeable, `solve_task` submits
+    and stops — so "asking elsewhere rather than repairing it" described
+    something that did not happen, on fifteen solves in one log."""
+    program = "```python\ndef g(n):\n    return n\n```"
+
+    class _Chat:
+        provider = "claude"
+        still_writing = False
+        def __init__(self):
+            self.n, self.alive, self.empty_reason = -1, True, None
+        async def send(self, text, timeout_s, extend_to_s=None):
+            if not self.alive:
+                self.empty_reason = "unreadable"
+                return ""
+            self.n += 1
+            if self.n >= 1:
+                self.alive = False
+            return ["```json\n[]\n```", program][min(self.n, 1)]
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        asyncio.run(
+            VerifyingSolver(_Fleet(), second_opinion=False).solve_task(
+                SolveTask(problem_id="p", language="python", statement="s",
+                          entrypoint="g", public_examples=[], deadline_s=300.0),
+                timeout_s=300.0,
+            )
+        )
+    log = chatter.getvalue()
+    assert "asking elsewhere rather than repairing it" not in log, log
 
 
 def test_a_repair_cannot_pass_a_bar_it_rewrote_in_the_same_breath():

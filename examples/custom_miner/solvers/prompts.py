@@ -474,6 +474,49 @@ def build_code_prompt(
     return "\n".join(parts)
 
 
+def build_resume_prompt(
+    language: str,
+    statement: str,
+    entrypoint: str,
+    examples: list[dict[str, Any]],
+    cases: Optional[Sequence[dict[str, Any]]],
+    code: str,
+    failures: list[str],
+    defect: Optional[str] = None,
+    from_self_tests: bool = False,
+) -> str:
+    """A repair round for a conversation that no longer exists.
+
+    Repairs normally stay inside one conversation, because the model can see
+    its own previous attempt there and the prompt need only carry what went
+    wrong. When the tab that produced the answer cannot be used again -- the
+    prompt will not go into it, or the page died -- that context is gone with
+    it, and the round used to be abandoned along with it. Measured over a
+    production run: fifteen answers went out carrying failures nobody had asked
+    the model to fix, with an average of 129 seconds of budget unspent.
+
+    So the whole conversation is reconstituted in one message: the problem as
+    turn 2 states it, the program that was produced, and what happened when it
+    ran. A fresh tab has no history, so nothing here may assume any.
+    """
+    base = build_code_prompt(language, statement, entrypoint, examples, cases=cases)
+    report = build_repair_prompt(
+        failures, language, entrypoint, defect=defect, from_self_tests=from_self_tests
+    )
+    return "\n".join([
+        base,
+        "",
+        '<previous_attempt note="YOUR program, from a conversation that ended '
+        'before it could be corrected. This is what happened when I ran it.">',
+        f"```{'rust' if language == 'rust' else 'python'}",
+        code.strip(),
+        "```",
+        "",
+        report,
+        "</previous_attempt>",
+    ])
+
+
 def build_repair_prompt(
     failures: list[str],
     language: str,
