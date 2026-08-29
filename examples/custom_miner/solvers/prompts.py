@@ -536,7 +536,8 @@ def build_repair_prompt(
             "silently: a repair that fixes one case and breaks another is still "
             "wrong. Reply with the corrected program block. "
             "If it was the CASE that was wrong, add a second `json` block "
-            "holding the corrected cases; otherwise send the program alone."
+            "holding the COMPLETE corrected list of cases — all of them, not "
+            "only the ones you changed; otherwise send the program alone."
         )
     else:
         detail = "\n".join(f"  - {line}" for line in failures)
@@ -635,7 +636,17 @@ def _parse_cases(block: str, language: str) -> list[dict[str, Any]]:
     """
     text = block.strip()
     if not text.startswith("["):
-        return []
+        # One leaked language chip, and no more. A copy control that hands back
+        # `json\n[{...}]` would otherwise fail the fast path and drop the
+        # array -- and on a repair round that array is the corrected cases,
+        # so losing it means the same wrong case breaks the program again on
+        # every remaining round.
+        head, _, rest = text.partition("\n")
+        if head.strip().casefold() not in ("json", "jsonc", "json5"):
+            return []
+        text = rest.strip()
+        if not text.startswith("["):
+            return []
     try:
         raw = json.loads(text)
     except Exception:  # noqa: BLE001 - a model wrote it; anything is possible

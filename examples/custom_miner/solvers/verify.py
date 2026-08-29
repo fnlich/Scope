@@ -818,6 +818,9 @@ class VerifyingSolver:
             # with no answer. A crash that looks like a dead tab is the worst
             # kind, so the line does not depend on the guard above surviving.
             agreed = list(cases or [])
+            # The program the LAST round produced, so a repair that corrects a
+            # case can be told apart from one that rewrites both.
+            last_code: Optional[str] = None
             for attempt in range(1, self._max_attempts + 1):
                 left = budget - (time.monotonic() - started)
                 if attempt > 1 and left < 12.0:
@@ -853,15 +856,41 @@ class VerifyingSolver:
                     reply = await conversation.send(prompt, slice_s, extend_to_s=left)
                 else:
                     reply = await conversation.send(prompt, slice_s)
-                candidate = await self._graded(
-                    reply, task, budget - (time.monotonic() - started), agreed
-                )
                 # A repair reply may carry a CORRECTED case array: the repair
                 # prompt says so outright ("if the case was wrong, fix the case
                 # and leave the program alone"). Freezing turn 1's cases would
                 # kill that escape hatch and let one wrong case break a correct
                 # program on every round.
+                #
+                # WHEN it takes effect differs by the shape the repair came
+                # back in, and both shapes matter.
+                #
+                # Program UNCHANGED, cases corrected -- exactly what was asked
+                # for. Applied to this same reply, because the alternative is to
+                # report the identical failure it was sent to fix: the round is
+                # spent, the next prompt quotes the same disagreement, and the
+                # correction lands only on the round after -- which, at
+                # SOLVER_MAX_ATTEMPTS=3, may not exist. Measured on a live
+                # solve: turn 1 wrote three cases whose `final_records` order
+                # was wrong, the program was right, the model corrected the
+                # cases exactly as asked, and the answer still went out
+                # reported 17/20. Nothing is conceded by grading it now: the
+                # program is the one already judged, so a weakened case cannot
+                # launder a rewrite that did not happen.
+                #
+                # Program CHANGED as well -- the one thing the prompt forbids
+                # ("Do not change both to make them agree"). That reply is
+                # graded against the bar as it stood BEFORE it arrived, so a
+                # model cannot make a rewritten program pass by rewriting the
+                # bar in the same breath. Its cases apply from the next round.
                 revised = extract_self_tests(reply, task.entrypoint, task.language)
+                now_code = extract_code(reply, task.entrypoint, task.language).strip()
+                if revised and last_code is not None and now_code == last_code:
+                    agreed, revised = revised, None
+                candidate = await self._graded(
+                    reply, task, budget - (time.monotonic() - started), agreed
+                )
+                last_code = now_code
                 if revised:
                     agreed = revised
                 if best is None or candidate.score > best.score:

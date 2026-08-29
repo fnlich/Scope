@@ -4086,15 +4086,17 @@ def test_both_nudges_use_the_last_word_to_demand_code_first():
         assert site.nudge.startswith(
             "START your reply with the fenced block"
         ), site.nudge[:70]
-        # The nudge holds the recency slot AND is appended to every send, so a
-        # layout named here overrides the contract that named a different one.
-        # Both turns ask for ONE block, so that is what it may say -- and it
-        # said "the ordinary fenced block or blocks", which is the softer half
-        # of the contradiction a model resolves by emitting a second block.
-        assert "ONE ordinary fenced block" in site.nudge, site.nudge
-        for layout in ("or blocks", "two ordinary fenced blocks", "program first",
-                       "JSON cases second"):
-            assert layout not in site.nudge, f"{site.name}: nudge pins {layout!r}"
+        # The nudge holds the recency slot AND is appended to EVERY send, so
+        # any count named here overrides the contract of whichever turn it
+        # happens to ride on. Both solve turns ask for one block; a repair
+        # round may ask for a corrected `json` block beside the program. So it
+        # names no count at all and defers to the message above it -- pinning
+        # "ONE" here told a repair round to send the program alone, and a model
+        # obeying that can never correct a case that was wrong.
+        assert "the message above asks for" in site.nudge, site.nudge
+        for pinned in ("ONE ordinary fenced block", "two ordinary fenced blocks",
+                       "program first", "JSON cases second"):
+            assert pinned not in site.nudge, f"{site.name}: nudge pins {pinned!r}"
         # And it does not hurry the model. Correctness is the whole payment;
         # "an answer that arrives after a paragraph of prose may not arrive at
         # all" traded the thing being paid for against a thing that is not.
@@ -8243,13 +8245,15 @@ def test_a_repair_may_correct_a_case_the_first_turn_got_wrong():
     one of them can simply be wrong. Freeze those cases and a CORRECT program
     fails the same bogus case on every repair round, burns all three attempts,
     and is submitted with `verified=False` — the exact failure the two-turn
-    split was supposed to remove. So the repair prompt says outright to fix the
-    case and leave the program alone, and a repair reply carrying a corrected
-    array replaces the frozen one for the next round.
+    split was supposed to remove.
 
-    The correction lands on the NEXT round, not the one that carried it: a
-    reply is graded against the cases that were agreed BEFORE it arrived, so a
-    model cannot make its program pass by rewriting the bar in the same breath.
+    The correction lands on the reply that CARRIES it, because the program came
+    back unchanged — which is precisely what the repair prompt asked for. Read
+    off a live solve: turn 1 wrote three cases whose `final_records` order was
+    wrong, the program was right, the model corrected the cases exactly as
+    asked, and the miner still reported 17/20 because it graded that reply
+    against the cases it had just corrected. The round after would have fixed
+    it; the tab died first, and there was no round after.
     """
     right = "```python\ndef g(n):\n    s = 0\n    while n > 0:\n        s += n % 10\n        n //= 10\n    return s\n```"
     # "zero" is wrong -- the digits of 0 sum to 0, not 99. A correct program
@@ -8265,25 +8269,78 @@ def test_a_repair_may_correct_a_case_the_first_turn_got_wrong():
             300.0,
             [bad,                     # turn 1: cases, one of them bogus
              right,                   # attempt 1: correct program, fails "zero"
-             right + "\n\n" + fixed,  # attempt 2: same program, corrected case
-             right],                  # attempt 3: graded against the CORRECTION
+             right + "\n\n" + fixed,  # attempt 2: SAME program, corrected case
+             right],                  # never needed
         )
     log = chatter.getvalue()
 
-    assert len(prompts) == 4, [p[:40] for p in prompts]
     assert "while n > 0" in answer.code
-    # The last round ran the CORRECTED array and cleared it. Freeze turn 1's
-    # cases and this reads `self=1/2` forever, however right the program is.
     assert "self=2/2" in log, log
-
-    # Attempt 2 was still judged against the bogus case: the repair prompt it
-    # was sent quotes the failure, so the correction it carries cannot grade
-    # the reply that carried it.
-    assert "99" in prompts[2], prompts[2][:400]
+    # Three sends, not four: cases, program, one repair. The correction was
+    # applied to the reply that carried it, so the loop had nothing left to
+    # complain about and stopped.
+    assert len(prompts) == 3, [p[:40] for p in prompts]
     # And the repair prompt is what tells the model correcting a case is
     # allowed at all -- without that sentence the model rewrites the program.
+    assert "99" in prompts[2], prompts[2][:400]
     assert "fix the case" in prompts[2].lower(), prompts[2][:800]
+    # It must ask for the WHOLE array back, since the reply replaces the bar
+    # outright -- a model resending only the cases it changed would silently
+    # delete the rest.
+    assert "COMPLETE corrected list of cases" in prompts[2]
 
+
+def test_a_leaked_language_chip_does_not_cost_the_corrected_cases():
+    """`_parse_cases` fast-paths on a leading `[`, and a copy control that hands
+    back its own language label ahead of the array fails that test.
+
+    Everywhere else a dropped JSON block costs nothing — it was never the
+    answer. On a repair round it is the CORRECTED cases, and losing them means
+    the same wrong case breaks a correct program on every round that remains."""
+    from solvers.prompts import extract_self_tests
+
+    array = '[{"name": "zero", "args": [0], "expected": 0}]'
+    program = "```python\ndef g(n):\n    return 0\n```"
+    for block in (array, f"json\n{array}", f"JSON\n\n{array}"):
+        cases = extract_self_tests(f"{program}\n\n```\n{block}\n```", "g", "python")
+        assert len(cases) == 1, f"dropped the cases for {block[:12]!r}"
+        assert cases[0]["expected"] == 0
+    # ...but a chip is all that may precede it. Prose before an array is not a
+    # case list a model meant to send, and reading one out of it would grade a
+    # program against something nobody wrote as a test.
+    assert extract_self_tests(
+        f"{program}\n\n```\nhere are my cases\n{array}\n```", "g", "python"
+    ) == []
+
+
+def test_a_repair_cannot_pass_a_bar_it_rewrote_in_the_same_breath():
+    """The other half of the rule, and the reason the correction is not simply
+    applied to every reply that carries one.
+
+    "Do not change both to make them agree" is an instruction, and an
+    instruction is not a guarantee. A reply that changes the PROGRAM as well as
+    the cases is graded against the bar as it stood before it arrived — so a
+    rewritten program cannot be judged by a bar the same reply rewrote. Its
+    cases still apply from the next round, which is where a genuine correction
+    that also touched the program gets its hearing."""
+    first = "```python\ndef g(n):\n    return 0\n```"          # wrong
+    # Both changed at once: a different program AND a bar it trivially clears.
+    both = ("```python\ndef g(n):\n    return 42\n```\n\n"
+            '```json\n[{"name": "gamed", "args": [1], "expected": 42}]\n```')
+    cases = ('```json\n[{"name": "sum", "args": [12345], "expected": 15},\n'
+             ' {"name": "zero", "args": [0], "expected": 0}]\n```')
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        prompts, _, _, answer = _two_turn(300.0, [cases, first, both, both])
+    log = chatter.getvalue()
+
+    # The gamed reply was judged against the REAL cases, which it fails, so it
+    # never reports a clean run on the bar it brought with it.
+    assert "self=1/1" not in log, log
+    # ...and the round after it was still asked to fix something.
+    assert len(prompts) >= 4, [p[:40] for p in prompts]
+    assert "returned 42" in prompts[3] or "returned 0" in prompts[3], prompts[3][:400]
 
 def test_the_cases_turn_asks_for_the_common_path_before_the_boundaries():
     """Three ordinary cases FIRST, then the special values. A suite that is all

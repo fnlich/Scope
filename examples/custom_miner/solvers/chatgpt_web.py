@@ -72,12 +72,17 @@ ASSISTANT_AGENT_TURN = ".agent-turn"
 # exactly when a model moves the answer out of the message and into a side
 # panel, where the reader cannot see it. The reply then looks like prose with
 # no code, which costs a whole solve to discover.
+# It names no COUNT of blocks, and that is deliberate. The nudge is appended
+# to every send -- including a repair round, which may legitimately ask for a
+# corrected `json` block beside the program. Pinning "ONE" here contradicted
+# that from the recency slot, and a model resolving the contradiction the
+# other way sends the program alone and can never correct a wrong case.
 NUDGE = (
     "START your reply with the fenced block: no preamble and no explanation. "
-    "Reply directly in the chat with exactly the ONE ordinary fenced block the "
-    "output contract above asks for and nothing else, however long it is. Do "
-    "not use canvas. Do not run code and do not try to compile or test "
-    "anything — there is no toolchain here."
+    "Reply directly in the chat with exactly the ordinary fenced block or "
+    "blocks the message above asks for and nothing else, however long they "
+    "are. Do not use canvas. Do not run code and do not try to compile or "
+    "test anything — there is no toolchain here."
 )
 
 
