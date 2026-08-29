@@ -1618,6 +1618,84 @@ def test_a_draft_left_in_the_composer_never_reaches_a_validator():
     assert page.pressed[:2] == ["Control+A", "Delete"], page.pressed
 
 
+def test_an_editor_that_reformats_the_prompt_is_not_contamination():
+    """Read off a live miner, where this retired a working tab:
+
+        the composer did not hold the prompt as typed; clearing it and typing
+        it again, once
+        failed to submit: RuntimeError: the composer does not hold the prompt
+        as typed, twice over
+
+    The box was holding the prompt exactly as intended. claude.ai's composer is
+    a rich-text editor and applies input rules as text arrives: `- ` at the
+    start of a line becomes a bullet, `1. ` becomes an ordered list, and the
+    marker is then list STRUCTURE rather than text — so `innerText` gives the
+    line back without it, the ordered marker's digit included. Turn 1 carries
+    nine such lines. Demanding the text back verbatim called every one of those
+    sends contaminated, and retyping reproduces it exactly, so the second look
+    failed too and the tab was thrown away.
+
+    What may not happen is a word appearing that we never typed."""
+    from solvers.prompts import build_tests_prompt
+
+    prompt = build_tests_prompt("python", "Do a thing.", "g", [])
+    reformatted = "\n".join(
+        re.sub(r"^(- |[0-9]+\. )", "", line) for line in prompt.splitlines()
+    )
+    page = _FakePage({"#composer": [_Node()], "#send": [], "#assistant": []})
+    page.on_insert = lambda _: reformatted          # the editor rewrites it
+    tab = _tab(page, _site())
+    with contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(tab.send(prompt, 1.0))
+
+    assert page.pressed.count("Enter") == 1, "a reformatted prompt was not sent"
+    assert tab.alive is True, "the tab was retired over the editor's own markup"
+    # One clear, one insert: it must not have retyped either.
+    assert page.typed == [prompt], f"retyped a prompt that was already right: {len(page.typed)}"
+
+
+def test_a_composer_read_before_it_has_painted_is_waited_for_not_retyped():
+    """`insert_text` returns when the input event is delivered, not when the
+    editor has rendered it. On a box running four Chrome instances in 5 GB that
+    gap is visible, and reading straight after catches an empty box or half a
+    prompt — which is not contamination and must not be answered by retyping
+    into an editor that is still catching up."""
+    prompt = "solve this problem please"
+    page = _FakePage({"#composer": [_Node()], "#send": [], "#assistant": []})
+    state = {"inserted": None, "reads": 0}
+
+    def paints_late(text):
+        state["inserted"] = text
+        return ""                      # the box shows nothing yet
+
+    page.on_insert = paints_late
+
+    class _Slow(_Loc):
+        @property
+        def first(self):               # a real locator's `.first` keeps its type
+            return self
+
+        async def evaluate(self, expression):
+            if state["inserted"] is None:
+                return ""              # before we type: an empty box, as clearing wants
+            state["reads"] += 1
+            return state["inserted"] if state["reads"] >= 3 else ""
+
+    plain = page.locator
+    page.locator = lambda sel: (
+        _Slow(page, sel, page.dom.get(sel, [])) if sel == "#composer" else plain(sel)
+    )
+    tab = _tab(page, _site())
+    with contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(tab.send(prompt, 3.0))
+
+    assert state["reads"] >= 3, "did not wait for the editor to paint"
+    assert page.pressed.count("Enter") == 1, "never sent a prompt that did arrive"
+    assert page.typed == [prompt], (
+        f"retyped into an editor that was merely slow to paint: {page.typed}"
+    )
+    assert tab.alive is True
+
 def test_a_composer_that_will_not_empty_is_never_sent_to():
     """A box we cannot empty is a box whose contents we cannot vouch for, so the
     tab is thrown away rather than the prompt sent into it. `send` already turns

@@ -421,15 +421,53 @@ _COMPOSER_TEXT_JS = (
 )
 
 
-def _same_message(typed: str, seen: str) -> bool:
-    """Is the box holding the message we typed, and nothing else?
+# How long to let the editor finish painting what was inserted, and how often
+# to look. A composer is React over ProseMirror: `insert_text` returns when the
+# input event is delivered, not when the DOM shows the result, and on a box
+# running four Chrome instances in 5 GB that gap is visible.
+COMPOSER_SETTLE_S = 3.0
+COMPOSER_POLL_S = 0.1
 
-    Compared on collapsed whitespace, because a contenteditable turns our
-    newlines into block elements and hands them back as its own arrangement of
-    them -- an exact comparison would fail on every send. What this still
-    catches is the only thing it has to: text in the box that we did not type.
+_WORDS_RE = re.compile(r"[0-9A-Za-z_]+")
+
+
+def _words(text: str) -> list[str]:
+    return _WORDS_RE.findall(text)
+
+
+def _same_message(typed: str, seen: str) -> bool:
+    """Is the box holding our message, and nothing that is not ours?
+
+    Not equality, and the difference is the whole of it. The question is "did
+    somebody else's text get in" -- and no editor invents a word, while every
+    rich-text editor rewrites punctuation. A composer applies input rules as
+    text arrives: `- ` at the start of a line becomes a bullet and `1. `
+    becomes an ordered list, at which point the marker is list STRUCTURE and
+    `innerText` hands the line back without it -- the digit of an ordered
+    marker included. This prompt carries four of the first and five of the
+    second, and demanding the text back verbatim reported those sends as
+    contaminated, twice each (retyping reproduces it), and retired the tab.
+    Measured on a live miner: "the composer does not hold the prompt as typed,
+    twice over", on a tab that was holding the prompt exactly as intended.
+
+    So: every word the box shows must be one of ours, in our order, and nearly
+    all of ours must be there. An editor may DROP a marker; it may not add a
+    word. A leftover human draft is made of words that are not ours and fails
+    on the first of them, which is the job this check exists to do. A read that
+    caught the editor half-painted fails the second test rather than the first,
+    and `_settled_composer` is what waits that out instead of retyping into it.
     """
-    return " ".join(typed.split()) == " ".join(seen.split())
+    ours, shown = _words(typed), _words(seen)
+    if len(shown) < 0.95 * len(ours):
+        return False
+    i = 0
+    for word in shown:
+        while i < len(ours) and ours[i] != word:
+            i += 1
+        if i == len(ours):
+            return False          # a word the box shows that we never typed
+        i += 1
+    return True
 
 
 @dataclass(frozen=True)
@@ -647,6 +685,8 @@ class _Tab:
         self._warned_echo = False
         self._warned_branches = False
         self._warned_copy = False
+        # Said once when the editor reformats what we typed (see `_same_message`).
+        self._warned_rewrite = False
         # A COUNT, not a flag. The other notes on this class are configuration
         # advice and say themselves once; this one is damage to the answer being
         # submitted right now, and how OFTEN it happens is the number an
@@ -811,6 +851,31 @@ class _Tab:
             raise
         self._fresh = True
 
+    async def _settled_composer(self, text: str, ui_ms: int) -> str:
+        """What the composer holds once it has finished painting.
+
+        `insert_text` returns when the input event is delivered; a React editor
+        applies it a frame or more later, and reading immediately catches an
+        empty box or half a prompt. That is not contamination and must not be
+        treated as any: it read as "the composer does not hold the prompt as
+        typed", retyped, raced again, and retired a working tab.
+
+        Returns as soon as it matches, so the ordinary send pays one poll.
+
+        Bounded by the caller's own slice as well as by COMPOSER_SETTLE_S: the
+        submit phase has a budget, and waiting past it does not buy a send, it
+        buys a timeout that retires the tab. On a one-second slice this waits
+        fractions of a second and then retypes, which is the right order.
+        """
+        deadline = time.monotonic() + min(
+            COMPOSER_SETTLE_S, max(0.1, (ui_ms / 1000.0) * 0.4)
+        )
+        seen = await self._composer_holds()
+        while not _same_message(text, seen) and time.monotonic() < deadline:
+            await asyncio.sleep(COMPOSER_POLL_S)
+            seen = await self._composer_holds()
+        return seen
+
     async def _composer_holds(self) -> str:
         """What the composer contains right now.
 
@@ -883,7 +948,16 @@ class _Tab:
             await self._clear_composer(ui_ms)
             # insert_text handles newlines safely — typing them would submit early.
             await self._page.keyboard.insert_text(text)
-            if _same_message(text, await self._composer_holds()):
+            seen = await self._settled_composer(text, ui_ms)
+            if _same_message(text, seen):
+                if " ".join(text.split()) != " ".join(seen.split()) and not self._warned_rewrite:
+                    self._warned_rewrite = True
+                    print(
+                        f"[{self.site.name}] note: tab {self.label}: the composer "
+                        f"REWROTE the prompt's punctuation as it went in — every "
+                        f"word is still there and in order, so this is the editor "
+                        f"formatting markdown, not somebody else's text. Once per run."
+                    )
                 break
             if attempt == 2:
                 raise RuntimeError(
