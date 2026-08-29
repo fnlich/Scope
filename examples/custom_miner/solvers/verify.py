@@ -884,6 +884,19 @@ class VerifyingSolver:
                 # model cannot make a rewritten program pass by rewriting the
                 # bar in the same breath. Its cases apply from the next round.
                 revised = extract_self_tests(reply, task.entrypoint, task.language)
+                if revised and len(revised) < len(agreed):
+                    # A revision may CORRECT a case. It may not delete one --
+                    # and dropping the case you cannot pass is exactly how a
+                    # bar gets cleared without the program improving. The
+                    # repair prompt asks for the complete array back, so a
+                    # short one is either disobedience or the thing this
+                    # guards against; either way the old bar stands.
+                    print(
+                        f"[verify] the repair sent back {len(revised)} case(s) "
+                        f"where {len(agreed)} were agreed; keeping the fuller "
+                        f"set — a case may be corrected, not dropped"
+                    )
+                    revised = []
                 now_code = extract_code(reply, task.entrypoint, task.language).strip()
                 if revised and last_code is not None and now_code == last_code:
                     agreed, revised = revised, None
@@ -894,6 +907,29 @@ class VerifyingSolver:
                 if revised:
                     agreed = revised
                 if best is None or candidate.score > best.score:
+                    best = candidate
+                elif candidate.score == best.score and not getattr(
+                    conversation, "still_writing", False
+                ):
+                    # A TIE goes to the later candidate, and that is not a
+                    # coin toss: this one was written after seeing the failure
+                    # report, so it is the model's considered revision of the
+                    # one already in hand.
+                    #
+                    # Strict `>` made every repair round a no-op whenever the
+                    # score could not move -- and the score cannot move when a
+                    # case is WRONG. Measured: turn 1 wrote a case no correct
+                    # program can pass, attempt 1 scored 1/2, the model then
+                    # rewrote the program properly, and the rewrite tied at 1/2
+                    # and was thrown away. The miner submitted the first draft
+                    # and the model's last word never left the tab. With three
+                    # bogus cases pinning a solve at 17/20, that is every
+                    # remaining round.
+                    #
+                    # Not when the model was STILL WRITING, though. What
+                    # arrived there is a fragment of an answer rather than a
+                    # revision of one, and a fragment that happens to parse and
+                    # tie must not displace the finished program above it.
                     best = candidate
                 if candidate.verified:
                     break

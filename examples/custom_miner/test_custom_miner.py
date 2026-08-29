@@ -8313,6 +8313,69 @@ def test_a_leaked_language_chip_does_not_cost_the_corrected_cases():
     ) == []
 
 
+def test_the_answer_that_goes_out_is_the_models_last_word():
+    """Strict `>` on the score made every repair round a no-op whenever the
+    score could not MOVE — and the score cannot move when a case is wrong.
+
+    Turn 1 writes a case no correct program can pass. Attempt 1 scores 1/2. The
+    model then rewrites the program properly; the rewrite still scores 1/2,
+    ties, and under `>` is thrown away — so the miner submits the first draft
+    and the model's last word never leaves the tab. With three bogus cases
+    pinning a solve at 17/20, that is every round after the first."""
+    cases = ('```json\n[{"name": "bogus", "args": [0], "expected": 99},\n'
+             ' {"name": "sum", "args": [12345], "expected": 15}]\n```')
+    first = "```python\ndef g(n):\n    v = 1\n    return sum(int(c) for c in str(abs(n)))\n```"
+    last = "```python\ndef g(n):\n    v = 2\n    return sum(int(c) for c in str(abs(n)))\n```"
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        _, _, _, answer = _two_turn(300.0, [cases, first, last, last])
+
+    assert "v = 2" in answer.code, (
+        f"submitted an earlier draft than the model's last word: {answer.code!r}"
+    )
+
+
+def test_a_fragment_never_displaces_the_finished_program_it_ties_with():
+    """The limit of that rule. A read that stops while the model is STILL
+    WRITING returns a piece of an answer, not a revision of one — and a piece
+    that happens to parse and tie must not replace the finished program above
+    it."""
+    from solvers.verify import VerifyingSolver
+
+    whole = "```python\ndef g(n):\n    v = 1\n    return sum(int(c) for c in str(abs(n)))\n```"
+    piece = "```python\ndef g(n):\n    v = 2\n    return sum(int(c) for c in str(abs(n)))\n```"
+    cases = ('```json\n[{"name": "bogus", "args": [0], "expected": 99},\n'
+             ' {"name": "sum", "args": [12345], "expected": 15}]\n```')
+
+    class _Chat:
+        provider = "claude"
+        empty_reason = None
+        def __init__(self): self.n = -1
+        async def send(self, text, timeout_s, extend_to_s=None):
+            self.n += 1
+            # The second program arrives with the model mid-sentence.
+            self.still_writing = self.n >= 2
+            return [cases, whole, piece, piece][min(self.n, 3)]
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        answer = asyncio.run(
+            VerifyingSolver(_Fleet(), second_opinion=False).solve_task(
+                SolveTask(problem_id="p", language="python", statement="s",
+                          entrypoint="g", public_examples=[], deadline_s=300.0),
+                timeout_s=300.0,
+            )
+        )
+    assert "v = 1" in answer.code, (
+        f"a fragment displaced the finished program: {answer.code!r}"
+    )
+
+
 def test_a_repair_cannot_pass_a_bar_it_rewrote_in_the_same_breath():
     """The other half of the rule, and the reason the correction is not simply
     applied to every reply that carries one.
@@ -8338,6 +8401,10 @@ def test_a_repair_cannot_pass_a_bar_it_rewrote_in_the_same_breath():
     # The gamed reply was judged against the REAL cases, which it fails, so it
     # never reports a clean run on the bar it brought with it.
     assert "self=1/1" not in log, log
+    # And the shrunken bar is refused outright, on that round and every one
+    # after it: dropping the case you cannot pass is how a bar gets cleared
+    # without the program improving.
+    assert "a case may be corrected, not dropped" in log, log
     # ...and the round after it was still asked to fix something.
     assert len(prompts) >= 4, [p[:40] for p in prompts]
     assert "returned 42" in prompts[3] or "returned 0" in prompts[3], prompts[3][:400]
