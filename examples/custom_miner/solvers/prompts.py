@@ -538,63 +538,57 @@ def build_repair_prompt(
     model rewrites the logic, which was never the problem, and the repair round
     is spent for nothing. Ask about delivery when delivery failed, and about
     shape when the shape is wrong.
+
+    What is NOT here is method. Earlier versions spent a paragraph on how to
+    think about the failure -- trace the call, do not guess from the shape of
+    it, re-check the fix against every other case silently, do not change both
+    to make them agree. That is work which never reaches the reply, competing
+    with the failure itself for attention, and it is the same class of
+    instruction the two-phase rewrite already took out of turns 1 and 2. The
+    error, and the one line naming what may come back. Nothing else.
+
+    "Do not change both" is not lost by leaving it unsaid: it is enforced in
+    ``verify.py``, where a reply that rewrites the program AND the cases is
+    graded against the bar as it stood before it arrived, and a revision that
+    drops cases is refused outright. The grader keeps the promise, so the
+    prompt stops asking for it.
     """
     if defect == NO_CODE:
         body = (
             "Your previous reply did not reach me as code. I can only read the "
-            "chat message itself, so an artifact, a canvas, a preview pane or a "
-            "collapsed block is invisible to me.\n\n"
+            "chat message itself.\n\n"
             "Send the COMPLETE program again as one ordinary fenced code block "
-            "written directly in the chat. Do not create an artifact or canvas. "
-            "Do not abbreviate it or replace any part with a comment. Same rules "
-            "as before, and nothing outside the block."
+            "written directly in the chat, with nothing outside it."
         )
     elif defect:
         body = (
             f"I could not run your previous reply: {defect}.\n\n"
-            "Nothing was executed, so none of this is about your logic yet — it "
-            "is about what arrived. Put that right and send the COMPLETE program "
-            "again as one ordinary fenced code block written directly in the "
-            "chat, with nothing outside it. Same rules as before."
+            "Send back ONE fenced code block: the corrected program, complete, "
+            "with nothing outside it."
         )
     elif from_self_tests:
         # Deliberately not "your solution is WRONG". These cases came from the
         # model itself, so a disagreement proves only that two things it wrote
         # contradict each other -- and telling it the CODE is at fault when the
-        # CASE was wrong is how a repair round breaks a correct program. Naming
-        # the real question is also the more useful prompt: one of the two is
-        # wrong, and deciding which is exactly the work.
+        # CASE was wrong is how a repair round breaks a correct program. The
+        # output rule names both ways out and lets the model pick.
         detail = "\n".join(f"  - {line}" for line in failures)
         target = "the program" if language == "rust" else f"`{entrypoint}`"
         body = (
-            f"Your program and your own test cases DISAGREE. I ran {target} "
-            f"against the cases you sent and got:\n"
+            f"I ran {target} against the test cases you sent and got:\n"
             f"{detail}\n\n"
-            "Exactly one of the two is wrong, and which one is the question. In "
-            "your reasoning — not in the reply — go back to the STATEMENT and "
-            "work out what it says the answer for that input is. If the case is "
-            "right, fix the program; if the case was wrong, fix the case and "
-            "leave the program alone. Do not change both to make them agree.\n\n"
-            "Then re-check the fix against every OTHER case you were sent, "
-            "silently: a repair that fixes one case and breaks another is still "
-            "wrong. Reply with the corrected program block. "
-            "If it was the CASE that was wrong, add a second `json` block "
-            "holding the COMPLETE corrected list of cases — all of them, not "
-            "only the ones you changed; otherwise send the program alone."
+            "Send back ONE fenced block: the corrected program — or, if the "
+            "case was wrong rather than the program, a `json` array holding "
+            "ALL of the cases, corrected."
         )
     else:
         detail = "\n".join(f"  - {line}" for line in failures)
         target = "the program" if language == "rust" else f"`{entrypoint}`"
         body = (
-            f"Your solution is WRONG. I ran {target} against the examples and got:\n"
+            f"I ran {target} against the examples and got:\n"
             f"{detail}\n\n"
-            "In your reasoning — not in the reply — trace the failing call through "
-            "your code until you find the actual line where the computed value and "
-            "the expected one part company; do not guess at the fix from the shape "
-            "of the failure. Re-check the fix against every OTHER case you were "
-            "sent, silently: a repair that fixes this one and breaks another is "
-            "still wrong. Then reply with "
-            "ONLY ONE corrected code block and nothing else."
+            "Send back ONE fenced block: the corrected program, complete, with "
+            "nothing outside it."
         )
     return body
 

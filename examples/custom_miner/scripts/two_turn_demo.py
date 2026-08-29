@@ -96,9 +96,9 @@ def drive(deadline: float, replies: list[str], **kw) -> None:
 
     print(f"  turns   {[kind(t) for t, _, _ in seen]}")
     print(f"  slices  {[round(s, 1) for _, s, _ in seen]}s"
-          f"   what each read is allocated")
+          f"   every read gets what is left, repairs included")
     print(f"  caps    {[None if c is None else round(c, 1) for _, _, c in seen]}s"
-          f"   None on turn 1: nothing is held back, so nothing to extend into")
+          f"   None throughout: nothing is held back, so nothing to extend into")
     # What each turn ASKED for, which is the half no test can check for you: a
     # repair may legitimately ask for a corrected `json` block beside the
     # program, and nothing else here ever may.

@@ -30,7 +30,6 @@ to use the container backend instead; Rust verification always requires it.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import os
 import threading
 import time
@@ -79,11 +78,9 @@ class Conversation(Protocol):
     model can see its own previous attempt alongside the failure report.
     """
 
-    # A backend MAY also accept ``extend_to_s`` -- the caller's real remaining
-    # budget, as opposed to the slice it allocated for this one read. One that
-    # does may read past its slice while the model is still writing rather than
-    # stop mid-answer. One that does not is simply never offered it; see
-    # ``_reads_past_its_slice``.
+    # Two arguments, always. A backend MAY also accept ``extend_to_s`` -- a
+    # hard bound past the slice, for a caller that hands out less than its whole
+    # remaining budget -- but nothing here does, so nothing here passes one.
     async def send(self, text: str, timeout_s: float) -> str: ...
     async def close(self) -> None: ...
 
@@ -438,27 +435,16 @@ class _Plan:
 # second chance in the same solve.
 
 
-# Which backends accept `extend_to_s`, by class, asked once each.
+# Nothing here passes `extend_to_s` any more, and that is the end of a long
+# argument rather than an oversight. It existed so a read could spend a repair
+# reserve on an answer that was still arriving; with every read given the whole
+# remaining budget there is no reserve, and a hard bound equal to the slice is
+# an extension that cannot extend. `send` still accepts the keyword -- see
+# `browser_pool` -- for a caller that does hand out less than everything.
 #
-# The parameter is optional on purpose. `Conversation` is a Protocol, so a
-# backend written outside this package satisfies it with the two-argument
-# `send` that has always been the contract -- and calling it with a keyword it
-# does not take would be a TypeError inside the one call the whole solve
-# depends on. Catching that TypeError is not an option either: one raised from
-# INSIDE `send` is indistinguishable, and retrying would send the prompt twice.
-_EXTEND_SUPPORT: dict[type, bool] = {}
-
-
-def _reads_past_its_slice(conversation: Any) -> bool:
-    cls = type(conversation)
-    known = _EXTEND_SUPPORT.get(cls)
-    if known is None:
-        try:
-            known = "extend_to_s" in inspect.signature(cls.send).parameters
-        except (TypeError, ValueError):  # builtins, C callables, no signature
-            known = False
-        _EXTEND_SUPPORT[cls] = known
-    return known
+# The happy side effect: every read here is the two-argument `send` that has
+# always been the `Conversation` contract, so a backend written outside this
+# package needs nothing new to work.
 
 
 class VerifyingSolver:
@@ -474,7 +460,7 @@ class VerifyingSolver:
         self,
         backend: Backend,
         *,
-        max_attempts: int = 3,
+        max_attempts: int = 0,
         safety_margin_s: float = 20.0,
         max_budget_s: float = 3600.0,
         cache_size: int = 256,
@@ -482,7 +468,11 @@ class VerifyingSolver:
         self_tests: bool = True,
     ):
         self._backend = backend
-        self._max_attempts = max(1, int(max_attempts))
+        # 0 means UNLIMITED, and that is the default. Correctness is the whole
+        # of the payment here, so the only thing that should stop a repair loop
+        # is the validator's deadline -- a count of three was a second, private
+        # deadline layered under the real one, and it fired first.
+        self._max_attempts = max(0, int(max_attempts))
         self._margin = max(0.0, float(safety_margin_s))
         self._max_budget = max(5.0, float(max_budget_s))
         self._second_opinion = bool(second_opinion)
@@ -838,7 +828,19 @@ class VerifyingSolver:
             last_code: Optional[str] = None
             # A repair may be carried to a fresh conversation ONCE per pass.
             resumed = False
-            for attempt in range(1, self._max_attempts + 1):
+            # The last reply, verbatim. With the round count gone, a tab that
+            # answers INSTANTLY is the one thing that can spin: `send` normally
+            # blocks on the model for tens of seconds, but a read that returns
+            # stale text returns it at once, and the loop would resend the same
+            # repair at machine speed for the whole budget -- hammering the site
+            # from an account the operator is signed in to. A byte-identical
+            # reply to a prompt quoting a fresh failure is not a revision.
+            last_reply: Optional[str] = None
+            attempt = 0
+            while True:
+                attempt += 1
+                if self._max_attempts and attempt > self._max_attempts:
+                    break
                 left = budget - (time.monotonic() - started)
                 if attempt > 1 and left < 12.0:
                     # Not enough left to be worth another ROUND TRIP -- which is
@@ -850,34 +852,26 @@ class VerifyingSolver:
                     # always runs, however little there is, exactly as the first
                     # pass does in `solve_task`.
                     break
-                # Give the first attempt the larger share; repairs are cheaper.
-                #
-                # How much larger depends on whether a repair can even happen.
-                # With public examples a repair is likely, and reserving 40% for
-                # it is well spent. With NONE -- every task on the run this was
-                # written for -- the only repair possible is defect-driven, and
-                # a first answer that is structurally fine ends the loop right
-                # there. Measured: a Claude tab spent its whole 135 second slice
-                # and the remaining 90 seconds of a 225 second budget went
-                # unused, on the one attempt that had to succeed.
-                first_share = 0.6 if task.public_examples else 0.85
-                slice_s = (
-                    left if attempt == self._max_attempts else left * first_share
-                )
-
-                # The slice is what this read is ALLOCATED; `left` is what the
-                # attempt actually still has. Handing over both lets the read
-                # spend the repair reserve on an answer that is still arriving,
-                # which is the only thing that can still produce one.
-                if _reads_past_its_slice(conversation):
-                    reply = await conversation.send(prompt, slice_s, extend_to_s=left)
-                else:
-                    reply = await conversation.send(prompt, slice_s)
+                # Every round reads against EVERYTHING that is left. Earlier
+                # builds handed the first attempt a fraction (60% with public
+                # examples, 85% without) so a repair would have something to
+                # spend, and that reserve was worth least exactly when it cost
+                # most: `send` returns the moment the model finishes, so the
+                # slice was never a wait -- only a ceiling on a read that ran
+                # long, which is the one case where cutting it short throws away
+                # the answer. The loop below stops when a round trip no longer
+                # fits; nothing is carved out in advance.
+                # No `extend_to_s`, for the same reason the cases turn passes
+                # none: the slice already IS everything left, so there is
+                # nothing being held back to extend into. Passing one equal to
+                # the slice makes `send`'s extension a no-op by construction and
+                # only reads as though a reserve existed.
+                reply = await conversation.send(prompt, left)
                 # A repair reply may carry a CORRECTED case array: the repair
-                # prompt says so outright ("if the case was wrong, fix the case
-                # and leave the program alone"). Freezing turn 1's cases would
-                # kill that escape hatch and let one wrong case break a correct
-                # program on every round.
+                # prompt offers it outright ("or, if the case was wrong rather
+                # than the program, a `json` array holding ALL of the cases").
+                # Freezing turn 1's cases would kill that escape hatch and let
+                # one wrong case break a correct program on every round.
                 #
                 # WHEN it takes effect differs by the shape the repair came
                 # back in, and both shapes matter.
@@ -886,8 +880,9 @@ class VerifyingSolver:
                 # for. Applied to this same reply, because the alternative is to
                 # report the identical failure it was sent to fix: the round is
                 # spent, the next prompt quotes the same disagreement, and the
-                # correction lands only on the round after -- which, at
-                # SOLVER_MAX_ATTEMPTS=3, may not exist. Measured on a live
+                # correction lands only on the round after -- one more round
+                # trip spent re-reporting a failure already fixed, against a
+                # deadline. Measured on a live
                 # solve: turn 1 wrote three cases whose `final_records` order
                 # was wrong, the program was right, the model corrected the
                 # cases exactly as asked, and the answer still went out
@@ -895,11 +890,21 @@ class VerifyingSolver:
                 # program is the one already judged, so a weakened case cannot
                 # launder a rewrite that did not happen.
                 #
-                # Program CHANGED as well -- the one thing the prompt forbids
-                # ("Do not change both to make them agree"). That reply is
-                # graded against the bar as it stood BEFORE it arrived, so a
-                # model cannot make a rewritten program pass by rewriting the
-                # bar in the same breath. Its cases apply from the next round.
+                # Program CHANGED as well -- the reply rewrote both sides of the
+                # disagreement. The prompt no longer spends a sentence
+                # forbidding that, because forbidding it was never what stopped
+                # it: this is. Such a reply is graded against the bar as it
+                # stood BEFORE it arrived, so a model cannot make a rewritten
+                # program pass by rewriting the bar in the same breath. Its
+                # cases apply from the next round.
+                if attempt > 1 and reply == last_reply:
+                    print(
+                        f"[verify] {provider or 'this model'} sent back the "
+                        f"identical reply after being shown the failure; "
+                        f"stopping rather than asking again"
+                    )
+                    break
+                last_reply = reply
                 revised = extract_self_tests(reply, task.entrypoint, task.language)
                 if revised and len(revised) < len(agreed):
                     # A revision may CORRECT a case. It may not delete one --

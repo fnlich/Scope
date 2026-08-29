@@ -1940,7 +1940,11 @@ def test_a_delivery_failure_is_not_reported_as_a_wrong_answer():
 
     prompt = build_repair_prompt([], "rust", "main", defect=NO_CODE)
     assert "did not reach me as code" in prompt
-    assert "artifact" in prompt and "canvas" in prompt
+    # Where the reply has to be WRITTEN is the whole of the fix, and it is said
+    # positively rather than as a list of the places it must not go. The ban on
+    # artifacts and canvases is the nudge's job, and the nudge is appended to
+    # every send including this one -- see `_submit`.
+    assert "directly in the chat" in prompt
     assert "I ran" not in prompt, "still claims to have run something"
     assert "WRONG" not in prompt, "still blames the answer for a delivery fault"
 
@@ -3177,24 +3181,31 @@ def test_the_output_contract_holds_the_first_word_and_the_nudge_the_last():
         ), site.nudge[:70]
 
 
-def test_a_repair_round_is_sent_back_through_the_checklist():
-    """Repairs go into the SAME conversation, so the checklist is still above
-    them — and a repair that fixes the failing example while breaking a
-    boundary scores the same zero as the answer it replaced."""
+def test_a_repair_carries_the_error_and_no_method_for_thinking():
+    """A repair round is the evidence plus one sentence naming what may come
+    back. Nothing else.
+
+    It used to carry a paragraph of method as well -- trace the failing call
+    through your code, do not guess at the fix from the shape of the failure,
+    re-check the fix against every OTHER case you were sent silently, do not
+    change both to make them agree. That is work which never reaches the reply,
+    competing with the failure itself for attention, and it is the same class of
+    instruction the two-phase rewrite already took out of turns 1 and 2."""
     from solvers.prompts import build_repair_prompt
 
     prompt = build_repair_prompt(["solve([]) raised IndexError"], "python", "solve")
-    # It points at the cases the model was actually sent. It used to point at
-    # "the edge-case checklist from my first message", and that message no
-    # longer carries one -- a repair prompt referring to a section that is not
-    # there is an instruction the model cannot follow.
-    assert "every OTHER case you were sent" in prompt, prompt
-    assert "breaks another is still wrong" in prompt
-    # ...but a DEFECT is not a logic problem, and must not be answered with it.
+    assert "solve([]) raised IndexError" in prompt, prompt
+    for method in ("in your reasoning", "silently", "trace the failing",
+                   "do not guess", "re-check", "same rules as before",
+                   "do not change both", "every other case"):
+        assert method not in prompt.lower(), (
+            f"method is back in the repair prompt: {method!r}"
+        )
+    # ...and a DEFECT is answered with delivery, never with a run report.
     for defect in ("the program does not define fn main()", NO_CODE):
         repair = build_repair_prompt([], "rust", "main", defect=defect)
-        assert "every OTHER case you were sent" not in repair, (
-            f"answered a delivery failure with logic advice: {defect!r}"
+        assert "I ran" not in repair, (
+            f"answered a delivery failure with evidence that does not exist: {defect!r}"
         )
 
 
@@ -4183,27 +4194,23 @@ def test_both_nudges_use_the_last_word_to_demand_code_first():
             assert rush not in site.nudge, f"{site.name}: nudge still rushes: {rush!r}"
 
 
-def test_the_first_attempt_gets_the_budget_when_no_repair_can_happen():
-    """Reserving 40% of the budget for repair rounds is well spent when public
-    examples exist and a repair is likely. With none shipped — every task on the
-    run this was written for — a structurally fine first answer ends the loop,
-    and the reserve is simply discarded. Measured: a tab spent its whole 135s
-    slice while 90s of a 225s budget went unused, on the one attempt that had
-    to succeed."""
+def test_every_round_reads_against_everything_that_is_left():
+    """The solve budget used to be sliced — 60% to the first attempt with public
+    examples, 85% without — so a later round would have something to spend.
+
+    The reserve was worth least exactly where it cost most. `send` returns the
+    moment the model finishes, so holding budget back was never a wait, only a
+    ceiling on a read that ran long — which is the one case where cutting it
+    short throws the answer away. Measured: a tab spent its whole 135s slice
+    while 90s of a 225s budget went unused, on the one attempt that had to
+    succeed."""
     import inspect
 
     from solvers.verify import VerifyingSolver
 
     source = inspect.getsource(VerifyingSolver._attempt)
-    assert "first_share = 0.6 if task.public_examples else 0.85" in source, source[:200]
-
-    budget = 225.0
-    with_examples = budget * 0.6
-    without = budget * 0.85
-    assert without > with_examples
-    assert without > 135.1, (
-        "the first attempt still gets less than the slice that was running out"
-    )
+    assert "first_share" not in source, "the private slice is back"
+    assert "conversation.send(prompt, left)" in source, source[:200]
 
 
 def test_the_examples_decide_when_the_statement_is_ambiguous():
@@ -6241,22 +6248,35 @@ def test_the_image_check_only_speaks_when_docker_actually_said_no_such_image(mon
 # Quality over speed: the prompt must tell the model the truth about what the
 # payment rule actually rewards.
 # --------------------------------------------------------------------------- #
-def test_a_repair_asks_for_a_diagnosis_not_a_guess():
-    """A repair that edits from the shape of the failure fixes the symptom the
-    failure happened to show. The prompt now demands the model find the actual
-    line where computed and expected part company before touching anything."""
+def test_a_repair_ends_on_the_rule_for_what_may_come_back():
+    """The last thing a repair says is what it will accept, because that is the
+    sentence the reply has to obey.
+
+    Which sentence depends on whose cases failed. The validator's examples
+    shipped with the task and are ground truth, so only the PROGRAM may change
+    there. The model's own cases may themselves be wrong -- turn 1 derives its
+    `expected` values by reasoning -- so that branch names both ways out and
+    lets the model pick."""
     from solvers.prompts import build_repair_prompt
 
-    prompt = build_repair_prompt(["g(*[0], **{}) returned 1, expected 0"],
-                                 "python", "g")
-    assert "In your reasoning — not in the reply" in prompt
-    assert "do not guess at the fix" in prompt
-    assert "before you send" not in prompt.lower(), (
+    failure = ["g(*[0], **{}) returned 1, expected 0"]
+
+    theirs = build_repair_prompt(failure, "python", "g")
+    assert theirs.rstrip().endswith(
+        "Send back ONE fenced block: the corrected program, complete, with "
+        "nothing outside it."
+    ), theirs
+    assert "json" not in theirs, (
+        "offered to rewrite the validator's own examples, which are ground truth"
+    )
+    assert "before you send" not in theirs.lower(), (
         "the repair prompt reintroduced the phrase that caused narration"
     )
-    assert prompt.rstrip().endswith("ONLY ONE corrected code block and nothing else."), (
-        "the repair prompt no longer ends on the output rule"
-    )
+
+    mine = build_repair_prompt(failure, "python", "g", from_self_tests=True)
+    assert mine.rstrip().endswith(
+        "a `json` array holding ALL of the cases, corrected."
+    ), mine
 
 
 # --------------------------------------------------------------------------- #
@@ -7273,9 +7293,11 @@ def test_a_backend_that_cannot_wait_is_never_asked_to():
     whole solve depends on. Catching that TypeError is not an option either: one
     raised from INSIDE `send` is indistinguishable, and retrying would send the
     prompt twice.
-    """
-    from solvers.verify import _reads_past_its_slice
 
+    It used to be a per-class probe of `send`'s signature. It is structural now:
+    every read here is given the whole remaining budget, so there is no reserve
+    to extend into and no reason to pass the keyword to anyone.
+    """
     seen: list[tuple] = []
 
     class _OldStyle:
@@ -7290,9 +7312,11 @@ def test_a_backend_that_cannot_wait_is_never_asked_to():
             seen.append((timeout_s, extend_to_s))
             return RIGHT
 
-    assert _reads_past_its_slice(_OldStyle()) is False
-    assert _reads_past_its_slice(_NewStyle()) is True
-
+    # Both are called the same way -- with ONE budget argument -- so the
+    # new-style backend simply sees `extend_to_s` at its default. (`arity` is
+    # what each fake RECORDS, which is fixed; what is being checked is that the
+    # old-style two-argument `send` is reached at all, and that the new-style
+    # one is never handed a bound it would have to honour.)
     for backend, arity in ((_OldStyle, 1), (_NewStyle, 2)):
         seen.clear()
 
@@ -7310,6 +7334,11 @@ def test_a_backend_that_cannot_wait_is_never_asked_to():
             f"{backend.__name__}.send was called with {len(seen[0])} budget "
             f"argument(s); it takes {arity}"
         )
+        if arity == 2:
+            assert seen[0][1] is None, (
+                f"a hard bound of {seen[0][1]} was passed to a read that was "
+                f"already given the whole budget"
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -7886,11 +7915,54 @@ def test_the_models_own_boundary_case_catches_a_wrong_program(capsys):
     assert len(sent) == 3, f"expected cases, program, repair; sent {len(sent)}"
     assert "<task>" in sent[0], "the first turn must ask for the cases alone"
     assert "<must_pass" in sent[1], "the program turn must restate the cases"
-    assert "DISAGREE" in sent[2], sent[2][:200]
+    assert "the test cases you sent" in sent[2], sent[2][:200]
     assert "'single digit'" in sent[2], (
         f"the repair has to name the case that broke: {sent[2][:300]}"
     )
     assert "self=3/3" in capsys.readouterr().out
+
+
+def test_correction_keeps_going_past_the_round_that_used_to_be_the_last():
+    """`SOLVER_MAX_ATTEMPTS` was 3, so a solve got the cases turn, the program
+    turn and exactly ONE repair. A count is a second, private deadline layered
+    under the only real one, and there is no partial credit for stopping early:
+    a program still wrong on the fourth round pays what no answer pays.
+
+    Four wrong programs here, each different from the last, and the right one
+    fifth. Under the old cap the first wrong one shipped."""
+    wrong = [
+        _WRONG_PROGRAM.replace("while n > 9", f"while n > {k}") for k in (9, 8, 7, 6)
+    ]
+    solver, sent = _solver_seeing([_CASES_ONLY, *wrong, _RIGHT_PROGRAM])
+    answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+
+    assert "while n > 0" in answer.code, f"gave up early: {answer.code!r}"
+    # cases, program, and FOUR repairs -- three more than the old cap allowed.
+    assert len(sent) == 6, [s[:40] for s in sent]
+    for i in range(2, 6):
+        assert "the test cases you sent" in sent[i], (
+            f"round {i} was not a repair: {sent[i][:120]}"
+        )
+
+
+def test_a_conversation_repeating_itself_is_not_asked_again(capsys):
+    """The one thing that can spin once the round count is gone.
+
+    `send` normally blocks on the model for tens of seconds, so a budget is a
+    real bound on the number of rounds. A read that returns STALE text returns
+    it at once, and the loop would resend the same repair at machine speed for
+    the whole budget -- hammering the site from an account the operator is
+    signed in to. A byte-identical reply to a prompt quoting a fresh failure is
+    not a revision, so it ends the loop instead of starting another one."""
+    solver, sent = _solver_seeing([_CASES_ONLY, _WRONG_PROGRAM])  # repeats forever
+    answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+
+    # cases, program, one repair -- then the identical reply stops it.
+    assert len(sent) == 3, [s[:40] for s in sent]
+    assert "identical reply" in capsys.readouterr().out
+    # And the answer it did get is still submitted: stopping the loop is not
+    # throwing away the best thing in hand.
+    assert "while n > 9" in answer.code
 
 
 def test_self_tests_never_reach_the_validator():
@@ -7936,12 +8008,16 @@ def test_a_disagreement_is_not_reported_as_the_program_being_wrong():
     mine = build_repair_prompt(failures, "python", "g", from_self_tests=True)
     theirs = build_repair_prompt(failures, "python", "g")
 
-    assert "DISAGREE" in mine and "WRONG" not in mine.split("\n")[0]
-    assert "Exactly one of the two is wrong" in mine
-    assert "leave the program alone" in mine
-    # The validator's own examples are ground truth and keep the blunt wording.
-    assert "Your solution is WRONG" in theirs
-    assert "DISAGREE" not in theirs
+    assert "WRONG" not in mine, "blamed the code for a case that may be wrong"
+    assert "the test cases you sent" in mine
+    # Which is not a lecture about deciding between them -- it is the OUTPUT
+    # rule offering both, so the model answers by choosing rather than by
+    # explaining its choice.
+    assert "`json` array holding ALL of the cases" in mine
+    # The validator's own examples are ground truth: only the program may change.
+    assert "against the examples" in theirs
+    assert "json" not in theirs
+    assert "the test cases you sent" not in theirs
 
 
 def test_self_tests_can_be_turned_off_completely():
@@ -8168,7 +8244,12 @@ def test_the_cases_turn_does_not_shrink_the_read_the_program_gets():
     # A fast cases turn costs the program almost nothing: these fakes reply
     # instantly, so turn 2 still opens on essentially the whole budget.
     assert slices[1] > 200.0, f"the program only got {slices[1]:.0f}s"
-    assert caps[1] > slices[1], "the program's read must still be extendable"
+    # And nothing extends into it either, because nothing is held back from it:
+    # the program turn is given everything left, exactly as turn 1 is.
+    assert caps[1] is None or caps[1] <= slices[1] + 0.01, (
+        "a reserve is back — the program's read is a share of the budget "
+        "rather than the whole of it"
+    )
 
 
 def test_every_deadline_asks_for_the_cases_first():
@@ -8370,11 +8451,11 @@ def test_a_repair_may_correct_a_case_the_first_turn_got_wrong():
     # And the repair prompt is what tells the model correcting a case is
     # allowed at all -- without that sentence the model rewrites the program.
     assert "99" in prompts[2], prompts[2][:400]
-    assert "fix the case" in prompts[2].lower(), prompts[2][:800]
+    assert "if the case was wrong" in prompts[2].lower(), prompts[2][:800]
     # It must ask for the WHOLE array back, since the reply replaces the bar
     # outright -- a model resending only the cases it changed would silently
     # delete the rest.
-    assert "COMPLETE corrected list of cases" in prompts[2]
+    assert "ALL of the cases" in prompts[2]
 
 
 def test_a_leaked_language_chip_does_not_cost_the_corrected_cases():
@@ -8582,8 +8663,9 @@ def test_a_repair_cannot_pass_a_bar_it_rewrote_in_the_same_breath():
     """The other half of the rule, and the reason the correction is not simply
     applied to every reply that carries one.
 
-    "Do not change both to make them agree" is an instruction, and an
-    instruction is not a guarantee. A reply that changes the PROGRAM as well as
+    The prompt no longer spends a sentence forbidding a reply that changes both
+    sides of the disagreement, because forbidding it was never what stopped it:
+    this is. A reply that changes the PROGRAM as well as
     the cases is graded against the bar as it stood before it arrived — so a
     rewritten program cannot be judged by a bar the same reply rewrote. Its
     cases still apply from the next round, which is where a genuine correction
@@ -8826,7 +8908,10 @@ def test_the_time_budget_is_gone_from_every_prompt():
         build_code_prompt("rust", "s", "main", [],
                           cases=[{"name": "n", "args": ["1\n"], "expected": "1"}]),
         build_repair_prompt(["g(1) returned 2, expected 3"], "python", "g"),
+        build_repair_prompt(["g(1) returned 2, expected 3"], "python", "g",
+                            from_self_tests=True),
         build_repair_prompt([], "rust", "main", defect="there is no fn main"),
+        build_repair_prompt([], "rust", "main", defect=NO_CODE),
     ]
     for p in prompts:
         for ghost in ("<budget>", "seconds for this reply", "seconds left",
@@ -8853,14 +8938,15 @@ def test_the_time_budget_is_gone_from_every_prompt():
                      "as fast as", "quickly", "95%", "fastest", "latency"):
             assert rush not in lowered, f"a hurry word is back: {rush!r} in {p[:60]!r}"
         # ...nor any instruction to do work that never appears in the reply.
-        # The one licensed exception is the repair round, which has to say where
-        # the diagnosis goes or it arrives as prose instead of a program.
-        if "corrected" not in lowered and "previous reply" not in lowered:
-            for silent in ("silently", "in your reasoning", "trace every",
-                           "checklist", "read the program back"):
-                assert silent not in lowered, (
-                    f"work that never reaches the reply is back: {silent!r}"
-                )
+        # The repair round used to be a licensed exception here, on the grounds
+        # that it had to say where the diagnosis goes. It does not: it carries
+        # the error and the rule for what may come back, and no exception is
+        # needed for a prompt that says nothing about how to think.
+        for silent in ("silently", "in your reasoning", "trace every",
+                       "checklist", "read the program back"):
+            assert silent not in lowered, (
+                f"work that never reaches the reply is back: {silent!r}"
+            )
 
 
 def test_no_prompt_contradicts_its_own_output_contract():

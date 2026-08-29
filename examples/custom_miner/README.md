@@ -972,17 +972,57 @@ opinion — silence has to mean the same thing as success, or a missing toolchai
 becomes an outage. `SOLVER_RUST_COMPILE=0` turns it off. The candidate is
 compiled, never run.
 
-### The first attempt gets the budget when no repair can happen
+### Correction runs until it passes, on the only deadline there is
 
-The solve budget was split 60/40 — the larger share to the first attempt, the
-rest held back for repair rounds. That is well spent when public examples exist
-and a repair is likely. With **none shipped**, a structurally sound first answer
-ends the loop immediately and the reserve is simply discarded: measured, a tab
-spent its whole 135-second slice while the remaining 90 seconds of a 225-second
-budget went unused, on the one attempt that had to succeed.
+Two private deadlines used to sit under the validator's. The loop stopped at
+`SOLVER_MAX_ATTEMPTS = 3`, and each round was handed a *fraction* of what was
+left — 60% to the first attempt with public examples, 85% without — so a later
+round would have something to spend.
 
-The share now depends on whether a repair is even possible — 85% to the first
-attempt when nothing can be graded against.
+Both are gone. `SOLVER_MAX_ATTEMPTS` defaults to `0`, unlimited: a solve keeps
+correcting until the answer verifies, until there is nothing left to act on, or
+until a round trip no longer fits in the budget. And every round now reads
+against **everything that is left**.
+
+The reserve was worth least exactly where it cost most. `send` returns the
+moment the model finishes, so holding budget back was never a wait — only a
+ceiling on a read that ran long, which is the one case where cutting it short
+throws the answer away. Measured: a tab spent its whole 135-second slice while
+the remaining 90 seconds of a 225-second budget went unused, on the one attempt
+that had to succeed.
+
+`SOLVER_SAFETY_MARGIN_S` stays, because it is not a deadline on the model: it is
+the time the answer needs to be graded, archived, signed and put on the wire
+before the validator stops listening.
+
+### A repair carries the error and nothing else
+
+The correction prompt is the evidence plus one sentence naming what may come
+back:
+
+```
+I ran `solve` against the test cases you sent and got:
+  - case 2 'single digit': solve(*[7], **{}) returned 0, expected 7
+
+Send back ONE fenced block: the corrected program — or, if the case was wrong
+rather than the program, a `json` array holding ALL of the cases, corrected.
+```
+
+What it no longer carries is method — *"trace the failing call through your
+code"*, *"do not guess at the fix from the shape of the failure"*, *"re-check
+the fix against every OTHER case you were sent, silently"*, *"Do not change both
+to make them agree"*. That is work which never reaches the reply, competing with
+the failure itself for attention, and it is the same class of instruction the
+two-phase rewrite already took out of turns 1 and 2.
+
+Nothing is conceded by dropping *"do not change both"*: the grader keeps that
+promise rather than the prompt asking for it. A reply that rewrites the program
+**and** the cases is graded against the bar as it stood before it arrived, and a
+revision that drops cases is refused outright.
+
+The validator's own examples are the one place a case cannot be corrected — they
+shipped with the task and are ground truth — so that branch asks for the program
+alone.
 
 ### Never give up on a task while an answer is still obtainable
 
@@ -1110,9 +1150,9 @@ came from the model, so a disagreement proves only that two things it wrote
 contradict each other, and blaming the code when the **case** was wrong is how a
 repair round breaks a correct program:
 
-> Your program and your own test cases DISAGREE. … Exactly one of the two is
-> wrong, and which one is the question. … If the case is right, fix the program;
-> if the case was wrong, fix the case and leave the program alone.
+> I ran `solve` against the test cases you sent and got: … Send back ONE fenced
+> block: the corrected program — or, if the case was wrong rather than the
+> program, a `json` array holding ALL of the cases, corrected.
 
 A repair reply may carry a corrected `json` block beside the program, and that
 is safe because `extract_code` picks the block that **defines the entrypoint**,
@@ -1208,7 +1248,8 @@ of time:
 - **A wrong case can still be corrected.** Turn 1 derives its `expected` values
   by reasoning, so one of them can simply be wrong — and freezing them would
   make a **correct** program fail the same bogus case on every repair round.
-  The repair prompt says outright to fix the case and leave the program alone,
+  The repair prompt offers a corrected `json` array as one of the two things it
+  will accept back,
   and a repair reply carrying a corrected array replaces the frozen one for the
   *next* round. Not the round that carried it: a reply is graded against the
   cases agreed before it arrived, so a model cannot make its program pass by
@@ -1353,11 +1394,11 @@ reports whether it happened twice or forty times.
 
 ### A model still writing is waited for, never interrupted
 
-The slice a read is given is an internal **allocation**, not a deadline: part of
-the budget is held back for a repair round. That reserve is well spent on an
-answer that arrived *wrong*. It is worth nothing at all on one that has not
-finished arriving — the composer is usually disabled while a reply streams, and
-where it is not the prompt simply queues behind the answer it is asking about.
+The slice a read is given is an internal **allocation**, not a deadline. Where a
+caller does hand out less than the whole budget, stopping the read at the slice
+is worth nothing on an answer that has not finished arriving — the composer is
+usually disabled while a reply streams, and where it is not the prompt simply
+queues behind the answer it is asking about.
 
 So when the slice runs out with the model still writing, the read extends once
 to the caller's real remaining budget rather than stopping to do something that
@@ -1451,6 +1492,7 @@ fresh conversation.
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `SOLVER_MAX_ATTEMPTS` | `0` | Rounds per solve, `0` meaning **unlimited** — correct until it passes or the request's deadline stops it. A count here is a second, private deadline under the only real one, and there is no partial credit for stopping early. Set a number to cap it anyway |
 | `SOLVER_SAFETY_MARGIN_S` | `20` | Headroom kept before the cutoff, for `send`'s post-deadline phases and for grading, signing and transport |
 | `SOLVER_MAX_BUDGET_S` | `3600` | The protocol's own maximum for `deadline_s`, so it cannot bind on a spec-compliant request. Lowering it below the advertised deadline throws away answers the validator would still pay for |
 | `SOLVER_VERIFY_EXECUTOR` | `subprocess` | Python grading backend; Rust always uses Docker |
