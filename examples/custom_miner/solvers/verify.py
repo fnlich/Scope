@@ -143,6 +143,12 @@ class Answer:
     verified: bool = False
     passed: int = 0
     total: int = 0
+    # The same question asked of the model's OWN cases, which on live traffic is
+    # the only suite that ever runs. Kept beside `verified` rather than merged
+    # into it -- see `Candidate.self_verified`.
+    self_verified: bool = False
+    self_passed: int = 0
+    self_total: int = 0
 
 
 @dataclass
@@ -177,6 +183,34 @@ class Candidate:
     def verified(self) -> bool:
         """Every public example reproduced exactly."""
         return self.defect is None and self.total > 0 and self.passed == self.total
+
+    @property
+    def self_verified(self) -> bool:
+        """Every case the MODEL wrote for itself reproduced, and it is all the
+        evidence there was.
+
+        Deliberately not folded into `verified`, and the reason is unchanged: a
+        model cannot confirm its own reading of a statement, so a program that
+        agrees with itself must not be able to earn the flag that gates the
+        answer cache and tells a chain of providers to stop trying.
+
+        But it is not nothing, either -- it is the ONLY evidence a live solve
+        ever has. Production ships no `public_examples` at all, so `verified`
+        is False on every real answer this miner sends, and a log that reports
+        only that cannot tell "ran every case it had and passed" from "was
+        never run at all". Those are the two ends of the range, and they read
+        identically. This is the one that says which.
+
+        `total == 0` is part of it: with public examples in hand THEY are the
+        verdict, and `verified` already reports it.
+        """
+        return (
+            self.defect is None
+            and self.total == 0
+            and self.self_total > 0
+            and self.self_passed == self.self_total
+            and not self.failures
+        )
 
     @property
     def score(self) -> tuple[int, int, int, int]:
@@ -578,7 +612,10 @@ class VerifyingSolver:
         self._grader = _Grader()
         self._cache: dict[str, tuple[str, str]] = {}
         self._cache_size = max(0, int(cache_size))
-        self._counts = {"solved": 0, "verified": 0, "cache_hits": 0, "empty": 0}
+        self._counts = {
+            "solved": 0, "verified": 0, "self_verified": 0, "cache_hits": 0,
+            "empty": 0,
+        }
         self._by_provider: dict[str, dict[str, int]] = {}
         # The no-examples explanation is worth saying, but only once a run.
         self._warned_ungradeable = False
@@ -811,6 +848,13 @@ class VerifyingSolver:
 
         if best.verified:
             self._counts["verified"] += 1
+        elif best.self_verified:
+            # Counted apart from `verified`, never inside it. On live traffic
+            # this is the only counter of the two that can ever move, so a
+            # `/solver-status` showing verified=0 over a whole run is the
+            # ordinary reading rather than the alarming one -- and this is the
+            # number that says whether the answers were any good.
+            self._counts["self_verified"] += 1
         if best.code.strip():
             self._counts["solved"] += 1
             # `not best.failures` as well as `verified`: with both suites run,
@@ -831,11 +875,24 @@ class VerifyingSolver:
             f"examples={best.passed}/{best.total} "
             + (f"self={best.self_passed}/{best.self_total} " if best.self_total else "")
             + f"verified={best.verified} "
-            f"{elapsed:.1f}s/{budget:.0f}s"
+            # `verified=False` is the only thing a live solve could ever print,
+            # because no request ships public examples -- so on its own it said
+            # the same thing about an answer that passed every case it had and
+            # about one that was never run. This says which, without ever
+            # claiming the word `verified` for a model agreeing with itself.
+            + (
+                f"(self-verified: passed all {best.self_total} of its own "
+                f"cases; no public examples exist to confirm it) "
+                if best.self_verified
+                else ""
+            )
+            + f"{elapsed:.1f}s/{budget:.0f}s"
         )
         return Answer(
             code=best.code, raw_response=best.raw,
             verified=best.verified, passed=best.passed, total=best.total,
+            self_verified=best.self_verified,
+            self_passed=best.self_passed, self_total=best.self_total,
         )
 
     async def _ask_for_cases(self, conversation, task, left: float):

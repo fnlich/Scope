@@ -6722,10 +6722,12 @@ def test_a_corpus_with_no_tests_is_not_reported_as_a_catastrophe(capsys):
     ])
     out = capsys.readouterr().out
     assert "would have scored" not in out, out
-    assert "none of the 4 could be graded here" in out, out
+    assert "could be graded against public examples" in out, out
     assert "3/4 produced an answer" in out, out
     assert "(1 submitted nothing)" in out, out
     assert "1/2 rust answer(s) compile" in out, out
+    # No solver stats passed, so nothing is claimed about local verification.
+    assert "wrote for itself" not in out, out
 
     # ...and when tests DID come with the problem, the old line is still the
     # headline. A SCORED verdict is only reachable when they did.
@@ -6734,6 +6736,54 @@ def test_a_corpus_with_no_tests_is_not_reported_as_a_catastrophe(capsys):
     out = capsys.readouterr().out
     assert "1/1 would have scored" in out, out
     assert "1/1 produced an answer" in out, out
+
+
+def test_a_replay_with_no_tests_still_reports_what_the_solver_could_check(capsys):
+    """The yardstick a corpus with no public examples DOES have.
+
+    "none of the 97 could be graded against public examples" is true and, on its
+    own, was the whole verdict a replay reached -- which cannot tell an answer
+    that ran every case the model wrote and passed from one that was never run.
+    That distinction is the entire question a replay exists to answer, and the
+    solver already knows it: `VerifyingSolver` runs the model's own cases with
+    the validator's executor and counts the clean ones.
+
+    Reported apart from "would have scored" and never merged into it. A model
+    agreeing with itself is weaker evidence than a public example, and the line
+    says so rather than letting the number be read as a score."""
+    from solvers import rehearse
+
+    problems = [
+        rehearse.Problem(
+            SolveTask(problem_id=f"p{i}", language="python", statement="s",
+                      entrypoint="g", public_examples=[], deadline_s=300.0),
+            [], "the archive", "nothing to check it against",
+        )
+        for i in range(3)
+    ]
+    results = [(p, rehearse.UNKNOWN, "no tests came with this problem")
+               for p in problems]
+
+    rehearse._summarise(results, {"solver": {"self_verified": 2, "empty": 0}})
+    out = capsys.readouterr().out
+    assert "2/3 passed every case the model wrote for itself" in out, out
+    assert "weaker than a public example" in out, out
+    assert "would have scored" not in out, "a self-check was reported as a score"
+
+    # A solver that checked nothing claims nothing -- no line at all, rather
+    # than a zero that reads as a failure.
+    rehearse._summarise(results, {"solver": {"self_verified": 0}})
+    assert "wrote for itself" not in capsys.readouterr().out
+
+    # ...and a stats() that is missing, broken or shaped differently is a
+    # missing line, never a crashed replay.
+    class _Broken:
+        def stats(self): raise RuntimeError("no")
+
+    assert rehearse._solver_stats(_Broken()) == {}
+    assert rehearse._solver_stats(SimpleNamespace(stats=lambda: None)) == {}
+    rehearse._summarise(results, rehearse._solver_stats(_Broken()))
+    assert "wrote for itself" not in capsys.readouterr().out
 
 
 def test_your_own_problems_directory_wins_over_the_shipped_samples(tmp_path):
@@ -7405,6 +7455,75 @@ def test_a_fragment_does_not_displace_the_whole_program_above_it():
     assert _supersedes(later_fragment, fragment, False)
     # And a fragment is still better than nothing at all.
     assert _supersedes(fragment, Candidate(code="", raw=""), False)
+
+
+def test_an_answer_that_passed_every_case_it_had_is_reported_as_such():
+    """`verified=False` is the only thing a live solve can print, and on its own
+    it says nothing.
+
+    `verified` means the VALIDATOR's public examples all reproduced. Live
+    traffic ships none — all 97 archived requests carry zero — so `verified` is
+    False on every real answer this miner sends, whether it passed every case
+    the model wrote for it or was never run at all. Those are the two ends of
+    the range and the log gave them the same word.
+
+    So the state is reported, without ever letting a model agreeing with itself
+    claim `verified`: that flag gates the answer cache and tells a chain of
+    providers to stop trying, and self-agreement must not be able to earn it."""
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "single", "args": [7], "expected": 7},\n'
+             ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    right = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+             "        t += n % 10\n        n //= 10\n    return t\n```")
+
+    task = SolveTask(problem_id="sv", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=60.0)
+    solver = _solver([cases, right], second_opinion=False, max_budget_s=60)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=60.0))
+    out = log.getvalue()
+
+    assert "self-verified" in out, out
+    assert "passed all 3 of its own cases" in out, out
+    assert "no public examples exist to confirm it" in out, (
+        "claimed more than the evidence supports:\n" + out
+    )
+    # `verified` itself is untouched: no public example ran, so nothing is
+    # verified in the sense that word is used everywhere else.
+    assert "verified=False" in out, out
+    assert answer.verified is False
+    assert answer.self_verified is True
+    assert (answer.self_passed, answer.self_total) == (3, 3)
+    # Counted apart, so `/solver-status` showing verified=0 over a live run
+    # reads as the ordinary case rather than as a catastrophe.
+    counts = solver.stats()["solver"]
+    assert counts["self_verified"] == 1 and counts["verified"] == 0, counts
+
+
+def test_a_self_check_that_failed_a_case_is_not_reported_as_verified():
+    """The other half. `self_verified` is every case, not most of them — the
+    payment rule is all-or-nothing, so "2 of 3" is worth exactly what 0 of 3 is
+    and must not read as a pass."""
+    from solvers.verify import Candidate
+
+    passed = Candidate(code="def g(n): return n", raw="", self_passed=3,
+                       self_total=3, from_self_tests=True)
+    partial = Candidate(code="def g(n): return n", raw="", self_passed=2,
+                        self_total=3, failures=["case 3 ..."], from_self_tests=True)
+    never_run = Candidate(code="def g(n): return n", raw="")
+    broken = Candidate(code="def g(", raw="", defect="not valid Python",
+                       self_passed=3, self_total=3, from_self_tests=True)
+    with_examples = Candidate(code="def g(n): return n", raw="", passed=2, total=2,
+                              self_passed=3, self_total=3, from_self_tests=True)
+
+    assert passed.self_verified
+    assert not partial.self_verified, "a partial pass read as verified"
+    assert not never_run.self_verified, "never running read as passing"
+    assert not broken.self_verified, "a defect read as verified"
+    # With public examples in hand THEY are the verdict, and `verified` reports
+    # it. Saying both would be two answers to one question.
+    assert with_examples.verified and not with_examples.self_verified
 
 
 def test_the_deadline_ending_the_loop_ships_the_last_version_and_says_so(monkeypatch):
