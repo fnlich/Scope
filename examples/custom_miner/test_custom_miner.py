@@ -95,6 +95,11 @@ DIGITS = SolveTask(
 
 WRONG = "```python\ndef g(n):\n    s = 0\n    while n > 9:\n        s += n % 10\n        n //= 10\n    return s\n```"
 RIGHT = "```python\ndef g(n):\n    s = 0\n    while n > 0:\n        s += n % 10\n        n //= 10\n    return s\n```"
+# What turn 1 sends back when a test needs the cases turn to produce cases
+# rather than be wasted on a stray code block. `WRONG` FAILS this one -- it
+# stops at `n > 9`, so 12345 sums to 14 -- which is what makes a repair round
+# in these tests real rather than decorative.
+CASES = '```json\n[{"name": "all five digits", "args": [12345], "expected": 15}]\n```'
 
 
 class _Chat:
@@ -144,7 +149,27 @@ def _never_archive_into_the_operators_corpus(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_reply_passes_every_validator_acceptance_check():
     miner_kp, validator_kp = keypair.create_from_uri("//Bob"), keypair.create_from_uri("//Alice")
-    solver = _solver([WRONG, RIGHT])
+    prompts: list[str] = []
+
+    class _Recording(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            return await super().send(text, timeout_s)
+
+    class _Recorded(_Backend):
+        async def open(self, avoid=None):
+            return _Recording(self._replies, self._provider)
+
+    # Three replies, not two, and the third is the point. This test used to read
+    # `_solver([WRONG, RIGHT])` and end on "the repaired answer, not the first
+    # draft" -- but the cases turn (`two_phase`, on by default) eats the first
+    # reply, so `WRONG` answered turn 1, `RIGHT` answered turn 2, and no repair
+    # round ever ran. The assertion passed because RIGHT was simply next in the
+    # list. The one test covering the wire path proved nothing about the loop
+    # that decides what goes ON that wire.
+    solver = VerifyingSolver(
+        _Recorded([CASES, WRONG, RIGHT]), reserve_s=0, max_budget_s=120
+    )
     metagraph = SimpleNamespace(
         hotkeys=[validator_kp.ss58_address], validator_permit=[True], S=[0.0]
     )
@@ -188,7 +213,97 @@ def test_reply_passes_every_validator_acceptance_check():
     #    over, so checking the wrong one here would pass a reply that is thrown
     #    away on arrival.
     assert len(response.content) <= Settings().miner_max_response_bytes
-    assert "while n > 0" in payload.code  # the repaired answer, not the first draft
+    # 5. ...and the answer is the REPAIRED one. Both halves are asserted: the
+    #    code that shipped, and that a repair round is what produced it.
+    assert "while n > 0" in payload.code, payload.code
+    assert len(prompts) == 3, f"expected cases, program, repair; got {len(prompts)}"
+    assert "I ran" in prompts[2], f"turn 3 was not a repair: {prompts[2]!r}"
+
+
+def test_the_correction_ships_on_chain_and_lands_in_the_archive(tmp_path):
+    """The rule -- THE LATEST VERSION WINS -- carried through `/solve` to the
+    file an operator reads, in the shape live traffic actually has.
+
+    Three things make this the case that matters, and all three are how the
+    original bug hid:
+
+    * `public_examples=[]`. All 97 archived requests carry none, so the model's
+      OWN cases are the only bar. That is the path the repair loop runs on in
+      production.
+    * THE CORRECTION IS TOO LATE TO GRADE. `_grade` declines below
+      `GRADE_FLOOR_S`, so phase 3 arrives carrying no evidence at all, and
+      `Candidate.score` puts the same 0 in the self-tests slot for "failed
+      them" and for "was never run". The draft passed 1 of its 3 and scores
+      (0,1,1,1); the correction scores (0,0,1,1) and LOSES to the answer it was
+      correcting. A correction that can be graded is picked by either rule --
+      only this one tells them apart.
+    * IT ASSERTS THE ARCHIVED FILE. The report was "the solution file holds
+      phase 2's code", and that file is written by `save_solution` after
+      `fit_response`, two hops past anything a `solve_task`-level test sees.
+
+    Betting on the ungraded correction is right rather than merely safe:
+    payment is all-or-nothing, so a program known to fail one of its own cases
+    is a certain zero, while an ungraded correction is at worst the same zero
+    and was written by a model that had just been shown what was wrong.
+    """
+    miner_kp = keypair.create_from_uri("//Bob")
+    validator_kp = keypair.create_from_uri("//Alice")
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "single", "args": [7], "expected": 7},\n'
+             ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    draft = "```python\ndef g(n):\n    return 0\n```"            # passes 1 of 3
+    fixed = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+             "        t += n % 10\n        n //= 10\n    return t\n```")
+    prompts: list[str] = []
+
+    class _Slow(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            # The correction takes most of the budget to arrive, so by the time
+            # it is graded there is less than GRADE_FLOOR_S left.
+            if len(prompts) == 3:
+                await asyncio.sleep(7.0)
+            return await super().send(text, timeout_s)
+
+    class _SlowBackend(_Backend):
+        async def open(self, avoid=None):
+            return _Slow(self._replies, self._provider)
+
+    miner = CustomMiner(
+        DemoMinerSettings(_env_file=None),
+        VerifyingSolver(_SlowBackend([cases, draft, fixed]), reserve_s=0,
+                        max_budget_s=20, second_opinion=False),
+        wallet=SimpleNamespace(hotkey=miner_kp), subtensor=None, metagraph=None,
+    )
+    request = TaskRequest(
+        problem_id="live-shape-1", language="python",
+        statement="Return the sum of the decimal digits of n.",
+        entrypoint="g", public_examples=[],
+    )
+    body = request.model_dump_json().encode()
+    headers = sign_message(validator_kp, body, signed_for=miner_kp.ss58_address)
+    headers["Content-Type"] = "application/json"
+
+    with TestClient(build_demo_miner_app(miner)) as client:
+        response = client.post("/solve", content=body, headers=headers)
+
+    assert response.status_code == 200
+    payload = SolutionPayload.model_validate_json(response.content)
+    # The repair round happened at all: cases, program, correction.
+    assert len(prompts) == 3, f"expected cases, program, repair; got {len(prompts)}"
+    assert "I ran" in prompts[2], f"turn 3 was not a repair: {prompts[2]!r}"
+    # What went out is phase 3, not the phase-2 draft it corrects.
+    assert "while n > 0" in payload.code, (
+        f"submitted the program the repair round corrected: {payload.code!r}"
+    )
+
+    archived = tmp_path / "solutions" / "live-shape-1.py"
+    assert archived.is_file(), (
+        f"nothing archived: {sorted((tmp_path / 'solutions').glob('*'))}"
+    )
+    assert archived.read_text() == payload.code, (
+        f"the file is not the submission: {archived.read_text()!r}"
+    )
 
 
 def test_a_long_transcript_is_trimmed_to_what_the_validator_will_read():
@@ -4846,8 +4961,9 @@ def test_grading_does_not_stop_the_world_for_every_other_solve():
     from solvers.verify import Candidate
 
     solver = _solver([RIGHT])
-    solver._grade = lambda reply, task, left=None, cases=None: time.sleep(1.0) or Candidate(
-        code="x = 1", raw=reply
+    solver._grade = (
+        lambda reply, task, left=None, cases=None, previous="":
+        time.sleep(1.0) or Candidate(code="x = 1", raw=reply)
     )
     late: list[float] = []
 
@@ -6606,10 +6722,12 @@ def test_a_corpus_with_no_tests_is_not_reported_as_a_catastrophe(capsys):
     ])
     out = capsys.readouterr().out
     assert "would have scored" not in out, out
-    assert "none of the 4 could be graded here" in out, out
+    assert "could be graded against public examples" in out, out
     assert "3/4 produced an answer" in out, out
     assert "(1 submitted nothing)" in out, out
     assert "1/2 rust answer(s) compile" in out, out
+    # No solver stats passed, so nothing is claimed about local verification.
+    assert "wrote for itself" not in out, out
 
     # ...and when tests DID come with the problem, the old line is still the
     # headline. A SCORED verdict is only reachable when they did.
@@ -6618,6 +6736,55 @@ def test_a_corpus_with_no_tests_is_not_reported_as_a_catastrophe(capsys):
     out = capsys.readouterr().out
     assert "1/1 would have scored" in out, out
     assert "1/1 produced an answer" in out, out
+
+
+def test_a_replay_with_no_tests_still_reports_what_the_solver_could_check(capsys):
+    """The yardstick a corpus with no public examples DOES have.
+
+    "none of the 97 could be graded against public examples" is true and, on its
+    own, was the whole verdict a replay reached -- which cannot tell an answer
+    that ran every case the model wrote and passed from one that was never run.
+    That distinction is the entire question a replay exists to answer, and the
+    solver already knows it: `VerifyingSolver` runs the model's own cases with
+    the validator's executor and counts the clean ones.
+
+    Reported apart from "would have scored" and never merged into it. A model
+    agreeing with itself is weaker evidence than a public example, and the line
+    says so rather than letting the number be read as a score."""
+    from solvers import rehearse
+
+    problems = [
+        rehearse.Problem(
+            SolveTask(problem_id=f"p{i}", language="python", statement="s",
+                      entrypoint="g", public_examples=[], deadline_s=300.0),
+            [], "the archive", "nothing to check it against",
+        )
+        for i in range(3)
+    ]
+    results = [(p, rehearse.UNKNOWN, "no tests came with this problem")
+               for p in problems]
+
+    rehearse._summarise(results, {"solver": {"verified_on_local": 2, "empty": 0}})
+    out = capsys.readouterr().out
+    assert "2/3 verified on local" in out, out
+    assert "passed every case the model wrote for itself" in out, out
+    assert "weaker than a public example" in out, out
+    assert "would have scored" not in out, "a self-check was reported as a score"
+
+    # A solver that checked nothing claims nothing -- no line at all, rather
+    # than a zero that reads as a failure.
+    rehearse._summarise(results, {"solver": {"verified_on_local": 0}})
+    assert "wrote for itself" not in capsys.readouterr().out
+
+    # ...and a stats() that is missing, broken or shaped differently is a
+    # missing line, never a crashed replay.
+    class _Broken:
+        def stats(self): raise RuntimeError("no")
+
+    assert rehearse._solver_stats(_Broken()) == {}
+    assert rehearse._solver_stats(SimpleNamespace(stats=lambda: None)) == {}
+    rehearse._summarise(results, rehearse._solver_stats(_Broken()))
+    assert "wrote for itself" not in capsys.readouterr().out
 
 
 def test_your_own_problems_directory_wins_over_the_shipped_samples(tmp_path):
@@ -6932,6 +7099,82 @@ def test_a_gradeable_failure_still_buys_a_second_opinion():
     assert len(asked) == 2, "a rankable failure should still ask the other model"
 
 
+def test_a_solve_that_used_its_whole_budget_does_not_promise_another_model(capsys):
+    """Both halves of a real log, from a Rust solve that submitted nothing.
+
+        [verify] claude was still writing when the budget ran out; nothing
+                 arrived to submit rather than interrupting it with a repair
+                 prompt
+        [verify] no public examples shipped with this task, and the model sent
+                 no usable cases of its own either, so nothing can be graded
+                 locally...
+        [verify] claude returned nothing; asking another model
+        [verify] -0s left; not enough to ask anyone else, submitting empty
+
+    Two of those four lines are false, and both point the reader away from what
+    actually went wrong -- a program turn that spent the entire 285s budget with
+    the model still writing.
+
+    "asking another model" was decided by `attempt_no < passes` alone, which
+    knows nothing about the clock; the loop head then re-decided it WITH the
+    clock and asked nobody. `_next_pass_blocked_by` is now the single answer
+    both lines read.
+
+    "the model sent no usable cases of its own either" was decided by
+    `from_self_tests`, which `_run_self_tests` only ever sets when there was
+    code to run the cases against. The cases turn here worked perfectly -- it
+    is the reply BELOW it that never arrived -- so an empty answer always
+    libelled turn 1 for turn 2's failure.
+    """
+    burned: list[str] = []
+
+    class _StillWriting(_Chat):
+        still_writing = False
+
+        async def send(self, text, timeout_s):
+            burned.append(text)
+            reply = await super().send(text, timeout_s)
+            if len(burned) >= 2:
+                # The program turn: the model is thinking, and it is still
+                # thinking when the budget is gone.
+                self.still_writing = True
+                self.empty_reason = "unfinished"
+                await asyncio.sleep(4.0)
+                return ""
+            return reply
+
+    class _Backend2(_Backend):
+        async def open(self, avoid=None):
+            return _StillWriting(self._replies, self._provider)
+
+    task = SolveTask(
+        problem_id="burned", language="python",
+        statement="Return the sum of the decimal digits of n.", entrypoint="g",
+        public_examples=[], deadline_s=3.0,
+    )
+    # `CASES` first, so turn 1 genuinely produces usable cases -- the whole
+    # point of the second assertion below.
+    solver = VerifyingSolver(_Backend2([CASES, ""]), reserve_s=0, max_budget_s=3,
+                             second_opinion=True)
+    answer = asyncio.run(solver.solve_task(task, timeout_s=3.0))
+    out = capsys.readouterr().out
+
+    assert not answer.code.strip(), "this reproduction is meant to submit nothing"
+    assert len(burned) == 2, f"expected a cases turn and a program turn: {len(burned)}"
+    assert "still writing when the budget ran out" in out, out
+    # 1. Nobody was asked, so nobody may be promised.
+    assert "asking another model" not in out, (
+        "promised a second model with the budget already spent:\n" + out
+    )
+    assert "not enough to ask anyone else" in out, out
+    # 2. Turn 1 delivered cases. The failure was turn 2's.
+    assert "no usable cases of its own" not in out, (
+        "blamed the cases turn for the program turn's failure:\n" + out
+    )
+    # 3. A budget that is a hair past spent reads as spent, not as negative.
+    assert "-0s left" not in out, out
+
+
 def test_the_archive_line_names_a_directory_you_can_find(tmp_path, monkeypatch, capsys):
     """`SOLVER_SOLUTION_DIR` defaults to the relative "solutions", so the line
     read "archived under solutions/" and left the reader to work out which
@@ -7102,15 +7345,12 @@ def test_a_repair_ends_on_the_rule_for_what_may_come_back():
     there. The model's own cases may themselves be wrong -- turn 1 derives its
     `expected` values by reasoning -- so that branch names both ways out and
     lets the model pick."""
-    from solvers.prompts import build_repair_prompt
+    from solvers.prompts import WHOLE_PROGRAM, build_repair_prompt
 
     failure = ["g(*[0], **{}) returned 1, expected 0"]
 
     theirs = build_repair_prompt(failure, "python", "g")
-    assert theirs.rstrip().endswith(
-        "Send back ONE fenced block: the corrected program, complete, with "
-        "nothing outside it."
-    ), theirs
+    assert theirs.rstrip().endswith(f"{WHOLE_PROGRAM}."), theirs
     assert "json" not in theirs, (
         "offered to rewrite the validator's own examples, which are ground truth"
     )
@@ -7122,6 +7362,520 @@ def test_a_repair_ends_on_the_rule_for_what_may_come_back():
     assert mine.rstrip().endswith(
         "a `json` array holding ALL of the cases, corrected."
     ), mine
+    # ALL of the cases on one side, ALL of the program on the other. This
+    # branch is the only one live traffic can reach -- every archived request
+    # ships zero `public_examples` -- and it was the only one of the four that
+    # said nothing about the program being complete.
+    assert WHOLE_PROGRAM in mine, mine
+
+
+def test_a_round_that_sends_only_what_it_changed_is_told_to_send_it_all():
+    """The repair round asks for the whole program; a model shown one failing
+    case answers about that case.
+
+    What comes back is the one function it fixed -- correct in itself, and
+    unrunnable, because the helper it calls is in the reply ABOVE it and the
+    file that gets submitted is this reply alone. `compile()` accepts it,
+    `python_defect` reports it clean, and every hidden test dies on `NameError`
+    for a function that was right there a round ago.
+
+    So the round is reported as incomplete, by name, and the next prompt asks
+    for the whole program rather than for different logic -- the same
+    distinction the defect branch already makes between "your logic is wrong"
+    and "I could not run this at all"."""
+    from solvers.prompts import build_repair_prompt, dropped_definitions
+
+    previous = ("import math\n"
+                "def digits(n):\n    return [int(c) for c in str(n)]\n"
+                "def g(n):\n    return sum(digits(n))")
+    only_the_fix = "def g(n):\n    return sum(digits(abs(n)))"
+
+    defect = dropped_definitions(only_the_fix, previous)
+    assert defect and "`digits`" in defect, defect
+    assert "only part of the program" in defect, defect
+
+    prompt = build_repair_prompt([], "python", "g", defect=defect)
+    assert "digits" in prompt, "the repair never named what was missing"
+    assert "not only the part you changed" in prompt, prompt
+    assert "I ran" not in prompt, "blamed logic that was never run"
+
+
+def test_a_whole_program_that_drops_a_helper_it_no_longer_calls_is_fine():
+    """The guard that keeps the one above honest.
+
+    A correction is allowed to be a rewrite. Inlining a helper, or replacing two
+    functions with one, drops a definition the previous version had -- and that
+    is a complete program, not a fragment. Only a name still USED and no longer
+    defined says the reply is part of something.
+
+    Measured against the corpus rather than argued: `_unbound` finds nothing
+    unresolvable in any of the 26 archived Python answers, so this check has no
+    false-positive surface on real submissions at all."""
+    from solvers.prompts import _unbound, dropped_definitions
+
+    previous = ("def digits(n):\n    return [int(c) for c in str(n)]\n"
+                "def g(n):\n    return sum(digits(n))")
+    inlined = "def g(n):\n    return sum(int(c) for c in str(n))"
+    assert dropped_definitions(inlined, previous) is None, "refused a rewrite"
+    # ...and the first answer of a solve, which has no predecessor at all.
+    assert dropped_definitions(previous, "") is None
+
+    archived = _archived_answers("python")
+    assert len(archived) >= 20, f"expected the archived answers, got {len(archived)}"
+    flagged = [name for name, code in archived if _unbound(code)]
+    assert not flagged, f"would have called a real submission incomplete: {flagged}"
+
+
+def test_a_fragment_does_not_displace_the_whole_program_above_it():
+    """The other half, and the one the prompt cannot cover.
+
+    THE LATEST VERSION WINS is the rule, and a fragment is not a version. If the
+    last round of a solve sends back only the function it fixed and the budget
+    ends before anything can be run, `_supersedes` would ship it -- a certain
+    zero, over a complete program that at least runs.
+
+    Nothing is ranked here: no score is compared, and between two fragments the
+    later one still wins, because between two fragments the later one is still
+    the correction."""
+    from solvers.verify import Candidate, _supersedes
+
+    whole = Candidate(code="def digits(n): return []\ndef g(n): return digits(n)",
+                      raw="", self_passed=1, self_total=3, failures=["case 2 ..."],
+                      from_self_tests=True)
+    fragment = Candidate(code="def g(n): return sum(digits(n))", raw="",
+                         defect="this is only part of the program: it uses `digits`",
+                         partial=True)
+    later_fragment = Candidate(code="def g(n): return sum(digits(abs(n)))", raw="",
+                               defect="this is only part of the program", partial=True)
+
+    assert not _supersedes(fragment, whole, False), "shipped a fragment"
+    # A whole program still supersedes, failures and all -- the rule is unchanged
+    # for everything that is actually a program.
+    assert _supersedes(whole, fragment, False)
+    # Two fragments: latest still wins. There is no complete answer to protect.
+    assert _supersedes(later_fragment, fragment, False)
+    # And a fragment is still better than nothing at all.
+    assert _supersedes(fragment, Candidate(code="", raw=""), False)
+
+
+def test_a_model_repeating_itself_keeps_being_corrected_while_time_remains(monkeypatch):
+    """Correcting runs until the answer passes or the deadline stops it. A model
+    that answers the same way twice is not the deadline.
+
+    The duplicate guard used to end the loop outright once there was nowhere to
+    carry the repair — measured, a model repeating itself once ended a solve at
+    0.2s of a 60s budget and shipped `return 0`, throwing away every round the
+    clock would still have paid for. Models are stochastic: the next ask is a
+    real chance, and a real chance is what the remaining budget is for.
+
+    The budget below is under `RESUME_FLOOR_S`, so carrying the repair to a
+    fresh conversation is not on the table and the duplicate branch is what
+    decides. Each round takes a real round trip."""
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "STALE_ROUND_S", 0.3)
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    stuck = "```python\ndef g(n):\n    return 0\n```"
+    right = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+             "        t += n % 10\n        n //= 10\n    return t\n```")
+    sent: list[str] = []
+
+    class _Repeats(_Chat):
+        async def send(self, text, timeout_s):
+            sent.append(text)
+            if len(sent) == 1:
+                return cases
+            await asyncio.sleep(0.5)     # a real exchange, not a stale read
+            return right if len(sent) >= 5 else stuck
+
+    class _Backend2(_Backend):
+        async def open(self, avoid=None):
+            return _Repeats(self._replies, self._provider)
+
+    task = SolveTask(problem_id="stuck", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=30.0)
+    solver = verify.VerifyingSolver(_Backend2([]), reserve_s=0, max_budget_s=30,
+                                    second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=30.0))
+
+    assert len(sent) == 5, f"gave up while the clock was still running: {len(sent)}"
+    assert "while n > 0" in answer.code, answer.code
+    assert "replaying an old reply" not in log.getvalue(), (
+        "called a real round trip a stale read"
+    )
+
+
+def test_a_tab_replaying_an_old_reply_stops_instead_of_spinning(monkeypatch):
+    """The other side of it, and the reason the guard exists at all.
+
+    `send` blocks on the chat UI until the reply finishes, so a round that comes
+    back instantly read something already on the page. Re-asking that does not
+    cost a round trip — it costs nothing — and the loop would resend the same
+    repair at machine speed until the budget was gone, thousands of times, for
+    one answer that never changes.
+
+    Time is what tells the two apart, not the count: the model answering the
+    same way twice is worth another ask, and a tab that never asked anything is
+    not."""
+    from solvers import verify
+
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    stale = "```python\ndef g(n):\n    return 0\n```"
+    sent: list[str] = []
+
+    class _Stale(_Chat):
+        async def send(self, text, timeout_s):
+            sent.append(text)
+            return cases if len(sent) == 1 else stale    # instantly, every time
+
+    class _Backend2(_Backend):
+        async def open(self, avoid=None):
+            return _Stale(self._replies, self._provider)
+
+    task = SolveTask(problem_id="stale", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=30.0)
+    solver = verify.VerifyingSolver(_Backend2([]), reserve_s=0, max_budget_s=30,
+                                    second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=30.0))
+    out = log.getvalue()
+
+    assert len(sent) <= 4, f"spun on a tab that was not answering: {len(sent)}"
+    assert "replaying an old reply" in out, out
+    # The last version still goes out. A stale tab is a reason to stop asking,
+    # never a reason to submit nothing.
+    assert answer.code.strip() == "def g(n):\n    return 0", answer.code
+
+
+def test_an_answer_that_passed_every_case_it_had_is_reported_as_such():
+    """`verified=False` is the only thing a live solve can print, and on its own
+    it says nothing.
+
+    `verified` means the VALIDATOR's public examples all reproduced. Live
+    traffic ships none — all 97 archived requests carry zero — so `verified` is
+    False on every real answer this miner sends, whether it passed every case
+    the model wrote for it or was never run at all. Those are the two ends of
+    the range and the log gave them the same word.
+
+    So the state is reported, without ever letting a model agreeing with itself
+    claim `verified`: that flag gates the answer cache and tells a chain of
+    providers to stop trying, and self-agreement must not be able to earn it."""
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "single", "args": [7], "expected": 7},\n'
+             ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    right = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+             "        t += n % 10\n        n //= 10\n    return t\n```")
+
+    task = SolveTask(problem_id="sv", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=60.0)
+    solver = _solver([cases, right], second_opinion=False, max_budget_s=60)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=60.0))
+    out = log.getvalue()
+
+    assert "verified on local" in out, out
+    assert "passed all 3 of its own cases" in out, out
+    assert "no public examples exist to confirm it" in out, (
+        "claimed more than the evidence supports:\n" + out
+    )
+    # `verified` itself is untouched: no public example ran, so nothing is
+    # verified in the sense that word is used everywhere else.
+    assert "verified=False" in out, out
+    assert answer.verified is False
+    assert answer.self_verified is True
+    assert (answer.self_passed, answer.self_total) == (3, 3)
+    # Counted apart, so `/solver-status` showing verified=0 over a live run
+    # reads as the ordinary case rather than as a catastrophe.
+    counts = solver.stats()["solver"]
+    assert counts["verified_on_local"] == 1 and counts["verified"] == 0, counts
+
+
+def test_a_self_check_that_failed_a_case_is_not_reported_as_verified():
+    """The other half. `self_verified` is every case, not most of them — the
+    payment rule is all-or-nothing, so "2 of 3" is worth exactly what 0 of 3 is
+    and must not read as a pass."""
+    from solvers.verify import Candidate
+
+    passed = Candidate(code="def g(n): return n", raw="", self_passed=3,
+                       self_total=3, from_self_tests=True)
+    partial = Candidate(code="def g(n): return n", raw="", self_passed=2,
+                        self_total=3, failures=["case 3 ..."], from_self_tests=True)
+    never_run = Candidate(code="def g(n): return n", raw="")
+    broken = Candidate(code="def g(", raw="", defect="not valid Python",
+                       self_passed=3, self_total=3, from_self_tests=True)
+    with_examples = Candidate(code="def g(n): return n", raw="", passed=2, total=2,
+                              self_passed=3, self_total=3, from_self_tests=True)
+
+    assert passed.self_verified
+    assert not partial.self_verified, "a partial pass read as verified"
+    assert not never_run.self_verified, "never running read as passing"
+    assert not broken.self_verified, "a defect read as verified"
+    # With public examples in hand THEY are the verdict, and `verified` reports
+    # it. Saying both would be two answers to one question.
+    assert with_examples.verified and not with_examples.self_verified
+
+
+def test_the_deadline_ending_the_loop_ships_the_last_version_and_says_so(monkeypatch):
+    """The ordinary way a correction loop ends, and it used to end in silence.
+
+    `max_attempts` defaults to 0 -- unlimited -- so the clock is what stops the
+    loop on nearly every real solve. `attempt > 1 and left < ROUND_TRIP_FLOOR_S`
+    was a bare `break`: the last version went out, correctly, with nothing in
+    the log to say the deadline was why or that it was going out ungraded. An
+    operator reading that saw a solve stop mid-correction for no stated reason.
+
+    What must be true, and all three are asserted: the repair prompt is NOT sent
+    (there is no time for the round trip), the last version in hand IS submitted
+    rather than nothing, and the line says both -- deadline, and unverified."""
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "ROUND_TRIP_FLOOR_S", 8.0)
+    prompts: list[str] = []
+    one_case = '```json\n[{"name": "carry", "args": [12345], "expected": 15}]\n```'
+    draft = "```python\ndef g(n):\n    return 0\n```"
+    never_sent = "```python\ndef g(n):\n    return 15\n```"
+
+    class _Slow(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            if len(prompts) == 2:       # the program turn eats the budget
+                await asyncio.sleep(2.0)
+            return await super().send(text, timeout_s)
+
+    class _SlowBackend(_Backend):
+        async def open(self, avoid=None):
+            return _Slow(self._replies, self._provider)
+
+    # 8s budget, 2s spent on the program turn: 6s left is enough to GRADE the
+    # draft (one case, `VERIFY_TIMEOUT_S` each) and not enough for another round
+    # trip. Both halves matter -- an ungraded draft would leave the loop by a
+    # different door, and this test is about the door the clock closes.
+    task = SolveTask(problem_id="clock", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=8.0)
+    solver = verify.VerifyingSolver(_SlowBackend([one_case, draft, never_sent]),
+                                    reserve_s=0, max_budget_s=8,
+                                    second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=8.0))
+    out = log.getvalue()
+
+    assert len(prompts) == 2, f"a repair went out with no time for it: {len(prompts)}"
+    assert "not enough for another correction round" in out, out
+    assert "submitting the last version unverified" in out, out
+    # The answer still goes out. An unverified answer can still be right; an
+    # answer never sent is a certain zero.
+    assert answer.code.strip() == "def g(n):\n    return 0", answer.code
+    assert answer.verified is False
+
+
+def test_running_out_before_the_models_own_cases_could_run_says_which(monkeypatch):
+    """`_grade` explains an ungraded answer -- and gated that explanation on
+    `task.public_examples`, which is the one thing live traffic never has.
+
+    Every archived request ships zero public examples, so on every real solve
+    that ran out of time the single line explaining why the answer went out
+    ungraded was the single line that never printed. Worse, `solve_task` then
+    filled the silence with the wrong reason: `from_self_tests` is only set when
+    the cases RAN, so a solve whose cases turn worked perfectly and simply had
+    no budget left to run them reported "the model sent no usable cases of its
+    own either" -- sending the reader to fix a prompt that is working."""
+    from solvers import verify
+
+    prompts: list[str] = []
+    one_case = '```json\n[{"name": "carry", "args": [12345], "expected": 15}]\n```'
+    draft = "```python\ndef g(n):\n    return 0\n```"
+
+    class _Slow(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            if len(prompts) == 2:
+                await asyncio.sleep(2.0)
+            return await super().send(text, timeout_s)
+
+    class _SlowBackend(_Backend):
+        async def open(self, avoid=None):
+            return _Slow(self._replies, self._provider)
+
+    task = SolveTask(problem_id="unrun", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=6.0)
+    solver = verify.VerifyingSolver(_SlowBackend([one_case, draft]), reserve_s=0,
+                                    max_budget_s=6, second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=6.0))
+    out = log.getvalue()
+
+    assert "out of budget before" in out and "own case(s) could be run" in out, out
+    assert "submitting the answer unverified" in out, out
+    assert "no usable cases of its own" not in out, (
+        "blamed the cases turn for the clock:\n" + out
+    )
+    assert answer.code.strip() == "def g(n):\n    return 0", answer.code
+    assert answer.verified is False
+    assert "verified=False" in out, out
+
+
+def test_a_corrected_case_stays_the_bar_for_every_later_round():
+    """The bar is the LAST version of the cases, not turn 1's, and it stays that
+    way for every round after the one that corrected it.
+
+    Four turns, and the two repair rounds are the evidence:
+
+      turn 1  three cases, `carry` expecting 14 — which is wrong, it is 15
+      turn 2  `return 0`, which passes `zero` and nothing else
+      round 1 is told "returned 0, expected 14"  ← turn 1's bar
+              the model corrects the CASE and sends no program
+      round 2 is told "returned 0, expected 15"  ← the CORRECTED bar
+
+    If the correction only applied to the round that carried it, round 2 would
+    quote 14 again and a correct program could never pass: `carry` would fail
+    forever against a case the model had already fixed, and the loop would run
+    until the deadline reporting a disagreement that no longer existed."""
+    prompts: list[str] = []
+    wrong_bar = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+                 ' {"name": "single", "args": [7], "expected": 7},\n'
+                 ' {"name": "carry", "args": [12345], "expected": 14}]\n```')
+    draft = "```python\ndef g(n):\n    return 0\n```"
+    fixed_bar = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+                 ' {"name": "single", "args": [7], "expected": 7},\n'
+                 ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    fixed_code = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+                  "        t += n % 10\n        n //= 10\n    return t\n```")
+
+    class _Recording(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            return await super().send(text, timeout_s)
+
+    class _Recorded(_Backend):
+        async def open(self, avoid=None):
+            return _Recording(self._replies, self._provider)
+
+    task = SolveTask(problem_id="bar2", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=60.0)
+    solver = VerifyingSolver(_Recorded([wrong_bar, draft, fixed_bar, fixed_code]),
+                             reserve_s=0, max_budget_s=60, second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=60.0))
+    out = log.getvalue()
+
+    assert len(prompts) == 4, f"expected cases, program, two rounds: {len(prompts)}"
+    assert "expected 14" in prompts[2], f"round 1 used a bar nobody set: {prompts[2]!r}"
+    assert "expected 15" in prompts[3] and "expected 14" not in prompts[3], (
+        "round 2 was graded against the case the model had already corrected:\n"
+        + prompts[3]
+    )
+    assert "while n > 0" in answer.code, answer.code
+    assert "self=3/3" in out, out
+
+
+def test_a_partial_correction_is_sent_back_and_the_whole_program_ships():
+    """Requirement 1 end to end, through the solve the miner actually runs.
+
+    Round 1 sends back only the function it changed. It parses, `compile()` is
+    happy, and `digits` — which turn 2 defined and this reply calls — exists
+    nowhere in the file that would be submitted. Round 2 is told exactly that,
+    by name, and asked for the whole program; what ships is the whole program.
+
+    Without the check the fragment is the latest version and `_supersedes`
+    ships it: a `NameError` on every hidden case, reported clean."""
+    prompts: list[str] = []
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    draft = ("```python\ndef digits(n):\n    return [int(c) for c in str(n)]\n"
+             "def g(n):\n    return len(digits(n))\n```")
+    partial = "```python\ndef g(n):\n    return sum(digits(n))\n```"
+    whole = ("```python\ndef digits(n):\n    return [int(c) for c in str(n)]\n"
+             "def g(n):\n    return sum(digits(n))\n```")
+
+    class _Recording(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            return await super().send(text, timeout_s)
+
+    class _Recorded(_Backend):
+        async def open(self, avoid=None):
+            return _Recording(self._replies, self._provider)
+
+    task = SolveTask(problem_id="partial", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=60.0)
+    solver = VerifyingSolver(_Recorded([cases, draft, partial, whole]),
+                             reserve_s=0, max_budget_s=60, second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        answer = asyncio.run(solver.solve_task(task, timeout_s=60.0))
+
+    assert len(prompts) == 4, f"expected cases, program, two rounds: {len(prompts)}"
+    assert "only part of the program" in prompts[3], (
+        f"the fragment was accepted as a version: {prompts[3]!r}"
+    )
+    assert "`digits`" in prompts[3], "never named what was missing"
+    assert "I ran" not in prompts[3], "blamed logic that was never run"
+    # The whole program ships, and the fragment did not displace anything.
+    assert "def digits" in answer.code and "sum(digits(n))" in answer.code, answer.code
+
+
+def test_each_round_is_graded_against_the_latest_corrected_cases():
+    """Phases 3, 4, ... run locally against the CORRECTED cases, round after
+    round, until a round has nothing left to fix.
+
+    The whole loop in one solve, with the bar moving under it:
+
+      turn 1  three cases, one of them wrong (`carry` expects 14, not 15)
+      turn 2  a program that is right, and fails the wrong case
+      round 1 the model corrects the CASE, sends no program
+              -> the program in hand is re-graded against the corrected bar
+      round 2 is never needed: with the case fixed the program passes 3/3
+
+    The bar that decided it is turn 1's cases WITH round 1's correction applied
+    -- not turn 1's, which would have failed a correct program forever, and not
+    a set the reply could shrink to fit."""
+    prompts: list[str] = []
+    cases_wrong = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+                   ' {"name": "single", "args": [7], "expected": 7},\n'
+                   ' {"name": "carry", "args": [12345], "expected": 14}]\n```')
+    program = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+               "        t += n % 10\n        n //= 10\n    return t\n```")
+    cases_fixed = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+                   ' {"name": "single", "args": [7], "expected": 7},\n'
+                   ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+
+    class _Recording(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            return await super().send(text, timeout_s)
+
+    class _Recorded(_Backend):
+        async def open(self, avoid=None):
+            return _Recording(self._replies, self._provider)
+
+    task = SolveTask(problem_id="bar", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=60.0)
+    solver = VerifyingSolver(_Recorded([cases_wrong, program, cases_fixed]),
+                             reserve_s=0, max_budget_s=60, second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=60.0))
+    out = log.getvalue()
+
+    assert "while n > 0" in answer.code, answer.code
+    # Exactly three turns: cases, program, one correction. The loop stopped
+    # because the corrected bar was met, not because it ran out of anything.
+    assert len(prompts) == 3, f"expected cases, program, one repair: {len(prompts)}"
+    assert "expected 14" in prompts[2] or "returned 15" in prompts[2], (
+        f"round 1 was not told about the disagreement: {prompts[2]!r}"
+    )
+    assert "self=3/3" in out, (
+        "the program was not re-graded against the corrected cases:\n" + out
+    )
 
 
 # --------------------------------------------------------------------------- #

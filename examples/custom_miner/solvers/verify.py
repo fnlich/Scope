@@ -43,6 +43,7 @@ from .prompts import (
     build_repair_prompt,
     build_resume_prompt,
     build_tests_prompt,
+    dropped_definitions,
     extract_code,
     extract_self_tests,
     python_defect,
@@ -97,6 +98,19 @@ OPEN_FLOOR_S = 5.0
 # The most `_grade` will insist on before it declines to run anything at all.
 GRADE_FLOOR_S = 15.0
 
+# The least a correction round can be worth starting with: one prompt out, one
+# reply back, and something read from the page at the end of it. Below this the
+# loop stops and the last version in hand goes out as it stands.
+ROUND_TRIP_FLOOR_S = 12.0
+
+# Under this, a round did not involve the model. `send` blocks on a chat UI
+# until the reply finishes -- tens of seconds, normally -- so a round that came
+# back in under a couple of seconds read something that was already on the page.
+# It is the difference between a model that answered the same way twice and a
+# tab that is handing back the previous answer forever, and only the second is
+# a reason to stop correcting.
+STALE_ROUND_S = 2.0
+
 
 class Conversation(Protocol):
     """One live, isolated model conversation.
@@ -137,6 +151,12 @@ class Answer:
     verified: bool = False
     passed: int = 0
     total: int = 0
+    # The same question asked of the model's OWN cases, which on live traffic is
+    # the only suite that ever runs. Kept beside `verified` rather than merged
+    # into it -- see `Candidate.self_verified`.
+    self_verified: bool = False
+    self_passed: int = 0
+    self_total: int = 0
 
 
 @dataclass
@@ -155,11 +175,50 @@ class Candidate:
     self_passed: int = 0
     self_total: int = 0
     from_self_tests: bool = False
+    # How many of the model's own cases were IN HAND for this candidate,
+    # whether or not there was time to run them. `from_self_tests` says they
+    # ran; this says they existed. Keeping only the first made "no time to run
+    # the cases" indistinguishable from "the model never sent any", and the
+    # warning in `solve_task` said the second when the truth was the first.
+    self_cases: int = 0
+    # This reply is part of a program rather than a program: it uses something
+    # only the round above it defined. Kept beside `defect` rather than folded
+    # into it because `_supersedes` has to tell this apart from every other way
+    # code can be wrong -- see there.
+    partial: bool = False
 
     @property
     def verified(self) -> bool:
         """Every public example reproduced exactly."""
         return self.defect is None and self.total > 0 and self.passed == self.total
+
+    @property
+    def self_verified(self) -> bool:
+        """Every case the MODEL wrote for itself reproduced, and it is all the
+        evidence there was.
+
+        Deliberately not folded into `verified`, and the reason is unchanged: a
+        model cannot confirm its own reading of a statement, so a program that
+        agrees with itself must not be able to earn the flag that gates the
+        answer cache and tells a chain of providers to stop trying.
+
+        But it is not nothing, either -- it is the ONLY evidence a live solve
+        ever has. Production ships no `public_examples` at all, so `verified`
+        is False on every real answer this miner sends, and a log that reports
+        only that cannot tell "ran every case it had and passed" from "was
+        never run at all". Those are the two ends of the range, and they read
+        identically. This is the one that says which.
+
+        `total == 0` is part of it: with public examples in hand THEY are the
+        verdict, and `verified` already reports it.
+        """
+        return (
+            self.defect is None
+            and self.total == 0
+            and self.self_total > 0
+            and self.self_passed == self.self_total
+            and not self.failures
+        )
 
     @property
     def score(self) -> tuple[int, int, int, int]:
@@ -230,11 +289,22 @@ def _supersedes(candidate: Candidate, best: Candidate, still_writing: bool) -> b
     * THE MODEL IS STILL WRITING. What arrived is a fragment of a reply rather
       than a revision of one, and a fragment that happens to parse must not
       displace the finished program above it.
+    * ONLY THE PART THAT CHANGED ARRIVED. The same thing said by the model
+      instead of by the clock: a round asked for the whole program sent back
+      the one function it fixed, and it uses a helper that lives in the round
+      above. `dropped_definitions` is what knows. This is not a judgement about
+      which program is better -- a fragment is not a program, and every hidden
+      test would die on `NameError` for a helper that was right there.
+
+    None of the three ranks anything. Two fragments still go latest-first,
+    because between two fragments the later one is still the correction.
     """
     if not candidate.code.strip():
         return False
     if still_writing:
         return not best.code.strip()
+    if candidate.partial and best.code.strip() and not best.partial:
+        return False
     return True
 
 
@@ -550,12 +620,51 @@ class VerifyingSolver:
         self._grader = _Grader()
         self._cache: dict[str, tuple[str, str]] = {}
         self._cache_size = max(0, int(cache_size))
-        self._counts = {"solved": 0, "verified": 0, "cache_hits": 0, "empty": 0}
+        self._counts = {
+            "solved": 0, "verified": 0, "verified_on_local": 0, "cache_hits": 0,
+            "empty": 0,
+        }
         self._by_provider: dict[str, dict[str, int]] = {}
         # The no-examples explanation is worth saying, but only once a run.
         self._warned_ungradeable = False
         # ...and so is a deadline being cut short by our own configuration.
         self._warned_short_deadline = False
+
+    def _next_pass_blocked_by(
+        self, best: Candidate, attempt_no: int, remaining: float
+    ) -> Optional[str]:
+        """Why the pass after this one will not happen, or None if it will.
+
+        Asked in TWO places, and it has to answer the same in both: at the top
+        of the next iteration, which ACTS on it, and at the bottom of this one,
+        which ANNOUNCES it. They were separate expressions and they drifted --
+        the announcement asked only `attempt_no < passes` and knew nothing
+        about the clock, so a solve that had spent its entire budget printed
+
+            [verify] claude returned nothing; asking another model
+            [verify] -0s left; not enough to ask anyone else, submitting empty
+
+        one line apart. Nobody was asked. An operator reading that goes looking
+        for a second provider's failure that never happened, while the real one
+        -- a program turn that ran the budget out -- sits three lines above it
+        wearing no emphasis at all.
+        """
+        empty_handed = not best.code.strip()
+        if not empty_handed and attempt_no >= SECOND_OPINION_PASSES:
+            # There is an answer in hand and it has already had its second
+            # opinion. `MAX_PASSES` is for the empty case only: spending it
+            # here would double or quadruple what every failing task costs a
+            # real account's quota, to improve on something already worth
+            # submitting.
+            return "the answer in hand has already had its second opinion"
+        floor_s = EMPTY_HANDED_FLOOR_S if empty_handed else SECOND_OPINION_FLOOR_S
+        if remaining < floor_s:
+            return (
+                "not enough to ask anyone else, submitting empty"
+                if empty_handed
+                else "no time for a second opinion"
+            )
+        return None
 
     # -- the Solver interface custom_miner.py expects ---------------------- #
     async def solve_task(self, task, timeout_s: float) -> Answer:
@@ -646,26 +755,13 @@ class VerifyingSolver:
             # The first pass always runs, however little is left: bailing here
             # would return nothing having asked nobody.
             if attempt_no:
-                empty_handed = not best.code.strip()
-                if not empty_handed and attempt_no >= SECOND_OPINION_PASSES:
-                    # There is an answer in hand and it has already had its
-                    # second opinion. `MAX_PASSES` is for the empty case only:
-                    # spending it here would double or quadruple what every
-                    # failing task costs a real account's quota, to improve on
-                    # something already worth submitting.
-                    break
-                floor_s = (
-                    EMPTY_HANDED_FLOOR_S if empty_handed else SECOND_OPINION_FLOOR_S
-                )
-                if remaining < floor_s:
-                    print(
-                        f"[verify] {remaining:.0f}s left; "
-                        + (
-                            "not enough to ask anyone else, submitting empty"
-                            if empty_handed
-                            else "no time for a second opinion"
-                        )
-                    )
+                blocked = self._next_pass_blocked_by(best, attempt_no, remaining)
+                if blocked is not None:
+                    # `max(0, ...)`: the budget can be a hair past spent by the
+                    # time this reads it, and "-0s left" reads as a bug in the
+                    # arithmetic rather than as a solve that used everything it
+                    # had.
+                    print(f"[verify] {max(0.0, remaining):.0f}s left; {blocked}")
                     break
             attempt_no += 1
             candidate, provider = await self._attempt(
@@ -688,10 +784,32 @@ class VerifyingSolver:
             # because two ungradeable candidates tie at `score` and `>` loses a
             # tie. Twice the time and twice the quota for no information at all.
             if best.total == 0:
-                if best.from_self_tests:
-                    # Not ungradeable after all: the model shipped cases and
-                    # they ran. The warning below is about having NOTHING to
-                    # run and would be false here.
+                if best.from_self_tests or not best.code.strip():
+                    # Two ways this warning would be a lie, and the second was
+                    # printed against a solve whose cases turn had worked
+                    # perfectly.
+                    #
+                    # `from_self_tests`: the model shipped cases and they ran,
+                    # so there was something to grade after all.
+                    #
+                    # NO CODE: `_run_self_tests` is gated on `code.strip()`, so
+                    # an empty candidate reports `from_self_tests=False`
+                    # whatever turn 1 produced -- and the warning then blames
+                    # the cases turn for the PROGRAM turn's failure. Measured:
+                    # a Rust solve whose cases turn returned usable cases in
+                    # silence, whose program turn then spent the whole 285s
+                    # budget still writing, and which reported "the model sent
+                    # no usable cases of its own either". Nothing can be graded
+                    # because there is no ANSWER, and the lines that say the
+                    # answer is missing already say so, about the right turn.
+                    pass
+                elif best.self_cases:
+                    # A THIRD way it would be a lie, and the one the deadline
+                    # produces: the cases turn worked, the cases are right
+                    # here, and there was no budget left to run them. Saying
+                    # "the model sent no usable cases" sends the reader to fix
+                    # a prompt that is working. `_grade` has already named this
+                    # one on the line above, so there is nothing to add.
                     pass
                 elif not self._warned_ungradeable:
                     self._warned_ungradeable = True
@@ -712,7 +830,9 @@ class VerifyingSolver:
                 # whole payment.
                 if best.code.strip():
                     break
-            if attempt_no < passes:
+            if attempt_no < passes and self._next_pass_blocked_by(
+                best, attempt_no, budget - (time.monotonic() - started)
+            ) is None:
                 print(
                     f"[verify] {provider or 'first'} "
                     + (
@@ -736,6 +856,14 @@ class VerifyingSolver:
 
         if best.verified:
             self._counts["verified"] += 1
+        elif best.self_verified:
+            # Counted apart from `verified`, never inside it, and named as
+            # the log line names it. On live traffic this is the only counter
+            # of the two that can ever move, so a `/solver-status` showing
+            # verified=0 over a whole run is the ordinary reading rather than
+            # the alarming one -- and this is the number that says whether the
+            # answers were any good.
+            self._counts["verified_on_local"] += 1
         if best.code.strip():
             self._counts["solved"] += 1
             # `not best.failures` as well as `verified`: with both suites run,
@@ -756,11 +884,24 @@ class VerifyingSolver:
             f"examples={best.passed}/{best.total} "
             + (f"self={best.self_passed}/{best.self_total} " if best.self_total else "")
             + f"verified={best.verified} "
-            f"{elapsed:.1f}s/{budget:.0f}s"
+            # `verified=False` is the only thing a live solve could ever print,
+            # because no request ships public examples -- so on its own it said
+            # the same thing about an answer that passed every case it had and
+            # about one that was never run. This says which, without ever
+            # claiming the word `verified` for a model agreeing with itself.
+            + (
+                f"(verified on local: passed all {best.self_total} of its "
+                f"own cases; no public examples exist to confirm it) "
+                if best.self_verified
+                else ""
+            )
+            + f"{elapsed:.1f}s/{budget:.0f}s"
         )
         return Answer(
             code=best.code, raw_response=best.raw,
             verified=best.verified, passed=best.passed, total=best.total,
+            self_verified=best.self_verified,
+            self_passed=best.self_passed, self_total=best.self_total,
         )
 
     async def _ask_for_cases(self, conversation, task, left: float):
@@ -1001,10 +1142,8 @@ class VerifyingSolver:
             attempt = 0
             while True:
                 attempt += 1
-                if self._max_attempts and attempt > self._max_attempts:
-                    break
                 left = budget - (time.monotonic() - started)
-                if attempt > 1 and left < 12.0:
+                if attempt > 1 and left < ROUND_TRIP_FLOOR_S:
                     # Not enough left to be worth another ROUND TRIP -- which is
                     # what this has always been about, and it never should have
                     # gated the first one. It did: below a 32-second deadline
@@ -1013,6 +1152,31 @@ class VerifyingSolver:
                     # without a single line of log to say why. The first attempt
                     # always runs, however little there is, exactly as the first
                     # pass does in `solve_task`.
+                    #
+                    # And this branch itself used to be the silent one. The
+                    # deadline is the ordinary way a correction loop ends -- it
+                    # runs until the answer passes or the clock stops it -- so
+                    # it is the last thing that should happen without a word.
+                    print(
+                        f"[verify] {max(0.0, left):.0f}s left, not enough for "
+                        f"another correction round; submitting the last version"
+                        + (
+                            " unverified"
+                            if best is None or not best.verified
+                            else ""
+                        )
+                    )
+                    break
+                if self._max_attempts and attempt > self._max_attempts:
+                    print(
+                        f"[verify] SOLVER_MAX_ATTEMPTS={self._max_attempts} "
+                        f"reached; submitting the last version"
+                        + (
+                            " unverified"
+                            if best is None or not best.verified
+                            else ""
+                        )
+                    )
                     break
                 # Every round reads against EVERYTHING that is left. Earlier
                 # builds handed the first attempt a fraction (60% with public
@@ -1031,7 +1195,11 @@ class VerifyingSolver:
                 # No `extend_to_s`: `left` already runs to the point the
                 # answer stops being deliverable, so there is nothing past it to
                 # extend into.
+                round_started = time.monotonic()
                 reply = await conversation.send(prompt, max(1.0, left))
+                # How long the round trip actually took. Used only by the
+                # duplicate branch below, and only to tell a model from a tab.
+                round_s = time.monotonic() - round_started
                 # A repair reply may carry a CORRECTED case array: the repair
                 # prompt offers it outright ("or, if the case was wrong rather
                 # than the program, a `json` array holding ALL of the cases").
@@ -1122,7 +1290,14 @@ class VerifyingSolver:
                         agreed, revised = revised, None
                         graded = last_program_reply or reply
                 candidate = await self._graded(
-                    graded, task, budget - (time.monotonic() - started), agreed
+                    graded, task, budget - (time.monotonic() - started), agreed,
+                    # The round ABOVE this one, still un-updated here -- see the
+                    # `last_code = now_code` below, which runs after this. That
+                    # is what a reply has to be complete with respect to: a
+                    # round that sends back only the function it fixed is using
+                    # helpers that exist in the reply above it and nowhere in
+                    # the file that would be submitted.
+                    previous=last_code or "",
                 )
                 # What this round AMOUNTED to. Compared against the round before
                 # rather than the replies themselves, because the same program
@@ -1237,31 +1412,46 @@ class VerifyingSolver:
                     )
                     break
                 if duplicate:
-                    # Same program, same failures: the round changed nothing,
-                    # and asking this conversation the same question again has
-                    # no new information to change it with. It is also the only
-                    # thing standing between a broken tab and a spin -- `send`
-                    # normally blocks on the model for tens of seconds, so the
-                    # budget bounds the rounds, but a read returning STALE text
-                    # returns it at once and the loop would resend the same
-                    # repair at machine speed for the whole budget.
-                    #
-                    # So: change something, rather than stop. Correcting runs
-                    # until the answer passes or the deadline stops it, and a
-                    # FRESH conversation is a real change where a re-ask is not
-                    # -- it is the same move the unreadable branch makes, for
-                    # the same reason, and `_resume_elsewhere` is that move.
-                    # Only when there is nowhere left to carry it does the loop
-                    # end, and it ends holding the best answer it ever had.
+                    # Same program, same failures: the round changed nothing.
+                    # Change something rather than re-ask -- a FRESH
+                    # conversation is a real change where a re-ask is not, and
+                    # `_resume_elsewhere` is that move.
                     carried = await _resume_elsewhere(
                         f"{provider or 'this model'} sent back the same program "
                         f"and the same failures after being shown them",
                         avoid=provider,
                     )
-                    if carried is None:
+                    if carried is not None:
+                        conversation, provider, prompt = carried
+                        continue
+                    # Nowhere left to carry it. Whether that ends the loop turns
+                    # on WHY the round changed nothing, and those are two
+                    # different things wearing one shape.
+                    #
+                    # A round that cost no time did not involve the model: the
+                    # read returned text that was already on the page. Re-asking
+                    # that spins at machine speed for the rest of the budget,
+                    # and this branch is the only thing standing between a
+                    # broken tab and that spin. Stop.
+                    #
+                    # A round that took a real round trip is the other thing
+                    # entirely -- the model answered, and answered the same.
+                    # Stopping there ended solves with the whole budget unspent:
+                    # measured, a model repeating itself once ended the loop at
+                    # 0.2s of a 60s budget, throwing away every round the clock
+                    # would still have paid for. Correcting runs until the
+                    # answer passes or the deadline stops it, and a model is
+                    # stochastic -- the next ask is a real chance, not a
+                    # certainty, and a real chance is what the remaining budget
+                    # is for. Fall through and ask again.
+                    if round_s < STALE_ROUND_S:
+                        print(
+                            f"[verify] {provider or 'this model'} returned the same "
+                            f"program in {round_s:.1f}s without being asked again — "
+                            f"the tab is replaying an old reply rather than "
+                            f"answering; submitting the last version"
+                        )
                         break
-                    conversation, provider, prompt = carried
-                    continue
                 if not candidate.defect and not candidate.failures:
                     break  # nothing actionable to report (no examples shipped)
                 # Kept apart, not merged into one list of "problems": a defect
@@ -1311,7 +1501,8 @@ class VerifyingSolver:
             )
 
     async def _graded(
-        self, reply: str, task, left: float, cases: Optional[list] = None
+        self, reply: str, task, left: float, cases: Optional[list] = None,
+        previous: str = "",
     ) -> Candidate:
         """`_grade`, run OFF the event loop.
 
@@ -1339,7 +1530,9 @@ class VerifyingSolver:
         running while it waits.
         """
         try:
-            return await asyncio.to_thread(self._grade, reply, task, left, cases)
+            return await asyncio.to_thread(
+                self._grade, reply, task, left, cases, previous
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - never lose the answer to the check
@@ -1404,15 +1597,26 @@ class VerifyingSolver:
 
     def _grade(
         self, reply: str, task, left: Optional[float] = None,
-        cases: Optional[list] = None,
+        cases: Optional[list] = None, previous: str = "",
     ) -> Candidate:
         code = extract_code(reply, task.entrypoint, task.language)
-        candidate = Candidate(code=code, raw=reply)
+        candidate = Candidate(code=code, raw=reply, self_cases=len(cases or []))
         defect = (
             rust_defect(code)
             if task.language == "rust"
             else python_defect(code, task.entrypoint)
         )
+        if defect is None and task.language != "rust":
+            # Only once the structural checks are happy, because they are the
+            # ones that say what is wrong most precisely. A reply that will not
+            # parse is not "incomplete", it is broken, and saying the wrong one
+            # sends the repair round after the wrong thing.
+            #
+            # `partial` rides along separately: `defect` tells the MODEL what to
+            # fix, and this tells `_supersedes` that what arrived is not a
+            # version of the answer at all.
+            defect = dropped_definitions(code, previous)
+            candidate.partial = defect is not None
         # Not `left <= 0`. `_Grader.check` gives every case
         # `VERIFY_TIMEOUT_S` and nothing bounds the run as a whole, so a
         # candidate that times out on each of its cases spends that many
@@ -1465,10 +1669,19 @@ class VerifyingSolver:
             # rather than late. The check would be paid for with the answer it
             # was checking. The structural checks above already ran; they cost
             # microseconds and are what ranks this candidate.
+            # Gated on `task.public_examples` until now, which is every
+            # live task: production ships none, so the one line explaining why
+            # an answer went out ungraded was the one line that never printed.
+            # What could not be run is what to name.
+            unrun = []
             if task.public_examples:
+                unrun.append(f"the {len(task.public_examples)} public example(s)")
+            if cases:
+                unrun.append(f"the model's {len(cases)} own case(s)")
+            if unrun:
                 print(
-                    "[verify] out of budget before the examples could be run; "
-                    "submitting the answer unverified"
+                    f"[verify] out of budget before {' or '.join(unrun)} could be "
+                    f"run; submitting the answer unverified"
                 )
             return candidate
 

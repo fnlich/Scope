@@ -234,6 +234,21 @@ you will be asked for it next."""
 CODE_OUTPUT_CONTRACT = _ONE_BLOCK + """\
 That block is the {language} program. Nothing else is graded."""
 
+# What "the corrected program" has to spell out, in every repair round.
+#
+# A model shown one failing case answers about that case: it sends back the one
+# function it changed, correct in itself and unrunnable on its own, because the
+# imports and the helpers are in the reply above it. Each round is graded as a
+# WHOLE FILE and submitted as one -- there is no conversation on the other side
+# to reassemble it -- so a reply that is a diff in spirit is a zero in fact, and
+# `compile()` will not say so: a lone corrected function parses perfectly.
+#
+# `_carry_imports` rescues the import half of this, and nothing rescues the rest.
+WHOLE_PROGRAM = (
+    "the corrected program, COMPLETE — every import, helper and definition it "
+    "needs to run on its own, not a diff and not only the part you changed"
+)
+
 
 # Turn 1. The cases, before the program exists.
 #
@@ -595,14 +610,14 @@ def build_repair_prompt(
         body = (
             "Your previous reply did not reach me as code. I can only read the "
             "chat message itself.\n\n"
-            "Send the COMPLETE program again as one ordinary fenced code block "
-            "written directly in the chat, with nothing outside it."
+            f"Send the program again as one ordinary fenced code block written "
+            f"directly in the chat, with nothing outside it: {WHOLE_PROGRAM}."
         )
     elif defect:
         body = (
             f"I could not run your previous reply: {defect}.\n\n"
-            "Send back ONE fenced code block: the corrected program, complete, "
-            "with nothing outside it."
+            f"Send back ONE fenced code block, with nothing outside it: "
+            f"{WHOLE_PROGRAM}."
         )
     elif from_self_tests:
         # Deliberately not "your solution is WRONG". These cases came from the
@@ -615,9 +630,9 @@ def build_repair_prompt(
         body = (
             f"I ran {target} against the test cases you sent and got:\n"
             f"{detail}\n\n"
-            "Send back ONE fenced block: the corrected program — or, if the "
-            "case was wrong rather than the program, a `json` array holding "
-            "ALL of the cases, corrected."
+            f"Send back ONE fenced block: {WHOLE_PROGRAM} — or, if the case "
+            f"was wrong rather than the program, a `json` array holding ALL of "
+            f"the cases, corrected."
         )
     else:
         detail = "\n".join(f"  - {line}" for line in failures)
@@ -625,8 +640,8 @@ def build_repair_prompt(
         body = (
             f"I ran {target} against the examples and got:\n"
             f"{detail}\n\n"
-            "Send back ONE fenced block: the corrected program, complete, with "
-            "nothing outside it."
+            f"Send back ONE fenced block, with nothing outside it: "
+            f"{WHOLE_PROGRAM}."
         )
     return body
 
@@ -878,14 +893,15 @@ def _import_bindings(code: str) -> dict[str, str]:
     return bound
 
 
-def _unbound(code: str) -> set[str]:
-    """Names this block READS and never binds anywhere, builtins aside.
+def _bound(code: str) -> set[str]:
+    """Every name this block binds, in any scope.
 
-    Bindings are collected from every scope at once rather than per-scope. That
-    is deliberately over-permissive: a local named `math` in some other function
-    hides a genuinely missing module-level `math`, and the cost of that is one
-    import not carried forward -- the failure this already had. The opposite
-    error would prepend an import the answer never asked for.
+    Collected from every scope at once rather than per-scope, and that is
+    deliberately over-permissive: a local named `math` in some other function
+    hides a genuinely missing module-level `math`. Both callers want the error
+    in that direction -- `_unbound` would otherwise prepend an import the answer
+    never asked for, and `dropped_definitions` would otherwise report a program
+    incomplete when it is not.
     """
     try:
         tree = ast.parse(code)
@@ -914,11 +930,68 @@ def _unbound(code: str) -> set[str]:
             bound.update(node.names)
         elif isinstance(node, ast.ExceptHandler) and node.name:
             bound.add(node.name)
-    used = {
+    return bound
+
+
+def _reads(code: str) -> set[str]:
+    """Every name this block reads."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set()
+    return {
         n.id for n in ast.walk(tree)
         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
     }
-    return used - bound - _BUILTIN_NAMES
+
+
+def _unbound(code: str) -> set[str]:
+    """Names this block READS and never binds anywhere, builtins aside."""
+    return _reads(code) - _bound(code) - _BUILTIN_NAMES
+
+
+def dropped_definitions(code: str, previous: str) -> Optional[str]:
+    """Names this reply uses that only the reply BEFORE it defined, or None.
+
+    A repair round is asked for the whole program and sometimes sends back only
+    the part it changed. That reply is not a worse answer, it is a fragment of
+    one: it parses, `compile()` is happy with it, `python_defect` reports it
+    clean, and every hidden test dies on `NameError` -- for a helper that was
+    right there in the round above. Submitted at the deadline, ungraded, it is
+    a certain zero wearing a clean bill of health.
+
+    So the check is not "does this look like a diff". Marker-hunting was
+    measured against the 97 archived answers and found two hits, BOTH FALSE --
+    Rust holding `b"UNCHANGED "` and `let mut unchanged` -- and no true ones.
+    This asks the only question with an answer: does this program use something
+    that only its predecessor supplied?
+
+    Python only, and the narrowness is the point:
+
+    * `_carry_imports` runs inside `extract_code` first, so a dropped IMPORT is
+      already spliced back before this sees it. What reaches here is helpers,
+      classes and constants -- which is precisely "only the updated code".
+    * Rust name resolution is not something to guess at (the same reason
+      `_carry_imports` gives for its own Rust path), and a Rust answer goes
+      through `compile_defect`'s real `rustc`, which reports a dropped `fn` far
+      better than any text search could.
+    * Both halves lean over-permissive -- `_bound` collects from every scope --
+      so a name has to be genuinely unresolvable HERE and genuinely bound THERE
+      before anything is said. Measured: fires on none of the 26 archived
+      Python answers.
+    """
+    if not code.strip() or not previous.strip():
+        return None
+    lost = sorted(_unbound(code) & _bound(previous))
+    if not lost:
+        return None
+    names = ", ".join(f"`{n}`" for n in lost[:4])
+    if len(lost) > 4:
+        names += f" and {len(lost) - 4} more"
+    return (
+        f"this is only part of the program: it uses {names}, which your "
+        f"previous reply defined and this one does not"
+    )
 
 
 _RUST_USE_RE = re.compile(r"^[ \t]*(?:pub\s+)?use\s", re.MULTILINE)

@@ -276,6 +276,19 @@ async def _answer(miner, request: TaskRequest, timeout_s: float):
     return status, payload, time.monotonic() - started
 
 
+def _solver_stats(solver) -> dict:
+    """`solver.stats()`, or an empty dict. Never raises.
+
+    A summary line is not worth a crashed rehearsal, and `solver_factory` in
+    the tests hands back doubles whose `stats()` shape is their own business.
+    """
+    try:
+        stats = solver.stats()
+    except Exception:  # noqa: BLE001 - a report must not cost the run
+        return {}
+    return stats if isinstance(stats, dict) else {}
+
+
 # What the rehearsal concluded, and what each means for the exit code.
 SCORED, FAILED, UNKNOWN = "SCORES", "DOES NOT SCORE", "COULD NOT BE CHECKED"
 
@@ -520,7 +533,7 @@ async def run(
         await solver.aclose()
 
     if len(results) > 1:
-        _summarise(results)
+        _summarise(results, _solver_stats(solver))
     # 0 everything scored, 1 something answered and was wrong, 2 nothing could
     # be concluded -- so a rehearsal in a shell script can tell "my miner is
     # broken" from "this machine cannot grade Rust". A mixed run reports the
@@ -606,7 +619,10 @@ def _fit(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[: limit - 3] + "..."
 
 
-def _summarise(results: list[tuple[Problem, str, str]]) -> None:
+def _summarise(
+    results: list[tuple[Problem, str, str]],
+    solver_stats: Optional[dict] = None,
+) -> None:
     """One table at the end, because the per-problem output scrolls away.
 
     A run over five challenges prints several hundred lines and takes long
@@ -642,8 +658,21 @@ def _summarise(results: list[tuple[Problem, str, str]]) -> None:
         # missing yardstick. Live traffic ships no public examples -- all 97 of
         # the archived requests carry zero -- so this is the ordinary case for
         # a replay, not an edge one.
-        print(f"\n  none of the {total} could be graded here: no tests came "
-              f"with them")
+        print(f"\n  none of the {total} could be graded against public "
+              f"examples: none came with any")
+    # The yardstick that DOES exist on a corpus with no tests in it, and the
+    # only one a live solve ever has: the cases the model wrote for itself,
+    # run with the validator's own executor. Reported apart from "would have
+    # scored" and never merged into it -- a model agreeing with itself is
+    # weaker evidence than a public example, and saying so is the point.
+    # Without this the line above was the whole verdict on a replay, and it
+    # could not tell an answer that passed every case it had from one that was
+    # never run.
+    local = (solver_stats or {}).get("solver", {}).get("verified_on_local", 0)
+    if local:
+        print(f"  {local}/{total} verified on local: passed every case the "
+              f"model wrote for itself  (weaker than a public example, and all "
+              f"a live solve ever gets)")
     # Said either way, because it is the measurement a replay actually makes.
     # An empty answer is the failure this miner has most of: of 97 archived
     # solves, 32 submitted nothing at all. Whether a build changes that number
