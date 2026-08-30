@@ -4961,8 +4961,9 @@ def test_grading_does_not_stop_the_world_for_every_other_solve():
     from solvers.verify import Candidate
 
     solver = _solver([RIGHT])
-    solver._grade = lambda reply, task, left=None, cases=None: time.sleep(1.0) or Candidate(
-        code="x = 1", raw=reply
+    solver._grade = (
+        lambda reply, task, left=None, cases=None, previous="":
+        time.sleep(1.0) or Candidate(code="x = 1", raw=reply)
     )
     late: list[float] = []
 
@@ -7293,15 +7294,12 @@ def test_a_repair_ends_on_the_rule_for_what_may_come_back():
     there. The model's own cases may themselves be wrong -- turn 1 derives its
     `expected` values by reasoning -- so that branch names both ways out and
     lets the model pick."""
-    from solvers.prompts import build_repair_prompt
+    from solvers.prompts import WHOLE_PROGRAM, build_repair_prompt
 
     failure = ["g(*[0], **{}) returned 1, expected 0"]
 
     theirs = build_repair_prompt(failure, "python", "g")
-    assert theirs.rstrip().endswith(
-        "Send back ONE fenced block: the corrected program, complete, with "
-        "nothing outside it."
-    ), theirs
+    assert theirs.rstrip().endswith(f"{WHOLE_PROGRAM}."), theirs
     assert "json" not in theirs, (
         "offered to rewrite the validator's own examples, which are ground truth"
     )
@@ -7313,6 +7311,155 @@ def test_a_repair_ends_on_the_rule_for_what_may_come_back():
     assert mine.rstrip().endswith(
         "a `json` array holding ALL of the cases, corrected."
     ), mine
+    # ALL of the cases on one side, ALL of the program on the other. This
+    # branch is the only one live traffic can reach -- every archived request
+    # ships zero `public_examples` -- and it was the only one of the four that
+    # said nothing about the program being complete.
+    assert WHOLE_PROGRAM in mine, mine
+
+
+def test_a_round_that_sends_only_what_it_changed_is_told_to_send_it_all():
+    """The repair round asks for the whole program; a model shown one failing
+    case answers about that case.
+
+    What comes back is the one function it fixed -- correct in itself, and
+    unrunnable, because the helper it calls is in the reply ABOVE it and the
+    file that gets submitted is this reply alone. `compile()` accepts it,
+    `python_defect` reports it clean, and every hidden test dies on `NameError`
+    for a function that was right there a round ago.
+
+    So the round is reported as incomplete, by name, and the next prompt asks
+    for the whole program rather than for different logic -- the same
+    distinction the defect branch already makes between "your logic is wrong"
+    and "I could not run this at all"."""
+    from solvers.prompts import build_repair_prompt, dropped_definitions
+
+    previous = ("import math\n"
+                "def digits(n):\n    return [int(c) for c in str(n)]\n"
+                "def g(n):\n    return sum(digits(n))")
+    only_the_fix = "def g(n):\n    return sum(digits(abs(n)))"
+
+    defect = dropped_definitions(only_the_fix, previous)
+    assert defect and "`digits`" in defect, defect
+    assert "only part of the program" in defect, defect
+
+    prompt = build_repair_prompt([], "python", "g", defect=defect)
+    assert "digits" in prompt, "the repair never named what was missing"
+    assert "not only the part you changed" in prompt, prompt
+    assert "I ran" not in prompt, "blamed logic that was never run"
+
+
+def test_a_whole_program_that_drops_a_helper_it_no_longer_calls_is_fine():
+    """The guard that keeps the one above honest.
+
+    A correction is allowed to be a rewrite. Inlining a helper, or replacing two
+    functions with one, drops a definition the previous version had -- and that
+    is a complete program, not a fragment. Only a name still USED and no longer
+    defined says the reply is part of something.
+
+    Measured against the corpus rather than argued: `_unbound` finds nothing
+    unresolvable in any of the 26 archived Python answers, so this check has no
+    false-positive surface on real submissions at all."""
+    from solvers.prompts import _unbound, dropped_definitions
+
+    previous = ("def digits(n):\n    return [int(c) for c in str(n)]\n"
+                "def g(n):\n    return sum(digits(n))")
+    inlined = "def g(n):\n    return sum(int(c) for c in str(n))"
+    assert dropped_definitions(inlined, previous) is None, "refused a rewrite"
+    # ...and the first answer of a solve, which has no predecessor at all.
+    assert dropped_definitions(previous, "") is None
+
+    archived = _archived_answers("python")
+    assert len(archived) >= 20, f"expected the archived answers, got {len(archived)}"
+    flagged = [name for name, code in archived if _unbound(code)]
+    assert not flagged, f"would have called a real submission incomplete: {flagged}"
+
+
+def test_a_fragment_does_not_displace_the_whole_program_above_it():
+    """The other half, and the one the prompt cannot cover.
+
+    THE LATEST VERSION WINS is the rule, and a fragment is not a version. If the
+    last round of a solve sends back only the function it fixed and the budget
+    ends before anything can be run, `_supersedes` would ship it -- a certain
+    zero, over a complete program that at least runs.
+
+    Nothing is ranked here: no score is compared, and between two fragments the
+    later one still wins, because between two fragments the later one is still
+    the correction."""
+    from solvers.verify import Candidate, _supersedes
+
+    whole = Candidate(code="def digits(n): return []\ndef g(n): return digits(n)",
+                      raw="", self_passed=1, self_total=3, failures=["case 2 ..."],
+                      from_self_tests=True)
+    fragment = Candidate(code="def g(n): return sum(digits(n))", raw="",
+                         defect="this is only part of the program: it uses `digits`",
+                         partial=True)
+    later_fragment = Candidate(code="def g(n): return sum(digits(abs(n)))", raw="",
+                               defect="this is only part of the program", partial=True)
+
+    assert not _supersedes(fragment, whole, False), "shipped a fragment"
+    # A whole program still supersedes, failures and all -- the rule is unchanged
+    # for everything that is actually a program.
+    assert _supersedes(whole, fragment, False)
+    # Two fragments: latest still wins. There is no complete answer to protect.
+    assert _supersedes(later_fragment, fragment, False)
+    # And a fragment is still better than nothing at all.
+    assert _supersedes(fragment, Candidate(code="", raw=""), False)
+
+
+def test_each_round_is_graded_against_the_latest_corrected_cases():
+    """Phases 3, 4, ... run locally against the CORRECTED cases, round after
+    round, until a round has nothing left to fix.
+
+    The whole loop in one solve, with the bar moving under it:
+
+      turn 1  three cases, one of them wrong (`carry` expects 14, not 15)
+      turn 2  a program that is right, and fails the wrong case
+      round 1 the model corrects the CASE, sends no program
+              -> the program in hand is re-graded against the corrected bar
+      round 2 is never needed: with the case fixed the program passes 3/3
+
+    The bar that decided it is turn 1's cases WITH round 1's correction applied
+    -- not turn 1's, which would have failed a correct program forever, and not
+    a set the reply could shrink to fit."""
+    prompts: list[str] = []
+    cases_wrong = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+                   ' {"name": "single", "args": [7], "expected": 7},\n'
+                   ' {"name": "carry", "args": [12345], "expected": 14}]\n```')
+    program = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+               "        t += n % 10\n        n //= 10\n    return t\n```")
+    cases_fixed = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+                   ' {"name": "single", "args": [7], "expected": 7},\n'
+                   ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+
+    class _Recording(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            return await super().send(text, timeout_s)
+
+    class _Recorded(_Backend):
+        async def open(self, avoid=None):
+            return _Recording(self._replies, self._provider)
+
+    task = SolveTask(problem_id="bar", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=60.0)
+    solver = VerifyingSolver(_Recorded([cases_wrong, program, cases_fixed]),
+                             reserve_s=0, max_budget_s=60, second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=60.0))
+    out = log.getvalue()
+
+    assert "while n > 0" in answer.code, answer.code
+    # Exactly three turns: cases, program, one correction. The loop stopped
+    # because the corrected bar was met, not because it ran out of anything.
+    assert len(prompts) == 3, f"expected cases, program, one repair: {len(prompts)}"
+    assert "expected 14" in prompts[2] or "returned 15" in prompts[2], (
+        f"round 1 was not told about the disagreement: {prompts[2]!r}"
+    )
+    assert "self=3/3" in out, (
+        "the program was not re-graded against the corrected cases:\n" + out
+    )
 
 
 # --------------------------------------------------------------------------- #

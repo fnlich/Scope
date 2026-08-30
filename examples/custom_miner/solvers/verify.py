@@ -43,6 +43,7 @@ from .prompts import (
     build_repair_prompt,
     build_resume_prompt,
     build_tests_prompt,
+    dropped_definitions,
     extract_code,
     extract_self_tests,
     python_defect,
@@ -155,6 +156,11 @@ class Candidate:
     self_passed: int = 0
     self_total: int = 0
     from_self_tests: bool = False
+    # This reply is part of a program rather than a program: it uses something
+    # only the round above it defined. Kept beside `defect` rather than folded
+    # into it because `_supersedes` has to tell this apart from every other way
+    # code can be wrong -- see there.
+    partial: bool = False
 
     @property
     def verified(self) -> bool:
@@ -230,11 +236,22 @@ def _supersedes(candidate: Candidate, best: Candidate, still_writing: bool) -> b
     * THE MODEL IS STILL WRITING. What arrived is a fragment of a reply rather
       than a revision of one, and a fragment that happens to parse must not
       displace the finished program above it.
+    * ONLY THE PART THAT CHANGED ARRIVED. The same thing said by the model
+      instead of by the clock: a round asked for the whole program sent back
+      the one function it fixed, and it uses a helper that lives in the round
+      above. `dropped_definitions` is what knows. This is not a judgement about
+      which program is better -- a fragment is not a program, and every hidden
+      test would die on `NameError` for a helper that was right there.
+
+    None of the three ranks anything. Two fragments still go latest-first,
+    because between two fragments the later one is still the correction.
     """
     if not candidate.code.strip():
         return False
     if still_writing:
         return not best.code.strip()
+    if candidate.partial and best.code.strip() and not best.partial:
+        return False
     return True
 
 
@@ -1161,7 +1178,14 @@ class VerifyingSolver:
                         agreed, revised = revised, None
                         graded = last_program_reply or reply
                 candidate = await self._graded(
-                    graded, task, budget - (time.monotonic() - started), agreed
+                    graded, task, budget - (time.monotonic() - started), agreed,
+                    # The round ABOVE this one, still un-updated here -- see the
+                    # `last_code = now_code` below, which runs after this. That
+                    # is what a reply has to be complete with respect to: a
+                    # round that sends back only the function it fixed is using
+                    # helpers that exist in the reply above it and nowhere in
+                    # the file that would be submitted.
+                    previous=last_code or "",
                 )
                 # What this round AMOUNTED to. Compared against the round before
                 # rather than the replies themselves, because the same program
@@ -1350,7 +1374,8 @@ class VerifyingSolver:
             )
 
     async def _graded(
-        self, reply: str, task, left: float, cases: Optional[list] = None
+        self, reply: str, task, left: float, cases: Optional[list] = None,
+        previous: str = "",
     ) -> Candidate:
         """`_grade`, run OFF the event loop.
 
@@ -1378,7 +1403,9 @@ class VerifyingSolver:
         running while it waits.
         """
         try:
-            return await asyncio.to_thread(self._grade, reply, task, left, cases)
+            return await asyncio.to_thread(
+                self._grade, reply, task, left, cases, previous
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - never lose the answer to the check
@@ -1443,7 +1470,7 @@ class VerifyingSolver:
 
     def _grade(
         self, reply: str, task, left: Optional[float] = None,
-        cases: Optional[list] = None,
+        cases: Optional[list] = None, previous: str = "",
     ) -> Candidate:
         code = extract_code(reply, task.entrypoint, task.language)
         candidate = Candidate(code=code, raw=reply)
@@ -1452,6 +1479,17 @@ class VerifyingSolver:
             if task.language == "rust"
             else python_defect(code, task.entrypoint)
         )
+        if defect is None and task.language != "rust":
+            # Only once the structural checks are happy, because they are the
+            # ones that say what is wrong most precisely. A reply that will not
+            # parse is not "incomplete", it is broken, and saying the wrong one
+            # sends the repair round after the wrong thing.
+            #
+            # `partial` rides along separately: `defect` tells the MODEL what to
+            # fix, and this tells `_supersedes` that what arrived is not a
+            # version of the answer at all.
+            defect = dropped_definitions(code, previous)
+            candidate.partial = defect is not None
         # Not `left <= 0`. `_Grader.check` gives every case
         # `VERIFY_TIMEOUT_S` and nothing bounds the run as a whole, so a
         # candidate that times out on each of its cases spends that many
