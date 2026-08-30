@@ -63,6 +63,26 @@ def fenced_blocks(markdown: str) -> list[str]:
     blocks: list[str] = []
     body: Optional[list[str]] = None
     fence = ""
+    # How far the OPENING fence was indented. Markdown requires that
+    # indentation of every line inside a block nested under a list item, and it
+    # is not part of the source:
+    #
+    #     1. Sort, then sum:
+    #
+    #        ```python
+    #        import math
+    #
+    #        def solve(nums):
+    #            return sum(sorted(nums)[-2:])
+    #        ```
+    #
+    # Keeping it handed `extract_code` a block whose every line began with three
+    # spaces; `.strip()` then removed them from the FIRST line only, and the
+    # result was `unexpected indent, line 3` on a program the model had written
+    # correctly. CommonMark strips exactly this, and never more than the fence
+    # itself had -- so a line the author genuinely indented further keeps the
+    # difference.
+    indent = 0
     for line in markdown.splitlines():
         stripped = line.strip()
         if body is None:
@@ -87,17 +107,35 @@ def fenced_blocks(markdown: str) -> list[str]:
             )
             if opener:
                 fence = opener.group(1)
+                indent = len(line) - len(line.lstrip(" "))
                 body = []
             continue
         if re.fullmatch(re.escape(fence[0]) + "{%d,}" % len(fence), stripped):
             if "\n".join(body).strip():
                 blocks.append("\n".join(body) + "\n")
-            body, fence = None, ""
+            body, fence, indent = None, "", 0
             continue
-        body.append(line)
+        body.append(_unindent(line, indent))
     if body is not None and "\n".join(body).strip():
         blocks.append("\n".join(body) + "\n")
     return blocks
+
+
+def _unindent(line: str, indent: int) -> str:
+    """Drop up to ``indent`` leading SPACES -- never more, never a tab.
+
+    Never more, because a line the author indented past the fence keeps the
+    difference. Never a tab, because a tab cannot be partially removed and
+    guessing its width would corrupt source that a chat UI does render with
+    them; a block opened at column zero, which is every unnested block, is
+    returned untouched either way.
+    """
+    if indent <= 0:
+        return line
+    kept = 0
+    while kept < indent and kept < len(line) and line[kept] == " ":
+        kept += 1
+    return line[kept:]
 
 
 # Characters that only ever arrive from a RENDERED page, never from source a
@@ -474,6 +512,49 @@ def build_code_prompt(
     return "\n".join(parts)
 
 
+def build_resume_prompt(
+    language: str,
+    statement: str,
+    entrypoint: str,
+    examples: list[dict[str, Any]],
+    cases: Optional[Sequence[dict[str, Any]]],
+    code: str,
+    failures: list[str],
+    defect: Optional[str] = None,
+    from_self_tests: bool = False,
+) -> str:
+    """A repair round for a conversation that no longer exists.
+
+    Repairs normally stay inside one conversation, because the model can see
+    its own previous attempt there and the prompt need only carry what went
+    wrong. When the tab that produced the answer cannot be used again -- the
+    prompt will not go into it, or the page died -- that context is gone with
+    it, and the round used to be abandoned along with it. Measured over a
+    production run: fifteen answers went out carrying failures nobody had asked
+    the model to fix, with an average of 129 seconds of budget unspent.
+
+    So the whole conversation is reconstituted in one message: the problem as
+    turn 2 states it, the program that was produced, and what happened when it
+    ran. A fresh tab has no history, so nothing here may assume any.
+    """
+    base = build_code_prompt(language, statement, entrypoint, examples, cases=cases)
+    report = build_repair_prompt(
+        failures, language, entrypoint, defect=defect, from_self_tests=from_self_tests
+    )
+    return "\n".join([
+        base,
+        "",
+        '<previous_attempt note="YOUR program, from a conversation that ended '
+        'before it could be corrected. This is what happened when I ran it.">',
+        f"```{'rust' if language == 'rust' else 'python'}",
+        code.strip(),
+        "```",
+        "",
+        report,
+        "</previous_attempt>",
+    ])
+
+
 def build_repair_prompt(
     failures: list[str],
     language: str,
@@ -495,62 +576,57 @@ def build_repair_prompt(
     model rewrites the logic, which was never the problem, and the repair round
     is spent for nothing. Ask about delivery when delivery failed, and about
     shape when the shape is wrong.
+
+    What is NOT here is method. Earlier versions spent a paragraph on how to
+    think about the failure -- trace the call, do not guess from the shape of
+    it, re-check the fix against every other case silently, do not change both
+    to make them agree. That is work which never reaches the reply, competing
+    with the failure itself for attention, and it is the same class of
+    instruction the two-phase rewrite already took out of turns 1 and 2. The
+    error, and the one line naming what may come back. Nothing else.
+
+    "Do not change both" is not lost by leaving it unsaid: it is enforced in
+    ``verify.py``, where a reply that rewrites the program AND the cases is
+    graded against the bar as it stood before it arrived, and a revision that
+    drops cases is refused outright. The grader keeps the promise, so the
+    prompt stops asking for it.
     """
     if defect == NO_CODE:
         body = (
             "Your previous reply did not reach me as code. I can only read the "
-            "chat message itself, so an artifact, a canvas, a preview pane or a "
-            "collapsed block is invisible to me.\n\n"
+            "chat message itself.\n\n"
             "Send the COMPLETE program again as one ordinary fenced code block "
-            "written directly in the chat. Do not create an artifact or canvas. "
-            "Do not abbreviate it or replace any part with a comment. Same rules "
-            "as before, and nothing outside the block."
+            "written directly in the chat, with nothing outside it."
         )
     elif defect:
         body = (
             f"I could not run your previous reply: {defect}.\n\n"
-            "Nothing was executed, so none of this is about your logic yet — it "
-            "is about what arrived. Put that right and send the COMPLETE program "
-            "again as one ordinary fenced code block written directly in the "
-            "chat, with nothing outside it. Same rules as before."
+            "Send back ONE fenced code block: the corrected program, complete, "
+            "with nothing outside it."
         )
     elif from_self_tests:
         # Deliberately not "your solution is WRONG". These cases came from the
         # model itself, so a disagreement proves only that two things it wrote
         # contradict each other -- and telling it the CODE is at fault when the
-        # CASE was wrong is how a repair round breaks a correct program. Naming
-        # the real question is also the more useful prompt: one of the two is
-        # wrong, and deciding which is exactly the work.
+        # CASE was wrong is how a repair round breaks a correct program. The
+        # output rule names both ways out and lets the model pick.
         detail = "\n".join(f"  - {line}" for line in failures)
         target = "the program" if language == "rust" else f"`{entrypoint}`"
         body = (
-            f"Your program and your own test cases DISAGREE. I ran {target} "
-            f"against the cases you sent and got:\n"
+            f"I ran {target} against the test cases you sent and got:\n"
             f"{detail}\n\n"
-            "Exactly one of the two is wrong, and which one is the question. In "
-            "your reasoning — not in the reply — go back to the STATEMENT and "
-            "work out what it says the answer for that input is. If the case is "
-            "right, fix the program; if the case was wrong, fix the case and "
-            "leave the program alone. Do not change both to make them agree.\n\n"
-            "Then re-check the fix against every OTHER case you were sent, "
-            "silently: a repair that fixes one case and breaks another is still "
-            "wrong. Reply with the corrected program block. "
-            "If it was the CASE that was wrong, add a second `json` block "
-            "holding the corrected cases; otherwise send the program alone."
+            "Send back ONE fenced block: the corrected program — or, if the "
+            "case was wrong rather than the program, a `json` array holding "
+            "ALL of the cases, corrected."
         )
     else:
         detail = "\n".join(f"  - {line}" for line in failures)
         target = "the program" if language == "rust" else f"`{entrypoint}`"
         body = (
-            f"Your solution is WRONG. I ran {target} against the examples and got:\n"
+            f"I ran {target} against the examples and got:\n"
             f"{detail}\n\n"
-            "In your reasoning — not in the reply — trace the failing call through "
-            "your code until you find the actual line where the computed value and "
-            "the expected one part company; do not guess at the fix from the shape "
-            "of the failure. Re-check the fix against every OTHER case you were "
-            "sent, silently: a repair that fixes this one and breaks another is "
-            "still wrong. Then reply with "
-            "ONLY ONE corrected code block and nothing else."
+            "Send back ONE fenced block: the corrected program, complete, with "
+            "nothing outside it."
         )
     return body
 
@@ -635,7 +711,17 @@ def _parse_cases(block: str, language: str) -> list[dict[str, Any]]:
     """
     text = block.strip()
     if not text.startswith("["):
-        return []
+        # One leaked language chip, and no more. A copy control that hands back
+        # `json\n[{...}]` would otherwise fail the fast path and drop the
+        # array -- and on a repair round that array is the corrected cases,
+        # so losing it means the same wrong case breaks the program again on
+        # every remaining round.
+        head, _, rest = text.partition("\n")
+        if head.strip().casefold() not in ("json", "jsonc", "json5"):
+            return []
+        text = rest.strip()
+        if not text.startswith("["):
+            return []
     try:
         raw = json.loads(text)
     except Exception:  # noqa: BLE001 - a model wrote it; anything is possible
@@ -835,6 +921,19 @@ def _unbound(code: str) -> set[str]:
     return used - bound - _BUILTIN_NAMES
 
 
+_RUST_USE_RE = re.compile(r"^[ \t]*(?:pub\s+)?use\s", re.MULTILINE)
+# A preamble block: `use` lines, `extern crate`, inner/outer attributes and
+# comments, and nothing else. Anything with a body is a program, not a preamble.
+_RUST_PREAMBLE_LINE_RE = re.compile(
+    r"^[ \t]*(?:(?:pub\s+)?use\s.*;|extern\s+crate\s.*;|#!?\[.*\]|//.*)?[ \t]*$"
+)
+
+
+def _is_rust_preamble(block: str) -> bool:
+    lines = [ln for ln in block.splitlines() if ln.strip()]
+    return bool(lines) and all(_RUST_PREAMBLE_LINE_RE.fullmatch(ln) for ln in lines)
+
+
 def _carry_imports(block: str, earlier: list[str], language: str) -> str:
     """Bring forward an imports-only block the chosen one turns out to need.
 
@@ -847,11 +946,24 @@ def _carry_imports(block: str, earlier: list[str], language: str) -> str:
 
     Narrow on purpose. Only top-level `import` statements are eligible, only
     the ones binding a name this block reads and never binds are taken, and a
-    block that needs nothing is returned untouched. Rust is left alone: `use` has the
-    same shape, but a Rust answer is put through the compiler, which says so.
+    block that needs nothing is returned untouched.
+
+    Rust used to be left alone on the grounds that `use` has the same shape but
+    a Rust answer goes through the compiler, which says so. The compiler is
+    allowed not to be there -- no local `rustc`, or `SOLVER_RUST_COMPILE=0` --
+    and then nothing says so at all, exactly as with `_rust_unclosed`. Narrower
+    still than the Python path, because Rust name resolution is not something to
+    guess at: an earlier block that is NOTHING but `use` lines and attributes is
+    a preamble the model split off, and it is carried only when the chosen block
+    has no `use` of its own.
     """
     if language == "rust":
-        return block
+        if _RUST_USE_RE.search(block):
+            return block
+        carried = [b.strip() for b in earlier if _is_rust_preamble(b)]
+        if not carried:
+            return block
+        return "\n".join(carried) + "\n\n" + block
     missing = _unbound(block)
     if not missing:
         return block
@@ -864,7 +976,45 @@ def _carry_imports(block: str, earlier: list[str], language: str) -> str:
         missing -= set(bindings)
     if not carried:
         return block
-    return "\n".join(carried) + "\n\n" + block
+    return _splice_imports(block, carried)
+
+
+def _splice_imports(block: str, carried: list[str]) -> str:
+    """Put ``carried`` at the top of ``block`` -- but below what must be first.
+
+    `from __future__` has to be the first statement in the file, after at most a
+    docstring, and `import math` above it is a file `ast.parse` accepts and the
+    grader's import rejects:
+
+        SyntaxError: from __future__ imports must occur at the beginning of the
+        file
+
+    Nothing downstream noticed, so it went out as a confident answer and scored
+    zero. Anything the module may legally open with -- its docstring, a
+    `__future__` import, a comment, a shebang, an encoding line -- stays where
+    it is and the carried imports follow it.
+    """
+    try:
+        tree = ast.parse(block)
+    except SyntaxError:
+        # No tree to ask, so no claim to make about what must come first.
+        return "\n".join(carried) + "\n\n" + block
+    after = 0
+    for node in tree.body:
+        docstring = (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        )
+        future = isinstance(node, ast.ImportFrom) and node.module == "__future__"
+        if not (docstring or future):
+            break
+        after = node.end_lineno or after
+    if not after:
+        return "\n".join(carried) + "\n\n" + block
+    lines = block.splitlines()
+    head, tail = lines[:after], lines[after:]
+    return "\n".join(head + [""] + carried + [""] + [t for t in tail if True]).rstrip("\n") + "\n"
 
 
 def _defines(code: str, entrypoint: str, language: str = "python") -> bool:
@@ -915,10 +1065,25 @@ NO_CODE = "the reply contained no code"
 # `MOD = 10**9 + 7` -- so no allowlist can be written that does not reject real
 # code. What CAN be named there is the short list of things a tool call opens
 # with.
-_SHELL_OPENER_RE = re.compile(
-    r"^[ \t]*(?:[$#>]\s|cat|cd|mkdir|echo|ls|rm|cp|mv|touch|chmod|export|sudo"
+_SHELL_COMMANDS = (
+    r"cat|cd|mkdir|echo|ls|rm|cp|mv|touch|chmod|export|sudo"
     r"|apt|apt-get|yum|brew|pip3?|python3?|rustc|cargo|npm|yarn|git|curl|wget"
-    r"|bash|sh|zsh|make|which|pytest|node)\b"
+    r"|bash|sh|zsh|make|which|pytest|node"
+)
+# `$ ` and `> ` open no Python statement, so a bare prompt character is enough.
+# `#` is different and the difference cost real answers: it is a ROOT shell
+# prompt and it is also how a great many Python programs begin. `# Sliding
+# window over the log lines.` matched `[$#>]\s` and the whole block was declared
+# "not source at all" -- so `extract_code` fell past it and submitted the
+# model's own one-line usage example instead. Deleting only that comment made
+# the same reply return the program.
+#
+# So `#` counts only when a command follows it, which is what a root prompt
+# actually looks like and what no comment does. The bare command alternatives
+# below still catch an unprompted command line.
+_SHELL_OPENER_RE = re.compile(
+    r"^[ \t]*(?:[$>]\s|\#\s*(?:" + _SHELL_COMMANDS + r")\b|(?:"
+    + _SHELL_COMMANDS + r")\b)"
 )
 
 
@@ -941,6 +1106,19 @@ def plausible_source(code: str, language: str = "python") -> bool:
     return not _SHELL_OPENER_RE.match(first)
 
 
+def _is_generator(fn) -> bool:
+    """Does THIS function yield? Not one nested inside it."""
+    stack: list = list(fn.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.Yield, ast.YieldFrom)):
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue  # a yield in there makes IT a generator, not us
+        stack.extend(ast.iter_child_nodes(node))
+    return False
+
+
 def _always_returns(body: list) -> bool:
     """Does this statement list guarantee a `return` or a `raise`?
 
@@ -948,10 +1126,21 @@ def _always_returns(body: list) -> bool:
     Python one. Only the LAST statement matters: anything before it can be
     skipped, so only the tail decides whether control can fall off the end.
 
-    Conservative in the direction that costs least. A `for` loop is never
+    Conservative in the direction that costs least. A bare `for` loop is never
     treated as guaranteeing a return even when it obviously does, because the
     price of being wrong here is one repair round, while the price of missing a
     truncated answer is the whole solve.
+
+    A loop with an `else`, though, is not a guess: the clause runs on every exit
+    that is not a `break`, so an `else` that always returns leaves no way to
+    fall through -- unless a `break` bound to THIS loop skips it. That is the
+    same rule `while True:` already gets, and the same helper decides it.
+    Without this, the ordinary "search, else report not found" shape was
+    reported as `can reach the end of its body without returning ... which is
+    what a reply cut off mid-answer looks like`, about a correct program. The
+    cost is not only the wasted round: a block carrying a defect loses
+    `extract_code`'s gradeable preference, and a trailing usage example can then
+    outrank the answer.
     """
     if not body:
         return False
@@ -972,13 +1161,30 @@ def _always_returns(body: list) -> bool:
         head = _always_returns(last.orelse) if last.orelse else _always_returns(last.body)
         return head and all(_always_returns(h.body) for h in last.handlers)
     if isinstance(last, ast.While):
-        # `while True:` with no way out never falls through to the end.
-        if isinstance(last.test, ast.Constant) and last.test.value is True:
+        # `while True:` with no way out never falls through to the end -- and
+        # `while 1:` is the same loop. Testing `is True` recognised only the
+        # keyword, so the numeric spelling (which competitive-programming
+        # answers use constantly) was reported as "can reach the end of its body
+        # without returning ... which is what a reply cut off mid-answer looks
+        # like", about a correct program. Any truthy constant reads the same
+        # way to the interpreter, so it reads the same way here.
+        if isinstance(last.test, ast.Constant) and bool(last.test.value):
             return not _breaks_out_of(last)
-        return False
+        return _loop_else_returns(last)
+    if isinstance(last, (ast.For, ast.AsyncFor)):
+        return _loop_else_returns(last)
     if isinstance(last, ast.Match):
         return bool(last.cases) and all(_always_returns(c.body) for c in last.cases)
     return False
+
+
+def _loop_else_returns(loop) -> bool:
+    """A loop whose `else` always returns, and which cannot `break` past it."""
+    return (
+        bool(loop.orelse)
+        and _always_returns(loop.orelse)
+        and not _breaks_out_of(loop)
+    )
 
 
 def _breaks_out_of(loop) -> bool:
@@ -1016,9 +1222,20 @@ def python_defect(code: str, entrypoint: str) -> Optional[str]:
     if not code.strip():
         return NO_CODE
     try:
+        # `compile`, not `ast.parse`. The validator IMPORTS this source, and
+        # import compiles it -- so `ast.parse` is the wrong question by exactly
+        # the set of programs that parse and will not compile. `from __future__`
+        # in the wrong place is the one that reached a validator: `ast.parse`
+        # said fine, the import raised `SyntaxError: from __future__ imports
+        # must occur at the beginning of the file`, and this function had
+        # reported the answer clean. Same exception, same message shape, one
+        # more class of certain zero caught before it ships.
         tree = ast.parse(code)
+        compile(code, "<solution>", "exec")
     except SyntaxError as exc:
         return f"the code is not valid Python ({exc.msg}, line {exc.lineno})"
+    except ValueError as exc:  # noqa: BLE001 - null bytes and the like
+        return f"the code is not valid Python ({exc})"
     # A top-level statement that is just a bare name runs at import time and
     # raises NameError, so every hidden test fails. It is never meaningful code,
     # and it is exactly what a leaked language chip looks like once it parses.
@@ -1030,6 +1247,16 @@ def python_defect(code: str, entrypoint: str) -> Optional[str]:
             )
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == entrypoint:
+            if _is_generator(node):
+                # Also a defect, and a real one -- the grader compares RETURN
+                # VALUES structurally, so what it receives here is a generator
+                # object rather than the answer. But it is not a truncation, and
+                # the sentence below would tell the model its reply was cut off.
+                return (
+                    f"`{entrypoint}` is a generator: it yields instead of "
+                    f"returning, so the grader is handed a generator object "
+                    f"rather than the answer"
+                )
             if not _always_returns(node.body):
                 # `ast.parse` is Python's version of grepping for `fn main`: it
                 # is happy with source that was CUT OFF, because a reply
@@ -1077,6 +1304,124 @@ _RUST_OPENER_RE = re.compile(
 )
 
 
+# `r"..."`, `r#"..."#`, `b"..."`, `br#"..."#`. The quote is required, which is
+# what keeps a raw IDENTIFIER (`r#type`, `r#match`) from being read as one.
+_RUST_RAW_RE = re.compile(r'b?r(#*)"')
+_IDENT_CH = re.compile(r"[A-Za-z0-9_]")
+
+
+def _rust_unclosed(code: str) -> Optional[str]:
+    """The delimiter a truncated Rust program leaves open, or None.
+
+    The check Python gets from `ast.parse` and `_always_returns`, and Rust had
+    only from a compiler that is allowed not to be there. `rust_defect`'s two
+    other tests both pass a truncation -- the first line still opens like Rust
+    and `fn main` still begins a line -- so an answer the deadline cut in half
+    went out as a confident one. Measured on a real submission: 10,608 bytes,
+    75 `{` against 71 `}`, ending mid-identifier four blocks deep. `rustc` says
+    `error: this file contains an unclosed delimiter`; nothing here did.
+
+    Conservative in the one direction that matters. A false positive does not
+    merely cost a repair round: a block carrying a defect loses `extract_code`'s
+    "last gradeable" preference, and a trailing usage example can then outrank
+    the real answer -- which is the damage `_breaks_out_of` was written for. So
+    this reports ONLY a delimiter still open at the end of the input, and gives
+    up (returns None) the moment the scan meets anything it cannot account for:
+    a mismatched closer, a closer with nothing open, a string or comment that
+    never ends. Each of those is at least as likely to be this function
+    misreading Rust as it is to be a broken program.
+    """
+    stack: list[tuple[str, int]] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    i, n, line = 0, len(code), 1
+    while i < n:
+        c = code[i]
+        if c == "\n":
+            line += 1
+            i += 1
+            continue
+        if c == "/" and i + 1 < n:
+            if code[i + 1] == "/":
+                while i < n and code[i] != "\n":
+                    i += 1
+                continue
+            if code[i + 1] == "*":
+                # Rust nests block comments, unlike C.
+                depth, i = 1, i + 2
+                while i < n and depth:
+                    if code.startswith("/*", i):
+                        depth, i = depth + 1, i + 2
+                    elif code.startswith("*/", i):
+                        depth, i = depth - 1, i + 2
+                    else:
+                        line += code[i] == "\n"
+                        i += 1
+                if depth:
+                    return None  # ran off the end inside a comment
+                continue
+        raw = _RUST_RAW_RE.match(code, i)
+        if raw and not (i and _IDENT_CH.match(code[i - 1])):
+            close = '"' + raw.group(1)
+            end = code.find(close, raw.end())
+            if end < 0:
+                return None
+            line += code.count("\n", i, end)
+            i = end + len(close)
+            continue
+        if c == '"':
+            i += 1
+            while i < n and code[i] != '"':
+                line += code[i] == "\n"
+                i += 2 if code[i] == "\\" else 1
+            if i >= n:
+                return None
+            i += 1
+            continue
+        if c == "'":
+            # A char literal, or a lifetime/loop label. `'a'` is a literal;
+            # `'a` in `&'a str` or `'outer: loop` is not, and reading it as one
+            # would swallow the rest of the line looking for a closing quote.
+            nxt = code[i + 1] if i + 1 < n else ""
+            after = code[i + 2] if i + 2 < n else ""
+            if nxt and nxt != "\\" and _IDENT_CH.match(nxt) and after != "'":
+                i += 1  # a lifetime: skip the tick, scan the name as code
+                continue
+            j = i + 1
+            if j < n and code[j] == "\\":
+                # PAST what the backslash escapes, not onto it. Landing on it
+                # made `'\\''` close on its own escaped quote, so the real
+                # closing tick opened a second literal and the scan
+                # resynchronised on whatever tick came next -- a lifetime, a
+                # later char literal. Differential-fuzzed against rustc over 726
+                # generated programs the verdict never actually changed: the
+                # swallowed span kept its own delimiters balanced, or the scan
+                # ran off the end and declined to judge. So this is a
+                # correctness fix, not a measured loss.
+                j += 2
+            while j < n and code[j] != "'":
+                line += code[j] == "\n"
+                j += 1
+            if j >= n:
+                return None
+            i = j + 1
+            continue
+        if c in "([{":
+            stack.append((c, line))
+        elif c in pairs:
+            if not stack or stack[-1][0] != pairs[c]:
+                return None  # more likely this scanner than a broken program
+            stack.pop()
+        i += 1
+    if not stack:
+        return None
+    opener, where = stack[0]
+    return (
+        f"the program ends with {len(stack)} unclosed `{opener}` — the outermost "
+        f"opens on line {where} and is never closed, which is what a reply cut "
+        f"off mid-answer looks like"
+    )
+
+
 def rust_defect(code: str) -> Optional[str]:
     """Cheap structural check before paying for a compile.
 
@@ -1109,4 +1454,7 @@ def rust_defect(code: str) -> Optional[str]:
         )
     if not _RUST_MAIN_RE.search(code):
         return "the program does not define `fn main()`"
-    return None
+    # Last, because it is the only one of the three that a program which IS
+    # Rust can fail. See `_rust_unclosed` for why it only ever reports a
+    # delimiter left open at the end.
+    return _rust_unclosed(code)

@@ -421,15 +421,53 @@ _COMPOSER_TEXT_JS = (
 )
 
 
-def _same_message(typed: str, seen: str) -> bool:
-    """Is the box holding the message we typed, and nothing else?
+# How long to let the editor finish painting what was inserted, and how often
+# to look. A composer is React over ProseMirror: `insert_text` returns when the
+# input event is delivered, not when the DOM shows the result, and on a box
+# running four Chrome instances in 5 GB that gap is visible.
+COMPOSER_SETTLE_S = 3.0
+COMPOSER_POLL_S = 0.1
 
-    Compared on collapsed whitespace, because a contenteditable turns our
-    newlines into block elements and hands them back as its own arrangement of
-    them -- an exact comparison would fail on every send. What this still
-    catches is the only thing it has to: text in the box that we did not type.
+_WORDS_RE = re.compile(r"[0-9A-Za-z_]+")
+
+
+def _words(text: str) -> list[str]:
+    return _WORDS_RE.findall(text)
+
+
+def _same_message(typed: str, seen: str) -> bool:
+    """Is the box holding our message, and nothing that is not ours?
+
+    Not equality, and the difference is the whole of it. The question is "did
+    somebody else's text get in" -- and no editor invents a word, while every
+    rich-text editor rewrites punctuation. A composer applies input rules as
+    text arrives: `- ` at the start of a line becomes a bullet and `1. `
+    becomes an ordered list, at which point the marker is list STRUCTURE and
+    `innerText` hands the line back without it -- the digit of an ordered
+    marker included. This prompt carries four of the first and five of the
+    second, and demanding the text back verbatim reported those sends as
+    contaminated, twice each (retyping reproduces it), and retired the tab.
+    Measured on a live miner: "the composer does not hold the prompt as typed,
+    twice over", on a tab that was holding the prompt exactly as intended.
+
+    So: every word the box shows must be one of ours, in our order, and nearly
+    all of ours must be there. An editor may DROP a marker; it may not add a
+    word. A leftover human draft is made of words that are not ours and fails
+    on the first of them, which is the job this check exists to do. A read that
+    caught the editor half-painted fails the second test rather than the first,
+    and `_settled_composer` is what waits that out instead of retyping into it.
     """
-    return " ".join(typed.split()) == " ".join(seen.split())
+    ours, shown = _words(typed), _words(seen)
+    if len(shown) < 0.95 * len(ours):
+        return False
+    i = 0
+    for word in shown:
+        while i < len(ours) and ours[i] != word:
+            i += 1
+        if i == len(ours):
+            return False          # a word the box shows that we never typed
+        i += 1
+    return True
 
 
 @dataclass(frozen=True)
@@ -647,6 +685,8 @@ class _Tab:
         self._warned_echo = False
         self._warned_branches = False
         self._warned_copy = False
+        # Said once when the editor reformats what we typed (see `_same_message`).
+        self._warned_rewrite = False
         # A COUNT, not a flag. The other notes on this class are configuration
         # advice and say themselves once; this one is damage to the answer being
         # submitted right now, and how OFTEN it happens is the number an
@@ -659,6 +699,14 @@ class _Tab:
         self._warned_relatch = False
         self._warned_stream = False
         self._warned_stream_diff = False
+        # Which assistant candidate `_fingerprint`'s count was taken with.
+        self._counted_with: Optional[str] = None
+        # Counted rather than flagged. A once-per-tab bool reported two
+        # incidents across 56 solves -- exactly one per tab, which is what it
+        # reports whether it happened twice or forty times. Every one of
+        # these is an answer that would have gone out truncated, so the
+        # NUMBER is the thing an operator needs.
+        self._cut_short_stream = 0
         # Highest network record seen before this send's prompt went out, so a
         # reply is never reconstructed out of the PREVIOUS answer's stream.
         self._stream_before = 0
@@ -811,6 +859,31 @@ class _Tab:
             raise
         self._fresh = True
 
+    async def _settled_composer(self, text: str, ui_ms: int) -> str:
+        """What the composer holds once it has finished painting.
+
+        `insert_text` returns when the input event is delivered; a React editor
+        applies it a frame or more later, and reading immediately catches an
+        empty box or half a prompt. That is not contamination and must not be
+        treated as any: it read as "the composer does not hold the prompt as
+        typed", retyped, raced again, and retired a working tab.
+
+        Returns as soon as it matches, so the ordinary send pays one poll.
+
+        Bounded by the caller's own slice as well as by COMPOSER_SETTLE_S: the
+        submit phase has a budget, and waiting past it does not buy a send, it
+        buys a timeout that retires the tab. On a one-second slice this waits
+        fractions of a second and then retypes, which is the right order.
+        """
+        deadline = time.monotonic() + min(
+            COMPOSER_SETTLE_S, max(0.1, (ui_ms / 1000.0) * 0.4)
+        )
+        seen = await self._composer_holds()
+        while not _same_message(text, seen) and time.monotonic() < deadline:
+            await asyncio.sleep(COMPOSER_POLL_S)
+            seen = await self._composer_holds()
+        return seen
+
     async def _composer_holds(self) -> str:
         """What the composer contains right now.
 
@@ -883,7 +956,16 @@ class _Tab:
             await self._clear_composer(ui_ms)
             # insert_text handles newlines safely — typing them would submit early.
             await self._page.keyboard.insert_text(text)
-            if _same_message(text, await self._composer_holds()):
+            seen = await self._settled_composer(text, ui_ms)
+            if _same_message(text, seen):
+                if " ".join(text.split()) != " ".join(seen.split()) and not self._warned_rewrite:
+                    self._warned_rewrite = True
+                    print(
+                        f"[{self.site.name}] note: tab {self.label}: the composer "
+                        f"REWROTE the prompt's punctuation as it went in — every "
+                        f"word is still there and in order, so this is the editor "
+                        f"formatting markdown, not somebody else's text. Once per run."
+                    )
                 break
             if attempt == 2:
                 raise RuntimeError(
@@ -939,19 +1021,21 @@ class _Tab:
     ) -> str:
         """Ask, then read. ``timeout_s`` is the slice; ``extend_to_s`` the cap.
 
-        They differ because the slice is an internal ALLOCATION, not a
-        deadline. The caller holds back part of its budget for a repair round,
-        and that reserve is well spent on an answer that arrived wrong. It is
-        worth nothing at all on one that has not finished arriving: the composer
-        is usually disabled mid-stream, and where it is not the prompt simply
-        queues behind the answer it is asking about.
-
-        So when the slice runs out with the model still writing, the read
+        They differ because a slice is an internal ALLOCATION rather than a
+        deadline. When the slice runs out with the model still writing, the read
         extends ONCE to ``extend_to_s`` -- the caller's real remaining budget --
-        rather than stopping to do something that cannot help. Waiting is the
-        only move that can still produce the answer, and the payment policy
-        agrees: a correct answer arriving late earns at least 95% of what the
-        fastest earns, and an unfinished one earns nothing.
+        rather than stopping to do something that cannot help: the composer is
+        usually disabled mid-stream, and where it is not the prompt simply
+        queues behind the answer it is asking about. Waiting is the only move
+        that can still produce the answer, and the payment policy agrees: a
+        correct answer arriving late earns at least 95% of what the fastest
+        earns, and an unfinished one earns nothing.
+
+        ``VerifyingSolver`` no longer slices. Every read it makes is given the
+        whole remaining budget, so it passes no ``extend_to_s`` and there is
+        nothing here to extend into -- ``timeout_s`` IS the request's deadline,
+        less what delivering the answer costs. The parameter stays for a caller
+        that does hand out less than everything.
         """
         if not self.alive:
             # The pool has not recycled this tab yet. Retrying a known-dead tab
@@ -979,6 +1063,7 @@ class _Tab:
         # different candidate once the reply renders, and comparing a count taken
         # from one selector against a count taken from another is meaningless.
         self._assistant = None
+        self._counted_with = None
         self._reply_index = None
         self._reply_key = None
         # Reserve a slice of the caller's budget for getting the prompt in;
@@ -1082,19 +1167,35 @@ class _Tab:
         grew = False
         last_whole: Optional[str] = None
         def out_of_time() -> bool:
-            """Stop reading? Extends once, and only mid-answer."""
+            """Stop reading? Extends once, while the answer may still arrive."""
             nonlocal deadline
             if time.monotonic() < deadline:
                 return False
             # `hard <= deadline` is also what makes this happen at most once:
             # the extension below sets them equal.
-            if hard <= deadline or not (last_busy or grew):
+            #
+            # `not saw_reply` extends too, and it is the case a slice serves
+            # worst: a model that thinks before it writes renders nothing while
+            # it thinks (77 seconds, measured on a live tab), so stopping at the
+            # slice with an empty page trades an answer that was still coming
+            # for time there is nothing left to spend it on.
+            #
+            # With no slice -- which is every read `VerifyingSolver` makes now
+            # -- `hard` equals `deadline` and none of this runs: the first test
+            # returns True and the read has already had the whole budget.
+            if hard <= deadline or not (last_busy or grew or not saw_reply):
                 return True
             deadline = hard
             print(
-                f"[{self.site.name}] tab {self.label} is still writing at its "
-                f"{timeout_s:.0f}s slice; reading on to {hard - started:.0f}s rather "
-                f"than interrupting an answer that is still arriving."
+                f"[{self.site.name}] tab {self.label} "
+                + ("is still writing at" if saw_reply else "has rendered nothing by")
+                + f" its {timeout_s:.0f}s slice; reading on to "
+                f"{hard - started:.0f}s rather than "
+                + (
+                    "interrupting an answer that is still arriving."
+                    if saw_reply
+                    else "abandoning an answer that may still arrive."
+                )
             )
             return time.monotonic() >= deadline
 
@@ -1127,33 +1228,34 @@ class _Tab:
                 if on_screen:
                     saw_reply = True
                 elif (
-                    not saw_reply
+                    not blind
                     and time.monotonic() - submitted_at >= BLIND_TAB_GRACE_S
                 ):
                     # Nothing has rendered in the time a working tab needs to
-                    # paint an empty bubble. Polling on is not patience, it is
-                    # the rest of the budget: stop, and let the caller ask
-                    # somebody else while there is still time to.
+                    # paint an empty bubble. That is worth SAYING and it is not
+                    # worth acting on, and the difference cost a run.
                     #
-                    # `alive` is NOT cleared here, and that is the whole point
-                    # of the distinction. Retiring the tab now would skip the
-                    # copy control and the network stream, and those are read by
-                    # other means than the selector that just failed -- the
-                    # stream especially, which is captured off the wire by CDP
-                    # and has never touched the DOM. `_reconcile_stream` exists
-                    # for exactly this case and says so: "a selector that
-                    # stopped matching, a render this tab cannot see". Nine
-                    # bounded seconds there can turn this zero into the whole
-                    # payment. The tab is retired at the single exit below,
-                    # after they have had their say.
+                    # It used to stop the read here and retire the tab, on the
+                    # reasoning that the budget was better spent elsewhere.
+                    # Measured over a live run: every one of eighteen tabs this
+                    # fired on had its answer recovered off the wire moments
+                    # later -- the model was not silent, the DOM was late. So
+                    # the answer was never what the bail saved; what it threw
+                    # away was the CONVERSATION, and with it every repair round
+                    # that solve could still have run. Fifteen answers went out
+                    # with failing cases and an average of 129 unused seconds.
+                    #
+                    # A model that thinks before it writes renders nothing for
+                    # as long as it thinks -- 77 seconds, measured on a live
+                    # tab. There is no per-turn deadline to protect here, only
+                    # the request's own, so the read waits for the answer.
                     blind = True
                     print(
-                        f"[{self.site.name}] tab {self.label} showed no reply at all "
-                        f"in {BLIND_TAB_GRACE_S:.0f}s; giving up on it now rather "
-                        f"than at the deadline, so the rest of the budget can go to "
-                        f"another tab."
+                        f"[{self.site.name}] tab {self.label} has shown no reply yet "
+                        f"after {BLIND_TAB_GRACE_S:.0f}s — still waiting. A model "
+                        f"that thinks before it writes renders nothing while it "
+                        f"thinks, and the answer may also arrive off the wire."
                     )
-                    break
                 if text_now is not None:
                     best = text_now  # keep it even mid-generation
                 if busy or text_now is None:
@@ -1173,9 +1275,39 @@ class _Tab:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the page died mid-read
+            # RETIRED, but not yet finished with. `alive` decides whether the
+            # pool hands this tab to another task; it is not a verdict on
+            # whether the answer can still be recovered, and the recovery
+            # phases below no longer read it.
+            #
+            # They used to. An exception out of `_poll` set `alive = False` and
+            # that gated off the copy control, the whole network-stream rescue
+            # AND the post-mortem -- so the send returned "" with one line of
+            # log and no diagnosis, on a page whose stream buffer still held
+            # the finished program. The exceptions that land here are mostly
+            # transient on a live SPA: "Execution context was destroyed, most
+            # likely because of a navigation" as claude.ai swaps /new for
+            # /chat/<uuid> after the first send, or "Element is not attached to
+            # the DOM" on a message re-rendered mid-stream. The operator's log
+            # shows 18 "tab replaced after failure" beside 17 "read NOTHING
+            # from the page and recovered N code block(s) from the network
+            # stream instead" -- the rescue exists for exactly the failure this
+            # gate was switching off.
+            #
+            # Running them is safe on a genuinely dead page: `_streamed_markdown`
+            # catches everything and returns None, `_reconcile_stream` wraps its
+            # own DOM refetch, and each phase is bounded by `tail`. Measured
+            # cost on a closed page: 0.06s.
+            #
+            # `test_a_blind_tab_still_gets_its_answer_off_the_wire` already made
+            # this argument for the blind path -- "Clearing `alive` inside the
+            # read loop skipped both the copy control and the stream, which is
+            # the difference between a zero and the whole payment on the one tab
+            # that needed them" -- and it was never carried to the exception
+            # path, which sets `alive` directly.
             self.alive = False
             print(f"[{self.site.name}] tab {self.label} died while reading: {type(exc).__name__}")
-        if self.alive and self.site.copy:
+        if self.site.copy:
             # Once per send, never per poll: the answer is finished by now, and
             # clicking a control on every poll would be dozens of clicks a
             # solve. Scraping decided WHEN to read; the copy control decides
@@ -1211,7 +1343,7 @@ class _Tab:
                 # shorter one is older. Take the fuller one. Anything else --
                 # a difference in the middle, which is what a highlighter
                 # artefact looks like -- leaves the copy in charge as before.
-                lost = self._copy_was_cut_short(rendered or [], copied)
+                lost = self._cut_short_by(rendered or [], copied)
                 if lost:
                     self._cut_short_count += 1
                     if self._cut_short_count == 1:
@@ -1252,7 +1384,7 @@ class _Tab:
                     f"Run `python -m solvers.doctor {self.site.name}` if answers "
                     f"start arriving mangled — the control may have been renamed."
                 )
-        if self.alive and self.site.stream:
+        if self.site.stream:
             try:
                 best = await asyncio.wait_for(
                     self._reconcile_stream(before, best, page_blocks),
@@ -1266,13 +1398,13 @@ class _Tab:
                     f"checking the answer against the network stream in "
                     f"{STREAM_PHASE_TIMEOUT_S:.0f}s. Submitting what the page gave."
                 )
-        if blind:
-            # Now, and not before: the recovery phases above needed a tab that
-            # was still allowed to be read. Whatever they found, the DOM here is
-            # unreadable and the next task on this tab would spend another
-            # BLIND_TAB_GRACE_S discovering that. Retire it; the pool spawns a
-            # replacement in the background.
-            self.alive = False
+        # A tab that showed no reply is NOT retired here, and that is the
+        # point. Retiring it threw away the conversation the repair loop needs
+        # -- and the tab was usually fine: the page rendered late, or not at
+        # all, while the answer came off the wire. A tab is dead when the PAGE
+        # dies (the read above clears `alive`) or when the prompt cannot be put
+        # into it (`send` clears it on a failed submit). Being slow to paint is
+        # neither.
         if best and self._is_our_own_prompt(best):
             # Last line of defence, at the ONE exit, because everything above
             # it can produce a submission and only one of them was guarded.
@@ -1303,7 +1435,10 @@ class _Tab:
             self.empty_reason = "unfinished"
         else:
             self.empty_reason = "no-code"
-        if not best and (self.alive or blind):
+        # `or blind or not self.alive`: an empty send is exactly when the
+        # post-mortem is worth having, and a retired tab is exactly when nobody
+        # can go and look afterwards.
+        if not best:
             try:
                 await asyncio.wait_for(
                     self._explain_empty(before), timeout=POSTMORTEM_TIMEOUT_S * tail
@@ -1343,7 +1478,36 @@ class _Tab:
         own accounts turns `stream_first` on and gets it as the primary.
         """
         streamed = await self._streamed_markdown()
-        if streamed is None:
+        blocks = _fenced_blocks(streamed) if streamed is not None else []
+        # The page is re-read FIRST, and whatever the network did. This used to
+        # sit below an early return taken when the capture came back empty, so
+        # whether the late-rendered answer on the page was even looked at
+        # depended on something with no bearing on it: a wire that captured
+        # prose recovered the program, and a wire that captured nothing threw
+        # the identical page away and submitted "". The two questions -- did the
+        # network hold the answer, has the page since rendered it -- are
+        # independent, and this one is asked either way.
+        if page_blocks is None:
+            try:
+                reply = await self._new_reply(before)
+                page_blocks = await self._dom_blocks(reply) if reply is not None else []
+                if page_blocks and self._echoes_prompt(await self._whole(reply)):
+                    # The SAME question the scrape path asks in `_poll`, asked
+                    # again here because this refetch is a second route to a
+                    # submission and would otherwise go around it. An assistant
+                    # selector that also matches the user's turn hands back a
+                    # message whose whole text is our prompt and whose code
+                    # block is whatever the statement quoted -- so the block
+                    # alone looks like a fine answer, and `_is_our_own_prompt`
+                    # at the exit below is testing the block, not the message.
+                    # That is exactly how two of this miner's own prompts
+                    # reached a validator as Rust programs.
+                    page_blocks = []
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - nothing to compare against, then
+                page_blocks = []
+        if streamed is None and not blocks and not page_blocks:
             if not best and not self._warned_stream:
                 self._warned_stream = True
                 print(
@@ -1353,15 +1517,6 @@ class _Tab:
                     f"what each source returned."
                 )
             return best
-        blocks = _fenced_blocks(streamed)
-        if page_blocks is None:
-            try:
-                reply = await self._new_reply(before)
-                page_blocks = await self._dom_blocks(reply) if reply is not None else []
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - nothing to compare against, then
-                page_blocks = []
         if not best:
             # The read loop finished holding nothing. Everything read since is
             # strictly better than the empty string, and the ONLY question left
@@ -1404,18 +1559,98 @@ class _Tab:
                 f"({len(streamed)} chars captured). Nothing to submit."
             )
             return ""
-        if blocks and page_blocks and not self._warned_stream_diff:
-            gap = self._first_difference(page_blocks, blocks, "the page", "the wire")
-            if gap:
-                self._warned_stream_diff = True
-                print(
-                    f"[{self.site.name}] note: tab {self.label}: what the page shows and "
-                    f"what came off the wire are not the same — {gap}. Using the page. "
-                    f"If the wire is the one that is right, set "
-                    f"{self.site.env_prefix}_STREAM_FIRST=1."
-                )
+        if blocks and page_blocks:
+            # The page against the wire, asked the same question the copy
+            # control is asked: is one of these the other CUT SHORT?
+            #
+            # It wins on FIDELITY and has no authority at all on COMPLETENESS,
+            # and the two are different questions. The rule existed for the
+            # copy-vs-page pair and was never carried to this one, so this pair
+            # got the comparison, a printed note, and no decision. Measured on a
+            # live solve, in the operator's own log:
+            #
+            #   what the page shows and what came off the wire are not the same
+            #   — they differ at character 5605: the page nothing (it ends
+            #   here), the wire ' ' (U+0020). Using the page.
+            #
+            # The page ENDED at 5605 and the wire carried on. The page was the
+            # answer cut short, the wire held the whole of it, this code knew,
+            # said so, and submitted the truncation.
+            #
+            # The prefix test is what makes taking the wire safe here. The
+            # stream reconstruction is a heuristic over an undocumented private
+            # format, and the thing to fear from it is a reading that picked up
+            # the CONVERSATION rather than the reply -- but such a reading
+            # cannot have the page as its prefix. Any other disagreement, a
+            # difference in the middle above all, still leaves the page in
+            # charge exactly as before.
+            lost = self._cut_short_by(blocks, page_blocks)
+            if lost:
+                self._cut_short_stream += 1
+                if self._cut_short_stream == 1:
+                    print(
+                        f"[{self.site.name}] note: tab {self.label}: the page has the "
+                        f"answer CUT SHORT — {lost} character(s) fewer than came off "
+                        f"the wire, and the wire's version starts with all of it. "
+                        f"Submitting what came off the wire. This is a page read "
+                        f"taken before the last of the answer rendered, and every "
+                        f"one of these is an answer that would have gone out "
+                        f"truncated."
+                    )
+                else:
+                    print(
+                        f"[{self.site.name}] tab {self.label}: the page was CUT SHORT "
+                        f"again, {lost} character(s) missing "
+                        f"(#{self._cut_short_stream} on this tab)"
+                    )
+                return "\n".join(self._fence(b) for b in blocks)
+            if not self._warned_stream_diff:
+                gap = self._first_difference(page_blocks, blocks, "the page", "the wire")
+                if gap:
+                    self._warned_stream_diff = True
+                    print(
+                        f"[{self.site.name}] note: tab {self.label}: what the page shows "
+                        f"and what came off the wire are not the same — {gap}. Using "
+                        f"the page. If the wire is the one that is right, set "
+                        f"{self.site.env_prefix}_STREAM_FIRST=1."
+                    )
         if self.site.stream_first and blocks:
             return "\n".join(self._fence(b) for b in blocks)
+        # And finally the reading that is actually going out, against the two
+        # that were just compared to each other.
+        #
+        # `best` comes off the read loop, which stops at the deadline; the page
+        # and the wire are both read AFTER it. So `best` is the oldest of the
+        # three and the likeliest to be short, and until this ran nothing ever
+        # asked. Measured: `best` a truncation, the page and the wire each
+        # holding the whole program and agreeing with each other exactly -- so
+        # `_cut_short_by` saw no gap between THEM and `_first_difference` found
+        # nothing to report, and the truncation was submitted without a single
+        # line of log. Every comparison in this function was made and the one
+        # that mattered was not among them.
+        fuller = page_blocks if page_blocks else blocks
+        if fuller and best:
+            lost = self._cut_short_by(fuller, _fenced_blocks(best))
+            if lost:
+                self._cut_short_stream += 1
+                where = "the page" if page_blocks else "the wire"
+                if self._cut_short_stream == 1:
+                    print(
+                        f"[{self.site.name}] note: tab {self.label}: the read that "
+                        f"ended at the deadline has the answer CUT SHORT — "
+                        f"{lost} character(s) fewer than {where} shows, and "
+                        f"{where}'s version starts with all of it. Submitting "
+                        f"{where}'s. The read loop stops at the deadline and both "
+                        f"other readings are taken after it, so this one is the "
+                        f"oldest of the three."
+                    )
+                else:
+                    print(
+                        f"[{self.site.name}] tab {self.label}: the deadline read was "
+                        f"CUT SHORT again, {lost} character(s) missing "
+                        f"(#{self._cut_short_stream} on this tab)"
+                    )
+                return "\n".join(self._fence(b) for b in fuller)
         return best
 
     async def _poll(
@@ -1472,10 +1707,36 @@ class _Tab:
         better candidate once the DOM settles.
 
         The latch is dropped in exactly one case: the candidate it holds matches
-        nothing at all. There is no count to corrupt at zero, and the
-        alternative is reading nothing for the rest of the send.
+        nothing at all. "There is no count to corrupt at zero" was the reason
+        given, and it was wrong: `before[0]` was counted with the OLD candidate,
+        and `_new_reply` compares the new one's count against it directly. On
+        chatgpt.com the two shipped candidates count on different scales -- an
+        A/B pair is two messages inside one article -- so after a re-resolve the
+        comparison is meaningless and no reply is ever found. Measured:
+        before=(2,'m2') under the message selector, one transient zero, and then
+        `reply: None` on every poll for the rest of the send.
+
+        Two things follow, and they are below rather than here: `_counted_with`
+        remembers which candidate the baseline was taken with, and the fallback
+        is RE-EXAMINED rather than held -- the moment the earlier, more specific
+        candidate matches again it is taken back, which restores the selector
+        the baseline belongs to.
         """
         if self._assistant is not None:
+            # An earlier candidate is more specific by construction -- the list
+            # is ordered that way -- so if one that precedes the latch is
+            # matching now, it is the better reading AND, when it is the one the
+            # baseline was counted with, the only reading the baseline fits.
+            better = None
+            for selector in self.site.assistant:
+                if selector == self._assistant:
+                    break
+                if await self._page.locator(selector).count() > 0:
+                    better = selector
+                    break
+            if better is not None:
+                self._assistant = better
+                return self._page.locator(better)
             found = self._page.locator(self._assistant)
             if await found.count() > 0:
                 return found
@@ -1503,6 +1764,10 @@ class _Tab:
     async def _fingerprint(self) -> tuple[int, Optional[str]]:
         """How the conversation looked before we submitted."""
         messages = await self._messages()
+        # WHICH candidate that count belongs to. A count is only a number; it
+        # means "messages" under one selector and "turns" under another, and
+        # comparing across the two is how a re-resolve loses a whole send.
+        self._counted_with = self._assistant
         if messages is None:
             return 0, None
         count = await messages.count()
@@ -1561,6 +1826,14 @@ class _Tab:
         if self._reply_index is not None:
             return messages.nth(self._reply_index) if count > self._reply_index else None
 
+        # The baseline was counted with a DIFFERENT selector, so `count_before`
+        # is not a number this count can be compared to. The id and index
+        # latches above still work -- they identify a node, not a quantity -- so
+        # this only reaches here before anything has been latched, and then
+        # waiting for the original candidate to come back (which `_messages`
+        # now takes at the first opportunity) is the only sound move.
+        if self._counted_with is not None and self._assistant != self._counted_with:
+            return None
         if count > count_before:
             if count - count_before > 1 and not self._warned_branches:
                 self._warned_branches = True
@@ -1581,7 +1854,16 @@ class _Tab:
             return fresh
         # Some sites replace the last message rather than appending one, so a
         # changed id still means a new reply even when the count did not move.
-        if self.site.message_id_attr:
+        #
+        # `count >= count_before` is what makes that sound. When the list has
+        # SHRUNK the last message is an OLDER one wearing a different id, and
+        # latching it answers this prompt with a previous turn's program --
+        # silently, with `empty_reason` left at None, so nothing downstream
+        # questions it. Reproduced: before=(2,'id-B'), the DOM re-rendered down
+        # to one message, and `send` returned the program from branch A of the
+        # turn before. A shorter list means the page is mid-re-render, and
+        # waiting one poll is what every other unresolved state here does.
+        if self.site.message_id_attr and count >= count_before:
             last = messages.nth(count - 1)
             mid = await last.get_attribute(self.site.message_id_attr)
             if mid is not None and mid != id_before:
@@ -1653,7 +1935,12 @@ class _Tab:
         in four DOM queries, and only right now.
         """
         try:
-            resolved = await self._first_match(self.site.assistant)
+            # The LATCHED candidate, not whatever matches now. Re-resolving from
+            # scratch let the post-mortem count one selector and quote
+            # `before[0]`, which was counted with another -- so it could report
+            # "matched 2 message(s), the same as before the prompt was sent" of
+            # two different things, about a page holding the finished answer.
+            resolved = self._assistant or await self._first_match(self.site.assistant)
             count = 0
             if resolved is not None:
                 count = await self._page.locator(resolved).count()
@@ -1824,28 +2111,32 @@ class _Tab:
     _CUT_SHORT_SLACK = 4
 
     @staticmethod
-    def _copy_was_cut_short(rendered: list[str], copied: list[str]) -> int:
-        """Characters the copy is missing, when it is the same answer cut short.
+    def _cut_short_by(whole: list[str], part: list[str]) -> int:
+        """Characters `part` is missing, when it is `whole` CUT SHORT. Else 0.
 
-        Zero unless the copied source is a strict PREFIX of the rendered source
-        with whitespace ignored, which is what distinguishes the two ways these
-        readings disagree. A copy taken while the reply was still streaming is
-        the beginning of the answer and nothing else. A highlighter artefact --
-        the measured one was a Private Use Area character inside a Python
-        program -- is a difference in the MIDDLE, so the prefix test fails and
-        the copy keeps its authority, which is the whole reason it is preferred.
+        The one question worth asking whenever two readings of the same answer
+        disagree, and it has two callers because there are two such pairs: the
+        copy control against the page, and the page against the network stream.
+
+        Zero unless `part` is a strict PREFIX of `whole` with whitespace
+        ignored, which is what separates the two ways readings disagree. A
+        reading taken while the reply was still streaming is the beginning of
+        the answer and nothing else -- the shorter one is simply older, and the
+        fuller one wins. A rendering artefact -- the measured one was a Private
+        Use Area character inside a Python program -- is a difference in the
+        MIDDLE, so the prefix test fails and the usual precedence stands.
 
         Whitespace is ignored on both sides so that indentation rebuilt by the
         renderer, or the newline a copy control trims, is never mistaken for
         lost code.
         """
-        if not rendered or not copied:
+        if not whole or not part:
             return 0
-        whole = "".join("".join(b.split()) for b in rendered)
-        part = "".join("".join(b.split()) for b in copied)
-        if len(part) >= len(whole) or not whole.startswith(part):
+        full = "".join("".join(b.split()) for b in whole)
+        head = "".join("".join(b.split()) for b in part)
+        if len(head) >= len(full) or not full.startswith(head):
             return 0
-        missing = len(whole) - len(part)
+        missing = len(full) - len(head)
         return missing if missing > _Tab._CUT_SHORT_SLACK else 0
 
     def _disagreement(self, dom: list[str], copied: list[str]) -> Optional[str]:

@@ -972,17 +972,57 @@ opinion — silence has to mean the same thing as success, or a missing toolchai
 becomes an outage. `SOLVER_RUST_COMPILE=0` turns it off. The candidate is
 compiled, never run.
 
-### The first attempt gets the budget when no repair can happen
+### Correction runs until it passes, on the only deadline there is
 
-The solve budget was split 60/40 — the larger share to the first attempt, the
-rest held back for repair rounds. That is well spent when public examples exist
-and a repair is likely. With **none shipped**, a structurally sound first answer
-ends the loop immediately and the reserve is simply discarded: measured, a tab
-spent its whole 135-second slice while the remaining 90 seconds of a 225-second
-budget went unused, on the one attempt that had to succeed.
+Two private deadlines used to sit under the validator's. The loop stopped at
+`SOLVER_MAX_ATTEMPTS = 3`, and each round was handed a *fraction* of what was
+left — 60% to the first attempt with public examples, 85% without — so a later
+round would have something to spend.
 
-The share now depends on whether a repair is even possible — 85% to the first
-attempt when nothing can be graded against.
+Both are gone. `SOLVER_MAX_ATTEMPTS` defaults to `0`, unlimited: a solve keeps
+correcting until the answer verifies, until there is nothing left to act on, or
+until a round trip no longer fits in the budget. And every round now reads
+against **everything that is left**.
+
+The reserve was worth least exactly where it cost most. `send` returns the
+moment the model finishes, so holding budget back was never a wait — only a
+ceiling on a read that ran long, which is the one case where cutting it short
+throws the answer away. Measured: a tab spent its whole 135-second slice while
+the remaining 90 seconds of a 225-second budget went unused, on the one attempt
+that had to succeed.
+
+`SOLVER_SAFETY_MARGIN_S` stays, because it is not a deadline on the model: it is
+the time the answer needs to be graded, archived, signed and put on the wire
+before the validator stops listening.
+
+### A repair carries the error and nothing else
+
+The correction prompt is the evidence plus one sentence naming what may come
+back:
+
+```
+I ran `solve` against the test cases you sent and got:
+  - case 2 'single digit': solve(*[7], **{}) returned 0, expected 7
+
+Send back ONE fenced block: the corrected program — or, if the case was wrong
+rather than the program, a `json` array holding ALL of the cases, corrected.
+```
+
+What it no longer carries is method — *"trace the failing call through your
+code"*, *"do not guess at the fix from the shape of the failure"*, *"re-check
+the fix against every OTHER case you were sent, silently"*, *"Do not change both
+to make them agree"*. That is work which never reaches the reply, competing with
+the failure itself for attention, and it is the same class of instruction the
+two-phase rewrite already took out of turns 1 and 2.
+
+Nothing is conceded by dropping *"do not change both"*: the grader keeps that
+promise rather than the prompt asking for it. A reply that rewrites the program
+**and** the cases is graded against the bar as it stood before it arrived, and a
+revision that drops cases is refused outright.
+
+The validator's own examples are the one place a case cannot be corrected — they
+shipped with the task and are ground truth — so that branch asks for the program
+alone.
 
 ### Never give up on a task while an answer is still obtainable
 
@@ -1100,19 +1140,72 @@ code. That class stays uncaught. What it catches is the commoner one by far —
 the model knowing what the answer should be and coding it wrong — and that is
 objectively checkable.
 
+### Turn 2 is asked to pass both suites, so both are run
+
+The validator's examples and the model's own cases are both in the turn-2
+prompt — `<examples>` and `<must_pass>`. Only one of them used to be executed:
+the self-test path sat under `if not task.public_examples`, so a task that
+**shipped** examples had its own cases quoted and never run. A program right on
+the one example and wrong on its own boundary cases verified, ended the loop and
+shipped, and the repair round that exists to catch precisely that never fired.
+Live traffic ships no examples, which is why it went unnoticed rather than why
+it was harmless.
+
+The **order** is the whole of the precedence:
+
+1. The validator's examples first. They shipped with the task and are ground
+   truth — when they fail, the program is wrong, there is nothing to weigh, and
+   the own cases are not run at all. A second opinion from the same model on a
+   program already known wrong tells you nothing and costs an executor run per
+   case.
+2. Only once those are all green does a disagreement with the model's **own**
+   cases become the open question, and `failures` carries that instead.
+
+So `failures` names one suite at a time and `from_self_tests` says which — which
+is exactly what lets the repair prompt offer a corrected `json` array where a
+case may be wrong, and refuse to where the examples are ground truth.
+
+`verified` still means what it always meant: every public example reproduced. It
+can now be True on an answer that still disagrees with the model's own cases, so
+the answer **cache** is gated on `not failures` as well — caching one of those
+re-serves a wrong answer for every later task with the same statement.
+
 So `self_passed` is kept in its own field. It never touches `passed`/`total`,
-`verified` stays False, and the answer is never cached: one wrong answer that
-matched its own wrong cases must not be re-served for every later task with the
+`verified` is earned by the validator's examples alone — with none shipped it
+stays False however many of its own cases a program passes. The answer cache is
+gated on `verified` **and** on having no outstanding failures, so an answer that
+cleared the examples and still disagrees with its own cases is not cached
+either: one wrong answer must not be re-served for every later task with the
 same statement.
+
+Two rules keep the bar honest, and they are the same rule at two moments:
+
+- **The program turn cannot bring its own bar.** Cases written beside a program
+  are back-filled from what it happens to do, so they agree with its bugs. A
+  `json` block in turn 2 is refused and turn 1's cases stand. Measured before
+  this existed: turn 1 wrote a case that *caught* the bug, turn 2 sent the buggy
+  program with two cases of its own, round 1 reported the real failure and then
+  adopted them, and round 2 re-graded the same buggy program against the bar it
+  had brought with it — `self=2/2`, no failures, loop over, buggy program
+  submitted as passing everything.
+- **A repair cannot pass a bar it rewrote in the same breath.** A reply that
+  changes the program *and* the cases is graded against the bar as it stood
+  before it arrived; its cases apply from the next round.
+
+A repair reply that corrects a case and leaves the program alone is the one the
+prompt asks for, and it may arrive **without the program** — a `json` array and
+nothing else. The program already in hand is then re-graded against the
+corrected bar. Re-graded, not assumed to pass: there is no rewrite to launder
+because there is no new program.
 
 The repair wording changes with it. Not *"your solution is WRONG"* — these cases
 came from the model, so a disagreement proves only that two things it wrote
 contradict each other, and blaming the code when the **case** was wrong is how a
 repair round breaks a correct program:
 
-> Your program and your own test cases DISAGREE. … Exactly one of the two is
-> wrong, and which one is the question. … If the case is right, fix the program;
-> if the case was wrong, fix the case and leave the program alone.
+> I ran `solve` against the test cases you sent and got: … Send back ONE fenced
+> block: the corrected program — or, if the case was wrong rather than the
+> program, a `json` array holding ALL of the cases, corrected.
 
 A repair reply may carry a corrected `json` block beside the program, and that
 is safe because `extract_code` picks the block that **defines the entrypoint**,
@@ -1208,7 +1301,8 @@ of time:
 - **A wrong case can still be corrected.** Turn 1 derives its `expected` values
   by reasoning, so one of them can simply be wrong — and freezing them would
   make a **correct** program fail the same bogus case on every repair round.
-  The repair prompt says outright to fix the case and leave the program alone,
+  The repair prompt offers a corrected `json` array as one of the two things it
+  will accept back,
   and a repair reply carrying a corrected array replaces the frozen one for the
   *next* round. Not the round that carried it: a reply is graded against the
   cases agreed before it arrived, so a model cannot make its program pass by
@@ -1351,13 +1445,113 @@ once-per-tab flag. That distinction matters: a once-per-tab flag reported two
 incidents across 56 solves on two tabs — exactly one per tab, which is what it
 reports whether it happened twice or forty times.
 
+### …and neither does the page, against the wire
+
+There are **two** pairs of readings that can disagree, and the rule above was
+written for one of them. The page against the network stream got the same
+comparison, a printed note, and no decision. From the same operator's log:
+
+```
+what the page shows and what came off the wire are not the same — they differ at
+character 5605: the page nothing (it ends here), the wire ' ' (U+0020).
+Using the page.
+```
+
+The page **ended** at 5605 and the wire carried on. The page was a read taken
+before the last of the answer rendered, the wire held the whole of it, the miner
+knew, said so, and submitted the truncation.
+
+Both pairs now ask `_cut_short_by(whole, part)` the one question worth asking:
+is one of these the other cut short? When the page is a strict prefix of the
+wire, the wire wins and the count says how much was missing. The prefix test is
+what makes that safe. The stream reconstruction is a heuristic over a private,
+undocumented format, and the thing to fear from it is a reading that picked up
+the *conversation* rather than the reply — but such a reading cannot have the
+page as its prefix. Any other disagreement, a difference in the middle above
+all, still leaves the page in charge and only says so.
+
+`*_STREAM_FIRST=1` is unchanged: it makes the wire the primary outright, for an
+operator who has watched it agree on their own accounts.
+
+### Five ways the reader threw away an answer it had
+
+Found by a 29-agent adversarial hunt over the reading paths, each reproduced
+against the real modules before it was believed.
+
+**A leading `#` comment was read as a root shell prompt.** `_SHELL_OPENER_RE`
+opened with `[$#>]\s`, and `#` is how a great many Python programs start:
+
+```
+plausible_source("# Sliding window over the log lines.\ndef g(lines): ...") -> False
+extract_code(that reply + a demo block)  -> "print(g(['E1','I2']))"
+```
+
+The answer was declared "not source at all", `extract_code` fell past it, and
+the model's own one-line usage example went to the validator. Deleting only the
+comment made the same reply return the program. `#` now counts only when a
+command follows it — which is what a root prompt is and what no comment is.
+`$ ` and `> ` keep their bare form; neither opens a Python statement.
+
+**A code block nested under a list item was extracted unparseable.** Markdown
+*requires* that indentation, and it is not part of the source. `fenced_blocks`
+kept it and `extract_code`'s `.strip()` then removed it from the first line
+only, so a correct program came back as `unexpected indent, line 3`. The opening
+fence's indentation is now removed from every body line — never more than the
+fence itself had, so a line the author indented further keeps the difference,
+and a tab is never partially removed.
+
+**A carried import landed above `from __future__`.** That has to be the first
+statement in the file, and `import math` above it is source `ast.parse` accepts
+and the grader's import rejects:
+
+```
+python_defect -> None                    <- reported CLEAN
+compile(...)  -> SyntaxError: from __future__ imports must occur at the beginning
+```
+
+Carried imports now go below anything that must come first — a docstring, a
+`__future__` import. And `python_defect` asks `compile()` rather than
+`ast.parse`, because the validator *imports* this source and import compiles it:
+`ast.parse` is the wrong question by exactly the set of programs that parse and
+will not compile. None of the 43 archived submissions is newly rejected.
+
+**A momentarily shorter message list latched a previous turn's answer.**
+`_new_reply` read "the last message's id changed" as proof of a new reply. True
+when the list grew or held steady; when it *shrank*, the last message is an
+older one wearing a different id — so the prompt was answered with the previous
+turn's program, silently, `empty_reason=None`. The branch now requires
+`count >= count_before`; a shorter list means the page is mid-re-render, and
+waiting one poll is what every other unresolved state here does.
+
+**A transient selector miss stranded the whole send on a coarser candidate.**
+`_messages` dropped its latch when the candidate matched nothing, on the grounds
+that *"there is no count to corrupt at zero"*. There is: `before[0]` was counted
+with the **old** candidate, and `_new_reply` compares the new one's count
+against it. chatgpt.com ships two candidates that count on different scales — an
+A/B pair is two messages inside one article. Measured:
+
+```
+before = (2, 'm2') latched: #msg
+note: assistant selector '#msg' stopped matching mid-answer; re-resolving
+after the blink, latched: #article
+once #msg matches again, latched: #article      <- never re-examined
+reply found: False
+```
+
+Three things now hold it together: `_counted_with` remembers which candidate the
+baseline belongs to; the fallback is **re-examined** rather than held, so the
+earlier candidate is taken back the moment it matches again; and while the latch
+is not `_counted_with`, the count comparison is not made at all. `_explain_empty`
+reports the latched selector too, so its diagnosis names the selector the read
+actually used.
+
 ### A model still writing is waited for, never interrupted
 
-The slice a read is given is an internal **allocation**, not a deadline: part of
-the budget is held back for a repair round. That reserve is well spent on an
-answer that arrived *wrong*. It is worth nothing at all on one that has not
-finished arriving — the composer is usually disabled while a reply streams, and
-where it is not the prompt simply queues behind the answer it is asking about.
+The slice a read is given is an internal **allocation**, not a deadline. Where a
+caller does hand out less than the whole budget, stopping the read at the slice
+is worth nothing on an answer that has not finished arriving — the composer is
+usually disabled while a reply streams, and where it is not the prompt simply
+queues behind the answer it is asking about.
 
 So when the slice runs out with the model still writing, the read extends once
 to the caller's real remaining budget rather than stopping to do something that
@@ -1451,6 +1645,7 @@ fresh conversation.
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `SOLVER_MAX_ATTEMPTS` | `0` | Rounds per solve, `0` meaning **unlimited** — correct until it passes or the request's deadline stops it. A count here is a second, private deadline under the only real one, and there is no partial credit for stopping early. Set a number to cap it anyway |
 | `SOLVER_SAFETY_MARGIN_S` | `20` | Headroom kept before the cutoff, for `send`'s post-deadline phases and for grading, signing and transport |
 | `SOLVER_MAX_BUDGET_S` | `3600` | The protocol's own maximum for `deadline_s`, so it cannot bind on a spec-compliant request. Lowering it below the advertised deadline throws away answers the validator would still pay for |
 | `SOLVER_VERIFY_EXECUTOR` | `subprocess` | Python grading backend; Rust always uses Docker |

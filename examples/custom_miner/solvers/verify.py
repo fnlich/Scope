@@ -30,7 +30,6 @@ to use the container backend instead; Rust verification always requires it.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import os
 import threading
 import time
@@ -42,6 +41,7 @@ from rlvr.types import TestCase
 from .prompts import (
     build_code_prompt,
     build_repair_prompt,
+    build_resume_prompt,
     build_tests_prompt,
     extract_code,
     extract_self_tests,
@@ -64,6 +64,19 @@ VERIFY_TIMEOUT_S = float(os.environ.get("SOLVER_VERIFY_TIMEOUT_S", "5"))
 # fixed heals on its own.
 EXECUTOR_RETRY_S = float(os.environ.get("SOLVER_EXECUTOR_RETRY_S", "300"))
 
+# What a repair needs to be worth carrying to a FRESH conversation: a tab, a
+# prompt that restates the whole problem, and a read long enough to answer it.
+# More than the 12s an in-conversation round trip needs, because none of that
+# is warm.
+RESUME_FLOOR_S = 40.0
+
+# The least a lease wait may be cut to. Below this, waiting is pointless and
+# failing fast lets the pass end while another tab might still be tried.
+OPEN_FLOOR_S = 5.0
+
+# The most `_grade` will insist on before it declines to run anything at all.
+GRADE_FLOOR_S = 15.0
+
 
 class Conversation(Protocol):
     """One live, isolated model conversation.
@@ -72,11 +85,9 @@ class Conversation(Protocol):
     model can see its own previous attempt alongside the failure report.
     """
 
-    # A backend MAY also accept ``extend_to_s`` -- the caller's real remaining
-    # budget, as opposed to the slice it allocated for this one read. One that
-    # does may read past its slice while the model is still writing rather than
-    # stop mid-answer. One that does not is simply never offered it; see
-    # ``_reads_past_its_slice``.
+    # Two arguments, always. A backend MAY also accept ``extend_to_s`` -- a
+    # hard bound past the slice, for a caller that hands out less than its whole
+    # remaining budget -- but nothing here does, so nothing here passes one.
     async def send(self, text: str, timeout_s: float) -> str: ...
     async def close(self) -> None: ...
 
@@ -131,8 +142,9 @@ class Candidate:
         return self.defect is None and self.total > 0 and self.passed == self.total
 
     @property
-    def score(self) -> tuple[int, int, int]:
-        """Ranking key for 'best so far' — passes, then non-empty, then runnable.
+    def score(self) -> tuple[int, int, int, int]:
+        """Ranking key for 'best so far' — the validator's examples, then the
+        model's own cases, then non-empty, then runnable.
 
         A defect ranks BELOW clean code that merely could not be graded, and
         that is not cosmetic. Without a defect term at all, a first answer with
@@ -261,8 +273,15 @@ class _Grader:
         if language in self._reported:
             return
         self._reported.add(language)
-        fix = ""
-        if language == "rust":
+        # The hint, not just the error. A daemon that is UP and unreachable
+        # reports exactly like one that is not running -- read off a production
+        # run, where every Rust answer went out ungraded behind "permission
+        # denied ... /var/run/docker.sock", which is a group membership and not
+        # a broken install.
+        from .rehearse import _executor_hint
+
+        fix = _executor_hint(exc) or ""
+        if not fix and language == "rust":
             fix = (
                 " Rust has no subprocess path — grading it at all needs a Docker "
                 "daemon; see the README's \"Rust needs Docker\" section."
@@ -270,8 +289,9 @@ class _Grader:
         print(
             f"[verify] the {language} executor could not be built, so no {language} "
             f"answer can be graded here: no repair rounds, and verified=False "
-            f"however good the answer is. {type(exc).__name__}: {exc}{fix} Not "
-            f"probing again for {EXECUTOR_RETRY_S:.0f}s. Once per run."
+            f"however good the answer is. Not probing again for "
+            f"{EXECUTOR_RETRY_S:.0f}s. Once per run.\n"
+            f"           {type(exc).__name__}: {exc}{fix}"
         )
 
     def check(
@@ -423,27 +443,16 @@ class _Plan:
 # second chance in the same solve.
 
 
-# Which backends accept `extend_to_s`, by class, asked once each.
+# Nothing here passes `extend_to_s` any more, and that is the end of a long
+# argument rather than an oversight. It existed so a read could spend a repair
+# reserve on an answer that was still arriving; with every read given the whole
+# remaining budget there is no reserve, and a hard bound equal to the slice is
+# an extension that cannot extend. `send` still accepts the keyword -- see
+# `browser_pool` -- for a caller that does hand out less than everything.
 #
-# The parameter is optional on purpose. `Conversation` is a Protocol, so a
-# backend written outside this package satisfies it with the two-argument
-# `send` that has always been the contract -- and calling it with a keyword it
-# does not take would be a TypeError inside the one call the whole solve
-# depends on. Catching that TypeError is not an option either: one raised from
-# INSIDE `send` is indistinguishable, and retrying would send the prompt twice.
-_EXTEND_SUPPORT: dict[type, bool] = {}
-
-
-def _reads_past_its_slice(conversation: Any) -> bool:
-    cls = type(conversation)
-    known = _EXTEND_SUPPORT.get(cls)
-    if known is None:
-        try:
-            known = "extend_to_s" in inspect.signature(cls.send).parameters
-        except (TypeError, ValueError):  # builtins, C callables, no signature
-            known = False
-        _EXTEND_SUPPORT[cls] = known
-    return known
+# The happy side effect: every read here is the two-argument `send` that has
+# always been the `Conversation` contract, so a backend written outside this
+# package needs nothing new to work.
 
 
 class VerifyingSolver:
@@ -459,7 +468,7 @@ class VerifyingSolver:
         self,
         backend: Backend,
         *,
-        max_attempts: int = 3,
+        max_attempts: int = 0,
         safety_margin_s: float = 20.0,
         max_budget_s: float = 3600.0,
         cache_size: int = 256,
@@ -467,7 +476,11 @@ class VerifyingSolver:
         self_tests: bool = True,
     ):
         self._backend = backend
-        self._max_attempts = max(1, int(max_attempts))
+        # 0 means UNLIMITED, and that is the default. Correctness is the whole
+        # of the payment here, so the only thing that should stop a repair loop
+        # is the validator's deadline -- a count of three was a second, private
+        # deadline layered under the real one, and it fired first.
+        self._max_attempts = max(0, int(max_attempts))
         self._margin = max(0.0, float(safety_margin_s))
         self._max_budget = max(5.0, float(max_budget_s))
         self._second_opinion = bool(second_opinion)
@@ -593,7 +606,7 @@ class VerifyingSolver:
             if candidate is not None and candidate.score > best.score:
                 best = candidate
                 won_with = provider
-            if best.verified:
+            if best.verified and not best.failures:
                 break
             # Nothing RAN, whether or not anything was shipped to run. The
             # distinction used to be `not task.public_examples`, and that missed
@@ -633,10 +646,13 @@ class VerifyingSolver:
                 print(
                     f"[verify] {provider or 'first'} "
                     + (
-                        "returned nothing; asking another model"
+                        "returned nothing"
                         if not best.code.strip()
-                        else "did not verify; asking another model"
+                        else "cleared the examples but not its own cases"
+                        if best.verified
+                        else "did not verify"
                     )
+                    + "; asking another model"
                 )
         if asked:
             # `won_with`, not `asked[-1]`. They usually coincide -- a verified
@@ -652,7 +668,12 @@ class VerifyingSolver:
             self._counts["verified"] += 1
         if best.code.strip():
             self._counts["solved"] += 1
-            if best.verified and self._cache_size:
+            # `not best.failures` as well as `verified`: with both suites run,
+            # an answer can clear the validator's examples and still disagree
+            # with the model's own cases. Caching that re-serves one wrong
+            # answer for every later task with the same statement, which is the
+            # exact harm the cache gate exists to prevent.
+            if best.verified and not best.failures and self._cache_size:
                 if len(self._cache) >= self._cache_size:
                     self._cache.pop(next(iter(self._cache)))
                 self._cache[key] = (best.code, best.raw)
@@ -729,9 +750,27 @@ class VerifyingSolver:
         best: Optional[Candidate] = None
         conversation = None
         provider: Optional[str] = None
+        # Which provider produced `best` -- not which one this pass is talking
+        # to NOW. They part company the moment a repair is carried elsewhere:
+        # the pass then ends holding an answer from the first model and a
+        # conversation with the second, and returning the latter credits the
+        # wrong account. That is the one question the per-provider tally exists
+        # to answer, so it follows `best` rather than the conversation.
+        #
+        # Bound out here beside `provider`, for the same reason: `open()` can
+        # raise, the handler below catches it, and the return then reads a name
+        # the try block never got to bind.
+        best_provider: Optional[str] = None
         try:
-            conversation = await self._backend.open(avoid=avoid)
-            provider = getattr(conversation, "provider", None)
+            # BOUNDED by what is left. `BrowserFleet.open` waits for a free tab
+            # up to `MINER_TAB_WAIT_S`, which ships at 120s, and nothing here
+            # ever passed a smaller number -- so on a busy fleet a solve could
+            # spend 120s per pass waiting, three passes, 360s against a 280s
+            # deadline, and return empty having sent no prompt at all. Measured:
+            # budget 40s, elapsed 50.1s, `open()` called at t=0 and t=25.1,
+            # prompts sent 0.
+            conversation = await self._open_within(budget, started, avoid)
+            provider = best_provider = getattr(conversation, "provider", None)
             # Turn 1: the cases, before the program exists. Cases written
             # ALONGSIDE a program can be back-filled from what the program
             # happens to do, and then they agree with its bugs; cases written
@@ -806,7 +845,7 @@ class VerifyingSolver:
                         print(f"[verify] {left_after:.0f}s left; not asking for "
                               f"cases again this task, the remaining attempts "
                               f"go straight to the program")
-                    return best, provider
+                    return best, best_provider
             prompt = build_code_prompt(
                 task.language, task.statement, task.entrypoint,
                 task.public_examples, cases=cases,
@@ -818,7 +857,82 @@ class VerifyingSolver:
             # with no answer. A crash that looks like a dead tab is the worst
             # kind, so the line does not depend on the guard above surviving.
             agreed = list(cases or [])
-            for attempt in range(1, self._max_attempts + 1):
+            # The program the LAST round produced, so a repair that corrects a
+            # case can be told apart from one that rewrites both -- and the
+            # reply that carried it, so a correction sent WITHOUT the program
+            # can still be graded against something.
+            last_code: Optional[str] = None
+            last_program_reply: Optional[str] = None
+            # A repair may be carried to a fresh conversation ONCE per pass.
+            resumed = False
+            # What the last round AMOUNTED to -- the program, the defect and
+            # the failing cases -- so a round that changed nothing can be told
+            # from one that did. See `duplicate` below.
+            last_signature: Optional[tuple] = None
+            async def _resume_elsewhere(why: str, avoid: Optional[str] = None):
+                """Carry the repair to a FRESH conversation, or None.
+
+                The one move available when a conversation will not produce a
+                new answer -- because it is unreadable, or because it just
+                repeated itself. Both are the same situation from here: nothing
+                more is coming from this tab, and the repair is still worth
+                making somewhere else.
+
+                `avoid` is what separates the two. An unreadable tab is a TAB
+                problem -- the model is fine and any tab will do, so it passes
+                none. A conversation that repeated itself is a MODEL problem,
+                and the answer to that is the other model: it arrives holding
+                the previous program and the cases it failed, which is a far
+                better start than the fresh pass `solve_task` would give it.
+                On live traffic that pass does not happen at all -- with no
+                public examples nothing can be graded, and `solve_task` breaks
+                rather than spend a second account on an answer it cannot
+                compare. So this is the only place the other model gets asked.
+
+                Once per pass. A second tab that also fails is a fleet problem
+                rather than something to keep paying for, and the caller then
+                ends the loop holding the best answer it ever had.
+
+                Returns `(conversation, provider, prompt)` for the caller to
+                install, so the loop's own bindings stay the single source of
+                truth for what it is talking to.
+                """
+                nonlocal resumed
+                left_now = budget - (time.monotonic() - started)
+                if (
+                    resumed
+                    or best is None
+                    or not best.code.strip()
+                    or not (best.failures or best.defect)
+                    or left_now < RESUME_FLOOR_S
+                ):
+                    return None
+                resumed = True
+                print(
+                    f"[verify] {why}; carrying the repair to a fresh "
+                    f"conversation with {left_now:.0f}s left"
+                )
+                try:
+                    await conversation.close()
+                except Exception:  # noqa: BLE001 - it may already be broken
+                    pass
+                fresh = await self._open_within(budget, started, avoid)
+                return (
+                    fresh,
+                    getattr(fresh, "provider", provider),
+                    build_resume_prompt(
+                        task.language, task.statement, task.entrypoint,
+                        task.public_examples, agreed, best.code,
+                        best.failures, defect=best.defect,
+                        from_self_tests=best.from_self_tests,
+                    ),
+                )
+
+            attempt = 0
+            while True:
+                attempt += 1
+                if self._max_attempts and attempt > self._max_attempts:
+                    break
                 left = budget - (time.monotonic() - started)
                 if attempt > 1 and left < 12.0:
                     # Not enough left to be worth another ROUND TRIP -- which is
@@ -830,44 +944,160 @@ class VerifyingSolver:
                     # always runs, however little there is, exactly as the first
                     # pass does in `solve_task`.
                     break
-                # Give the first attempt the larger share; repairs are cheaper.
-                #
-                # How much larger depends on whether a repair can even happen.
-                # With public examples a repair is likely, and reserving 40% for
-                # it is well spent. With NONE -- every task on the run this was
-                # written for -- the only repair possible is defect-driven, and
-                # a first answer that is structurally fine ends the loop right
-                # there. Measured: a Claude tab spent its whole 135 second slice
-                # and the remaining 90 seconds of a 225 second budget went
-                # unused, on the one attempt that had to succeed.
-                first_share = 0.6 if task.public_examples else 0.85
-                slice_s = (
-                    left if attempt == self._max_attempts else left * first_share
-                )
-
-                # The slice is what this read is ALLOCATED; `left` is what the
-                # attempt actually still has. Handing over both lets the read
-                # spend the repair reserve on an answer that is still arriving,
-                # which is the only thing that can still produce one.
-                if _reads_past_its_slice(conversation):
-                    reply = await conversation.send(prompt, slice_s, extend_to_s=left)
-                else:
-                    reply = await conversation.send(prompt, slice_s)
-                candidate = await self._graded(
-                    reply, task, budget - (time.monotonic() - started), agreed
-                )
+                # Every round reads against EVERYTHING that is left. Earlier
+                # builds handed the first attempt a fraction (60% with public
+                # examples, 85% without) so a repair would have something to
+                # spend, and that reserve was worth least exactly when it cost
+                # most: `send` returns the moment the model finishes, so the
+                # slice was never a wait -- only a ceiling on a read that ran
+                # long, which is the one case where cutting it short throws away
+                # the answer. The loop below stops when a round trip no longer
+                # fits; nothing is carved out in advance.
+                # No `extend_to_s`, for the same reason the cases turn passes
+                # none: the slice already IS everything left, so there is
+                # nothing being held back to extend into. Passing one equal to
+                # the slice makes `send`'s extension a no-op by construction and
+                # only reads as though a reserve existed.
+                reply = await conversation.send(prompt, left)
                 # A repair reply may carry a CORRECTED case array: the repair
-                # prompt says so outright ("if the case was wrong, fix the case
-                # and leave the program alone"). Freezing turn 1's cases would
-                # kill that escape hatch and let one wrong case break a correct
-                # program on every round.
+                # prompt offers it outright ("or, if the case was wrong rather
+                # than the program, a `json` array holding ALL of the cases").
+                # Freezing turn 1's cases would kill that escape hatch and let
+                # one wrong case break a correct program on every round.
+                #
+                # WHEN it takes effect differs by the shape the repair came
+                # back in, and both shapes matter.
+                #
+                # Program UNCHANGED, cases corrected -- exactly what was asked
+                # for. Applied to this same reply, because the alternative is to
+                # report the identical failure it was sent to fix: the round is
+                # spent, the next prompt quotes the same disagreement, and the
+                # correction lands only on the round after -- one more round
+                # trip spent re-reporting a failure already fixed, against a
+                # deadline. Measured on a live
+                # solve: turn 1 wrote three cases whose `final_records` order
+                # was wrong, the program was right, the model corrected the
+                # cases exactly as asked, and the answer still went out
+                # reported 17/20. Nothing is conceded by grading it now: the
+                # program is the one already judged, so a weakened case cannot
+                # launder a rewrite that did not happen.
+                #
+                # Program CHANGED as well -- the reply rewrote both sides of the
+                # disagreement. The prompt no longer spends a sentence
+                # forbidding that, because forbidding it was never what stopped
+                # it: this is. Such a reply is graded against the bar as it
+                # stood BEFORE it arrived, so a model cannot make a rewritten
+                # program pass by rewriting the bar in the same breath. Its
+                # cases apply from the next round.
                 revised = extract_self_tests(reply, task.entrypoint, task.language)
+                if revised and attempt == 1:
+                    # The PROGRAM turn. Its cases are back-filled from what the
+                    # program happens to do -- they agree with its bugs, which
+                    # is the entire argument for splitting the turns -- so the
+                    # bar stays the one turn 1 wrote before any program existed.
+                    #
+                    # Not a theoretical objection. Measured: turn 1 wrote a case
+                    # that CAUGHT the bug, turn 2 sent the buggy program with
+                    # two cases of its own, round 1 reported the real failure
+                    # and then adopted them, and round 2 re-graded the same
+                    # buggy program against the bar it had brought with it --
+                    # `self=2/2`, no failures, loop over, buggy program
+                    # submitted as passing everything. The rule that a reply is
+                    # judged against the bar as it stood before it arrived
+                    # covered repair rounds and left this one round short.
+                    print(
+                        f"[verify] the program turn sent {len(revised)} case(s) "
+                        f"of its own; keeping turn 1's — cases written beside a "
+                        f"program are back-filled from it"
+                    )
+                    revised = []
+                if revised and len(revised) < len(agreed):
+                    # A revision may CORRECT a case. It may not delete one --
+                    # and dropping the case you cannot pass is exactly how a
+                    # bar gets cleared without the program improving. The
+                    # repair prompt asks for the complete array back, so a
+                    # short one is either disobedience or the thing this
+                    # guards against; either way the old bar stands.
+                    print(
+                        f"[verify] the repair sent back {len(revised)} case(s) "
+                        f"where {len(agreed)} were agreed; keeping the fuller "
+                        f"set — a case may be corrected, not dropped"
+                    )
+                    revised = []
+                now_code = extract_code(reply, task.entrypoint, task.language).strip()
+                # Which reply the candidate is actually graded FROM. Normally
+                # this one; see the cases-only branch below for when it is not.
+                graded = reply
+                if revised and last_code:
+                    if now_code == last_code:
+                        agreed, revised = revised, None
+                    elif not now_code:
+                        # Cases corrected, program deliberately NOT resent --
+                        # the one reply the repair prompt asks for by name when
+                        # the case was the thing that was wrong, and until this
+                        # branch existed the answer to it was "your previous
+                        # reply did not reach me as code". Measured: the program
+                        # was right, turn 1's case was not, the model corrected
+                        # exactly the case it was asked to, and the miner spent
+                        # the rest of the budget demanding a program it already
+                        # had before submitting one reported 0/1 on a bogus bar.
+                        #
+                        # Nothing here is taken on trust. The program is the one
+                        # already in hand and already judged, so a weakened bar
+                        # cannot launder a rewrite -- there was no rewrite. It
+                        # is re-graded, not assumed to pass.
+                        agreed, revised = revised, None
+                        graded = last_program_reply or reply
+                candidate = await self._graded(
+                    graded, task, budget - (time.monotonic() - started), agreed
+                )
+                # What this round AMOUNTED to. Compared against the round before
+                # rather than the replies themselves, because the same program
+                # under a different sentence of prose is the same program: byte
+                # equality misses that and this does not. The failures are in it
+                # so a corrected CASE reads as progress even when the program is
+                # untouched -- which is exactly what the repair prompt asks for.
+                signature = (
+                    candidate.code.strip(), candidate.defect, tuple(candidate.failures)
+                )
+                duplicate = attempt > 1 and signature == last_signature
+                last_signature = signature
+                # Only when one ARRIVED. A cases-only reply leaves the program
+                # in hand standing, and forgetting it here would make the very
+                # next correction unattributable to any program at all.
+                if now_code:
+                    last_code = now_code
+                    last_program_reply = reply
                 if revised:
                     agreed = revised
                 if best is None or candidate.score > best.score:
-                    best = candidate
-                if candidate.verified:
+                    best, best_provider = candidate, provider
+                elif candidate.score == best.score and not getattr(
+                    conversation, "still_writing", False
+                ):
+                    # A TIE goes to the later candidate, and that is not a
+                    # coin toss: this one was written after seeing the failure
+                    # report, so it is the model's considered revision of the
+                    # one already in hand.
+                    #
+                    # Strict `>` made every repair round a no-op whenever the
+                    # score could not move -- and the score cannot move when a
+                    # case is WRONG. Measured: turn 1 wrote a case no correct
+                    # program can pass, attempt 1 scored 1/2, the model then
+                    # rewrote the program properly, and the rewrite tied at 1/2
+                    # and was thrown away. The miner submitted the first draft
+                    # and the model's last word never left the tab. With three
+                    # bogus cases pinning a solve at 17/20, that is every
+                    # remaining round.
+                    #
+                    # Not when the model was STILL WRITING, though. What
+                    # arrived there is a fragment of an answer rather than a
+                    # revision of one, and a fragment that happens to parse and
+                    # tie must not displace the finished program above it.
+                    best, best_provider = candidate, provider
+                if candidate.verified and not candidate.failures:
                     break
+
                 if getattr(conversation, "still_writing", False):
                     # The model had not finished when the read stopped, so
                     # whatever is in hand is a fragment of an answer rather than
@@ -924,13 +1154,61 @@ class VerifyingSolver:
                     # empty one always carries a `defect`, because the
                     # structural checks reject empty source exactly as they
                     # reject a broken program. Only the tab knows.
+                    reason = getattr(conversation, "empty_reason", "?")
+                    if reason == "unreadable":
+                        # The conversation is gone; the REPAIR is not. Carry it
+                        # to a fresh tab rather than submitting an answer whose
+                        # failures nobody asked the model to fix. Measured over
+                        # a production run: fifteen solves ended exactly here,
+                        # each holding a candidate that failed its own cases,
+                        # with an average of 129 seconds still on the clock.
+                        carried = await _resume_elsewhere(
+                            f"{provider or 'this model'} returned nothing and "
+                            f"that conversation is unreadable"
+                        )
+                        if carried is not None:
+                            conversation, provider, prompt = carried
+                            continue
+                    # No repair to carry, or nothing left to carry it with. Say
+                    # which -- this line used to promise that somebody else
+                    # would be asked, and when an answer was already in hand
+                    # `solve_task` submitted it instead and asked nobody.
                     print(
                         f"[verify] {provider or 'this model'} returned nothing and "
-                        f"the conversation is "
-                        f"{getattr(conversation, 'empty_reason', '?')}; asking "
-                        f"elsewhere rather than repairing it"
+                        f"the conversation is {reason}; "
+                        + (
+                            f"submitting the answer already in hand"
+                            if best is not None and best.code.strip()
+                            else "asking elsewhere"
+                        )
                     )
                     break
+                if duplicate:
+                    # Same program, same failures: the round changed nothing,
+                    # and asking this conversation the same question again has
+                    # no new information to change it with. It is also the only
+                    # thing standing between a broken tab and a spin -- `send`
+                    # normally blocks on the model for tens of seconds, so the
+                    # budget bounds the rounds, but a read returning STALE text
+                    # returns it at once and the loop would resend the same
+                    # repair at machine speed for the whole budget.
+                    #
+                    # So: change something, rather than stop. Correcting runs
+                    # until the answer passes or the deadline stops it, and a
+                    # FRESH conversation is a real change where a re-ask is not
+                    # -- it is the same move the unreadable branch makes, for
+                    # the same reason, and `_resume_elsewhere` is that move.
+                    # Only when there is nowhere left to carry it does the loop
+                    # end, and it ends holding the best answer it ever had.
+                    carried = await _resume_elsewhere(
+                        f"{provider or 'this model'} sent back the same program "
+                        f"and the same failures after being shown them",
+                        avoid=provider,
+                    )
+                    if carried is None:
+                        break
+                    conversation, provider, prompt = carried
+                    continue
                 if not candidate.defect and not candidate.failures:
                     break  # nothing actionable to report (no examples shipped)
                 # Kept apart, not merged into one list of "problems": a defect
@@ -953,7 +1231,31 @@ class VerifyingSolver:
                     await conversation.close()
                 except Exception:  # noqa: BLE001 - cleanup must not mask a result
                     pass
-        return best, provider
+        return best, best_provider
+
+    async def _open_within(self, budget: float, started: float, avoid: Optional[str]):
+        """`backend.open`, bounded by the solve's own clock.
+
+        A fleet backend waits for a free tab, and the wait it defaults to is an
+        operator setting about fleet capacity that knows nothing about this
+        request's deadline. Half of what is left, floored at `OPEN_FLOOR_S`: a
+        lease that has not come free in half the remaining budget will not leave
+        time to use it, and the caller has other passes to spend.
+
+        The bound is offered as a keyword and the two-argument form is bounded
+        from out here instead. `Backend.open` has always been `open(avoid=...)`,
+        so a backend written outside this package need not have grown a
+        `timeout_s` -- and a keyword it does not take would be a TypeError
+        inside the one call the whole solve depends on.
+        """
+        left = budget - (time.monotonic() - started)
+        share = max(OPEN_FLOOR_S, left * 0.5)
+        try:
+            return await self._backend.open(avoid=avoid, timeout_s=share)
+        except TypeError:
+            return await asyncio.wait_for(
+                self._backend.open(avoid=avoid), timeout=max(share, 1.0)
+            )
 
     async def _graded(
         self, reply: str, task, left: float, cases: Optional[list] = None
@@ -1058,7 +1360,23 @@ class VerifyingSolver:
             if task.language == "rust"
             else python_defect(code, task.entrypoint)
         )
-        out_of_budget = left is not None and left <= 0
+        # Not `left <= 0`. `_Grader.check` gives every case
+        # `VERIFY_TIMEOUT_S` and nothing bounds the run as a whole, so a
+        # candidate that times out on each of its cases spends that many
+        # multiples of it: measured, 6 cases x 5s = 30s of executor time bought
+        # with 0.2s of budget, on a verdict nothing could act on -- there is no
+        # time left for a repair round and `verified` never reaches the
+        # validator. The guard's own reason ("running anything buys nothing that
+        # can still be acted on") is as true at 0.2s as at 0, so it asks what
+        # the run could actually cost.
+        #
+        # `GRADE_FLOOR_S` caps the demand: a task with twenty cases would
+        # otherwise refuse to grade anything under a hundred seconds, and a
+        # partial run that DOES fit is worth more than no evidence at all.
+        needed = VERIFY_TIMEOUT_S * max(
+            1, len(cases or []) or len(getattr(task, "public_examples", None) or [])
+        )
+        out_of_budget = left is not None and left < min(needed, GRADE_FLOOR_S)
         if defect is None and task.language == "rust" and not out_of_budget:
             # Python's check PARSED that code; Rust's only grepped it for
             # `fn main`. Ask the compiler the same question the validator will,
@@ -1084,20 +1402,8 @@ class VerifyingSolver:
             candidate.defect = defect
             candidate.code = "" if not code.strip() else code
             return candidate
-        if not task.public_examples:
-            # Nothing SHIPPED to verify against -- which is every task on live
-            # traffic -- so the only cases that can exist are the ones the model
-            # wrote for its own program. Running them is not verification and is
-            # never recorded as any: `passed`/`total` stay at zero, so `verified`
-            # stays False and the answer is never cached. What it does catch is
-            # the commonest failure by far, the model knowing what the answer
-            # should be and coding it wrong, and that is objectively checkable
-            # with the validator's own executor.
-            if self._self_tests and not out_of_budget and code.strip():
-                self._run_self_tests(candidate, task, cases)
-            return candidate
         if out_of_budget:
-            # The budget is gone, so running the examples buys nothing that can
+            # The budget is gone, so running anything buys nothing that can
             # still be acted on: there is no time for a repair round, and
             # `verified` never reaches the validator -- it feeds this process's
             # cache and its stats and nothing else. It is not free, either:
@@ -1106,19 +1412,52 @@ class VerifyingSolver:
             # rather than late. The check would be paid for with the answer it
             # was checking. The structural checks above already ran; they cost
             # microseconds and are what ranks this candidate.
-            print(
-                "[verify] out of budget before the examples could be run; "
-                "submitting the answer unverified"
-            )
+            if task.public_examples:
+                print(
+                    "[verify] out of budget before the examples could be run; "
+                    "submitting the answer unverified"
+                )
             return candidate
-        try:
-            passed, total, failures = self._grader.check(
-                code, task.language, task.entrypoint, task.public_examples
+
+        # BOTH suites, in this order, because turn 2 was asked to pass both:
+        # the validator's examples (in `<examples>`) and the model's own cases
+        # from turn 1 (in `<must_pass>`). Only one of them used to run. With
+        # examples shipped the own cases were quoted in the prompt and never
+        # executed, so a program right on the one example and wrong on its own
+        # boundary case verified, ended the loop and shipped -- the repair round
+        # that exists to catch exactly that never fired. Live traffic ships no
+        # examples, which is why it went unnoticed rather than why it was fine.
+        #
+        # The ORDER is the whole of the precedence. The validator's examples are
+        # ground truth: when they fail, the program is wrong, there is nothing
+        # to weigh, and the own cases are not run at all -- a second opinion
+        # from the same model on a program already known wrong tells us nothing
+        # and costs an executor run per case. Only once they are all green does
+        # a disagreement with the model's OWN cases become the open question,
+        # and `failures` then carries that instead. So `failures` names one
+        # suite at a time and `from_self_tests` says which, which is what lets
+        # the repair prompt ask for the right thing.
+        if task.public_examples:
+            try:
+                passed, total, failures = self._grader.check(
+                    code, task.language, task.entrypoint, task.public_examples
+                )
+            except Exception as exc:  # noqa: BLE001 - a broken grader loses no answer
+                print(f"[verify] local grading unavailable: {type(exc).__name__}: {exc}")
+                return candidate
+            candidate.passed, candidate.total, candidate.failures = (
+                passed, total, failures
             )
-        except Exception as exc:  # noqa: BLE001 - a broken grader must not lose the answer
-            print(f"[verify] local grading unavailable: {type(exc).__name__}: {exc}")
-            return candidate
-        candidate.passed, candidate.total, candidate.failures = passed, total, failures
+            if failures:
+                return candidate
+        # Running these is not verification and is never recorded as any:
+        # `passed`/`total` are the validator's examples alone, so `verified`
+        # cannot be earned by a model agreeing with itself. What they catch is
+        # the commonest failure by far -- the model knowing what the answer
+        # should be and coding it wrong -- and that is objectively checkable
+        # with the validator's own executor.
+        if self._self_tests and code.strip():
+            self._run_self_tests(candidate, task, cases)
         return candidate
 
     # -- what a Rust answer is actually checked with ----------------------- #

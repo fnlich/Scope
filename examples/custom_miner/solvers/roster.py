@@ -93,7 +93,11 @@ def build_solver(browsers: Optional[Sequence[Browser]] = None) -> VerifyingSolve
     )
     return VerifyingSolver(
         fleet,
-        max_attempts=int(os.environ.get("SOLVER_MAX_ATTEMPTS", "3")),
+        # 0 = keep correcting until the answer passes or the request's deadline
+        # stops it. A count here is a second, private deadline: the loop is what
+        # turns a nearly-right answer into a paid one, and there is no partial
+        # credit for stopping early. Set it to cap the rounds anyway.
+        max_attempts=int(os.environ.get("SOLVER_MAX_ATTEMPTS", "0")),
         safety_margin_s=float(os.environ.get("SOLVER_SAFETY_MARGIN_S", "20")),
         # The largest deadline the protocol allows (`TaskRequest.deadline_s` is
         # `le=3600`), so it cannot bind on a spec-compliant request: the budget

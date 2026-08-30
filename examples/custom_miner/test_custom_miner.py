@@ -1570,6 +1570,136 @@ def test_a_dead_tab_is_not_driven_again():
     assert page.typed == [], "it typed into a tab it knew was dead"
 
 
+def test_a_shorter_message_list_is_a_re_render_not_a_new_reply():
+    """`_new_reply` treated "the last message's id changed" as proof of a new
+    reply. That holds when the list grew or held steady; when it SHRANK, the
+    last message is an OLDER one wearing a different id — so this prompt was
+    answered with a previous turn's program, silently, `empty_reason=None`.
+
+    Reproduced: before=(2, 'id-B'), the DOM re-rendered down to one message, and
+    `send` returned branch A of the turn before."""
+    site = _site(message_id_attr="data-message-id")
+    old_a = _Node(text="OLD A", code=["def pong():\n    return 'OLD-BRANCH-A'"],
+                  attrs={"data-message-id": "id-A"})
+    old_b = _Node(text="OLD B", code=["def pong():\n    return 'OLD-BRANCH-B'"],
+                  attrs={"data-message-id": "id-B"})
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()],
+                      "#assistant": [old_a, old_b]})
+    # The click re-renders the list DOWN to one message and never grows it: the
+    # answer to this prompt has not been painted yet.
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [old_a])
+
+    got = asyncio.run(_tab(page, site).send("solve it", 0.4))
+    assert "OLD-BRANCH-A" not in got, (
+        f"answered this prompt with a previous turn's program: {got!r}"
+    )
+
+    # ...and the case the branch exists for still works: a site that REPLACES
+    # the last message rather than appending one.
+    replaced = _Node(text="new", code=["def pong():\n    return 'THE ANSWER'"],
+                     attrs={"data-message-id": "id-NEW"})
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()],
+                      "#assistant": [old_a, old_b]})
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [old_a, replaced])
+    got = asyncio.run(_tab(page, site).send("solve it", 0.4))
+    assert "THE ANSWER" in got, f"stopped seeing a replaced last message: {got!r}"
+
+
+def test_a_transient_selector_miss_does_not_strand_the_send_on_a_coarser_one():
+    """`_messages` dropped its latch when the candidate matched nothing,
+    reasoning "there is no count to corrupt at zero". There is: `before[0]` was
+    counted with the OLD candidate, and `_new_reply` compares the new one's
+    count against it directly. chatgpt.com ships two candidates that count on
+    different scales — an A/B pair is two messages inside one article — so after
+    a re-resolve the comparison is meaningless and no reply is ever found.
+
+    Measured on the code this replaces, step by step:
+
+        before = (2, 'm2') latched: #msg
+        note: assistant selector '#msg' stopped matching mid-answer; re-resolving
+        after the blink, latched: #article
+        once #msg matches again, latched: #article      <- never re-examined
+        reply found: False
+    """
+    MSG, ART = "#msg", "#article"
+    site = _site(assistant=(MSG, ART), message_id_attr="data-message-id")
+    m1 = _Node(text="old one", attrs={"data-message-id": "m1"})
+    m2 = _Node(text="old two", attrs={"data-message-id": "m2"})
+    answer = _Node(text="here", code=["def g(n):\n    return n * 7"],
+                   attrs={"data-message-id": "m3"})
+    art = _Node(text="one article holds every message")
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()],
+                      MSG: [m1, m2], ART: [art]})
+    tab = _tab(page, site)
+
+    async def go():
+        before = await tab._fingerprint()
+        assert before == (2, "m2") and tab._assistant == MSG, (before, tab._assistant)
+
+        page.dom[MSG] = []                       # the candidate blinks out
+        await tab._messages()
+
+        page.dom[MSG] = [m1, m2, answer]         # ...and the answer lands
+        await tab._messages()
+        assert tab._assistant == MSG, (
+            f"stayed on the coarser candidate: {tab._assistant} — the baseline "
+            f"was counted with {MSG} and the two count on different scales"
+        )
+        reply = await tab._new_reply(before)
+        assert reply is not None, "never found the reply after the blink"
+        assert await tab._read(reply) is not None
+
+    asyncio.run(go())
+
+
+def test_a_count_taken_with_one_selector_is_never_compared_against_another():
+    """The other half. While the latch is NOT the candidate the baseline was
+    counted with, the count comparison is meaningless and is not made at all —
+    `_new_reply` waits for the original to come back rather than guessing from
+    numbers on two different scales."""
+    MSG, ART = "#msg", "#article"
+    site = _site(assistant=(MSG, ART))          # no message id: counts only
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()],
+                      MSG: [_Node(text="a"), _Node(text="b")],
+                      ART: [_Node(text="t1"), _Node(text="t2"), _Node(text="t3")]})
+    tab = _tab(page, site)
+
+    async def go():
+        before = await tab._fingerprint()
+        assert before[0] == 2 and tab._counted_with == MSG
+
+        page.dom[MSG] = []                       # forced onto the coarser one
+        await tab._messages()
+        assert tab._assistant == ART
+        # ART's count is 3 against a baseline of 2 taken under MSG. Reading that
+        # as "a new message arrived" is how a whole send was lost.
+        assert await tab._new_reply(before) is None, (
+            "compared a count taken with one selector against another"
+        )
+
+    asyncio.run(go())
+
+
+def test_the_post_mortem_names_the_selector_the_read_actually_used(capsys):
+    """`_explain_empty` re-resolved from scratch, so it could count one selector
+    and quote `before[0]`, which was counted with another — reporting "matched 2
+    message(s), the same as before the prompt was sent" of two different things,
+    about a page holding the finished answer."""
+    MSG, ART = "#msg", "#article"
+    site = _site(assistant=(MSG, ART))
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()],
+                      MSG: [], ART: [_Node(text="a turn")]})
+    tab = _tab(page, site)
+    asyncio.run(tab._messages())          # latches ART, the only one matching
+    assert tab._assistant == ART
+
+    page.dom[MSG] = [_Node(text="x"), _Node(text="y")]
+    asyncio.run(tab._explain_empty((1, None)))
+    out = capsys.readouterr().out
+    assert ART in out, f"the post-mortem named a selector the read never used: {out}"
+    assert MSG not in out, out
+
+
 def test_the_echo_guard_reads_the_whole_message_not_the_code_block():
     """`_read` prefers the last `pre code`, and task statements routinely contain
     fenced code — so comparing the extracted block against the prompt would never
@@ -1617,6 +1747,84 @@ def test_a_draft_left_in_the_composer_never_reaches_a_validator():
     assert "mortgage" not in page.composer
     assert page.pressed[:2] == ["Control+A", "Delete"], page.pressed
 
+
+def test_an_editor_that_reformats_the_prompt_is_not_contamination():
+    """Read off a live miner, where this retired a working tab:
+
+        the composer did not hold the prompt as typed; clearing it and typing
+        it again, once
+        failed to submit: RuntimeError: the composer does not hold the prompt
+        as typed, twice over
+
+    The box was holding the prompt exactly as intended. claude.ai's composer is
+    a rich-text editor and applies input rules as text arrives: `- ` at the
+    start of a line becomes a bullet, `1. ` becomes an ordered list, and the
+    marker is then list STRUCTURE rather than text — so `innerText` gives the
+    line back without it, the ordered marker's digit included. Turn 1 carries
+    nine such lines. Demanding the text back verbatim called every one of those
+    sends contaminated, and retyping reproduces it exactly, so the second look
+    failed too and the tab was thrown away.
+
+    What may not happen is a word appearing that we never typed."""
+    from solvers.prompts import build_tests_prompt
+
+    prompt = build_tests_prompt("python", "Do a thing.", "g", [])
+    reformatted = "\n".join(
+        re.sub(r"^(- |[0-9]+\. )", "", line) for line in prompt.splitlines()
+    )
+    page = _FakePage({"#composer": [_Node()], "#send": [], "#assistant": []})
+    page.on_insert = lambda _: reformatted          # the editor rewrites it
+    tab = _tab(page, _site())
+    with contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(tab.send(prompt, 1.0))
+
+    assert page.pressed.count("Enter") == 1, "a reformatted prompt was not sent"
+    assert tab.alive is True, "the tab was retired over the editor's own markup"
+    # One clear, one insert: it must not have retyped either.
+    assert page.typed == [prompt], f"retyped a prompt that was already right: {len(page.typed)}"
+
+
+def test_a_composer_read_before_it_has_painted_is_waited_for_not_retyped():
+    """`insert_text` returns when the input event is delivered, not when the
+    editor has rendered it. On a box running four Chrome instances in 5 GB that
+    gap is visible, and reading straight after catches an empty box or half a
+    prompt — which is not contamination and must not be answered by retyping
+    into an editor that is still catching up."""
+    prompt = "solve this problem please"
+    page = _FakePage({"#composer": [_Node()], "#send": [], "#assistant": []})
+    state = {"inserted": None, "reads": 0}
+
+    def paints_late(text):
+        state["inserted"] = text
+        return ""                      # the box shows nothing yet
+
+    page.on_insert = paints_late
+
+    class _Slow(_Loc):
+        @property
+        def first(self):               # a real locator's `.first` keeps its type
+            return self
+
+        async def evaluate(self, expression):
+            if state["inserted"] is None:
+                return ""              # before we type: an empty box, as clearing wants
+            state["reads"] += 1
+            return state["inserted"] if state["reads"] >= 3 else ""
+
+    plain = page.locator
+    page.locator = lambda sel: (
+        _Slow(page, sel, page.dom.get(sel, [])) if sel == "#composer" else plain(sel)
+    )
+    tab = _tab(page, _site())
+    with contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(tab.send(prompt, 3.0))
+
+    assert state["reads"] >= 3, "did not wait for the editor to paint"
+    assert page.pressed.count("Enter") == 1, "never sent a prompt that did arrive"
+    assert page.typed == [prompt], (
+        f"retyped into an editor that was merely slow to paint: {page.typed}"
+    )
+    assert tab.alive is True
 
 def test_a_composer_that_will_not_empty_is_never_sent_to():
     """A box we cannot empty is a box whose contents we cannot vouch for, so the
@@ -1862,7 +2070,11 @@ def test_a_delivery_failure_is_not_reported_as_a_wrong_answer():
 
     prompt = build_repair_prompt([], "rust", "main", defect=NO_CODE)
     assert "did not reach me as code" in prompt
-    assert "artifact" in prompt and "canvas" in prompt
+    # Where the reply has to be WRITTEN is the whole of the fix, and it is said
+    # positively rather than as a list of the places it must not go. The ban on
+    # artifacts and canvases is the nudge's job, and the nudge is appended to
+    # every send including this one -- see `_submit`.
+    assert "directly in the chat" in prompt
     assert "I ran" not in prompt, "still claims to have run something"
     assert "WRONG" not in prompt, "still blames the answer for a delivery fault"
 
@@ -3099,24 +3311,31 @@ def test_the_output_contract_holds_the_first_word_and_the_nudge_the_last():
         ), site.nudge[:70]
 
 
-def test_a_repair_round_is_sent_back_through_the_checklist():
-    """Repairs go into the SAME conversation, so the checklist is still above
-    them — and a repair that fixes the failing example while breaking a
-    boundary scores the same zero as the answer it replaced."""
+def test_a_repair_carries_the_error_and_no_method_for_thinking():
+    """A repair round is the evidence plus one sentence naming what may come
+    back. Nothing else.
+
+    It used to carry a paragraph of method as well -- trace the failing call
+    through your code, do not guess at the fix from the shape of the failure,
+    re-check the fix against every OTHER case you were sent silently, do not
+    change both to make them agree. That is work which never reaches the reply,
+    competing with the failure itself for attention, and it is the same class of
+    instruction the two-phase rewrite already took out of turns 1 and 2."""
     from solvers.prompts import build_repair_prompt
 
     prompt = build_repair_prompt(["solve([]) raised IndexError"], "python", "solve")
-    # It points at the cases the model was actually sent. It used to point at
-    # "the edge-case checklist from my first message", and that message no
-    # longer carries one -- a repair prompt referring to a section that is not
-    # there is an instruction the model cannot follow.
-    assert "every OTHER case you were sent" in prompt, prompt
-    assert "breaks another is still wrong" in prompt
-    # ...but a DEFECT is not a logic problem, and must not be answered with it.
+    assert "solve([]) raised IndexError" in prompt, prompt
+    for method in ("in your reasoning", "silently", "trace the failing",
+                   "do not guess", "re-check", "same rules as before",
+                   "do not change both", "every other case"):
+        assert method not in prompt.lower(), (
+            f"method is back in the repair prompt: {method!r}"
+        )
+    # ...and a DEFECT is answered with delivery, never with a run report.
     for defect in ("the program does not define fn main()", NO_CODE):
         repair = build_repair_prompt([], "rust", "main", defect=defect)
-        assert "every OTHER case you were sent" not in repair, (
-            f"answered a delivery failure with logic advice: {defect!r}"
+        assert "I ran" not in repair, (
+            f"answered a delivery failure with evidence that does not exist: {defect!r}"
         )
 
 
@@ -4038,11 +4257,16 @@ def test_the_log_names_which_model_produced_the_answer(capsys):
 
     # ...and when the first model fails and the second is asked but does WORSE,
     # the credit must stay with the answer that actually went out.
-    backend = _TwoModels([("chatgpt", [WRONG, WRONG, WRONG]), ("claude", ["no code here"])])
+    # Three entries, not two: a conversation that repeats itself now carries
+    # its repair to the OTHER model inside the same pass, so `claude` is reached
+    # once there and once again on the second-opinion pass.
+    backend = _TwoModels([("chatgpt", [WRONG, WRONG, WRONG]),
+                          ("claude", ["no code here"]),
+                          ("claude", ["no code here"])])
     asyncio.run(VerifyingSolver(backend, safety_margin_s=0, max_budget_s=120)
                 .solve_task(task, 60.0))
     logged = capsys.readouterr().out
-    assert backend.seen == ["chatgpt", "claude"], backend.seen
+    assert backend.seen[0] == "chatgpt" and "claude" in backend.seen, backend.seen
     assert "provider=chatgpt" in logged, (
         f"credited the last model ASKED rather than the one whose answer was "
         f"submitted: {logged!r}"
@@ -4086,15 +4310,17 @@ def test_both_nudges_use_the_last_word_to_demand_code_first():
         assert site.nudge.startswith(
             "START your reply with the fenced block"
         ), site.nudge[:70]
-        # The nudge holds the recency slot AND is appended to every send, so a
-        # layout named here overrides the contract that named a different one.
-        # Both turns ask for ONE block, so that is what it may say -- and it
-        # said "the ordinary fenced block or blocks", which is the softer half
-        # of the contradiction a model resolves by emitting a second block.
-        assert "ONE ordinary fenced block" in site.nudge, site.nudge
-        for layout in ("or blocks", "two ordinary fenced blocks", "program first",
-                       "JSON cases second"):
-            assert layout not in site.nudge, f"{site.name}: nudge pins {layout!r}"
+        # The nudge holds the recency slot AND is appended to EVERY send, so
+        # any count named here overrides the contract of whichever turn it
+        # happens to ride on. Both solve turns ask for one block; a repair
+        # round may ask for a corrected `json` block beside the program. So it
+        # names no count at all and defers to the message above it -- pinning
+        # "ONE" here told a repair round to send the program alone, and a model
+        # obeying that can never correct a case that was wrong.
+        assert "the message above asks for" in site.nudge, site.nudge
+        for pinned in ("ONE ordinary fenced block", "two ordinary fenced blocks",
+                       "program first", "JSON cases second"):
+            assert pinned not in site.nudge, f"{site.name}: nudge pins {pinned!r}"
         # And it does not hurry the model. Correctness is the whole payment;
         # "an answer that arrives after a paragraph of prose may not arrive at
         # all" traded the thing being paid for against a thing that is not.
@@ -4103,27 +4329,23 @@ def test_both_nudges_use_the_last_word_to_demand_code_first():
             assert rush not in site.nudge, f"{site.name}: nudge still rushes: {rush!r}"
 
 
-def test_the_first_attempt_gets_the_budget_when_no_repair_can_happen():
-    """Reserving 40% of the budget for repair rounds is well spent when public
-    examples exist and a repair is likely. With none shipped — every task on the
-    run this was written for — a structurally fine first answer ends the loop,
-    and the reserve is simply discarded. Measured: a tab spent its whole 135s
-    slice while 90s of a 225s budget went unused, on the one attempt that had
-    to succeed."""
+def test_every_round_reads_against_everything_that_is_left():
+    """The solve budget used to be sliced — 60% to the first attempt with public
+    examples, 85% without — so a later round would have something to spend.
+
+    The reserve was worth least exactly where it cost most. `send` returns the
+    moment the model finishes, so holding budget back was never a wait, only a
+    ceiling on a read that ran long — which is the one case where cutting it
+    short throws the answer away. Measured: a tab spent its whole 135s slice
+    while 90s of a 225s budget went unused, on the one attempt that had to
+    succeed."""
     import inspect
 
     from solvers.verify import VerifyingSolver
 
     source = inspect.getsource(VerifyingSolver._attempt)
-    assert "first_share = 0.6 if task.public_examples else 0.85" in source, source[:200]
-
-    budget = 225.0
-    with_examples = budget * 0.6
-    without = budget * 0.85
-    assert without > with_examples
-    assert without > 135.1, (
-        "the first attempt still gets less than the slice that was running out"
-    )
+    assert "first_share" not in source, "the private slice is back"
+    assert "conversation.send(prompt, left)" in source, source[:200]
 
 
 def test_the_examples_decide_when_the_statement_is_ambiguous():
@@ -5147,6 +5369,256 @@ def test_the_wire_is_used_when_the_page_has_nothing_at_all():
     assert "def g(n)" in got, f"the wire rescue stopped working: {got!r}"
 
 
+def test_a_page_read_taken_before_the_answer_finished_never_beats_the_wire(capsys):
+    """The rule the copy control has always had, on the pair that never got it.
+
+    A reading wins on FIDELITY and has no authority at all on COMPLETENESS, and
+    the two are different questions. `_cut_short_by` decided that for copy vs
+    page; page vs wire got the comparison, a printed note, and no decision.
+    Measured on a live solve, in the operator's own log:
+
+        what the page shows and what came off the wire are not the same — they
+        differ at character 5605: the page nothing (it ends here), the wire ' '
+        (U+0020). Using the page.
+
+    The page ENDED at 5605 and the wire carried on. The page was the answer cut
+    short, the wire held the whole of it, and the truncation was submitted."""
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "solve it"
+    whole = "def g(n):\n    t = 0\n    while n > 0:\n        t += n % 10\n        n //= 10\n    return t"
+
+    async def wire():
+        return f"```python\n{whole}\n```\n"
+
+    tab._streamed_markdown = wire
+    # What the page had when the deadline landed: the same answer, cut off.
+    cut = "def g(n):\n    t = 0\n    while n > 0:\n        t"
+    got = asyncio.run(tab._reconcile_stream((0, None), _Tab._fence(cut), [cut]))
+
+    assert "return t" in got, f"submitted the page's truncation: {got!r}"
+    log = capsys.readouterr().out
+    assert "CUT SHORT" in log and "came off the wire" in log, log
+    # And the count is a count, not a once-per-tab flag: every one of these is
+    # an answer that would have gone out truncated, so the NUMBER is the thing.
+    assert tab._cut_short_stream == 1
+
+
+def test_the_wire_wins_only_when_the_page_is_its_PREFIX(capsys):
+    """The other half, and the reason the wire does not simply win.
+
+    Both stream formats are private, undocumented and free to change on any
+    deploy, and the reconstruction is a heuristic over their JSON. The one thing
+    to fear is a reading that picked up the CONVERSATION rather than the reply —
+    and such a reading cannot have the page as its prefix. So a difference in
+    the MIDDLE leaves the page in charge exactly as before, and only says so."""
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "solve it"
+    page = "def g(n):\n    return n + 1"
+
+    async def different_in_the_middle():
+        return "```python\ndef g(n):\n    return n + 2\n```\n"
+
+    tab._streamed_markdown = different_in_the_middle
+    got = asyncio.run(tab._reconcile_stream((0, None), _Tab._fence(page), [page]))
+
+    assert "n + 1" in got, f"a mid-answer disagreement handed the wire the answer: {got!r}"
+    log = capsys.readouterr().out
+    assert "Using the page" in log, log
+    assert "CUT SHORT" not in log, log
+    assert tab._cut_short_stream == 0
+
+
+def test_a_wire_shorter_than_the_page_never_replaces_it(capsys):
+    """The direction that must never fire. A stream capture that started late
+    holds the END of the answer, not the whole of it, and the page is then the
+    fuller reading — the prefix test is what tells the two apart."""
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "solve it"
+    page = "def g(n):\n    t = 0\n    for d in str(n):\n        t += int(d)\n    return t"
+
+    async def truncated_wire():
+        return "```python\ndef g(n):\n    t = 0\n```\n"
+
+    tab._streamed_markdown = truncated_wire
+    got = asyncio.run(tab._reconcile_stream((0, None), _Tab._fence(page), [page]))
+
+    assert "return t" in got, f"took a wire reading shorter than the page: {got!r}"
+    assert tab._cut_short_stream == 0
+
+
+def test_the_deadline_read_is_tested_for_completeness_like_every_other(capsys):
+    """`best` comes off the read loop, which stops at the deadline. The page and
+    the wire are both read AFTER it, so `best` is the oldest of the three and
+    the likeliest to be short — and until this ran, nothing ever asked.
+
+    Measured: `best` a truncation, the page and the wire each holding the whole
+    program and agreeing with each other exactly. `_cut_short_by` saw no gap
+    between THEM and `_first_difference` found nothing to report, so control
+    fell through to `return best` and the truncation was submitted without a
+    single line of log. Every comparison in the function was made and the one
+    that mattered was not among them."""
+    whole = ("def g(n):\n    total = 0\n    for i in range(n):\n"
+             "        total += i\n    return total")
+    cut = "def g(n):\n    total = 0\n    for i in ra"
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "solve it"
+
+    async def wire():
+        return f"```python\n{whole}\n```\n"
+
+    tab._streamed_markdown = wire
+    got = asyncio.run(tab._reconcile_stream((0, None), _Tab._fence(cut), [whole]))
+
+    assert "return total" in got, f"submitted the deadline read's truncation: {got!r}"
+    log = capsys.readouterr().out
+    assert "CUT SHORT" in log, log
+    assert tab._cut_short_stream == 1
+
+
+def test_the_page_is_re_read_whatever_the_network_did(capsys):
+    """These are independent questions — did the network hold the answer, has
+    the page since rendered it — and the second used to be asked only when the
+    first said yes.
+
+    The refetch and the late-page rescue sat BELOW the early return taken when
+    the capture came back empty. So a wire that captured prose recovered the
+    program off the page, and a wire that captured nothing threw the identical
+    page away and submitted "". Whether the answer was looked at depended on
+    something with no bearing on it."""
+    whole = "def g(n):\n    return n"
+
+    for label, wire in (("nothing", None), ("prose only", "just prose, no block")):
+        tab = _tab(None, _site(stream=True))
+        tab._sent = "solve it"
+        looked = []
+
+        async def streamed(w=wire):
+            return w
+
+        async def new_reply(before):
+            looked.append("page")
+            return object()
+
+        tab._streamed_markdown = streamed
+        tab._new_reply = new_reply
+        tab._dom_blocks = lambda reply: _done([whole])
+        tab._whole = lambda reply: _done("here is the answer")
+
+        got = asyncio.run(tab._reconcile_stream((0, None), "", None))
+        assert looked == ["page"], f"wire={label}: never re-read the page"
+        assert "return n" in got, f"wire={label}: threw the page's answer away: {got!r}"
+
+
+def test_the_page_refetch_cannot_hand_back_our_own_prompt():
+    """The refetch is a second route to a submission, so it asks the same
+    question the scrape path asks in `_poll`.
+
+    An assistant selector that also matches the USER's turn hands back a message
+    whose whole text is our prompt and whose code block is whatever the
+    statement quoted — so the block alone looks like a fine answer, and the
+    guard at the single exit is testing the block, not the message. That is
+    exactly how two of this miner's own prompts reached a validator as Rust
+    programs."""
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "Solve this programming problem in Python.\nReturn the digit sum."
+
+    async def no_wire():
+        return None
+
+    tab._streamed_markdown = no_wire
+    tab._new_reply = lambda before: _done(object())
+    tab._dom_blocks = lambda reply: _done(["example_from_the_statement()"])
+    tab._whole = lambda reply: _done(tab._sent)
+
+    got = asyncio.run(tab._reconcile_stream((0, None), "", None))
+    assert got == "", f"handed back a block from our own echoed prompt: {got!r}"
+
+
+def test_opening_a_tab_is_bounded_by_the_solve_budget():
+    """`BrowserFleet.open` waits for a free tab up to `MINER_TAB_WAIT_S`, which
+    ships at 120s, and nothing here ever passed a smaller number. On a busy
+    fleet that is 120s per pass against a deadline that knows nothing about it:
+    measured, budget 40s, elapsed 50.1s, `open()` called at t=0 and t=25.1,
+    prompts sent 0, answer empty."""
+    asked = []
+
+    class _Slow:
+        async def open(self, avoid=None, timeout_s=None):
+            asked.append(timeout_s)
+            raise RuntimeError("no free tab")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(_Slow(), safety_margin_s=0, max_budget_s=40,
+                             second_opinion=False)
+    asyncio.run(solver.solve_task(
+        SolveTask(problem_id="p", language="python", statement="s", entrypoint="g",
+                  public_examples=[], deadline_s=40.0),
+        timeout_s=40.0,
+    ))
+    assert asked, "open() was never called"
+    assert all(t is not None for t in asked), f"unbounded lease wait: {asked}"
+    assert all(t <= 40.0 for t in asked), f"waited longer than the whole solve: {asked}"
+
+
+def test_a_backend_without_a_lease_timeout_is_still_bounded():
+    """`Backend.open` has always been `open(avoid=...)`. A keyword a custom
+    backend does not take would be a TypeError inside the one call the whole
+    solve depends on, so the bound is offered and then applied from outside."""
+    class _TwoArg:
+        async def open(self, avoid=None):
+            await asyncio.sleep(30)
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(_TwoArg(), safety_margin_s=0, max_budget_s=12,
+                             second_opinion=False)
+    started = time.monotonic()
+    answer = asyncio.run(solver.solve_task(
+        SolveTask(problem_id="p", language="python", statement="s", entrypoint="g",
+                  public_examples=[], deadline_s=12.0),
+        timeout_s=12.0,
+    ))
+    elapsed = time.monotonic() - started
+    assert elapsed < 20.0, f"a two-argument backend hung for {elapsed:.0f}s"
+    assert answer.code == ""
+
+
+def test_grading_is_not_started_when_it_cannot_finish():
+    """`_Grader.check` gives every case `VERIFY_TIMEOUT_S` and nothing bounds
+    the run as a whole, so a candidate that times out on each of its cases
+    spends that many multiples of it. Measured: 6 cases x 5s = 30s of executor
+    time bought with 0.2s of budget, on a verdict nothing could act on — there
+    is no time for a repair round and `verified` never reaches the validator."""
+    from types import SimpleNamespace
+
+    from solvers.prompts import MAX_SELF_TESTS
+    from solvers.verify import GRADE_FLOOR_S, VERIFY_TIMEOUT_S
+
+    solver, _ = _solver_seeing([])
+    ran = []
+    solver._grader = SimpleNamespace(
+        check=lambda *a, **k: (ran.append(1), (0, 1, ["boom"]))[1]
+    )
+    task = SimpleNamespace(language="python", entrypoint="g", statement="s",
+                           public_examples=[])
+    reply = "```python\ndef g(n):\n    return n\n```"
+    cases = [{"name": f"c{i}", "args": [i], "expected": i} for i in range(6)]
+
+    # Six cases at VERIFY_TIMEOUT_S each cannot fit in a fifth of a second.
+    solver._grade(reply, task, 0.2, cases)
+    assert not ran, "started a grading run that could not finish inside the budget"
+
+    # ...and with the time to do it, it still runs.
+    solver._grade(reply, task, 300.0, cases)
+    assert ran, "stopped grading when there was plenty of budget"
+
+    # A cap on the cap: a task with twenty cases must not refuse to grade
+    # anything under a hundred seconds, because a partial run that DOES fit is
+    # worth more than no evidence at all.
+    assert 0 < GRADE_FLOOR_S < VERIFY_TIMEOUT_S * MAX_SELF_TESTS
+
+
 def test_nothing_anywhere_still_submits_nothing(capsys):
     """The streamed text is never handed back raw — a chat stream carries the
     conversation, and two of the miner's own prompts reached a validator as Rust
@@ -5305,12 +5777,264 @@ def test_carrying_imports_does_not_resurrect_the_usage_demo():
     assert value == 4 and "print(g(" not in code, code
 
 
-def test_rust_is_left_to_its_compiler():
-    """`use` has the same shape, but a Rust answer is put through rustc, which
-    says so in a message a repair round can act on."""
+def test_a_truncated_rust_program_is_caught_without_a_compiler():
+    """The check Python gets from `ast.parse` and `_always_returns`, and Rust
+    had only from a compiler that is allowed not to be there.
+
+    `rust_defect`'s other two tests both PASS a truncation: the first line still
+    opens like Rust and `fn main` still begins a line. Measured on a real
+    archived submission — 10,608 bytes, 75 `{` against 71 `}`, ending
+    mid-identifier four blocks deep. `rustc` calls it `error: this file contains
+    an unclosed delimiter`; nothing here did, and it went out as a confident
+    answer that cannot compile."""
+    from solvers.prompts import rust_defect
+
+    cut = ("fn main() {\n    for i in 0..10 {\n        if i > 3 {\n"
+           "            let x = i * 2;\n            i")
+    defect = rust_defect(cut)
+    assert defect and "unclosed" in defect, defect
+    assert "cut off mid-answer" in defect, defect
+
+    assert rust_defect('fn main() {\n    println!("ok");\n}\n') is None
+
+
+def test_the_rust_truncation_check_does_not_fire_on_valid_rust():
+    """A false positive here does not merely cost a repair round: a block
+    carrying a defect loses `extract_code`'s "last gradeable" preference, so a
+    trailing usage example can outrank the real answer. Every construct below is
+    one a naive delimiter counter gets wrong."""
+    from solvers.prompts import _rust_unclosed, rust_defect
+
+    valid = {
+        "brace in a string": 'fn main() { println!("}{ not real"); }',
+        "brace in a char": "fn main() { let c = '}'; let d = '{'; }",
+        "escaped quote char": "fn main() { let q = '\\''; let b = '\\\\'; }",
+        "lifetime": 'struct S<\'a> { s: &\'a str }\nfn main() { let _ = S { s: "h" }; }',
+        "loop label": "fn main() { 'outer: loop { break 'outer; } }",
+        "raw string": 'fn main() { let s = r#"he said "}" loudly"#; }',
+        "nested block comment": "fn main() { /* a /* b { */ c */ let x = 1; }",
+        "line comment": "fn main() { // } not real\n    let x = 1;\n}",
+        "byte string and byte char": 'fn main() { let b = b"}"; let c = b\'{\'; }',
+        "raw identifier": "fn main() { let r#type = 1; let _ = r#type; }",
+        "unicode escape char": "fn main() { let e = '\\u{1F600}'; }",
+        "closure": 'fn main() { let f = |x: i32| { x + 1 }; println!("{}", f(1)); }',
+    }
+    for label, src in valid.items():
+        assert rust_defect(src) is None, f"{label}: {rust_defect(src)}"
+
+    # And it gives UP rather than guessing when the scan meets something it
+    # cannot account for — an unterminated string or comment is as likely to be
+    # this scanner misreading Rust as it is to be a broken program.
+    assert _rust_unclosed('fn main() {\n    println!("unterminated') is None
+    assert _rust_unclosed("fn main() {\n    /* thinking about it") is None
+
+
+def test_a_loop_with_an_else_that_returns_is_not_a_truncation():
+    """`_always_returns` handled `If`, `With`, `Try`, `while True` and `Match`,
+    and fell through to False for every `For`. So the ordinary "search, else
+    report not found" shape was reported as *can reach the end of its body
+    without returning ... which is what a reply cut off mid-answer looks like*,
+    about a correct program.
+
+    A loop's `else` runs on every exit that is not a `break`, so an `else` that
+    always returns leaves no way to fall through — the same rule `while True:`
+    already had, decided by the same helper."""
+    from solvers.prompts import python_defect
+
+    found = ("def g(n):\n    for i in range(n):\n        if i == 3:\n"
+             "            return i\n    else:\n        return -1\n")
+    assert python_defect(found, "g") is None, python_defect(found, "g")
+
+    while_else = "def g(n):\n    while n:\n        n -= 1\n    else:\n        return n\n"
+    assert python_defect(while_else, "g") is None, python_defect(while_else, "g")
+
+    # A `break` bound to the loop SKIPS the else, so control can still fall
+    # through — and a bare loop with no else says nothing either way.
+    breaks = ("def g(n):\n    for i in range(n):\n        if i == 3:\n"
+              "            break\n    else:\n        return -1\n")
+    assert python_defect(breaks, "g"), "a break past the else was not noticed"
+    bare = "def g(n):\n    for i in range(n):\n        pass\n"
+    assert python_defect(bare, "g"), "a bare loop stopped being a truncation signal"
+
+
+def test_a_generator_is_reported_as_a_generator_not_as_a_truncation():
+    """Still a defect — the grader compares RETURN VALUES structurally, so what
+    it receives is a generator object rather than the answer. But it is not a
+    reply that was cut off, and saying so sent the model looking for a
+    truncation that was not there."""
+    from solvers.prompts import python_defect
+
+    gen = "def g(n):\n    for i in range(n):\n        yield i\n"
+    defect = python_defect(gen, "g")
+    assert defect and "generator" in defect, defect
+    assert "cut off" not in defect, defect
+
+    # A nested helper that yields makes IT a generator, not `g`.
+    nested = "def g(n):\n    def h():\n        yield 1\n    return list(h())\n"
+    assert python_defect(nested, "g") is None, python_defect(nested, "g")
+
+
+def test_every_archived_rust_answer_is_judged_the_same_way_as_rustc():
+    """The 43 committed submissions in `solutions/` are the exact bytes the
+    validator received, which makes them a regression fixture rather than a
+    hypothetical. Exactly one is truncated; the structural check has to find
+    that one and leave the other seventeen alone."""
+    import pathlib
+
+    from solvers.prompts import rust_defect
+
+    archive = pathlib.Path(__file__).resolve().parents[2] / "solutions"
+    answers = sorted(archive.glob("*.rs"))
+    if not answers:
+        pytest.skip("the archived submissions are not checked out")
+
+    truncated = [f.name for f in answers
+                 if (rust_defect(f.read_text()) or "").find("unclosed") >= 0]
+    assert len(truncated) == 1, truncated
+    assert truncated[0].startswith("f8fe7918"), truncated
+
+
+def test_a_commented_first_line_is_python_not_a_root_shell_prompt():
+    r"""`_SHELL_OPENER_RE` opened with `[$#>]\s`, where `#` meant a root shell
+    prompt. In Python `# ` is a comment, and a commented first line is one of
+    the commonest ways a program starts — so the whole block was declared "not
+    source at all", `extract_code` fell past it, and the model's own one-line
+    usage example was submitted instead. Deleting only the comment made the same
+    reply return the program."""
+    from solvers.prompts import plausible_source
+
+    answer = ("# Sliding window over the log lines.\n"
+              "def g(lines):\n    best = 0\n    for ln in lines:\n"
+              "        if ln.startswith('E'):\n            best += 1\n    return best\n")
+    assert plausible_source(answer, "python"), "a commented answer is not source"
+
+    reply = f"```python\n{answer}```\n\nExample:\n\n```python\nprint(g(['E1']))\n```\n"
+    got = extract_code(reply, "g", "python")
+    assert "def g(lines)" in got, f"submitted the demo instead of the answer: {got!r}"
+    assert "print(g(" not in got, got
+
+    # ...and the thing the `#` alternative was there for still fails: a root
+    # prompt is a prompt CHARACTER followed by a command, which no comment is.
+    for tool_call in ("# cat > main.rs << 'EOF'\nfn main() {}\n",
+                      "# pip install numpy\n",
+                      "$ python3 solve.py\n",
+                      "> npm run build\n",
+                      "cd /home/claude && python sol.py\n",
+                      '{"command": "mkdir -p /home/claude"}\n'):
+        assert not plausible_source(tool_call, "python"), tool_call
+
+
+def test_a_code_block_nested_under_a_list_item_still_parses():
+    """Markdown REQUIRES the indentation of every line inside a block nested
+    under a list item, and it is not part of the source. Keeping it handed
+    `extract_code` a block whose every line began with three spaces; `.strip()`
+    then removed them from the first line only, and a program the model wrote
+    correctly came back as `unexpected indent, line 3`."""
+    from solvers.prompts import fenced_blocks
+
+    reply = ("Plan:\n\n"
+             "1. Sort the distinct values.\n"
+             "2. Sum the top two:\n\n"
+             "   ```python\n"
+             "   import math\n"
+             "\n"
+             "   def solve(nums):\n"
+             "       vals = sorted(set(nums), reverse=True)\n"
+             "       return sum(vals[:2]) if len(vals) >= 2 else 0\n"
+             "   ```\n")
+    got = extract_code(reply, "solve", "python")
+    assert python_defect(got, "solve") is None, python_defect(got, "solve")
+    assert got.startswith("import math"), got
+
+    # Never MORE than the fence had: a line the author indented further keeps
+    # the difference, which is the whole of the program's own structure.
+    assert fenced_blocks("  ```py\n  a\n      b\n  ```\n") == ["a\n    b\n"]
+    # An unnested block — every ordinary reply — is untouched.
+    assert fenced_blocks("```py\ndef g():\n    return 1\n```\n") == [
+        "def g():\n    return 1\n"
+    ]
+    # A tab is never partially removed; guessing its width would corrupt source.
+    assert fenced_blocks(" ```py\n\tdef g():\n\t\treturn 1\n ```\n") == [
+        "\tdef g():\n\t\treturn 1\n"
+    ]
+
+
+def test_a_carried_import_never_displaces_a_future_import():
+    """`from __future__` must be the first statement in the file, after at most
+    a docstring. `import math` above it is source `ast.parse` accepts and the
+    grader's import rejects — so it was reported CLEAN and scored zero."""
+    reply = ("```python\nimport math\n```\n\n"
+             "```python\nfrom __future__ import annotations\n\n"
+             "def g(n):\n    return math.isqrt(n)\n```\n")
+    got = extract_code(reply, "g", "python")
+    assert got.lstrip().startswith("from __future__"), got
+    assert "import math" in got, got
+    compile(got, "<solution>", "exec")          # the question the grader asks
+    assert python_defect(got, "g") is None
+
+    # A docstring may precede it, and has the same must-be-first rule.
+    with_doc = ('```python\nimport math\n```\n\n```python\n"""Solve it."""\n'
+                "from __future__ import annotations\n\ndef g(n):\n    return math.isqrt(n)\n```\n")
+    got = extract_code(with_doc, "g", "python")
+    compile(got, "<solution>", "exec")
+    assert got.lstrip().startswith('"""Solve it."""'), got
+
+    # With nothing that must come first, the import still goes to the top.
+    plain = "```python\nimport math\n```\n\n```python\ndef g(n):\n    return math.isqrt(n)\n```\n"
+    assert extract_code(plain, "g", "python").startswith("import math"), plain
+
+
+def test_the_parse_gate_asks_what_the_grader_will_ask():
+    """The validator IMPORTS this source, and import COMPILES it — so
+    `ast.parse` is the wrong question by exactly the set of programs that parse
+    and will not compile."""
+    bad = "import math\nfrom __future__ import annotations\ndef g(n):\n    return n\n"
+    import ast as _ast
+    _ast.parse(bad)                              # parses...
+    defect = python_defect(bad, "g")             # ...and is caught anyway
+    assert defect and "not valid Python" in defect, defect
+
+    # Nothing that compiles today may start failing: the archived submissions
+    # are the exact bytes the validator received.
+    import pathlib
+
+    archive = pathlib.Path(__file__).resolve().parents[2] / "solutions"
+    for f in sorted(archive.glob("*.py")):
+        src = f.read_text()
+        try:
+            _ast.parse(src)
+        except SyntaxError:
+            continue
+        compile(src, "<archived>", "exec")
+
+
+def test_a_rust_preamble_split_into_its_own_block_is_carried_too():
+    """Rust used to be left to its compiler here: `use` has the same shape as
+    `import`, and a Rust answer is put through rustc, which says so.
+
+    The compiler is allowed not to be there. With no local `rustc`, or with
+    `SOLVER_RUST_COMPILE=0`, nothing says so at all — and on the operator's own
+    host every Rust solve went out ungraded for want of a Docker daemon. So the
+    `use` lines are carried, on the same argument as the Python path.
+
+    Narrower than the Python path, though, because Rust name resolution is not
+    something to guess at: the earlier block has to be NOTHING but `use` lines,
+    attributes and comments, and the chosen block has to have no `use` of its
+    own."""
     got = extract_code("```rust\nuse std::io;\n```\n\n"
                        "```rust\nfn main() {\n    println!(\"x\");\n}\n```", "main", "rust")
-    assert got.strip().startswith("fn main()"), got
+    assert "use std::io;" in got, f"lost the preamble the program needs: {got!r}"
+    assert got.rstrip().endswith("}"), got
+
+    # A block with its own `use` is complete; nothing is prepended to it.
+    own = extract_code("```rust\nuse std::io;\n```\n\n"
+                       "```rust\nuse std::fmt;\nfn main() {}\n```", "main", "rust")
+    assert "std::io" not in own, f"stacked a preamble onto a complete program: {own!r}"
+
+    # An earlier block that is a PROGRAM is not a preamble, and is left alone.
+    prog = extract_code("```rust\nfn helper() {}\n```\n\n"
+                        "```rust\nfn main() {}\n```", "main", "rust")
+    assert prog.strip() == "fn main() {}", prog
 
 
 def test_a_fence_that_ends_a_line_of_prose_still_opens_a_block():
@@ -6161,22 +6885,35 @@ def test_the_image_check_only_speaks_when_docker_actually_said_no_such_image(mon
 # Quality over speed: the prompt must tell the model the truth about what the
 # payment rule actually rewards.
 # --------------------------------------------------------------------------- #
-def test_a_repair_asks_for_a_diagnosis_not_a_guess():
-    """A repair that edits from the shape of the failure fixes the symptom the
-    failure happened to show. The prompt now demands the model find the actual
-    line where computed and expected part company before touching anything."""
+def test_a_repair_ends_on_the_rule_for_what_may_come_back():
+    """The last thing a repair says is what it will accept, because that is the
+    sentence the reply has to obey.
+
+    Which sentence depends on whose cases failed. The validator's examples
+    shipped with the task and are ground truth, so only the PROGRAM may change
+    there. The model's own cases may themselves be wrong -- turn 1 derives its
+    `expected` values by reasoning -- so that branch names both ways out and
+    lets the model pick."""
     from solvers.prompts import build_repair_prompt
 
-    prompt = build_repair_prompt(["g(*[0], **{}) returned 1, expected 0"],
-                                 "python", "g")
-    assert "In your reasoning — not in the reply" in prompt
-    assert "do not guess at the fix" in prompt
-    assert "before you send" not in prompt.lower(), (
+    failure = ["g(*[0], **{}) returned 1, expected 0"]
+
+    theirs = build_repair_prompt(failure, "python", "g")
+    assert theirs.rstrip().endswith(
+        "Send back ONE fenced block: the corrected program, complete, with "
+        "nothing outside it."
+    ), theirs
+    assert "json" not in theirs, (
+        "offered to rewrite the validator's own examples, which are ground truth"
+    )
+    assert "before you send" not in theirs.lower(), (
         "the repair prompt reintroduced the phrase that caused narration"
     )
-    assert prompt.rstrip().endswith("ONLY ONE corrected code block and nothing else."), (
-        "the repair prompt no longer ends on the output rule"
-    )
+
+    mine = build_repair_prompt(failure, "python", "g", from_self_tests=True)
+    assert mine.rstrip().endswith(
+        "a `json` array holding ALL of the cases, corrected."
+    ), mine
 
 
 # --------------------------------------------------------------------------- #
@@ -6278,54 +7015,60 @@ def test_the_file_follows_the_payload_even_if_fit_response_rewrites_the_code(tmp
 # earns nothing at all. Every test below pins one of the places the miner used
 # to stop early and hand the validator an empty response it would have paid for.
 # --------------------------------------------------------------------------- #
-def test_a_tab_that_never_renders_a_reply_is_dropped_in_seconds_not_at_the_deadline():
-    """Measured twice in one live run, on two different sites:
+def test_a_tab_that_renders_nothing_is_waited_for_and_kept():
+    """The reverse of what this file used to assert, and a live run is why.
 
-        chatgpt tab 9227: no assistant selector matched anything
-        claude  tab 9222: matched 1 message(s), the same as before the prompt
-                          was sent -- the answer never rendered
+    Giving up on a tab that had painted nothing after a grace period looked
+    free: the recovery phases still ran, so the ANSWER was not lost. What was
+    lost was the CONVERSATION. Over one production run the bail fired eighteen
+    times, the wire produced the answer in nearly every one — the model was not
+    silent, the DOM was late — and each of those solves then had its repair
+    round sent into a tab that had just been retired. Fifteen answers went out
+    with failing cases and an average of 129 unused seconds behind them.
 
-    Both polled a tab that could not be read for the whole 191s first slice,
-    then spent a 29s repair round on the same dead conversation, and ended the
-    task with 5s left -- fewer than the 20s a second opinion needs. Five healthy
-    tabs sat idle through both. The task scored zero.
+    A model that thinks before it writes renders nothing for as long as it
+    thinks: 77 seconds, measured on a live tab. There is no per-turn deadline
+    to protect, only the request's own. So the read waits, and the tab stays.
 
-    The distinction that makes this fixable is `on_screen`: a model that is
-    merely slow has ALREADY painted its bubble, so it is never mistaken for
-    this. The tab here paints nothing, ever.
+    A tab is dead when the PAGE dies or the prompt cannot be submitted into it.
+    Being slow to paint is neither.
     """
     playwright, chrome = _chromium_or_skip()
-    # A composer and a send button, and a send that renders nothing at all.
     url = _served(
         '<!doctype html><meta charset="utf-8">'
         '<div id="composer" contenteditable="true"></div><button id="send">go</button>'
     )
     site = _site(assistant=("#assistant",))  # matches nothing, now and forever
 
-    async def go(grace):
+    async def go(grace, budget):
         async with playwright.async_playwright() as p:
             browser = await p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
             page = await (await browser.new_context()).new_page()
             await page.goto(url)
             tab = _tab(page, site)
             real, _browser_pool.BLIND_TAB_GRACE_S = _browser_pool.BLIND_TAB_GRACE_S, grace
+            chatter = io.StringIO()
             try:
                 started = time.monotonic()
-                reply = await tab.send("solve it", 120.0)
+                with contextlib.redirect_stdout(chatter):
+                    reply = await tab.send("solve it", budget)
                 elapsed = time.monotonic() - started
             finally:
                 _browser_pool.BLIND_TAB_GRACE_S = real
                 await browser.close()
-            return reply, elapsed, tab.alive
+            return reply, elapsed, tab.alive, chatter.getvalue()
 
-    reply, elapsed, alive = asyncio.run(go(2.0))
+    reply, elapsed, alive, log = asyncio.run(go(1.0, 6.0))
     assert reply == "", f"there was nothing on the page to capture: {reply!r}"
-    assert elapsed < 30.0, (
-        f"the send spent {elapsed:.1f}s of a 120s budget on a tab that showed "
-        f"nothing. That time is the whole point: it belongs to another tab."
+    assert elapsed >= 5.0, (
+        f"stopped after {elapsed:.1f}s of a 6s budget instead of waiting for an "
+        f"answer that may still have been on its way"
     )
-    assert alive is False, "an unreadable tab must be retired, not handed back"
-
+    assert alive is True, (
+        "a tab that is merely slow to paint was retired; the conversation the "
+        "repair loop needs went with it"
+    )
+    assert "still waiting" in log, log
 
 def test_the_tab_says_WHY_a_send_came_back_empty():
     """`""` is the same string for three different failures, and only one of
@@ -6883,10 +7626,13 @@ def test_a_blind_tab_still_gets_its_answer_off_the_wire():
 
     reply, alive, reason = asyncio.run(go(1.0))
     assert "return 4" in extract_code(reply, "pong"), (
-        f"the DOM was unreadable and the answer was on the wire, and the tab was "
-        f"retired before anything looked: {reply!r}"
+        f"the DOM was unreadable and the answer was on the wire, and nothing "
+        f"looked: {reply!r}"
     )
-    assert alive is False, "the DOM is still unreadable; the tab is finished"
+    assert alive is True, (
+        "the tab was retired after the wire had just proved the model was "
+        "answering it — and the repair round for this solve dies with it"
+    )
     assert reason is None, "an answer came back, so there is no empty to explain"
 
 
@@ -7184,9 +7930,11 @@ def test_a_backend_that_cannot_wait_is_never_asked_to():
     whole solve depends on. Catching that TypeError is not an option either: one
     raised from INSIDE `send` is indistinguishable, and retrying would send the
     prompt twice.
-    """
-    from solvers.verify import _reads_past_its_slice
 
+    It used to be a per-class probe of `send`'s signature. It is structural now:
+    every read here is given the whole remaining budget, so there is no reserve
+    to extend into and no reason to pass the keyword to anyone.
+    """
     seen: list[tuple] = []
 
     class _OldStyle:
@@ -7201,9 +7949,11 @@ def test_a_backend_that_cannot_wait_is_never_asked_to():
             seen.append((timeout_s, extend_to_s))
             return RIGHT
 
-    assert _reads_past_its_slice(_OldStyle()) is False
-    assert _reads_past_its_slice(_NewStyle()) is True
-
+    # Both are called the same way -- with ONE budget argument -- so the
+    # new-style backend simply sees `extend_to_s` at its default. (`arity` is
+    # what each fake RECORDS, which is fixed; what is being checked is that the
+    # old-style two-argument `send` is reached at all, and that the new-style
+    # one is never handed a bound it would have to honour.)
     for backend, arity in ((_OldStyle, 1), (_NewStyle, 2)):
         seen.clear()
 
@@ -7221,6 +7971,11 @@ def test_a_backend_that_cannot_wait_is_never_asked_to():
             f"{backend.__name__}.send was called with {len(seen[0])} budget "
             f"argument(s); it takes {arity}"
         )
+        if arity == 2:
+            assert seen[0][1] is None, (
+                f"a hard bound of {seen[0][1]} was passed to a read that was "
+                f"already given the whole budget"
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -7295,7 +8050,7 @@ def test_a_copy_that_differs_in_the_middle_still_wins():
     complete and authoritative. Only a copy that is the same answer cut short
     loses. A plain "is it shorter" test would hand every highlighter bug back
     to the DOM, which is the damage the copy control exists to avoid."""
-    cut = _Tab._copy_was_cut_short
+    cut = _Tab._cut_short_by
 
     whole = ["def g(n):\n    total = 1 + 2\n    return total"]
     # Truncated: a strict prefix, materially shorter -> the render wins.
@@ -7797,11 +8552,282 @@ def test_the_models_own_boundary_case_catches_a_wrong_program(capsys):
     assert len(sent) == 3, f"expected cases, program, repair; sent {len(sent)}"
     assert "<task>" in sent[0], "the first turn must ask for the cases alone"
     assert "<must_pass" in sent[1], "the program turn must restate the cases"
-    assert "DISAGREE" in sent[2], sent[2][:200]
+    assert "the test cases you sent" in sent[2], sent[2][:200]
     assert "'single digit'" in sent[2], (
         f"the repair has to name the case that broke: {sent[2][:300]}"
     )
     assert "self=3/3" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# Turn 2 is asked to pass BOTH suites, so both have to be run.
+# --------------------------------------------------------------------------- #
+# The validator's examples and the model's own cases from turn 1 are both in
+# the turn-2 prompt -- `<examples>` and `<must_pass>`. Only one of them used to
+# be executed: the self-test path sat under `if not task.public_examples`, so a
+# task that SHIPPED examples had its own cases quoted and never run. Live
+# traffic ships none, which is why this went unnoticed rather than why it was
+# harmless.
+_WITH_EXAMPLES = SolveTask(
+    problem_id="both", language="python", statement="Sum the digits of n.",
+    entrypoint="g",
+    public_examples=[{"args": [12345], "kwargs": {}, "expected": 15}],
+    deadline_s=300.0,
+)
+# Right on the ONE example that shipped, wrong on the boundary cases the model
+# wrote for itself. Exactly the answer the two-phase split exists to catch.
+_PASSES_THE_EXAMPLE_ONLY = (
+    "```python\ndef g(n):\n    return 15 if n == 12345 else 99\n```"
+)
+
+
+def test_the_examples_and_the_models_own_cases_are_both_run(capsys):
+    """A program right on the shipped example and wrong on its own boundary
+    cases used to VERIFY, end the loop and ship. The repair round that exists
+    to catch precisely that never fired, because the cases were never run."""
+    solver, sent = _solver_seeing(
+        [_CASES_ONLY, _PASSES_THE_EXAMPLE_ONLY, _RIGHT_PROGRAM]
+    )
+    answer = asyncio.run(solver.solve_task(_WITH_EXAMPLES, timeout_s=300.0))
+
+    assert "while n > 0" in answer.code, f"shipped the half-right program: {answer.code!r}"
+    assert len(sent) == 3, f"the repair round never fired: {[t[:40] for t in sent]}"
+    assert "the test cases you sent" in sent[2], sent[2][:200]
+    out = capsys.readouterr().out
+    assert "examples=1/1" in out and "self=3/3" in out, out
+
+
+def test_the_validators_examples_are_settled_before_the_models_own_cases():
+    """Precedence, and it is not a detail. The examples shipped with the task
+    and are ground truth: when they fail the program is wrong, there is nothing
+    to weigh, and asking the model's own cases about it buys an executor run per
+    case to learn nothing.
+
+    It is also what keeps `failures` unambiguous. One suite at a time, with
+    `from_self_tests` saying which — that is what lets the repair prompt offer a
+    corrected `json` array where a case may be wrong, and refuse to where the
+    examples are ground truth."""
+    from types import SimpleNamespace
+
+    task = SimpleNamespace(
+        language="python", entrypoint="g", statement="s",
+        public_examples=[{"args": [12345], "kwargs": {}, "expected": 15}],
+    )
+    cases = [{"name": "zero", "args": [0], "expected": 0}]
+    solver, _ = _solver_seeing([])  # nothing is asked; only `_grade` is used
+
+    wrong = solver._grade("```python\ndef g(n):\n    return 0\n```", task, 300.0, cases)
+    assert wrong.passed == 0 and wrong.total == 1
+    assert wrong.self_total == 0, "ran the own cases on a program already known wrong"
+    assert wrong.from_self_tests is False, "a repair would have offered to fix a case"
+    assert "expected 15" in wrong.failures[0], wrong.failures
+
+    half = solver._grade(_PASSES_THE_EXAMPLE_ONLY, task, 300.0, cases)
+    assert half.verified, "the example did pass"
+    assert half.self_passed == 0 and half.self_total == 1
+    assert half.from_self_tests is True
+    assert "expected 0" in half.failures[0], half.failures
+
+
+def test_an_answer_that_fails_its_own_cases_is_never_cached():
+    """`verified` means the validator's examples were reproduced, and it gates
+    the answer cache. With both suites run it can now be True on an answer that
+    still disagrees with the model's own cases — and caching that re-serves one
+    wrong answer for every later task with the same statement, which is the
+    exact harm the gate exists to prevent."""
+    solver, _ = _solver_seeing([_CASES_ONLY, _PASSES_THE_EXAMPLE_ONLY])  # repeats
+    answer = asyncio.run(solver.solve_task(_WITH_EXAMPLES, timeout_s=300.0))
+
+    assert answer.code, "the answer still goes out — it is the best thing in hand"
+    assert answer.verified, "the shipped example really did pass"
+    assert solver._cache == {}, "cached an answer that fails its own cases"
+
+
+def test_the_same_program_under_different_prose_is_the_same_program(capsys):
+    """Why the round is judged by what it AMOUNTED to rather than by its bytes.
+
+    A model that resends an unchanged program under a fresh sentence of
+    explanation has changed nothing, and a byte comparison of the replies says
+    it has. Left there it is a spin: every round differs, every round fails
+    identically, and the budget goes on asking."""
+    program = "```python\ndef g(n):\n    return 99\n```"
+    solver, sent = _solver_seeing([
+        _CASES_ONLY,
+        program,
+        "Sure — here is the corrected version.\n\n" + program,
+        "You're right, my mistake. Fixed:\n\n" + program,
+    ])
+    asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+
+    # cases, program, one repair -- and then the round that changed nothing is
+    # recognised, rather than a fourth identical program being asked for.
+    assert "the same program and the same failures" in capsys.readouterr().out
+    assert len(sent) <= 4, [s[:40] for s in sent]
+
+
+def test_a_corrected_case_counts_as_progress_even_with_the_program_untouched():
+    """The other half, and the reason the failures are in the signature at all.
+
+    The repair prompt asks for exactly this: leave the program alone and send
+    the cases back corrected. The program is then byte-identical two rounds
+    running — and if that alone ended the loop, the one shape the prompt asks
+    for would be the one shape it refused to hear."""
+    program = "```python\ndef g(n):\n    t = 0\n    while n > 0:\n        t += n % 10\n        n //= 10\n    return t\n```"
+    bad = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+           ' {"name": "wrong", "args": [12345], "expected": 99}]\n```')
+    fixed = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "wrong", "args": [12345], "expected": 15}]\n```')
+
+    solver, sent = _solver_seeing([bad, program, program + "\n\n" + fixed])
+    answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+
+    assert "while n > 0" in answer.code
+    # cases, program, one repair — and the repair was HEARD rather than read as
+    # an unchanged round, so the loop ended on a clean run, not on a stall.
+    assert len(sent) == 3, [s[:40] for s in sent]
+
+
+def test_a_repair_may_send_the_corrected_cases_ALONE():
+    """The reply the repair prompt asks for by name, and the one the miner had
+    no answer to.
+
+    "Send back ONE fenced block: the corrected program — or, if the case was
+    wrong rather than the program, a `json` array holding ALL of the cases" —
+    so a model whose PROGRAM was right sends the cases and nothing else. That
+    reply carries no code, and until this worked the miner answered it with
+    "your previous reply did not reach me as code", demanded a program it
+    already had, and submitted the right program reported 0/1 against a bogus
+    case.
+
+    The program in hand is re-graded against the corrected bar. Re-graded, not
+    assumed to pass: there was no rewrite to launder, because there was no new
+    program at all."""
+    program = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+               "        t += n % 10\n        n //= 10\n    return t\n```")
+    bad = '```json\n[{"name": "wrong", "args": [12345], "expected": 99}]\n```'
+    fixed = '```json\n[{"name": "wrong", "args": [12345], "expected": 15}]\n```'
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        solver, sent = _solver_seeing([bad, program, fixed])
+        answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+    log = chatter.getvalue()
+
+    assert "while n > 0" in answer.code, "lost the program the correction was about"
+    # cases, program, ONE repair. A fourth would be the miner asking for a
+    # program it was holding.
+    assert len(sent) == 3, [t[:40] for t in sent]
+    assert "did not reach me as code" not in "".join(sent), sent[-1][:200]
+    assert "self=1/1" in log, log
+
+
+def test_the_program_turn_cannot_bring_its_own_bar():
+    """The one round the "judged against the bar as it stood before it arrived"
+    rule was a round short of covering.
+
+    Cases written beside a program are back-filled from what it happens to do,
+    so they agree with its bugs — that is the entire argument for splitting the
+    turns. A repair reply may correct a case; the PROGRAM turn may not write
+    the bar it is about to be measured against.
+
+    Measured before this: turn 1 wrote a case that CAUGHT the bug, turn 2 sent
+    the buggy program with two cases of its own, round 1 reported the real
+    failure and then adopted them, and round 2 re-graded the same buggy program
+    against the bar it brought with it — `self=2/2`, no failures, loop over,
+    buggy program submitted as passing everything."""
+    caught = '```json\n[{"name": "single", "args": [7], "expected": 7}]\n```'
+    buggy = ("```python\ndef g(n):\n    t = 0\n    while n > 9:\n"
+             "        t += n % 10\n        n //= 10\n    return t\n```")
+    # Two cases the buggy program passes and turn 1 never wrote.
+    backfilled = ('```json\n[{"name": "a", "args": [99], "expected": 9},\n'
+                  ' {"name": "b", "args": [123], "expected": 5}]\n```')
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        solver, sent = _solver_seeing([caught, buggy + "\n\n" + backfilled, buggy])
+        asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+    log = chatter.getvalue()
+
+    assert "back-filled" in log, log
+    # Turn 1's case is still the bar, and it still catches the bug.
+    assert "self=0/1" in log, log
+    assert "self=2/2" not in log, "the program turn cleared a bar it wrote itself"
+    assert "'single'" in sent[2], f"the repair stopped naming the real failure: {sent[2][:200]}"
+
+
+def test_correction_keeps_going_past_the_round_that_used_to_be_the_last():
+    """`SOLVER_MAX_ATTEMPTS` was 3, so a solve got the cases turn, the program
+    turn and exactly ONE repair. A count is a second, private deadline layered
+    under the only real one, and there is no partial credit for stopping early:
+    a program still wrong on the fourth round pays what no answer pays.
+
+    Four wrong programs here, each different from the last, and the right one
+    fifth. Under the old cap the first wrong one shipped."""
+    wrong = [
+        _WRONG_PROGRAM.replace("while n > 9", f"while n > {k}") for k in (9, 8, 7, 6)
+    ]
+    solver, sent = _solver_seeing([_CASES_ONLY, *wrong, _RIGHT_PROGRAM])
+    answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+
+    assert "while n > 0" in answer.code, f"gave up early: {answer.code!r}"
+    # cases, program, and FOUR repairs -- three more than the old cap allowed.
+    assert len(sent) == 6, [s[:40] for s in sent]
+    for i in range(2, 6):
+        assert "the test cases you sent" in sent[i], (
+            f"round {i} was not a repair: {sent[i][:120]}"
+        )
+
+
+def test_a_round_that_changed_nothing_moves_to_a_different_model(capsys):
+    """The one thing that can spin once the round count is gone.
+
+    `send` normally blocks on the model for tens of seconds, so a budget is a
+    real bound on the number of rounds. A read that returns STALE text returns
+    it at once, and the loop would resend the same repair at machine speed for
+    the whole budget -- hammering the site from an account the operator is
+    signed in to.
+
+    So the answer is to CHANGE something rather than to stop. Correcting runs
+    until the answer passes or the deadline stops it, and a repeat is a MODEL
+    problem: the repair is carried to the other model, arriving with the
+    previous program and the cases it failed. On live traffic this is the only
+    place that happens at all -- with no public examples nothing can be graded,
+    so `solve_task` will not spend a second account on a fresh pass."""
+    asked: list = []
+
+    class _Chat:
+        def __init__(self, provider, replies):
+            self.provider, self._replies, self.n = provider, replies, -1
+        async def send(self, text, timeout_s, extend_to_s=None):
+            asked.append((self.provider, text))
+            self.n += 1
+            return self._replies[min(self.n, len(self._replies) - 1)]
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None):
+            # Honours `avoid`, exactly as the real fleet does.
+            return (_Chat("chatgpt", [_RIGHT_PROGRAM]) if avoid == "claude"
+                    else _Chat("claude", [_CASES_ONLY, _WRONG_PROGRAM]))
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        answer = asyncio.run(
+            VerifyingSolver(_Fleet(), second_opinion=False)
+            .solve_task(_NO_EXAMPLES, timeout_s=300.0)
+        )
+    log = chatter.getvalue()
+
+    assert "the same program and the same failures" in log, log
+    assert "carrying the repair to a fresh conversation" in log, log
+    # It went to the OTHER model, and the repair arrived with the program and
+    # the failing cases rather than starting the problem over.
+    providers = [p for p, _ in asked]
+    assert providers[-1] == "chatgpt", providers
+    assert "<previous_attempt" in asked[-1][1], asked[-1][1][:200]
+    assert "while n > 0" in answer.code, f"lost the answer the other model gave: {answer.code!r}"
 
 
 def test_self_tests_never_reach_the_validator():
@@ -7847,12 +8873,16 @@ def test_a_disagreement_is_not_reported_as_the_program_being_wrong():
     mine = build_repair_prompt(failures, "python", "g", from_self_tests=True)
     theirs = build_repair_prompt(failures, "python", "g")
 
-    assert "DISAGREE" in mine and "WRONG" not in mine.split("\n")[0]
-    assert "Exactly one of the two is wrong" in mine
-    assert "leave the program alone" in mine
-    # The validator's own examples are ground truth and keep the blunt wording.
-    assert "Your solution is WRONG" in theirs
-    assert "DISAGREE" not in theirs
+    assert "WRONG" not in mine, "blamed the code for a case that may be wrong"
+    assert "the test cases you sent" in mine
+    # Which is not a lecture about deciding between them -- it is the OUTPUT
+    # rule offering both, so the model answers by choosing rather than by
+    # explaining its choice.
+    assert "`json` array holding ALL of the cases" in mine
+    # The validator's own examples are ground truth: only the program may change.
+    assert "against the examples" in theirs
+    assert "json" not in theirs
+    assert "the test cases you sent" not in theirs
 
 
 def test_self_tests_can_be_turned_off_completely():
@@ -8079,7 +9109,12 @@ def test_the_cases_turn_does_not_shrink_the_read_the_program_gets():
     # A fast cases turn costs the program almost nothing: these fakes reply
     # instantly, so turn 2 still opens on essentially the whole budget.
     assert slices[1] > 200.0, f"the program only got {slices[1]:.0f}s"
-    assert caps[1] > slices[1], "the program's read must still be extendable"
+    # And nothing extends into it either, because nothing is held back from it:
+    # the program turn is given everything left, exactly as turn 1 is.
+    assert caps[1] is None or caps[1] <= slices[1] + 0.01, (
+        "a reserve is back — the program's read is a share of the budget "
+        "rather than the whole of it"
+    )
 
 
 def test_every_deadline_asks_for_the_cases_first():
@@ -8243,13 +9278,15 @@ def test_a_repair_may_correct_a_case_the_first_turn_got_wrong():
     one of them can simply be wrong. Freeze those cases and a CORRECT program
     fails the same bogus case on every repair round, burns all three attempts,
     and is submitted with `verified=False` — the exact failure the two-turn
-    split was supposed to remove. So the repair prompt says outright to fix the
-    case and leave the program alone, and a repair reply carrying a corrected
-    array replaces the frozen one for the next round.
+    split was supposed to remove.
 
-    The correction lands on the NEXT round, not the one that carried it: a
-    reply is graded against the cases that were agreed BEFORE it arrived, so a
-    model cannot make its program pass by rewriting the bar in the same breath.
+    The correction lands on the reply that CARRIES it, because the program came
+    back unchanged — which is precisely what the repair prompt asked for. Read
+    off a live solve: turn 1 wrote three cases whose `final_records` order was
+    wrong, the program was right, the model corrected the cases exactly as
+    asked, and the miner still reported 17/20 because it graded that reply
+    against the cases it had just corrected. The round after would have fixed
+    it; the tab died first, and there was no round after.
     """
     right = "```python\ndef g(n):\n    s = 0\n    while n > 0:\n        s += n % 10\n        n //= 10\n    return s\n```"
     # "zero" is wrong -- the digits of 0 sum to 0, not 99. A correct program
@@ -8265,25 +9302,261 @@ def test_a_repair_may_correct_a_case_the_first_turn_got_wrong():
             300.0,
             [bad,                     # turn 1: cases, one of them bogus
              right,                   # attempt 1: correct program, fails "zero"
-             right + "\n\n" + fixed,  # attempt 2: same program, corrected case
-             right],                  # attempt 3: graded against the CORRECTION
+             right + "\n\n" + fixed,  # attempt 2: SAME program, corrected case
+             right],                  # never needed
         )
     log = chatter.getvalue()
 
-    assert len(prompts) == 4, [p[:40] for p in prompts]
     assert "while n > 0" in answer.code
-    # The last round ran the CORRECTED array and cleared it. Freeze turn 1's
-    # cases and this reads `self=1/2` forever, however right the program is.
     assert "self=2/2" in log, log
-
-    # Attempt 2 was still judged against the bogus case: the repair prompt it
-    # was sent quotes the failure, so the correction it carries cannot grade
-    # the reply that carried it.
-    assert "99" in prompts[2], prompts[2][:400]
+    # Three sends, not four: cases, program, one repair. The correction was
+    # applied to the reply that carried it, so the loop had nothing left to
+    # complain about and stopped.
+    assert len(prompts) == 3, [p[:40] for p in prompts]
     # And the repair prompt is what tells the model correcting a case is
     # allowed at all -- without that sentence the model rewrites the program.
-    assert "fix the case" in prompts[2].lower(), prompts[2][:800]
+    assert "99" in prompts[2], prompts[2][:400]
+    assert "if the case was wrong" in prompts[2].lower(), prompts[2][:800]
+    # It must ask for the WHOLE array back, since the reply replaces the bar
+    # outright -- a model resending only the cases it changed would silently
+    # delete the rest.
+    assert "ALL of the cases" in prompts[2]
 
+
+def test_a_leaked_language_chip_does_not_cost_the_corrected_cases():
+    """`_parse_cases` fast-paths on a leading `[`, and a copy control that hands
+    back its own language label ahead of the array fails that test.
+
+    Everywhere else a dropped JSON block costs nothing — it was never the
+    answer. On a repair round it is the CORRECTED cases, and losing them means
+    the same wrong case breaks a correct program on every round that remains."""
+    from solvers.prompts import extract_self_tests
+
+    array = '[{"name": "zero", "args": [0], "expected": 0}]'
+    program = "```python\ndef g(n):\n    return 0\n```"
+    for block in (array, f"json\n{array}", f"JSON\n\n{array}"):
+        cases = extract_self_tests(f"{program}\n\n```\n{block}\n```", "g", "python")
+        assert len(cases) == 1, f"dropped the cases for {block[:12]!r}"
+        assert cases[0]["expected"] == 0
+    # ...but a chip is all that may precede it. Prose before an array is not a
+    # case list a model meant to send, and reading one out of it would grade a
+    # program against something nobody wrote as a test.
+    assert extract_self_tests(
+        f"{program}\n\n```\nhere are my cases\n{array}\n```", "g", "python"
+    ) == []
+
+
+def test_the_answer_that_goes_out_is_the_models_last_word():
+    """Strict `>` on the score made every repair round a no-op whenever the
+    score could not MOVE — and the score cannot move when a case is wrong.
+
+    Turn 1 writes a case no correct program can pass. Attempt 1 scores 1/2. The
+    model then rewrites the program properly; the rewrite still scores 1/2,
+    ties, and under `>` is thrown away — so the miner submits the first draft
+    and the model's last word never leaves the tab. With three bogus cases
+    pinning a solve at 17/20, that is every round after the first."""
+    cases = ('```json\n[{"name": "bogus", "args": [0], "expected": 99},\n'
+             ' {"name": "sum", "args": [12345], "expected": 15}]\n```')
+    first = "```python\ndef g(n):\n    v = 1\n    return sum(int(c) for c in str(abs(n)))\n```"
+    last = "```python\ndef g(n):\n    v = 2\n    return sum(int(c) for c in str(abs(n)))\n```"
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        _, _, _, answer = _two_turn(300.0, [cases, first, last, last])
+
+    assert "v = 2" in answer.code, (
+        f"submitted an earlier draft than the model's last word: {answer.code!r}"
+    )
+
+
+def test_a_fragment_never_displaces_the_finished_program_it_ties_with():
+    """The limit of that rule. A read that stops while the model is STILL
+    WRITING returns a piece of an answer, not a revision of one — and a piece
+    that happens to parse and tie must not replace the finished program above
+    it."""
+    from solvers.verify import VerifyingSolver
+
+    whole = "```python\ndef g(n):\n    v = 1\n    return sum(int(c) for c in str(abs(n)))\n```"
+    piece = "```python\ndef g(n):\n    v = 2\n    return sum(int(c) for c in str(abs(n)))\n```"
+    cases = ('```json\n[{"name": "bogus", "args": [0], "expected": 99},\n'
+             ' {"name": "sum", "args": [12345], "expected": 15}]\n```')
+
+    class _Chat:
+        provider = "claude"
+        empty_reason = None
+        def __init__(self): self.n = -1
+        async def send(self, text, timeout_s, extend_to_s=None):
+            self.n += 1
+            # The second program arrives with the model mid-sentence.
+            self.still_writing = self.n >= 2
+            return [cases, whole, piece, piece][min(self.n, 3)]
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        answer = asyncio.run(
+            VerifyingSolver(_Fleet(), second_opinion=False).solve_task(
+                SolveTask(problem_id="p", language="python", statement="s",
+                          entrypoint="g", public_examples=[], deadline_s=300.0),
+                timeout_s=300.0,
+            )
+        )
+    assert "v = 1" in answer.code, (
+        f"a fragment displaced the finished program: {answer.code!r}"
+    )
+
+
+def test_a_repair_survives_the_conversation_that_produced_it():
+    """Read off a production run, fifteen times in one log.
+
+    A tab paints nothing, the answer is recovered off the wire, the tab is
+    finished — and the repair round is then sent into it and comes straight
+    back empty, because a dead conversation answers instantly. The solve ended
+    there, submitting a program that failed its own cases, with an average of
+    129 seconds still on the clock. `simplify_dataflow` went out at 0/20 with
+    118 seconds unspent.
+
+    The conversation is gone; the repair is not. It moves to a fresh one,
+    carrying the problem and the program with it, because a new tab has no
+    history to refer back to."""
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "sum", "args": [12345], "expected": 15}]\n```')
+    wrong = "```python\ndef g(n):\n    return 0\n```"
+    right = "```python\ndef g(n):\n    return sum(int(c) for c in str(abs(n)))\n```"
+
+    sent, opened = [], []
+
+    class _Chat:
+        """Dies after answering, exactly as a tab does once its page is gone."""
+        provider = "claude"
+        still_writing = False
+
+        def __init__(self, replies):
+            self.replies, self.n, self.alive = replies, -1, True
+            self.empty_reason = None
+            opened.append(self)
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            sent.append(text)
+            if not self.alive:                    # what a retired tab returns
+                self.empty_reason = "unreadable"
+                return ""
+            self.n += 1
+            reply = self.replies[min(self.n, len(self.replies) - 1)]
+            if self.n >= 1:
+                self.alive = False                # the page died on the answer
+            return reply
+
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None):
+            return _Chat([cases, wrong] if not opened else [right])
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        answer = asyncio.run(
+            VerifyingSolver(_Fleet(), second_opinion=False).solve_task(
+                SolveTask(problem_id="p", language="python",
+                          statement="Sum the decimal digits of n.", entrypoint="g",
+                          public_examples=[], deadline_s=300.0),
+                timeout_s=300.0,
+            )
+        )
+    log = chatter.getvalue()
+
+    assert len(opened) == 2, f"never opened a fresh conversation: {len(opened)}"
+    assert "carrying the repair to a fresh conversation" in log, log
+    # The fresh tab has no history, so the message must carry the problem AND
+    # the program it is being asked to fix.
+    resume = sent[-1]
+    assert "<previous_attempt" in resume, resume[:200]
+    assert "return 0" in resume, "the program to be fixed was not carried over"
+    assert "Sum the decimal digits" in resume, "a fresh tab was sent no problem"
+    # ...and the repaired answer is the one that goes out.
+    assert "self=2/2" in log, log
+    assert "int(c) for c in" in answer.code, answer.code
+
+
+def test_a_dead_conversation_with_nothing_to_repair_says_what_it_does():
+    """The line that used to promise a second opinion it never asked for.
+
+    With an answer already in hand and nothing gradeable, `solve_task` submits
+    and stops — so "asking elsewhere rather than repairing it" described
+    something that did not happen, on fifteen solves in one log."""
+    program = "```python\ndef g(n):\n    return n\n```"
+
+    class _Chat:
+        provider = "claude"
+        still_writing = False
+        def __init__(self):
+            self.n, self.alive, self.empty_reason = -1, True, None
+        async def send(self, text, timeout_s, extend_to_s=None):
+            if not self.alive:
+                self.empty_reason = "unreadable"
+                return ""
+            self.n += 1
+            if self.n >= 1:
+                self.alive = False
+            return ["```json\n[]\n```", program][min(self.n, 1)]
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        asyncio.run(
+            VerifyingSolver(_Fleet(), second_opinion=False).solve_task(
+                SolveTask(problem_id="p", language="python", statement="s",
+                          entrypoint="g", public_examples=[], deadline_s=300.0),
+                timeout_s=300.0,
+            )
+        )
+    log = chatter.getvalue()
+    assert "asking elsewhere rather than repairing it" not in log, log
+
+
+def test_a_repair_cannot_pass_a_bar_it_rewrote_in_the_same_breath():
+    """The other half of the rule, and the reason the correction is not simply
+    applied to every reply that carries one.
+
+    The prompt no longer spends a sentence forbidding a reply that changes both
+    sides of the disagreement, because forbidding it was never what stopped it:
+    this is. A reply that changes the PROGRAM as well as
+    the cases is graded against the bar as it stood before it arrived — so a
+    rewritten program cannot be judged by a bar the same reply rewrote. Its
+    cases still apply from the next round, which is where a genuine correction
+    that also touched the program gets its hearing."""
+    first = "```python\ndef g(n):\n    return 0\n```"          # wrong
+    # Both changed at once: a different program AND a bar it trivially clears.
+    both = ("```python\ndef g(n):\n    return 42\n```\n\n"
+            '```json\n[{"name": "gamed", "args": [1], "expected": 42}]\n```')
+    cases = ('```json\n[{"name": "sum", "args": [12345], "expected": 15},\n'
+             ' {"name": "zero", "args": [0], "expected": 0}]\n```')
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        prompts, _, _, answer = _two_turn(300.0, [cases, first, both, both])
+    log = chatter.getvalue()
+
+    # The gamed reply was judged against the REAL cases, which it fails, so it
+    # never reports a clean run on the bar it brought with it.
+    assert "self=1/1" not in log, log
+    # And the shrunken bar is refused outright, on that round and every one
+    # after it: dropping the case you cannot pass is how a bar gets cleared
+    # without the program improving.
+    assert "a case may be corrected, not dropped" in log, log
+    # ...and the round after it was still asked to fix something.
+    assert len(prompts) >= 4, [p[:40] for p in prompts]
+    assert "returned 42" in prompts[3] or "returned 0" in prompts[3], prompts[3][:400]
 
 def test_the_cases_turn_asks_for_the_common_path_before_the_boundaries():
     """Three ordinary cases FIRST, then the special values. A suite that is all
@@ -8500,7 +9773,10 @@ def test_the_time_budget_is_gone_from_every_prompt():
         build_code_prompt("rust", "s", "main", [],
                           cases=[{"name": "n", "args": ["1\n"], "expected": "1"}]),
         build_repair_prompt(["g(1) returned 2, expected 3"], "python", "g"),
+        build_repair_prompt(["g(1) returned 2, expected 3"], "python", "g",
+                            from_self_tests=True),
         build_repair_prompt([], "rust", "main", defect="there is no fn main"),
+        build_repair_prompt([], "rust", "main", defect=NO_CODE),
     ]
     for p in prompts:
         for ghost in ("<budget>", "seconds for this reply", "seconds left",
@@ -8527,14 +9803,15 @@ def test_the_time_budget_is_gone_from_every_prompt():
                      "as fast as", "quickly", "95%", "fastest", "latency"):
             assert rush not in lowered, f"a hurry word is back: {rush!r} in {p[:60]!r}"
         # ...nor any instruction to do work that never appears in the reply.
-        # The one licensed exception is the repair round, which has to say where
-        # the diagnosis goes or it arrives as prose instead of a program.
-        if "corrected" not in lowered and "previous reply" not in lowered:
-            for silent in ("silently", "in your reasoning", "trace every",
-                           "checklist", "read the program back"):
-                assert silent not in lowered, (
-                    f"work that never reaches the reply is back: {silent!r}"
-                )
+        # The repair round used to be a licensed exception here, on the grounds
+        # that it had to say where the diagnosis goes. It does not: it carries
+        # the error and the rule for what may come back, and no exception is
+        # needed for a prompt that says nothing about how to think.
+        for silent in ("silently", "in your reasoning", "trace every",
+                       "checklist", "read the program back"):
+            assert silent not in lowered, (
+                f"work that never reaches the reply is back: {silent!r}"
+            )
 
 
 def test_no_prompt_contradicts_its_own_output_contract():
