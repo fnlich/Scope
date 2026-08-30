@@ -5316,6 +5316,179 @@ def test_a_wire_shorter_than_the_page_never_replaces_it(capsys):
     assert tab._cut_short_stream == 0
 
 
+def test_the_deadline_read_is_tested_for_completeness_like_every_other(capsys):
+    """`best` comes off the read loop, which stops at the deadline. The page and
+    the wire are both read AFTER it, so `best` is the oldest of the three and
+    the likeliest to be short — and until this ran, nothing ever asked.
+
+    Measured: `best` a truncation, the page and the wire each holding the whole
+    program and agreeing with each other exactly. `_cut_short_by` saw no gap
+    between THEM and `_first_difference` found nothing to report, so control
+    fell through to `return best` and the truncation was submitted without a
+    single line of log. Every comparison in the function was made and the one
+    that mattered was not among them."""
+    whole = ("def g(n):\n    total = 0\n    for i in range(n):\n"
+             "        total += i\n    return total")
+    cut = "def g(n):\n    total = 0\n    for i in ra"
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "solve it"
+
+    async def wire():
+        return f"```python\n{whole}\n```\n"
+
+    tab._streamed_markdown = wire
+    got = asyncio.run(tab._reconcile_stream((0, None), _Tab._fence(cut), [whole]))
+
+    assert "return total" in got, f"submitted the deadline read's truncation: {got!r}"
+    log = capsys.readouterr().out
+    assert "CUT SHORT" in log, log
+    assert tab._cut_short_stream == 1
+
+
+def test_the_page_is_re_read_whatever_the_network_did(capsys):
+    """These are independent questions — did the network hold the answer, has
+    the page since rendered it — and the second used to be asked only when the
+    first said yes.
+
+    The refetch and the late-page rescue sat BELOW the early return taken when
+    the capture came back empty. So a wire that captured prose recovered the
+    program off the page, and a wire that captured nothing threw the identical
+    page away and submitted "". Whether the answer was looked at depended on
+    something with no bearing on it."""
+    whole = "def g(n):\n    return n"
+
+    for label, wire in (("nothing", None), ("prose only", "just prose, no block")):
+        tab = _tab(None, _site(stream=True))
+        tab._sent = "solve it"
+        looked = []
+
+        async def streamed(w=wire):
+            return w
+
+        async def new_reply(before):
+            looked.append("page")
+            return object()
+
+        tab._streamed_markdown = streamed
+        tab._new_reply = new_reply
+        tab._dom_blocks = lambda reply: _done([whole])
+        tab._whole = lambda reply: _done("here is the answer")
+
+        got = asyncio.run(tab._reconcile_stream((0, None), "", None))
+        assert looked == ["page"], f"wire={label}: never re-read the page"
+        assert "return n" in got, f"wire={label}: threw the page's answer away: {got!r}"
+
+
+def test_the_page_refetch_cannot_hand_back_our_own_prompt():
+    """The refetch is a second route to a submission, so it asks the same
+    question the scrape path asks in `_poll`.
+
+    An assistant selector that also matches the USER's turn hands back a message
+    whose whole text is our prompt and whose code block is whatever the
+    statement quoted — so the block alone looks like a fine answer, and the
+    guard at the single exit is testing the block, not the message. That is
+    exactly how two of this miner's own prompts reached a validator as Rust
+    programs."""
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "Solve this programming problem in Python.\nReturn the digit sum."
+
+    async def no_wire():
+        return None
+
+    tab._streamed_markdown = no_wire
+    tab._new_reply = lambda before: _done(object())
+    tab._dom_blocks = lambda reply: _done(["example_from_the_statement()"])
+    tab._whole = lambda reply: _done(tab._sent)
+
+    got = asyncio.run(tab._reconcile_stream((0, None), "", None))
+    assert got == "", f"handed back a block from our own echoed prompt: {got!r}"
+
+
+def test_opening_a_tab_is_bounded_by_the_solve_budget():
+    """`BrowserFleet.open` waits for a free tab up to `MINER_TAB_WAIT_S`, which
+    ships at 120s, and nothing here ever passed a smaller number. On a busy
+    fleet that is 120s per pass against a deadline that knows nothing about it:
+    measured, budget 40s, elapsed 50.1s, `open()` called at t=0 and t=25.1,
+    prompts sent 0, answer empty."""
+    asked = []
+
+    class _Slow:
+        async def open(self, avoid=None, timeout_s=None):
+            asked.append(timeout_s)
+            raise RuntimeError("no free tab")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(_Slow(), safety_margin_s=0, max_budget_s=40,
+                             second_opinion=False)
+    asyncio.run(solver.solve_task(
+        SolveTask(problem_id="p", language="python", statement="s", entrypoint="g",
+                  public_examples=[], deadline_s=40.0),
+        timeout_s=40.0,
+    ))
+    assert asked, "open() was never called"
+    assert all(t is not None for t in asked), f"unbounded lease wait: {asked}"
+    assert all(t <= 40.0 for t in asked), f"waited longer than the whole solve: {asked}"
+
+
+def test_a_backend_without_a_lease_timeout_is_still_bounded():
+    """`Backend.open` has always been `open(avoid=...)`. A keyword a custom
+    backend does not take would be a TypeError inside the one call the whole
+    solve depends on, so the bound is offered and then applied from outside."""
+    class _TwoArg:
+        async def open(self, avoid=None):
+            await asyncio.sleep(30)
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(_TwoArg(), safety_margin_s=0, max_budget_s=12,
+                             second_opinion=False)
+    started = time.monotonic()
+    answer = asyncio.run(solver.solve_task(
+        SolveTask(problem_id="p", language="python", statement="s", entrypoint="g",
+                  public_examples=[], deadline_s=12.0),
+        timeout_s=12.0,
+    ))
+    elapsed = time.monotonic() - started
+    assert elapsed < 20.0, f"a two-argument backend hung for {elapsed:.0f}s"
+    assert answer.code == ""
+
+
+def test_grading_is_not_started_when_it_cannot_finish():
+    """`_Grader.check` gives every case `VERIFY_TIMEOUT_S` and nothing bounds
+    the run as a whole, so a candidate that times out on each of its cases
+    spends that many multiples of it. Measured: 6 cases x 5s = 30s of executor
+    time bought with 0.2s of budget, on a verdict nothing could act on — there
+    is no time for a repair round and `verified` never reaches the validator."""
+    from types import SimpleNamespace
+
+    from solvers.prompts import MAX_SELF_TESTS
+    from solvers.verify import GRADE_FLOOR_S, VERIFY_TIMEOUT_S
+
+    solver, _ = _solver_seeing([])
+    ran = []
+    solver._grader = SimpleNamespace(
+        check=lambda *a, **k: (ran.append(1), (0, 1, ["boom"]))[1]
+    )
+    task = SimpleNamespace(language="python", entrypoint="g", statement="s",
+                           public_examples=[])
+    reply = "```python\ndef g(n):\n    return n\n```"
+    cases = [{"name": f"c{i}", "args": [i], "expected": i} for i in range(6)]
+
+    # Six cases at VERIFY_TIMEOUT_S each cannot fit in a fifth of a second.
+    solver._grade(reply, task, 0.2, cases)
+    assert not ran, "started a grading run that could not finish inside the budget"
+
+    # ...and with the time to do it, it still runs.
+    solver._grade(reply, task, 300.0, cases)
+    assert ran, "stopped grading when there was plenty of budget"
+
+    # A cap on the cap: a task with twenty cases must not refuse to grade
+    # anything under a hundred seconds, because a partial run that DOES fit is
+    # worth more than no evidence at all.
+    assert 0 < GRADE_FLOOR_S < VERIFY_TIMEOUT_S * MAX_SELF_TESTS
+
+
 def test_nothing_anywhere_still_submits_nothing(capsys):
     """The streamed text is never handed back raw — a chat stream carries the
     conversation, and two of the miner's own prompts reached a validator as Rust

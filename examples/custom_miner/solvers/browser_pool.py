@@ -1272,9 +1272,39 @@ class _Tab:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the page died mid-read
+            # RETIRED, but not yet finished with. `alive` decides whether the
+            # pool hands this tab to another task; it is not a verdict on
+            # whether the answer can still be recovered, and the recovery
+            # phases below no longer read it.
+            #
+            # They used to. An exception out of `_poll` set `alive = False` and
+            # that gated off the copy control, the whole network-stream rescue
+            # AND the post-mortem -- so the send returned "" with one line of
+            # log and no diagnosis, on a page whose stream buffer still held
+            # the finished program. The exceptions that land here are mostly
+            # transient on a live SPA: "Execution context was destroyed, most
+            # likely because of a navigation" as claude.ai swaps /new for
+            # /chat/<uuid> after the first send, or "Element is not attached to
+            # the DOM" on a message re-rendered mid-stream. The operator's log
+            # shows 18 "tab replaced after failure" beside 17 "read NOTHING
+            # from the page and recovered N code block(s) from the network
+            # stream instead" -- the rescue exists for exactly the failure this
+            # gate was switching off.
+            #
+            # Running them is safe on a genuinely dead page: `_streamed_markdown`
+            # catches everything and returns None, `_reconcile_stream` wraps its
+            # own DOM refetch, and each phase is bounded by `tail`. Measured
+            # cost on a closed page: 0.06s.
+            #
+            # `test_a_blind_tab_still_gets_its_answer_off_the_wire` already made
+            # this argument for the blind path -- "Clearing `alive` inside the
+            # read loop skipped both the copy control and the stream, which is
+            # the difference between a zero and the whole payment on the one tab
+            # that needed them" -- and it was never carried to the exception
+            # path, which sets `alive` directly.
             self.alive = False
             print(f"[{self.site.name}] tab {self.label} died while reading: {type(exc).__name__}")
-        if self.alive and self.site.copy:
+        if self.site.copy:
             # Once per send, never per poll: the answer is finished by now, and
             # clicking a control on every poll would be dozens of clicks a
             # solve. Scraping decided WHEN to read; the copy control decides
@@ -1351,7 +1381,7 @@ class _Tab:
                     f"Run `python -m solvers.doctor {self.site.name}` if answers "
                     f"start arriving mangled — the control may have been renamed."
                 )
-        if self.alive and self.site.stream:
+        if self.site.stream:
             try:
                 best = await asyncio.wait_for(
                     self._reconcile_stream(before, best, page_blocks),
@@ -1402,7 +1432,10 @@ class _Tab:
             self.empty_reason = "unfinished"
         else:
             self.empty_reason = "no-code"
-        if not best and (self.alive or blind):
+        # `or blind or not self.alive`: an empty send is exactly when the
+        # post-mortem is worth having, and a retired tab is exactly when nobody
+        # can go and look afterwards.
+        if not best:
             try:
                 await asyncio.wait_for(
                     self._explain_empty(before), timeout=POSTMORTEM_TIMEOUT_S * tail
@@ -1442,7 +1475,36 @@ class _Tab:
         own accounts turns `stream_first` on and gets it as the primary.
         """
         streamed = await self._streamed_markdown()
-        if streamed is None:
+        blocks = _fenced_blocks(streamed) if streamed is not None else []
+        # The page is re-read FIRST, and whatever the network did. This used to
+        # sit below an early return taken when the capture came back empty, so
+        # whether the late-rendered answer on the page was even looked at
+        # depended on something with no bearing on it: a wire that captured
+        # prose recovered the program, and a wire that captured nothing threw
+        # the identical page away and submitted "". The two questions -- did the
+        # network hold the answer, has the page since rendered it -- are
+        # independent, and this one is asked either way.
+        if page_blocks is None:
+            try:
+                reply = await self._new_reply(before)
+                page_blocks = await self._dom_blocks(reply) if reply is not None else []
+                if page_blocks and self._echoes_prompt(await self._whole(reply)):
+                    # The SAME question the scrape path asks in `_poll`, asked
+                    # again here because this refetch is a second route to a
+                    # submission and would otherwise go around it. An assistant
+                    # selector that also matches the user's turn hands back a
+                    # message whose whole text is our prompt and whose code
+                    # block is whatever the statement quoted -- so the block
+                    # alone looks like a fine answer, and `_is_our_own_prompt`
+                    # at the exit below is testing the block, not the message.
+                    # That is exactly how two of this miner's own prompts
+                    # reached a validator as Rust programs.
+                    page_blocks = []
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - nothing to compare against, then
+                page_blocks = []
+        if streamed is None and not blocks and not page_blocks:
             if not best and not self._warned_stream:
                 self._warned_stream = True
                 print(
@@ -1452,15 +1514,6 @@ class _Tab:
                     f"what each source returned."
                 )
             return best
-        blocks = _fenced_blocks(streamed)
-        if page_blocks is None:
-            try:
-                reply = await self._new_reply(before)
-                page_blocks = await self._dom_blocks(reply) if reply is not None else []
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - nothing to compare against, then
-                page_blocks = []
         if not best:
             # The read loop finished holding nothing. Everything read since is
             # strictly better than the empty string, and the ONLY question left
@@ -1560,6 +1613,41 @@ class _Tab:
                     )
         if self.site.stream_first and blocks:
             return "\n".join(self._fence(b) for b in blocks)
+        # And finally the reading that is actually going out, against the two
+        # that were just compared to each other.
+        #
+        # `best` comes off the read loop, which stops at the deadline; the page
+        # and the wire are both read AFTER it. So `best` is the oldest of the
+        # three and the likeliest to be short, and until this ran nothing ever
+        # asked. Measured: `best` a truncation, the page and the wire each
+        # holding the whole program and agreeing with each other exactly -- so
+        # `_cut_short_by` saw no gap between THEM and `_first_difference` found
+        # nothing to report, and the truncation was submitted without a single
+        # line of log. Every comparison in this function was made and the one
+        # that mattered was not among them.
+        fuller = page_blocks if page_blocks else blocks
+        if fuller and best:
+            lost = self._cut_short_by(fuller, _fenced_blocks(best))
+            if lost:
+                self._cut_short_stream += 1
+                where = "the page" if page_blocks else "the wire"
+                if self._cut_short_stream == 1:
+                    print(
+                        f"[{self.site.name}] note: tab {self.label}: the read that "
+                        f"ended at the deadline has the answer CUT SHORT — "
+                        f"{lost} character(s) fewer than {where} shows, and "
+                        f"{where}'s version starts with all of it. Submitting "
+                        f"{where}'s. The read loop stops at the deadline and both "
+                        f"other readings are taken after it, so this one is the "
+                        f"oldest of the three."
+                    )
+                else:
+                    print(
+                        f"[{self.site.name}] tab {self.label}: the deadline read was "
+                        f"CUT SHORT again, {lost} character(s) missing "
+                        f"(#{self._cut_short_stream} on this tab)"
+                    )
+                return "\n".join(self._fence(b) for b in fuller)
         return best
 
     async def _poll(

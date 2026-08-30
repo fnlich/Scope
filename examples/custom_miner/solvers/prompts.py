@@ -1070,8 +1070,14 @@ def _always_returns(body: list) -> bool:
         head = _always_returns(last.orelse) if last.orelse else _always_returns(last.body)
         return head and all(_always_returns(h.body) for h in last.handlers)
     if isinstance(last, ast.While):
-        # `while True:` with no way out never falls through to the end.
-        if isinstance(last.test, ast.Constant) and last.test.value is True:
+        # `while True:` with no way out never falls through to the end -- and
+        # `while 1:` is the same loop. Testing `is True` recognised only the
+        # keyword, so the numeric spelling (which competitive-programming
+        # answers use constantly) was reported as "can reach the end of its body
+        # without returning ... which is what a reply cut off mid-answer looks
+        # like", about a correct program. Any truthy constant reads the same
+        # way to the interpreter, so it reads the same way here.
+        if isinstance(last.test, ast.Constant) and bool(last.test.value):
             return not _breaks_out_of(last)
         return _loop_else_returns(last)
     if isinstance(last, (ast.For, ast.AsyncFor)):
@@ -1280,7 +1286,16 @@ def _rust_unclosed(code: str) -> Optional[str]:
                 continue
             j = i + 1
             if j < n and code[j] == "\\":
-                j += 1
+                # PAST what the backslash escapes, not onto it. Landing on it
+                # made `'\\''` close on its own escaped quote, so the real
+                # closing tick opened a second literal and the scan
+                # resynchronised on whatever tick came next -- a lifetime, a
+                # later char literal. Differential-fuzzed against rustc over 726
+                # generated programs the verdict never actually changed: the
+                # swallowed span kept its own delimiters balanced, or the scan
+                # ran off the end and declined to judge. So this is a
+                # correctness fix, not a measured loss.
+                j += 2
             while j < n and code[j] != "'":
                 line += code[j] == "\n"
                 j += 1

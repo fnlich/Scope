@@ -70,6 +70,13 @@ EXECUTOR_RETRY_S = float(os.environ.get("SOLVER_EXECUTOR_RETRY_S", "300"))
 # is warm.
 RESUME_FLOOR_S = 40.0
 
+# The least a lease wait may be cut to. Below this, waiting is pointless and
+# failing fast lets the pass end while another tab might still be tried.
+OPEN_FLOOR_S = 5.0
+
+# The most `_grade` will insist on before it declines to run anything at all.
+GRADE_FLOOR_S = 15.0
+
 
 class Conversation(Protocol):
     """One live, isolated model conversation.
@@ -755,7 +762,14 @@ class VerifyingSolver:
         # the try block never got to bind.
         best_provider: Optional[str] = None
         try:
-            conversation = await self._backend.open(avoid=avoid)
+            # BOUNDED by what is left. `BrowserFleet.open` waits for a free tab
+            # up to `MINER_TAB_WAIT_S`, which ships at 120s, and nothing here
+            # ever passed a smaller number -- so on a busy fleet a solve could
+            # spend 120s per pass waiting, three passes, 360s against a 280s
+            # deadline, and return empty having sent no prompt at all. Measured:
+            # budget 40s, elapsed 50.1s, `open()` called at t=0 and t=25.1,
+            # prompts sent 0.
+            conversation = await self._open_within(budget, started, avoid)
             provider = best_provider = getattr(conversation, "provider", None)
             # Turn 1: the cases, before the program exists. Cases written
             # ALONGSIDE a program can be back-filled from what the program
@@ -902,7 +916,7 @@ class VerifyingSolver:
                     await conversation.close()
                 except Exception:  # noqa: BLE001 - it may already be broken
                     pass
-                fresh = await self._backend.open(avoid=avoid)
+                fresh = await self._open_within(budget, started, avoid)
                 return (
                     fresh,
                     getattr(fresh, "provider", provider),
@@ -1219,6 +1233,30 @@ class VerifyingSolver:
                     pass
         return best, best_provider
 
+    async def _open_within(self, budget: float, started: float, avoid: Optional[str]):
+        """`backend.open`, bounded by the solve's own clock.
+
+        A fleet backend waits for a free tab, and the wait it defaults to is an
+        operator setting about fleet capacity that knows nothing about this
+        request's deadline. Half of what is left, floored at `OPEN_FLOOR_S`: a
+        lease that has not come free in half the remaining budget will not leave
+        time to use it, and the caller has other passes to spend.
+
+        The bound is offered as a keyword and the two-argument form is bounded
+        from out here instead. `Backend.open` has always been `open(avoid=...)`,
+        so a backend written outside this package need not have grown a
+        `timeout_s` -- and a keyword it does not take would be a TypeError
+        inside the one call the whole solve depends on.
+        """
+        left = budget - (time.monotonic() - started)
+        share = max(OPEN_FLOOR_S, left * 0.5)
+        try:
+            return await self._backend.open(avoid=avoid, timeout_s=share)
+        except TypeError:
+            return await asyncio.wait_for(
+                self._backend.open(avoid=avoid), timeout=max(share, 1.0)
+            )
+
     async def _graded(
         self, reply: str, task, left: float, cases: Optional[list] = None
     ) -> Candidate:
@@ -1322,7 +1360,23 @@ class VerifyingSolver:
             if task.language == "rust"
             else python_defect(code, task.entrypoint)
         )
-        out_of_budget = left is not None and left <= 0
+        # Not `left <= 0`. `_Grader.check` gives every case
+        # `VERIFY_TIMEOUT_S` and nothing bounds the run as a whole, so a
+        # candidate that times out on each of its cases spends that many
+        # multiples of it: measured, 6 cases x 5s = 30s of executor time bought
+        # with 0.2s of budget, on a verdict nothing could act on -- there is no
+        # time left for a repair round and `verified` never reaches the
+        # validator. The guard's own reason ("running anything buys nothing that
+        # can still be acted on") is as true at 0.2s as at 0, so it asks what
+        # the run could actually cost.
+        #
+        # `GRADE_FLOOR_S` caps the demand: a task with twenty cases would
+        # otherwise refuse to grade anything under a hundred seconds, and a
+        # partial run that DOES fit is worth more than no evidence at all.
+        needed = VERIFY_TIMEOUT_S * max(
+            1, len(cases or []) or len(getattr(task, "public_examples", None) or [])
+        )
+        out_of_budget = left is not None and left < min(needed, GRADE_FLOOR_S)
         if defect is None and task.language == "rust" and not out_of_budget:
             # Python's check PARSED that code; Rust's only grepped it for
             # `fn main`. Ask the compiler the same question the validator will,
