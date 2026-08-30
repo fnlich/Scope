@@ -991,9 +991,45 @@ throws the answer away. Measured: a tab spent its whole 135-second slice while
 the remaining 90 seconds of a 225-second budget went unused, on the one attempt
 that had to succeed.
 
-`SOLVER_SAFETY_MARGIN_S` stays, because it is not a deadline on the model: it is
+`DELIVERY_RESERVE_S` stays, because it is not a deadline on the model: it is
 the time the answer needs to be graded, archived, signed and put on the wire
 before the validator stops listening.
+
+### The latest version is the one that ships
+
+No score is compared between the rounds of a solve. A round only happens because
+the one before it was wrong — the loop ends the moment there is no defect and no
+failure — so every candidate after the first exists *because* the model was
+shown what was wrong and asked to correct it. The later program is the corrected
+one, and ranking them against each other asks a question that has already been
+answered.
+
+Scoring them did real damage. `Candidate.score` cannot tell *"failed its tests"*
+from *"was never tested"* — both put `0` in the same slot:
+
+```
+phase 2, graded, fails 2 of 3 : (0, 1, 1, 1)
+phase 3, corrected, NOT graded: (0, 0, 1, 1)   ← ranks LOWER
+```
+
+so a correction that arrived too late in the budget to grade lost to the answer
+it was correcting. Reproduced end to end: phase 3 returned the right program,
+`self=1/3` went out, and the file held phase 2's code. Every refinement of the
+comparison was another way to get that wrong; not comparing cannot.
+
+Two things are still not versions of the answer, and neither is a judgement
+about how good the code is:
+
+- **Nothing arrived.** An empty capture is the *absence* of an answer rather
+  than a worse one — a dead tab, a reply that rendered as prose, a read that
+  timed out. It never displaces a program already in hand.
+- **The model is still writing.** What arrived is a fragment of a reply rather
+  than a revision of one, and a fragment that happens to parse must not displace
+  the finished program above it.
+
+`score` still decides **between passes**, where two models answered the same
+problem independently and neither saw the other. There, grading is the only
+thing that can separate them.
 
 ### A repair carries the error and nothing else
 
@@ -1103,7 +1139,7 @@ cut the whole solve by 20 seconds. Neither was visible as anything except
 answers that arrived unfinished.
 
 What remains is not a deadline but the **cost of delivering**:
-`SOLVER_SAFETY_MARGIN_S` covers `send`'s post-read phases (5 + 4 + 2 = 11s) plus
+`DELIVERY_RESERVE_S` covers `send`'s post-read phases (5 + 4 + 2 = 11s) plus
 grading, archiving, signing and transmission. The budget is the advertised
 deadline minus that, and nothing else.
 
@@ -1403,7 +1439,7 @@ Everything above 300s belongs to the validator:
  -11s send tail: copy 5 + stream 4 + postmortem 2, all AFTER the read
  -~9s grade, archive, sign, put on the wire
 ----
-280s  the last moment a read can still end   ← SOLVER_SAFETY_MARGIN_S = 20
+285s  the last moment a read can still end   ← DELIVERY_RESERVE_S = 15
 ```
 
 A model needing 300s misses by 20; one needing 360s misses by 80. The only
@@ -1545,6 +1581,51 @@ is not `_counted_with`, the count comparison is not made at all. `_explain_empty
 reports the latched selector too, so its diagnosis names the selector the read
 actually used.
 
+### One reserve, and it is what delivery needs
+
+`handle_request` wraps the **whole** solve — including `fit_response`,
+`save_solution` and `save_exchange` — in a single
+
+```python
+asyncio.wait_for(solve_with_slot(), timeout=min(deadline_s, GLM_REQUEST_TIMEOUT_S))
+```
+
+and a solve that overruns it is cancelled and answered **504 with nothing**. Not
+a late answer: no answer. So everything after the last read has to fit inside
+one reserve, and that is what `DELIVERY_RESERVE_S` (15s) is: `send`'s post-read
+phases (copy, stream, post-mortem — 11s, scaled down on short deadlines by
+`tail_budget`), then the archive writes and the response.
+
+There used to be a second reserve as well, `SOLVER_SAFETY_MARGIN_S` at 20s,
+which also held time back for **grading**. Two reserves for one deadline is one
+too many — the working budget was 20s short of the limit while the true limit
+was 15s short, and the difference bought nothing but arithmetic. One number now,
+and it is the real one:
+
+```
+300s   deadline_s
+285s   budget            ← every phase plans against this, and it runs to the limit
+296s   read + tail
+300s   504 here
+```
+
+A 300s deadline gives the reads **285s** where it used to give 280s. Checked
+across the whole legal range — `TaskRequest.deadline_s` is `le=3600` — including
+the small end where `solve_task` falls back to half the request and
+`tail_budget` scales the tail down with it.
+
+⚠ Check `GLM_REQUEST_TIMEOUT_S` before blaming any of this. It bounds the whole
+solve at `min(deadline_s, GLM_REQUEST_TIMEOUT_S)`, and the reference miner's
+docs put it at **280** — below the 300s this subnet advertises, so it silently
+costs 20 seconds of every solve. `.env.example` now ships `3600`, which
+`TaskRequest.deadline_s`'s own `le=3600` makes structurally incapable of
+binding. The miner says so once per run:
+
+```
+[verify] the validator offered 300s but this miner caps the solve at 280s, so
+every answer gets 20s less than it could.
+```
+
 ### A model still writing is waited for, never interrupted
 
 The slice a read is given is an internal **allocation**, not a deadline. Where a
@@ -1646,7 +1727,6 @@ fresh conversation.
 | Variable | Default | Meaning |
 |---|---|---|
 | `SOLVER_MAX_ATTEMPTS` | `0` | Rounds per solve, `0` meaning **unlimited** — correct until it passes or the request's deadline stops it. A count here is a second, private deadline under the only real one, and there is no partial credit for stopping early. Set a number to cap it anyway |
-| `SOLVER_SAFETY_MARGIN_S` | `20` | Headroom kept before the cutoff, for `send`'s post-deadline phases and for grading, signing and transport |
 | `SOLVER_MAX_BUDGET_S` | `3600` | The protocol's own maximum for `deadline_s`, so it cannot bind on a spec-compliant request. Lowering it below the advertised deadline throws away answers the validator would still pay for |
 | `SOLVER_VERIFY_EXECUTOR` | `subprocess` | Python grading backend; Rust always uses Docker |
 | `SOLVER_EXECUTOR_RETRY_S` | `300` | How long an executor that could not be BUILT stays unavailable before a solve tries again. Without a daemon, building the Rust executor runs `docker info` — 60ms against a missing socket, up to 20s against a hung one — and it used to run once per Rust task, inside the solve's budget. A hold rather than a verdict: a daemon started after the miner is picked up on its own |

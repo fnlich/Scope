@@ -121,8 +121,8 @@ COPY_TIMEOUT_MS = 1_500
 # nothing: copy falls back to what scraping saw, the stream leaves `best`
 # untouched, and the post-mortem is a log line whose absence costs no answer.
 #
-# The three together must stay inside VerifyingSolver's safety margin
-# (`SOLVER_SAFETY_MARGIN_S`, 20 seconds), and the reason is not tidiness either:
+# The three together must stay inside `VerifyingSolver.DELIVERY_RESERVE_S`
+# (15 seconds), and the reason is not tidiness either:
 # `handle_request` wraps the whole solve in an `asyncio.wait_for` and answers
 # 504 -- NOTHING -- when it is exceeded. Overrunning does not deliver the answer
 # late; it throws away an answer already in hand. 5 + 4 + 2 = 11 leaves the last

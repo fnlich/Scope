@@ -70,6 +70,26 @@ EXECUTOR_RETRY_S = float(os.environ.get("SOLVER_EXECUTOR_RETRY_S", "300"))
 # is warm.
 RESUME_FLOOR_S = 40.0
 
+# What must be left when a read stops, for the answer to reach the validator at
+# all. THE ONLY reserve taken out of the deadline, and the only thing standing
+# between a full-budget solve and a 504 with nothing in it.
+#
+# `handle_request` wraps the WHOLE solve -- including `fit_response`,
+# `save_solution` and `save_exchange` -- in one `asyncio.wait_for(...,
+# timeout=min(deadline_s, GLM_REQUEST_TIMEOUT_S))`, and a solve that overruns it
+# is cancelled and answered 504 with nothing. So everything after the last read
+# has to fit in here: `send`'s post-read phases (copy, stream, post-mortem --
+# `FULL_TAIL_S`, 11s, itself scaled down on short deadlines by `tail_budget`),
+# then the archive writes and the response.
+#
+# There used to be a second reserve as well, `SOLVER_SAFETY_MARGIN_S` at 20s,
+# which also held time back for GRADING. Two reserves for one deadline is one
+# too many: the working budget was 20s short of the limit while the true limit
+# was 12s short, and the 8s difference did nothing but complicate the
+# arithmetic. One number, and it is the real one -- a 300s deadline now gives
+# the reads 285s rather than 280s.
+DELIVERY_RESERVE_S = 15.0
+
 # The least a lease wait may be cut to. Below this, waiting is pointless and
 # failing fast lets the pass end while another tab might still be tried.
 OPEN_FLOOR_S = 5.0
@@ -146,6 +166,12 @@ class Candidate:
         """Ranking key for 'best so far' — the validator's examples, then the
         model's own cases, then non-empty, then runnable.
 
+        Used BETWEEN PASSES only, where two models answered the same problem
+        independently and neither saw the other -- there, grading is the only
+        thing that can separate them. Within one pass the rounds are corrections
+        of each other and the latest simply wins; see `_supersedes`, and the
+        damage this ranking did when it was applied there too.
+
         A defect ranks BELOW clean code that merely could not be graded, and
         that is not cosmetic. Without a defect term at all, a first answer with
         no `fn main()` and a corrected second answer score identically -- a tie,
@@ -174,6 +200,42 @@ class Candidate:
             1 if self.code.strip() else 0,
             0 if self.defect else 1,
         )
+
+
+def _supersedes(candidate: Candidate, best: Candidate, still_writing: bool) -> bool:
+    """Should `candidate` replace `best` as the answer that ships?
+
+    THE LATEST VERSION WINS. No score is compared, and that is the whole rule.
+
+    A round only happens because the one before it was wrong: the loop ends the
+    moment there is no defect and no failure, so every candidate after the first
+    exists BECAUSE the model was shown what was wrong with its predecessor and
+    asked to correct it. The later program is the corrected one. Ranking them
+    against each other asks a question that has already been answered.
+
+    Scoring them did real damage. `Candidate.score` cannot tell "failed its
+    tests" from "was never tested" -- both put 0 in the same slot -- so a
+    correction that arrived too late in the budget to grade scored (0,0,1,1)
+    against the wrong program's (0,1,1,1) and LOST to the answer it was
+    correcting. Reproduced end to end: phase 3 returned the right program,
+    `self=1/3` went out, and the file held phase 2's code. Every refinement of
+    the comparison was another way to get that wrong; not comparing cannot.
+
+    Two things are still not versions of the answer, and neither is a judgement
+    about how good the code is:
+
+    * NOTHING ARRIVED. An empty capture is the absence of an answer rather than
+      a worse one -- a dead tab, a reply that rendered as prose, a read that
+      timed out. It must never displace a program already in hand.
+    * THE MODEL IS STILL WRITING. What arrived is a fragment of a reply rather
+      than a revision of one, and a fragment that happens to parse must not
+      displace the finished program above it.
+    """
+    if not candidate.code.strip():
+        return False
+    if still_writing:
+        return not best.code.strip()
+    return True
 
 
 class _Grader:
@@ -469,7 +531,7 @@ class VerifyingSolver:
         backend: Backend,
         *,
         max_attempts: int = 0,
-        safety_margin_s: float = 20.0,
+        reserve_s: float = DELIVERY_RESERVE_S,
         max_budget_s: float = 3600.0,
         cache_size: int = 256,
         second_opinion: bool = True,
@@ -481,7 +543,7 @@ class VerifyingSolver:
         # is the validator's deadline -- a count of three was a second, private
         # deadline layered under the real one, and it fired first.
         self._max_attempts = max(0, int(max_attempts))
-        self._margin = max(0.0, float(safety_margin_s))
+        self._reserve = max(0.0, float(reserve_s))
         self._max_budget = max(5.0, float(max_budget_s))
         self._second_opinion = bool(second_opinion)
         self._self_tests = bool(self_tests)
@@ -511,7 +573,15 @@ class VerifyingSolver:
         # longer had its answer thrown away by this miner rather than by the
         # validator -- which would have paid 96% for the same answer arriving at
         # six minutes. Correctness is worth 100%; speed is worth at most 5%.
-        budget = min(float(timeout_s), self._max_budget) - self._margin
+        # ONE reserve, and it is what delivery needs. Everything else the
+        # solve does -- reading, grading, repairing -- happens inside `budget`,
+        # and `budget` runs right up to the point the answer stops being
+        # deliverable. Waiting is close to free and giving up is a certain zero:
+        # the validator reads until `deadline_s + 10`, and its payment rule has
+        # no deadline term at all -- correctness is a hard gate and speed is a
+        # relative multiplier floored at 0.95, so the same answer a minute later
+        # is still worth 95%.
+        budget = min(float(timeout_s), self._max_budget) - self._reserve
         if budget <= 5.0:
             # Too short for the whole margin, so keep the SHAPE of the promise
             # instead of its size: half the request, which leaves the other half
@@ -709,8 +779,8 @@ class VerifyingSolver:
         prompt = build_tests_prompt(
             task.language, task.statement, task.entrypoint, task.public_examples
         )
-        # No `extend_to_s`: the slice already IS everything left, so there is
-        # nothing to extend to and nothing being held back to extend into.
+        # The slice IS everything left, and everything left runs to the point
+        # the answer stops being deliverable. Nothing is held back to extend to.
         reply = await conversation.send(prompt, slice_s)
         if getattr(conversation, "still_writing", False) or getattr(
             conversation, "empty_reason", None
@@ -958,7 +1028,10 @@ class VerifyingSolver:
                 # nothing being held back to extend into. Passing one equal to
                 # the slice makes `send`'s extension a no-op by construction and
                 # only reads as though a reserve existed.
-                reply = await conversation.send(prompt, left)
+                # No `extend_to_s`: `left` already runs to the point the
+                # answer stops being deliverable, so there is nothing past it to
+                # extend into.
+                reply = await conversation.send(prompt, max(1.0, left))
                 # A repair reply may carry a CORRECTED case array: the repair
                 # prompt offers it outright ("or, if the case was wrong rather
                 # than the program, a `json` array holding ALL of the cases").
@@ -1070,30 +1143,10 @@ class VerifyingSolver:
                     last_program_reply = reply
                 if revised:
                     agreed = revised
-                if best is None or candidate.score > best.score:
-                    best, best_provider = candidate, provider
-                elif candidate.score == best.score and not getattr(
-                    conversation, "still_writing", False
+                if best is None or _supersedes(
+                    candidate, best,
+                    getattr(conversation, "still_writing", False),
                 ):
-                    # A TIE goes to the later candidate, and that is not a
-                    # coin toss: this one was written after seeing the failure
-                    # report, so it is the model's considered revision of the
-                    # one already in hand.
-                    #
-                    # Strict `>` made every repair round a no-op whenever the
-                    # score could not move -- and the score cannot move when a
-                    # case is WRONG. Measured: turn 1 wrote a case no correct
-                    # program can pass, attempt 1 scored 1/2, the model then
-                    # rewrote the program properly, and the rewrite tied at 1/2
-                    # and was thrown away. The miner submitted the first draft
-                    # and the model's last word never left the tab. With three
-                    # bogus cases pinning a solve at 17/20, that is every
-                    # remaining round.
-                    #
-                    # Not when the model was STILL WRITING, though. What
-                    # arrived there is a fragment of an answer rather than a
-                    # revision of one, and a fragment that happens to parse and
-                    # tie must not displace the finished program above it.
                     best, best_provider = candidate, provider
                 if candidate.verified and not candidate.failures:
                     break
