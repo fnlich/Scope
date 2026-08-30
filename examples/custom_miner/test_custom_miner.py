@@ -7407,6 +7407,107 @@ def test_a_fragment_does_not_displace_the_whole_program_above_it():
     assert _supersedes(fragment, Candidate(code="", raw=""), False)
 
 
+def test_a_corrected_case_stays_the_bar_for_every_later_round():
+    """The bar is the LAST version of the cases, not turn 1's, and it stays that
+    way for every round after the one that corrected it.
+
+    Four turns, and the two repair rounds are the evidence:
+
+      turn 1  three cases, `carry` expecting 14 — which is wrong, it is 15
+      turn 2  `return 0`, which passes `zero` and nothing else
+      round 1 is told "returned 0, expected 14"  ← turn 1's bar
+              the model corrects the CASE and sends no program
+      round 2 is told "returned 0, expected 15"  ← the CORRECTED bar
+
+    If the correction only applied to the round that carried it, round 2 would
+    quote 14 again and a correct program could never pass: `carry` would fail
+    forever against a case the model had already fixed, and the loop would run
+    until the deadline reporting a disagreement that no longer existed."""
+    prompts: list[str] = []
+    wrong_bar = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+                 ' {"name": "single", "args": [7], "expected": 7},\n'
+                 ' {"name": "carry", "args": [12345], "expected": 14}]\n```')
+    draft = "```python\ndef g(n):\n    return 0\n```"
+    fixed_bar = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+                 ' {"name": "single", "args": [7], "expected": 7},\n'
+                 ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    fixed_code = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+                  "        t += n % 10\n        n //= 10\n    return t\n```")
+
+    class _Recording(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            return await super().send(text, timeout_s)
+
+    class _Recorded(_Backend):
+        async def open(self, avoid=None):
+            return _Recording(self._replies, self._provider)
+
+    task = SolveTask(problem_id="bar2", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=60.0)
+    solver = VerifyingSolver(_Recorded([wrong_bar, draft, fixed_bar, fixed_code]),
+                             reserve_s=0, max_budget_s=60, second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=60.0))
+    out = log.getvalue()
+
+    assert len(prompts) == 4, f"expected cases, program, two rounds: {len(prompts)}"
+    assert "expected 14" in prompts[2], f"round 1 used a bar nobody set: {prompts[2]!r}"
+    assert "expected 15" in prompts[3] and "expected 14" not in prompts[3], (
+        "round 2 was graded against the case the model had already corrected:\n"
+        + prompts[3]
+    )
+    assert "while n > 0" in answer.code, answer.code
+    assert "self=3/3" in out, out
+
+
+def test_a_partial_correction_is_sent_back_and_the_whole_program_ships():
+    """Requirement 1 end to end, through the solve the miner actually runs.
+
+    Round 1 sends back only the function it changed. It parses, `compile()` is
+    happy, and `digits` — which turn 2 defined and this reply calls — exists
+    nowhere in the file that would be submitted. Round 2 is told exactly that,
+    by name, and asked for the whole program; what ships is the whole program.
+
+    Without the check the fragment is the latest version and `_supersedes`
+    ships it: a `NameError` on every hidden case, reported clean."""
+    prompts: list[str] = []
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    draft = ("```python\ndef digits(n):\n    return [int(c) for c in str(n)]\n"
+             "def g(n):\n    return len(digits(n))\n```")
+    partial = "```python\ndef g(n):\n    return sum(digits(n))\n```"
+    whole = ("```python\ndef digits(n):\n    return [int(c) for c in str(n)]\n"
+             "def g(n):\n    return sum(digits(n))\n```")
+
+    class _Recording(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            return await super().send(text, timeout_s)
+
+    class _Recorded(_Backend):
+        async def open(self, avoid=None):
+            return _Recording(self._replies, self._provider)
+
+    task = SolveTask(problem_id="partial", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=60.0)
+    solver = VerifyingSolver(_Recorded([cases, draft, partial, whole]),
+                             reserve_s=0, max_budget_s=60, second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        answer = asyncio.run(solver.solve_task(task, timeout_s=60.0))
+
+    assert len(prompts) == 4, f"expected cases, program, two rounds: {len(prompts)}"
+    assert "only part of the program" in prompts[3], (
+        f"the fragment was accepted as a version: {prompts[3]!r}"
+    )
+    assert "`digits`" in prompts[3], "never named what was missing"
+    assert "I ran" not in prompts[3], "blamed logic that was never run"
+    # The whole program ships, and the fragment did not displace anything.
+    assert "def digits" in answer.code and "sum(digits(n))" in answer.code, answer.code
+
+
 def test_each_round_is_graded_against_the_latest_corrected_cases():
     """Phases 3, 4, ... run locally against the CORRECTED cases, round after
     round, until a round has nothing left to fix.
