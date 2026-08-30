@@ -1,0 +1,17 @@
+{
+  "problem_id": "a85b781ecf5b98ed41c8ef3cdab9b379b6fc923136616f33e59360ffba0dbbf2",
+  "request": {
+    "problem_id": "a85b781ecf5b98ed41c8ef3cdab9b379b6fc923136616f33e59360ffba0dbbf2",
+    "language": "python",
+    "statement": "Implement `registry_timeline(horizon, ttl, renewal, latency, retry_base, retry_cap, initial_healthy, initial_version, health_changes, descriptor_changes, lifecycle_events)`.\n\nAll times are integer ticks. The observed range is `[0, horizon)`, where `1 <= horizon <= 10**18`, `1 <= latency`, `1 <= renewal`, `latency + renewal < ttl`, and `1 <= retry_base <= retry_cap <= 10**18`.\n\nEach change list is strictly increasing by timestamp, all timestamps lie in `[0, horizon)`, and their combined length is at most 200,000:\n\n- `health_changes`: `(time, healthy)` pairs with boolean values.\n- `descriptor_changes`: `(time, version)` pairs with nonnegative integer versions.\n- `lifecycle_events`: `(time, command)` pairs, where commands are `\"START\"` or `\"STOP\"`.\n\nThe service is initially stopped with the supplied health and descriptor values. At each timestamp, operations occur in this order:\n\n1. Apply the health change, if any.\n2. Apply the descriptor change, if any.\n3. Apply the lifecycle command, if any.\n4. Complete an in-flight attempt due then, if it was not canceled.\n5. Dispatch an attempt scheduled for then, if still running.\n\nOnly one attempt may be in flight. Dispatch captures the currently cached version, and completion occurs exactly `latency` ticks later. Success is determined by health at completion, not dispatch. A success writes the captured version, replacing any live lease, and creates a lease for `[completion_time, completion_time + ttl)`. It resets the failure streak and schedules dispatch `renewal` ticks after completion.\n\nA failure leaves any lease unchanged. For the kth consecutive completed failure since the latest start or success, dispatch is scheduled after `min(retry_base * 2**(k-1), retry_cap)` ticks from completion.\n\n`START` while stopped starts a fresh retry cycle and schedules immediate dispatch; while running it does nothing. `STOP` while running cancels any in-flight attempt and future dispatch, resets retry state, and deletes the registry entry only if its lease is live then. `STOP` while stopped does nothing. A canceled attempt is neither successful nor failed.\n\nThe service is discoverable only while a lease is live and has not been deleted. At `horizon`, an implicit shutdown occurs before any completion or dispatch due there, with the same cancellation and deletion effects as an effective stop. Intervals are clipped to `[0, horizon)`.\n\nReturn a dictionary with exactly these keys:\n\n- `\"intervals\"`: maximal `(start, end, version)` discoverability intervals ordered by start; adjacent intervals with equal versions are merged.\n- `\"successes\"`: completed successful attempts before `horizon`.\n- `\"failures\"`: completed failed attempts before `horizon`.\n- `\"cancellations\"`: dispatched attempts canceled by effective stops or shutdown.\n- `\"deletions\"`: effective stops or shutdowns that delete a live lease.\n\nUse only the Python standard library. Perform no I/O and use no global state.",
+    "entrypoint": "registry_timeline",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 1743425571
+  },
+  "response": {
+    "problem_id": "a85b781ecf5b98ed41c8ef3cdab9b379b6fc923136616f33e59360ffba0dbbf2",
+    "code": "",
+    "raw_response": ""
+  }
+}

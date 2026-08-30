@@ -1,0 +1,17 @@
+{
+  "problem_id": "46e26cf3c512eb61cb1ceb61807f78eeaf25a5e72228834e25b40f2b0a6e1636",
+  "request": {
+    "problem_id": "46e26cf3c512eb61cb1ceb61807f78eeaf25a5e72228834e25b40f2b0a6e1636",
+    "language": "python",
+    "statement": "### Exercise: Nested Multiplexed Call Lifetimes\n\nA transport contains plugin calls, open input streams, and nested-call relationships forming a forest. A call is **live** until all three conditions hold:\n\n1. its primary response has been handled;\n2. it owns no open input stream; and\n3. it has no live direct child call.\n\nCleanup occurs immediately when all three first hold. When a call is cleaned, it ceases to count as a live child of its parent; this may immediately trigger further cleanup up the forest. A cleaned call never becomes live again.\n\nImplement\n\n`simulate_lifetimes(call_ids, streams, parents, events)`\n\nwhere:\n\n- `call_ids` is a list of distinct integer call identifiers.\n- `streams` is a list of pairs `(s, c)`, with distinct stream identifiers `s`, assigning each initially open stream to call `c`.\n- `parents` is a list of pairs `(child, parent)`. Each child occurs at most once, every identifier names a listed call, and these relationships form a forest. Calls absent as children are roots.\n- `events` contains tuples of these forms:\n  - `(\"respond\", L, R)`: handle the primary response of every call with identifier in the closed interval `[L,R]`. An already handled response is unaffected.\n  - `(\"end\", L, R)`: end every still-open stream with identifier in `[L,R]`, removing it from its owner.\n  - `(\"move\", s, c)`: atomically transfer open stream `s` to live call `c`. If `c` already owns it, nothing changes.\n  - `(\"reparent\", child, parent)`: atomically transfer live `child` from its current parent, if any, to live `parent`. If that relationship already exists, nothing changes.\n\nEvents are processed in order. All changes of one event occur before any resulting cleanup is evaluated, after which cleanup is repeatedly applied until no further call qualifies. Interval events affect all designated items as one event; their internal order has no observable significance.\n\nInitially, no response has been handled and every call is live. All inputs are valid at the moment used: moves name open streams and live destinations; reparenting names two distinct live calls, preserves a forest, and may name a root as the child; intervals satisfy `L <= R`.\n\nAfter every event, let the live call identifiers be\n\n`a1 < a2 < ... < ak`.\n\nReturn one pair per event:\n\n- `(0, None)` if `k = 0`;\n- otherwise `(k, a[ceil(k/2)])`, using one-based indexing. Thus, an even-sized set reports its lower central identifier.\n\nConstraints:\n\n- `1 <= len(call_ids) <= 200000`\n- `0 <= len(streams), len(parents), len(events) <= 200000`\n- identifiers and interval endpoints lie in `[-10^9,10^9]`\n\nUse only the Python standard library. Perform no input/output, filesystem access, networking, global-state mutation, or nondeterministic operations.",
+    "entrypoint": "simulate_lifetimes",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 1418217597
+  },
+  "response": {
+    "problem_id": "46e26cf3c512eb61cb1ceb61807f78eeaf25a5e72228834e25b40f2b0a6e1636",
+    "code": "",
+    "raw_response": ""
+  }
+}

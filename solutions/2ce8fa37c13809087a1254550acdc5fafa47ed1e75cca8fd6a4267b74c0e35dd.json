@@ -1,0 +1,17 @@
+{
+  "problem_id": "2ce8fa37c13809087a1254550acdc5fafa47ed1e75cca8fd6a4267b74c0e35dd",
+  "request": {
+    "problem_id": "2ce8fa37c13809087a1254550acdc5fafa47ed1e75cca8fd6a4267b74c0e35dd",
+    "language": "rust",
+    "statement": "Write one complete Rust program containing `fn main()`. Only the Rust standard library may be used, and unsafe code is not permitted.\n\nTwo planar bodies A and B have nonnegative integer inverse inertias `IA` and `IB`, integer initial angular velocities `wA` and `wB`, a cached motor impulse `C=0`, and a global selector bit `P=0`. The duration preceding the first tick is 1. All arithmetic below is exact rational arithmetic.\n\nA phase contains `r` consecutive ticks with parameters `h e a b s0 s1 T`. During each tick, let `s=s0` if `P=0`, otherwise `s=s1`, and perform exactly:\n\n1. Add `a` to A's angular velocity and `b` to B's angular velocity.\n2. If `e=0`, set `C=0` and perform no motor action.\n3. Otherwise, if `IA+IB=0`, set `C=0` and perform no motor action.\n4. Otherwise, let `hp` be the preceding tick's duration. Replace `C` by `C*h/hp`, then subtract `IA*C` from A's velocity and add `IB*C` to B's velocity.\n5. Let `v=wB-wA`. Set `D=(s-v)/(IA+IB)`. Let `Cold` be the current warmed value of `C`, replace\n   `C` by `clamp(C+D,-T*h,T*h)`,\n   then subtract `IA*(C-Cold)` from A's velocity and add `IB*(C-Cold)` to B's velocity. Here `clamp(x,l,u)=min(max(x,l),u)`, including equality at either bound.\n6. Set the preceding duration to `h`, then toggle `P`. The toggle occurs even if the motor was disabled or degenerate.\n\nPhases are processed in input order. The final reaction torque is `C/h` after the final tick.\n\nInput:\n- First line: `IA IB wA wB`\n- Second line: `Q`\n- Next `Q` lines: `r h e a b s0 s1 T`\n\nConstraints:\n- `1<=Q<=200000`, `1<=r<=10^12`\n- `0<=IA,IB,T<=10^6`, `1<=h<=10^6`, `e` is 0 or 1\n- `|wA|,|wB|,|a|,|b|,|s0|,|s1|<=10^6`\n- Every exact value implied by the simulation has absolute numerator and denominator below `10^35`.\n\nOutput the final angular velocity of A, final angular velocity of B, and final reaction torque as three reduced fractions `p/q`. Denominators must be positive, `gcd(|p|,q)=1`, and zero must be `0/1`.\n\nOutput is judged by splitting only on ASCII whitespace bytes `0x09` through `0x0D` and `0x20`, then comparing tokens exactly in order and count.",
+    "entrypoint": "main",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 231149428
+  },
+  "response": {
+    "problem_id": "2ce8fa37c13809087a1254550acdc5fafa47ed1e75cca8fd6a4267b74c0e35dd",
+    "code": "",
+    "raw_response": ""
+  }
+}

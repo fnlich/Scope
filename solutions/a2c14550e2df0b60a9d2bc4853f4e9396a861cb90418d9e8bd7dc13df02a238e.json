@@ -1,0 +1,17 @@
+{
+  "problem_id": "a2c14550e2df0b60a9d2bc4853f4e9396a861cb90418d9e8bd7dc13df02a238e",
+  "request": {
+    "problem_id": "a2c14550e2df0b60a9d2bc4853f4e9396a861cb90418d9e8bd7dc13df02a238e",
+    "language": "rust",
+    "statement": "Write one complete Rust program containing `fn main()` that simulates a non-blocking FIFO output queue. Only the Rust standard library may be used.\n\nInput begins with `N K`, where `1 <= N <= 500000` and `1 <= K <= 500000`. The next `N` lines are events:\n\n- `D L`: append a data buffer of `L` bytes (`1 <= L <= 9*10^18`). Every `D` event receives a serial number, starting at 1, including events ignored after closure.\n- `P I E`: append a packet-boundary marker with ID `I` and expected packet size `E` (`1 <= I <= 10^9`, `0 <= E <= 9*10^18`).\n- `C R`: append a close marker with reason `R` (`1 <= R <= 10^9`).\n- `X J`: cancel data buffer serial `J` (`1 <= J <= N`). If that buffer is currently queued, remove it immediately and discard all its unwritten bytes. Otherwise this event has no effect. Cancellation never processes newly exposed markers.\n- `W Q`: perform one write attempt with byte quota `Q` (`0 <= Q <= 9*10^18`).\n\nThe sum of all `L` values fits in `u64`.\n\nThe queue is initially open. A write attempt repeatedly applies these rules in order:\n\n1. Process every marker currently at the front. For `P I E`, compare `E` with the bytes written since the previous successfully processed packet marker, initially zero. If equal, packet `I` completes and the counter resets to zero. Otherwise the queue closes with reason `-I`. For `C R`, it closes with reason `R`. A processed marker, including one causing closure, is removed.\n2. If still open, quota remains, fewer than `K` distinct data buffers have been touched during this attempt, and the front is data, write as many bytes from it as possible. Update its offset, quota, and the packet-byte counter. Remove it if fully written. Writing a positive number of bytes from a buffer counts as one touch.\n3. Repeat.\n\nThus markers exposed by fully consuming a buffer are processed even when quota becomes zero or `K` buffers have been touched. Cancelled or otherwise discarded bytes never contribute to the packet-byte counter.\n\nOnce closed, all later `D`, `P`, `C`, and `X` effects are ignored, and later writes change nothing. Entries behind the removed closing marker remain queued.\n\nFor every `W`, output:\n`W B T I1 ... IT S U`\nwhere `B` is bytes written in that attempt, `T` is its number of completed packets, the IDs follow in completion order, `S` is zero while open or the permanent closure reason, and `U` is total unwritten data bytes still queued.\n\nFinally output `FINAL M`, then the `M` remaining entries in FIFO order:\n- `D serial offset original_length`\n- `P I E`\n- `C R`\n\nInput is supplied as one stdin string and output is one stdout string. Integers use decimal notation. Output is compared by splitting only on ASCII whitespace bytes `0x09` through `0x0D` and `0x20`, then comparing tokens exactly.",
+    "entrypoint": "main",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 1535320790
+  },
+  "response": {
+    "problem_id": "a2c14550e2df0b60a9d2bc4853f4e9396a861cb90418d9e8bd7dc13df02a238e",
+    "code": "",
+    "raw_response": ""
+  }
+}

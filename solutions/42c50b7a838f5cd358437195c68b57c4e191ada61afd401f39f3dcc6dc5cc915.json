@@ -1,0 +1,17 @@
+{
+  "problem_id": "42c50b7a838f5cd358437195c68b57c4e191ada61afd401f39f3dcc6dc5cc915",
+  "request": {
+    "problem_id": "42c50b7a838f5cd358437195c68b57c4e191ada61afd401f39f3dcc6dc5cc915",
+    "language": "rust",
+    "statement": "Expiring Account Deletion Markers\n\nAccount-scoped interval markers may expire, be deleted for one account, or be deleted globally across all accounts. Stored metadata may be malformed.\n\nWrite a complete Rust program with entrypoint `fn main()`. Use only the Rust standard library.\n\nInput\n\n- First line: integer `Q`.\n- Next `Q` lines, in chronological order, each in one of these forms:\n  - `P t account metadata`\n  - `D t selector a b`\n- Final line: integer `F`.\n\nTokens are separated by ASCII whitespace.\n\nConstraints\n\n- `1 <= Q <= 200000`.\n- Operation times `t` are nondecreasing; `0 <= t <= F <= 10^18`.\n- A `P` account is `-`, meaning empty, or 1–20 lowercase English letters.\n- A `D` selector is `-`, `*`, or 1–20 lowercase English letters. `*` selects every nonempty account.\n- For every `D`, `0 <= a < b <= 10^18`.\n- Metadata length is 1–100 and contains only letters, digits, and `:`.\n- Total input size is at most 20 MiB.\n\nMetadata decoding\n\nMetadata is valid exactly when it has form `l:r:e`, consisting of exactly three nonempty decimal digit strings. Every decoded value must be at most `10^18`, with `l < r` and `e > t`, where `t` is that `P` operation's time. All other metadata is malformed.\n\nState rules\n\n- Before each operation at time `t`, remove every stored marker whose expiration `e <= t`.\n- Equal-time operations are processed in input order, with expiration removal before each operation.\n- `P` has no effect when its account is `-` or its metadata is malformed. Otherwise it inserts a marker belonging to that account, with interval `[l,r)`, expiration `e`, and order equal to this operation's 1-based position among the `Q` operations.\n- `D` with selector `-` has no effect.\n- `D` with a lowercase selector removes every currently stored marker of exactly that account whose interval overlaps `[a,b)`.\n- `D` with selector `*` removes every currently stored marker, regardless of account, whose interval overlaps `[a,b)`.\n- Half-open intervals `[l,r)` and `[a,b)` overlap exactly when `r > a` and `l < b`. Boundary contact alone is not overlap.\n- Removed or expired markers never reappear.\n- After all operations, remove every marker whose expiration `e <= F`.\n\nOutput\n\nOutput the number of remaining markers `K`, followed by `K` rows in increasing insertion order:\n\n`order account l r e`\n\nOutput is judged by splitting only on ASCII whitespace bytes and comparing all tokens exactly.",
+    "entrypoint": "main",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 50024356
+  },
+  "response": {
+    "problem_id": "42c50b7a838f5cd358437195c68b57c4e191ada61afd401f39f3dcc6dc5cc915",
+    "code": "",
+    "raw_response": ""
+  }
+}

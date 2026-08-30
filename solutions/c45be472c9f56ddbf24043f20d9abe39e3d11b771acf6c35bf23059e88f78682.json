@@ -1,0 +1,17 @@
+{
+  "problem_id": "c45be472c9f56ddbf24043f20d9abe39e3d11b771acf6c35bf23059e88f78682",
+  "request": {
+    "problem_id": "c45be472c9f56ddbf24043f20d9abe39e3d11b771acf6c35bf23059e88f78682",
+    "language": "python",
+    "statement": "`enrich_rpc_trace(catalog, lanes, links)`\n\nReconstruct the canonical completion stream of an asynchronous RPC trace and enrich eligible successful responses with the collection identity captured when the call starts.\n\nParameters:\n\n- `catalog` maps every operation name to either `\"scoped\"` or `\"global\"`.\n- `lanes` is a list of event lists. Events within a lane must occur in list order; different lanes may interleave. An event coordinate is `(lane_index, position_index)`.\n- `links` contains `(source_lane, source_position, target_lane, target_position)` tuples, each requiring the source event to precede the target event.\n\nLane order and `links` form a directed acyclic precedence relation. The canonical serialization is obtained by repeatedly selecting, among all unselected events whose required predecessors have been selected, the event with the lexicographically smallest coordinate.\n\nEvents are:\n\n- `(\"alias\", source, target)`, where both names are nonempty strings. From this event onward, `source` resolves to whatever collection name `target` currently or subsequently resolves to. Each `source` occurs in at most one alias event. Immediately before an alias event, following existing aliases from `target` never reaches `source`.\n- `(\"start\", call_id, operation, collection)`. For a scoped operation, `collection` is a nonempty string; for a global operation it is `None`. At a scoped start, follow all aliases effective at that point to their final name and permanently copy that result for this call. Later alias events do not change the copied context.\n- `(\"ok\", call_id, payload, extensions)`, where `payload` is a string and `extensions` is a tuple of `(type_name, value)` string pairs. Type names are distinct, lexicographically sorted, and never `\"collection.context\"`.\n- `(\"error\", call_id, code, detail)`, where `code` and `detail` are strings.\n\nEvery call has exactly one start and exactly one later terminal event in the canonical serialization. Call IDs are unique, and every operation is present in `catalog`.\n\nReturn terminal events in canonical serialization order:\n\n- For a successful scoped call, insert `(\"collection.context\", copied_name)` into `extensions`, preserving lexicographic order by type name.\n- A successful global call is returned exactly unchanged.\n- Every error is returned exactly unchanged.\n- Start and alias events are not returned.\n\nThe input must not be modified.\n\nThere are at most 200,000 events, 300,000 links, and 100,000 calls. The total length of all strings is at most 2,000,000 characters.\n\nUse only the Python standard library. No I/O, filesystem, network, global state, or nondeterminism is permitted.",
+    "entrypoint": "enrich_rpc_trace",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 1239954715
+  },
+  "response": {
+    "problem_id": "c45be472c9f56ddbf24043f20d9abe39e3d11b771acf6c35bf23059e88f78682",
+    "code": "",
+    "raw_response": ""
+  }
+}

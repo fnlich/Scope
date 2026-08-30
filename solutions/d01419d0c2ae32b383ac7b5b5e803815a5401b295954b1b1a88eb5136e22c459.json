@@ -1,0 +1,17 @@
+{
+  "problem_id": "d01419d0c2ae32b383ac7b5b5e803815a5401b295954b1b1a88eb5136e22c459",
+  "request": {
+    "problem_id": "d01419d0c2ae32b383ac7b5b5e803815a5401b295954b1b1a88eb5136e22c459",
+    "language": "rust",
+    "statement": "## Leased Monthly Manifest Checkpoints\n\nAn object store receives snapshots in strictly increasing sequence order. Each snapshot contains file removals and leased additions. Valid snapshots are assigned to calendar months.\n\nA snapshot with snapshot month `s` and persistence month `p` has effective month:\n\n- `p`, if `p != -1`;\n- otherwise `s`, if `s != -1`;\n- otherwise it is invalid and all its operations are ignored.\n\nThe effective months of valid snapshots are nondecreasing.\n\nAn addition `A id size d` made in effective month `m` expires at the beginning of month `m + d`. It is live in checkpoints for months `m` through `m + d - 1`, unless removed or replaced earlier. Expirations occur before all snapshots of their month. Replacing a file cancels its previous expiration; that old expiration must have no effect later.\n\nWithin one snapshot, all removals occur before all additions, regardless of input order. Removing a non-live file does nothing. Adding a non-live file inserts it. Adding an already-live file replaces its size, addition sequence, and expiration. Thus, an ID both removed and added in one snapshot is live afterward with the new data.\n\nFor every month from the first valid effective month through the last, including months without snapshots, output one checkpoint after that month's expirations and snapshots. No checkpoints after the last valid snapshot month are output.\n\nA checkpoint's live rows are ordered by increasing file ID. For row `(id, size, seq)`, define, with `P = 1000000007` and `C = 1000003`:\n\n`v = ((((id mod P) * C + (size mod P)) mod P) * C + (seq mod P)) mod P`.\n\nStarting with `h = 0`, process the ordered rows using\n\n`h = (h * B + v) mod P`,\n\nwhere `B = 911382323`. An empty manifest has hash `0`.\n\n### Input\n\nThe first line contains `N`, the number of snapshots.\n\nEach snapshot begins with four integers:\n\n`q seq s p`\n\nfollowed by `q` operation lines:\n\n- `R id`\n- `A id size d`\n\nWithin a snapshot, an ID appears at most once in a removal and at most once in an addition.\n\nConstraints:\n\n- `1 <= N <= 200000`\n- `0 <= sum(q) <= 400000`\n- sequences are strictly increasing and at most `10^18`\n- `s` and `p` are either `-1` or in `[0, 10^9]`\n- `0 <= id <= 10^18`\n- `0 <= size <= 10^12`\n- `1 <= d <= 10^9`\n- if a valid snapshot exists, its last effective month minus its first is at most `200000`\n\n### Output\n\nFirst print the number of checkpoints. Then, in increasing month order, print:\n\n`month live_count total_size hash`\n\nIf there are no valid snapshots, print only `0`.\n\nWrite one complete Rust program using only the standard library and containing `fn main()`. Output is compared by splitting on ASCII whitespace bytes.",
+    "entrypoint": "main",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 1469434228
+  },
+  "response": {
+    "problem_id": "d01419d0c2ae32b383ac7b5b5e803815a5401b295954b1b1a88eb5136e22c459",
+    "code": "",
+    "raw_response": ""
+  }
+}

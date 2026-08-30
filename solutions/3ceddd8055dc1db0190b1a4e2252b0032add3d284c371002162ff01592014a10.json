@@ -1,0 +1,17 @@
+{
+  "problem_id": "3ceddd8055dc1db0190b1a4e2252b0032add3d284c371002162ff01592014a10",
+  "request": {
+    "problem_id": "3ceddd8055dc1db0190b1a4e2252b0032add3d284c371002162ff01592014a10",
+    "language": "python",
+    "statement": "A professional league audits a scout’s online itinerary. The scout starts at one statistics URL, then follows recorded redirect references. Define `audit_itinerary(start_url, redirects, dns, restricted_cidrs)`.\n\n`start_url` must be an absolute HTTP or HTTPS URL. Each redirect is processed in order and may be an absolute URL, a network reference beginning `//` that inherits the current scheme, or any other relative reference that inherits the current scheme and authority.\n\nA string is malformed if it contains a character outside printable ASCII `!` through `~`. A leading scheme declaration has form `[A-Za-z][A-Za-z0-9+.-]*:`; only `http:` and `https:` are allowed, and they must be followed by `//`. An authority ends at the first `/`, `?`, or `#`, and must not contain `@`.\n\nAn authority is `HOST` or `HOST:PORT`. A port is decimal and must have value 1 through 65535. IPv6 hosts must be bracketed, and bracketed hosts must be valid IPv6 literals without zone identifiers. An unbracketed host containing only ASCII digits and dots is an IPv4 literal and must use strict four-part decimal notation without leading zeroes. Otherwise it must be a case-insensitive DNS name: after removing one optional trailing dot, its length is at most 253, and every nonempty label has length at most 63, uses only ASCII letters, digits, and hyphens, and neither begins nor ends with a hyphen.\n\n`dns` maps canonical lowercase DNS names without trailing dots to lists of DNS snapshots. Each snapshot is a list of IP-literal strings. Every visit to a DNS host, including one whose authority was inherited, consumes that host’s next unused snapshot. A missing host, missing next snapshot, empty snapshot, malformed answer, or restricted answer makes that visit ineligible. IPv4 answers use the strict notation above; IPv6 answers are unbracketed and have no zone identifier.\n\nThe first successful snapshot for each DNS name pins its normalized set of addresses. Every later snapshot consumed for that name must have exactly the same normalized set; otherwise that visit is ineligible, even if every address is public. Answer order and duplicate answers do not affect the set.\n\n`restricted_cidrs` contains valid IPv4 or IPv6 CIDR strings. An address is restricted exactly when it belongs to a listed CIDR. Before restriction checks and pinning, an IPv6 address whose first 96 bits are zero, or whose first 80 bits are zero and next 16 bits are one, is normalized to the IPv4 address in its final 32 bits. IP hosts do not use DNS snapshots.\n\nValidate the starting URL as visit 0, then each resolved redirect target. Stop at the first malformed, unresolvable, restricted, or pin-violating visit. Return its zero-based visit index, or `-1` if all visits are eligible.\n\nConstraints: at most 200,000 redirects and CIDRs, at most 400,000 snapshots, at most 800,000 DNS answers, and at most 2,000,000 total URL/reference characters. Use only the Python standard library and perform no I/O, networking, global-state mutation, or nondeterministic operation.",
+    "entrypoint": "audit_itinerary",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 965751374
+  },
+  "response": {
+    "problem_id": "3ceddd8055dc1db0190b1a4e2252b0032add3d284c371002162ff01592014a10",
+    "code": "",
+    "raw_response": ""
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "problem_id": "162d69020566bc090f3aac6aacfd126f337be83134eef4c669aef8540acd96ee",
+  "request": {
+    "problem_id": "162d69020566bc090f3aac6aacfd126f337be83134eef4c669aef8540acd96ee",
+    "language": "rust",
+    "statement": "We’re sizing persistence for a voxel world whose integer `(x, z)` plane is divided into square chunks of width `W`. For any coordinate `q`, its chunk index is mathematical `floor(q / W)`, including for negative coordinates. Its local coordinate is therefore in `0..W-1`.\n\nA batch contains paint commands in input order. Each command paints every integer cell of one inclusive axis-aligned segment with its given value. If several commands cover a cell, the last such command in input order determines that cell’s final value. A covered cell remains an edited cell even when its final value is zero.\n\nEvery edited cell `(x, z)` has an authoritative record in its own chunk. Boundary shadows are mandatory:\n\n- If local `x` is `0`, the same cell and value are also recorded in the chunk immediately to the left.\n- If local `x` is `W-1`, they are also recorded in the chunk immediately to the right.\n- The analogous rules apply for local `z` and the chunks below or above.\n- Horizontal and vertical choices combine, so a cell at a chunk corner has four records.\n\nA record is identified by its chunk and exact world cell. Shadows of different cells never merge. Empty chunks have no records.\n\nCompute:\n\n1. the total number of distinct authoritative and shadow records after the complete batch;\n2. the sum of the final painted values stored in all those records, counting every authoritative record and every shadow separately.\n\nCoordinates and segment lengths are too large to enumerate cell by cell.\n\nInput:\n\n- The first line contains integers `N W`, where `1 <= N <= 200000` and `2 <= W <= 10^9`.\n- Each of the next `N` lines contains `x1 z1 x2 z2 v`, where every coordinate is between `-10^18` and `10^18` inclusive and `0 <= v <= 10^9`.\n- Every segment is axis-aligned: `x1 = x2` or `z1 = z2`. Endpoints may appear in either order. Coincident endpoints paint one cell.\n\nOutput two integers: first the total record count, then the sum of stored values. Each answer may exceed 64-bit range.\n\nSubmit one complete Rust program using only the standard library and containing `fn main()`. Output is judged by splitting only on ASCII whitespace bytes `0x09` through `0x0D` and `0x20`, then comparing tokens exactly in order and count.",
+    "entrypoint": "main",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 1795538025
+  },
+  "response": {
+    "problem_id": "162d69020566bc090f3aac6aacfd126f337be83134eef4c669aef8540acd96ee",
+    "code": "",
+    "raw_response": ""
+  }
+}

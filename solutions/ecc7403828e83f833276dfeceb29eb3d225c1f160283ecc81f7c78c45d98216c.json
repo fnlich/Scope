@@ -1,0 +1,17 @@
+{
+  "problem_id": "ecc7403828e83f833276dfeceb29eb3d225c1f160283ecc81f7c78c45d98216c",
+  "request": {
+    "problem_id": "ecc7403828e83f833276dfeceb29eb3d225c1f160283ecc81f7c78c45d98216c",
+    "language": "python",
+    "statement": "A compiler stores metadata for `n` modules numbered `0` through `n-1`. Imports may contain cycles. Modules that are mutually reachable through imports form one compilation unit and must always be rebuilt together.\n\nImplement `plan_rebuild(n, imports, public_imports, stored_times, current_times, compiled_gen, interface_gen, interface_will_change, new_generation)`.\n\nAn import pair `(a, b)` means module `a` imports module `b`. `public_imports` is a subset of `imports`; such an import also re-exports the dependency's interface.\n\nBefore the build, module `i` has a cached source timestamp, current source timestamp, last compilation generation, and last interface-change generation in the corresponding lists.\n\nModule `i` is initially stale if either:\n\n- `stored_times[i] != current_times[i]`; or\n- it imports a module `d` with `interface_gen[d] > compiled_gen[i]`.\n\nThe rebuild set and the set of interfaces changed by this build are the smallest sets jointly satisfying:\n\n- Every initially stale module is rebuilt.\n- If any module in a compilation unit is rebuilt, every module in that unit is rebuilt.\n- A rebuilt module `i` has a changed interface if `interface_will_change[i] == 1`.\n- A rebuilt module `i` also has a changed interface if some `(i, d)` in `public_imports` has `d` with a changed interface in this build.\n- If rebuilt module `d` has a changed interface, every module that directly imports `d` is rebuilt.\n\nThese rules repeat until neither set grows. `interface_will_change` has no effect for modules that are not rebuilt.\n\nEvery rebuilt module is compiled in `new_generation`, and its cached timestamp becomes its current timestamp. Its interface generation becomes `new_generation` exactly if its interface changes in this build. Metadata of modules not rebuilt remains unchanged.\n\n### Constraints\n\n- `1 <= n <= 200000`\n- `imports` contains at most `400000` distinct valid pairs.\n- `public_imports` contains distinct pairs, each present in `imports`.\n- All six lists have length `n`; `interface_will_change` contains only `0` and `1`.\n- Timestamps and generations are integers from `0` through `10^18`.\n- `new_generation` is greater than every existing compilation and interface generation.\n- Inputs are valid and must not be modified.\n\n### Return value\n\nReturn a 4-tuple containing:\n\n1. rebuilt module indices in strictly increasing order;\n2. updated cached timestamps;\n3. updated compilation generations;\n4. updated interface generations.\n\nThe submitted source must define `plan_rebuild`. It must not perform I/O, access external resources, retain state between calls, or require non-standard libraries.",
+    "entrypoint": "plan_rebuild",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 448139322
+  },
+  "response": {
+    "problem_id": "ecc7403828e83f833276dfeceb29eb3d225c1f160283ecc81f7c78c45d98216c",
+    "code": "",
+    "raw_response": ""
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "problem_id": "761d363ca2615eb07233c14c4e2f0c2475e28c830443c9962599652a0cab61d4",
+  "request": {
+    "problem_id": "761d363ca2615eb07233c14c4e2f0c2475e28c830443c9962599652a0cab61d4",
+    "language": "python",
+    "statement": "Define `branching_updates(initial, commands, queries, modulus)` to process branching immutable maps, lazy conditional replacements, and interval overlays.\n\n`initial` is a list of `(key, value)` pairs. Keys are integers; values are `None` or integers in `[0, modulus)`. Build version 0 in list order, with later occurrences replacing earlier ones. A key mapped to `None` is present.\n\nEach command creates one version. Commands are numbered from 1, and every referenced version is in `[0, i)` for command `i`. Older versions never change. Commands are:\n\n- `(\"present\", base, key, mul, add, make_null)`: execute its callback only when `key` is present.\n- `(\"missing\", base, key, seed, mul, add, make_null)`: execute its callback only when `key` is absent.\n- `(\"equal\", base, key, expected, mul, add, make_null)`: execute its callback only when `key` is present and its value equals `expected`. `expected` may be `None`.\n- `(\"erase\", base, key, expected)`: remove `key` only when it is present and equals `expected`; this is not a callback.\n- `(\"overlay\", base, donor, low, high)`: start from `base`, then replace the complete state of every key `k` satisfying `low <= k <= high` with its state in `donor`. Thus a donor value, including `None`, is copied, while a key absent from the donor is removed even if present in the base. Keys outside the interval retain their base state.\n\nFor a successful callback, store `None` if `make_null` is true; otherwise store `(mul*x + add) % modulus`. For `present` and `equal`, `x` is the old value, with `None` interpreted as zero. For `missing`, `x = seed`. A failed condition leaves the version identical to its base and does not execute its callback.\n\nA version's execution count is inherited from its `base` and increased by one exactly when that command executes a callback. An overlay inherits only the base's count: callbacks used to produce the donor are not added.\n\nEach query is `(version, key)`. Its answer is `(True, value)` if the key is present, including `(True, None)`, and `(False, None)` otherwise.\n\nReturn `(final_map, execution_counts, answers)`. `final_map` is an ordinary dictionary containing the complete last version, `execution_counts` covers versions `0..len(commands)`, and `answers` follows query order.\n\nConstraints: `2 <= modulus <= 2_000_000_000`; each of `initial`, `commands`, and `queries` has at most 120,000 elements; `low <= high`; keys, interval endpoints, seeds, `mul`, and `add` have absolute value at most `10^9`. All version references and values obey the rules above.",
+    "entrypoint": "branching_updates",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 933118951
+  },
+  "response": {
+    "problem_id": "761d363ca2615eb07233c14c4e2f0c2475e28c830443c9962599652a0cab61d4",
+    "code": "",
+    "raw_response": ""
+  }
+}

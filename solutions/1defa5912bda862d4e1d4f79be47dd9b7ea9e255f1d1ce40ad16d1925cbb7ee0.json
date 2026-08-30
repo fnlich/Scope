@@ -1,0 +1,17 @@
+{
+  "problem_id": "1defa5912bda862d4e1d4f79be47dd9b7ea9e255f1d1ce40ad16d1925cbb7ee0",
+  "request": {
+    "problem_id": "1defa5912bda862d4e1d4f79be47dd9b7ea9e255f1d1ce40ad16d1925cbb7ee0",
+    "language": "python",
+    "statement": "I’m going to give you a build inventory for an application with independent schema-generation pipelines, plugin-created compilation tasks, and frontend packages sharing a resource destination. Produce its canonical execution plan.\n\nDefine `plan_build(tasks, dependencies, activation_rules, ordering_rules, requested)`.\n\nInputs are:\n\n- `tasks`: a list of `(name, labels)` pairs. Each `name` is unique. `labels` is a sequence of distinct strings carried by that task.\n- `dependencies`: a list of `(task, prerequisite)` pairs. Selecting `task` also selects `prerequisite`, which must execute first.\n- `activation_rules`: a list of `(trigger_labels, minimum, introduced_label)` triples. `trigger_labels` is a sequence of distinct labels and `0 <= minimum <= len(trigger_labels)`. A rule fires when at least `minimum` of its trigger labels are carried by selected tasks. Firing selects every task carrying `introduced_label`. Rules with `minimum == 0` fire even when `requested` is empty. Newly selected tasks may satisfy further rules and dependencies.\n- `ordering_rules`: a list of `(before_label, after_label)` pairs. These rules never select tasks. For every pair of selected tasks `x` and `y` carrying the respective labels, `x` must execute strictly before `y`.\n- `requested`: a sequence of task names selected initially.\n\nSelection is the smallest set containing the requested tasks, all tasks introduced by every satisfied activation rule, and every prerequisite of a selected task. A label counts as active once at least one selected task carries it. Each selected task executes exactly once.\n\nAfter selection stabilizes, enforce dependencies and ordering rules together. Labels may overlap; if any resulting constraint requires a selected task to precede itself, or the combined constraints otherwise contain a cycle, no valid plan exists.\n\nReturn the lexicographically smallest list of selected task names among all valid execution orders. Names contain only ASCII letters, digits, `.`, `_`, and `-`, so ordinary Python string ordering is authoritative. Return `None` if no valid order exists, and `[]` if nothing is selected.\n\nAll referenced task names exist. Repeated semantic rules and repeated requested names are allowed. Inputs must not be mutated.\n\nThere are at most 150,000 tasks. The combined number of task-label memberships, dependencies, activation rules, trigger-label occurrences inside activation rules, and ordering rules is at most 400,000. A single ordering rule may constrain quadratically many task pairs, and those pairs cannot be assumed to fit in memory.\n\nUse only the Python standard library, with no filesystem, network, randomness, stdin, or stdout.",
+    "entrypoint": "plan_build",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 91346626
+  },
+  "response": {
+    "problem_id": "1defa5912bda862d4e1d4f79be47dd9b7ea9e255f1d1ce40ad16d1925cbb7ee0",
+    "code": "",
+    "raw_response": ""
+  }
+}

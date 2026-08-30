@@ -1,0 +1,17 @@
+{
+  "problem_id": "02802babec9c68a21d8f553bd91bc13510653b9beca95b0633862dfc32f12c34",
+  "request": {
+    "problem_id": "02802babec9c68a21d8f553bd91bc13510653b9beca95b0633862dfc32f12c34",
+    "language": "python",
+    "statement": "Define `migrate_registry(handlers, attempts, modulus)`.\n\nA handler is `[module, identity, state]`. All fields are integers, `0 <= state < modulus`, and no two handlers share `(module, identity)`. Registry order never changes.\n\nAn attempt is\n\n`[module, low, high, guard_module, guard_low, guard_high, expected, a, b, output_module, u, v]`.\n\nIts primary selection contains handlers whose module is `module` and identity is in `[low, high]`. Its guard selection contains handlers whose module is `guard_module` and identity is in `[guard_low, guard_high]`. Both selections and all states are evaluated when the attempt is processed.\n\nLet `count` and `guard_count` be their respective sizes. The attempt's digest is, modulo `modulus`, the sum of all primary states plus the sum of all guard states. If a handler belongs to both selections, its state is included twice.\n\nIf `digest != expected`, the attempt is stale: no callback result is considered and no state changes. Its response is `['stale', digest, count, guard_count, 0]`.\n\nOtherwise, independently for every primary handler `[module, identity, state]`, the attempted callback result is\n\n`[output_module, u * identity + v, (a * state + b) modulo modulus]`.\n\nA result is accepted only if its first two fields exactly equal that handler's existing module and identity. An accepted result replaces only its state. A rejected result is malformed and leaves it unchanged. All accepted results use states from before this attempt. Guard handlers are not otherwise modified. The response is `['done', digest, count, guard_count, accepted_count]`.\n\nAttempts are processed in input order. Thus, a successful attempt may change the digest observed later through either selection. Missing modules produce empty selections.\n\nReturn `[responses, final_registry, visible_states]`, where `responses` follows attempt order, `final_registry` contains final records in original registry order, and `visible_states` contains the same records sorted lexicographically by `(module, identity)`.\n\nAll inputs are valid. `2 <= modulus <= 1_000_000_007`; `0 <= len(handlers), len(attempts) <= 200_000`; both interval bounds are inclusive and ordered; `0 <= expected, a, b < modulus`; every other integer has absolute value at most `10^18`.\n\nUse only the Python standard library. Perform no I/O and access no external state. Define exactly the callable entrypoint `migrate_registry`.",
+    "entrypoint": "migrate_registry",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 124507115
+  },
+  "response": {
+    "problem_id": "02802babec9c68a21d8f553bd91bc13510653b9beca95b0633862dfc32f12c34",
+    "code": "",
+    "raw_response": ""
+  }
+}

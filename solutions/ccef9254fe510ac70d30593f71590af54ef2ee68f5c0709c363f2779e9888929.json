@@ -1,0 +1,17 @@
+{
+  "problem_id": "ccef9254fe510ac70d30593f71590af54ef2ee68f5c0709c363f2779e9888929",
+  "request": {
+    "problem_id": "ccef9254fe510ac70d30593f71590af54ef2ee68f5c0709c363f2779e9888929",
+    "language": "python",
+    "statement": "### Dialect Reference Normalization with Decision Consistency\n\nImplement `normalize_reference(tokens, separators, costs, switch_cost, min_parts, max_parts, case)`.\n\nInputs:\n- `tokens`: nonempty list of `(kind, text)` pairs; each token's original index is its list position\n- `kind`: one of `\"N\"`, `\"D\"`, `\"P\"`, `\"S\"`\n- `separators`: nonempty string of distinct ASCII characters, excluding backslash\n- `costs`: mapping from every separator character to `(split_cost, keep_cost)`; costs are nonnegative integers\n- `switch_cost`: nonnegative integer\n- `1 <= min_parts <= max_parts <= 200`\n- `case`: `\"preserve\"`, `\"lower\"`, or `\"upper\"`\n- Total token-text length is at most 6000\n- Escapes are valid: every backslash in an `N` token has a following character\n\nExpand tokens from left to right:\n- `N`: backslash escapes the following character, which becomes ordinary name material. Each unescaped separator becomes a soft separator. Remaining maximal runs become name material.\n- `D`: text is exactly one separator character and becomes a hard separator.\n- `P`: nonempty text becoming punctuation material.\n- `S`: text is exactly `\"*\"` and becomes wildcard material.\n\nNormalization removes escaping backslashes. Apply `case` only to ASCII letters originating as `N` material. Punctuation, retained separators, and wildcard text remain unchanged.\n\nInterpretation rules:\n- A hard separator is a mandatory part boundary.\n- A soft separator `c` is either a boundary costing `split_cost`, or retained literal material costing `keep_cost`.\n- Within each region separated by hard separators, soft-separator decisions form one sequence, even when ordinary material occurs between them. After the first decision, add `switch_cost` whenever its boundary/retained choice differs from the preceding soft decision. A hard separator resets this sequence.\n- Every ordinary part must begin and end with name material.\n- Punctuation and retained separators are allowed only between name material in the same part.\n- Adjacent material without a boundary belongs to the same part.\n- A wildcard must be the sole material of the final part.\n- Empty parts are forbidden.\n- The final part count must be within `[min_parts, max_parts]`.\n\nChoose by:\n1. Minimum total base and switching cost\n2. Minimum number of parts\n3. Lexicographically smallest soft-decision vector in left-to-right order, encoding boundary as `0` and retained as `1`\n\nReturn `None` if no interpretation is valid. Otherwise return one `(text, indices)` pair per part. `text` is concatenated normalized material. `indices` is the increasing list of distinct original token indices contributing retained material. Boundary separators contribute no index; one token may contribute to multiple parts.\n\nThe source must define `normalize_reference`, accept positional or keyword arguments, and use only the standard library. It must perform no I/O and use no mutable global state or nondeterminism.",
+    "entrypoint": "normalize_reference",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 1883366017
+  },
+  "response": {
+    "problem_id": "ccef9254fe510ac70d30593f71590af54ef2ee68f5c0709c363f2779e9888929",
+    "code": "",
+    "raw_response": ""
+  }
+}
