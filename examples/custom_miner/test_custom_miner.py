@@ -8006,6 +8006,116 @@ def test_an_answer_that_fails_its_own_cases_is_never_cached():
     assert solver._cache == {}, "cached an answer that fails its own cases"
 
 
+def test_the_same_program_under_different_prose_is_the_same_program(capsys):
+    """Why the round is judged by what it AMOUNTED to rather than by its bytes.
+
+    A model that resends an unchanged program under a fresh sentence of
+    explanation has changed nothing, and a byte comparison of the replies says
+    it has. Left there it is a spin: every round differs, every round fails
+    identically, and the budget goes on asking."""
+    program = "```python\ndef g(n):\n    return 99\n```"
+    solver, sent = _solver_seeing([
+        _CASES_ONLY,
+        program,
+        "Sure — here is the corrected version.\n\n" + program,
+        "You're right, my mistake. Fixed:\n\n" + program,
+    ])
+    asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+
+    assert len(sent) == 3, [s[:40] for s in sent]
+    assert "the same program and the same failures" in capsys.readouterr().out
+
+
+def test_a_corrected_case_counts_as_progress_even_with_the_program_untouched():
+    """The other half, and the reason the failures are in the signature at all.
+
+    The repair prompt asks for exactly this: leave the program alone and send
+    the cases back corrected. The program is then byte-identical two rounds
+    running — and if that alone ended the loop, the one shape the prompt asks
+    for would be the one shape it refused to hear."""
+    program = "```python\ndef g(n):\n    t = 0\n    while n > 0:\n        t += n % 10\n        n //= 10\n    return t\n```"
+    bad = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+           ' {"name": "wrong", "args": [12345], "expected": 99}]\n```')
+    fixed = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "wrong", "args": [12345], "expected": 15}]\n```')
+
+    solver, sent = _solver_seeing([bad, program, program + "\n\n" + fixed])
+    answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+
+    assert "while n > 0" in answer.code
+    # cases, program, one repair — and the repair was HEARD rather than read as
+    # an unchanged round, so the loop ended on a clean run, not on a stall.
+    assert len(sent) == 3, [s[:40] for s in sent]
+
+
+def test_a_repair_may_send_the_corrected_cases_ALONE():
+    """The reply the repair prompt asks for by name, and the one the miner had
+    no answer to.
+
+    "Send back ONE fenced block: the corrected program — or, if the case was
+    wrong rather than the program, a `json` array holding ALL of the cases" —
+    so a model whose PROGRAM was right sends the cases and nothing else. That
+    reply carries no code, and until this worked the miner answered it with
+    "your previous reply did not reach me as code", demanded a program it
+    already had, and submitted the right program reported 0/1 against a bogus
+    case.
+
+    The program in hand is re-graded against the corrected bar. Re-graded, not
+    assumed to pass: there was no rewrite to launder, because there was no new
+    program at all."""
+    program = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+               "        t += n % 10\n        n //= 10\n    return t\n```")
+    bad = '```json\n[{"name": "wrong", "args": [12345], "expected": 99}]\n```'
+    fixed = '```json\n[{"name": "wrong", "args": [12345], "expected": 15}]\n```'
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        solver, sent = _solver_seeing([bad, program, fixed])
+        answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+    log = chatter.getvalue()
+
+    assert "while n > 0" in answer.code, "lost the program the correction was about"
+    # cases, program, ONE repair. A fourth would be the miner asking for a
+    # program it was holding.
+    assert len(sent) == 3, [t[:40] for t in sent]
+    assert "did not reach me as code" not in "".join(sent), sent[-1][:200]
+    assert "self=1/1" in log, log
+
+
+def test_the_program_turn_cannot_bring_its_own_bar():
+    """The one round the "judged against the bar as it stood before it arrived"
+    rule was a round short of covering.
+
+    Cases written beside a program are back-filled from what it happens to do,
+    so they agree with its bugs — that is the entire argument for splitting the
+    turns. A repair reply may correct a case; the PROGRAM turn may not write
+    the bar it is about to be measured against.
+
+    Measured before this: turn 1 wrote a case that CAUGHT the bug, turn 2 sent
+    the buggy program with two cases of its own, round 1 reported the real
+    failure and then adopted them, and round 2 re-graded the same buggy program
+    against the bar it brought with it — `self=2/2`, no failures, loop over,
+    buggy program submitted as passing everything."""
+    caught = '```json\n[{"name": "single", "args": [7], "expected": 7}]\n```'
+    buggy = ("```python\ndef g(n):\n    t = 0\n    while n > 9:\n"
+             "        t += n % 10\n        n //= 10\n    return t\n```")
+    # Two cases the buggy program passes and turn 1 never wrote.
+    backfilled = ('```json\n[{"name": "a", "args": [99], "expected": 9},\n'
+                  ' {"name": "b", "args": [123], "expected": 5}]\n```')
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        solver, sent = _solver_seeing([caught, buggy + "\n\n" + backfilled, buggy])
+        asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+    log = chatter.getvalue()
+
+    assert "back-filled" in log, log
+    # Turn 1's case is still the bar, and it still catches the bug.
+    assert "self=0/1" in log, log
+    assert "self=2/2" not in log, "the program turn cleared a bar it wrote itself"
+    assert "'single'" in sent[2], f"the repair stopped naming the real failure: {sent[2][:200]}"
+
+
 def test_correction_keeps_going_past_the_round_that_used_to_be_the_last():
     """`SOLVER_MAX_ATTEMPTS` was 3, so a solve got the cases turn, the program
     turn and exactly ONE repair. A count is a second, private deadline layered
@@ -8029,21 +8139,21 @@ def test_correction_keeps_going_past_the_round_that_used_to_be_the_last():
         )
 
 
-def test_a_conversation_repeating_itself_is_not_asked_again(capsys):
+def test_a_round_that_changed_nothing_is_not_asked_again(capsys):
     """The one thing that can spin once the round count is gone.
 
     `send` normally blocks on the model for tens of seconds, so a budget is a
     real bound on the number of rounds. A read that returns STALE text returns
     it at once, and the loop would resend the same repair at machine speed for
     the whole budget -- hammering the site from an account the operator is
-    signed in to. A byte-identical reply to a prompt quoting a fresh failure is
-    not a revision, so it ends the loop instead of starting another one."""
+    signed in to. A round that produced the same program and the same failures
+    is not a revision, so it ends the loop instead of starting another one."""
     solver, sent = _solver_seeing([_CASES_ONLY, _WRONG_PROGRAM])  # repeats forever
     answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
 
-    # cases, program, one repair -- then the identical reply stops it.
+    # cases, program, one repair -- then the unchanged round stops it.
     assert len(sent) == 3, [s[:40] for s in sent]
-    assert "identical reply" in capsys.readouterr().out
+    assert "the same program and the same failures" in capsys.readouterr().out
     # And the answer it did get is still submitted: stopping the loop is not
     # throwing away the best thing in hand.
     assert "while n > 9" in answer.code

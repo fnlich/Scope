@@ -135,8 +135,9 @@ class Candidate:
         return self.defect is None and self.total > 0 and self.passed == self.total
 
     @property
-    def score(self) -> tuple[int, int, int]:
-        """Ranking key for 'best so far' — passes, then non-empty, then runnable.
+    def score(self) -> tuple[int, int, int, int]:
+        """Ranking key for 'best so far' — the validator's examples, then the
+        model's own cases, then non-empty, then runnable.
 
         A defect ranks BELOW clean code that merely could not be graded, and
         that is not cosmetic. Without a defect term at all, a first answer with
@@ -638,10 +639,13 @@ class VerifyingSolver:
                 print(
                     f"[verify] {provider or 'first'} "
                     + (
-                        "returned nothing; asking another model"
+                        "returned nothing"
                         if not best.code.strip()
-                        else "did not verify; asking another model"
+                        else "cleared the examples but not its own cases"
+                        if best.verified
+                        else "did not verify"
                     )
+                    + "; asking another model"
                 )
         if asked:
             # `won_with`, not `asked[-1]`. They usually coincide -- a verified
@@ -829,18 +833,17 @@ class VerifyingSolver:
             # kind, so the line does not depend on the guard above surviving.
             agreed = list(cases or [])
             # The program the LAST round produced, so a repair that corrects a
-            # case can be told apart from one that rewrites both.
+            # case can be told apart from one that rewrites both -- and the
+            # reply that carried it, so a correction sent WITHOUT the program
+            # can still be graded against something.
             last_code: Optional[str] = None
+            last_program_reply: Optional[str] = None
             # A repair may be carried to a fresh conversation ONCE per pass.
             resumed = False
-            # The last reply, verbatim. With the round count gone, a tab that
-            # answers INSTANTLY is the one thing that can spin: `send` normally
-            # blocks on the model for tens of seconds, but a read that returns
-            # stale text returns it at once, and the loop would resend the same
-            # repair at machine speed for the whole budget -- hammering the site
-            # from an account the operator is signed in to. A byte-identical
-            # reply to a prompt quoting a fresh failure is not a revision.
-            last_reply: Optional[str] = None
+            # What the last round AMOUNTED to -- the program, the defect and
+            # the failing cases -- so a round that changed nothing can be told
+            # from one that did. See `duplicate` below.
+            last_signature: Optional[tuple] = None
             attempt = 0
             while True:
                 attempt += 1
@@ -902,15 +905,28 @@ class VerifyingSolver:
                 # stood BEFORE it arrived, so a model cannot make a rewritten
                 # program pass by rewriting the bar in the same breath. Its
                 # cases apply from the next round.
-                if attempt > 1 and reply == last_reply:
-                    print(
-                        f"[verify] {provider or 'this model'} sent back the "
-                        f"identical reply after being shown the failure; "
-                        f"stopping rather than asking again"
-                    )
-                    break
-                last_reply = reply
                 revised = extract_self_tests(reply, task.entrypoint, task.language)
+                if revised and attempt == 1:
+                    # The PROGRAM turn. Its cases are back-filled from what the
+                    # program happens to do -- they agree with its bugs, which
+                    # is the entire argument for splitting the turns -- so the
+                    # bar stays the one turn 1 wrote before any program existed.
+                    #
+                    # Not a theoretical objection. Measured: turn 1 wrote a case
+                    # that CAUGHT the bug, turn 2 sent the buggy program with
+                    # two cases of its own, round 1 reported the real failure
+                    # and then adopted them, and round 2 re-graded the same
+                    # buggy program against the bar it had brought with it --
+                    # `self=2/2`, no failures, loop over, buggy program
+                    # submitted as passing everything. The rule that a reply is
+                    # judged against the bar as it stood before it arrived
+                    # covered repair rounds and left this one round short.
+                    print(
+                        f"[verify] the program turn sent {len(revised)} case(s) "
+                        f"of its own; keeping turn 1's — cases written beside a "
+                        f"program are back-filled from it"
+                    )
+                    revised = []
                 if revised and len(revised) < len(agreed):
                     # A revision may CORRECT a case. It may not delete one --
                     # and dropping the case you cannot pass is exactly how a
@@ -925,12 +941,49 @@ class VerifyingSolver:
                     )
                     revised = []
                 now_code = extract_code(reply, task.entrypoint, task.language).strip()
-                if revised and last_code is not None and now_code == last_code:
-                    agreed, revised = revised, None
+                # Which reply the candidate is actually graded FROM. Normally
+                # this one; see the cases-only branch below for when it is not.
+                graded = reply
+                if revised and last_code:
+                    if now_code == last_code:
+                        agreed, revised = revised, None
+                    elif not now_code:
+                        # Cases corrected, program deliberately NOT resent --
+                        # the one reply the repair prompt asks for by name when
+                        # the case was the thing that was wrong, and until this
+                        # branch existed the answer to it was "your previous
+                        # reply did not reach me as code". Measured: the program
+                        # was right, turn 1's case was not, the model corrected
+                        # exactly the case it was asked to, and the miner spent
+                        # the rest of the budget demanding a program it already
+                        # had before submitting one reported 0/1 on a bogus bar.
+                        #
+                        # Nothing here is taken on trust. The program is the one
+                        # already in hand and already judged, so a weakened bar
+                        # cannot launder a rewrite -- there was no rewrite. It
+                        # is re-graded, not assumed to pass.
+                        agreed, revised = revised, None
+                        graded = last_program_reply or reply
                 candidate = await self._graded(
-                    reply, task, budget - (time.monotonic() - started), agreed
+                    graded, task, budget - (time.monotonic() - started), agreed
                 )
-                last_code = now_code
+                # What this round AMOUNTED to. Compared against the round before
+                # rather than the replies themselves, because the same program
+                # under a different sentence of prose is the same program: byte
+                # equality misses that and this does not. The failures are in it
+                # so a corrected CASE reads as progress even when the program is
+                # untouched -- which is exactly what the repair prompt asks for.
+                signature = (
+                    candidate.code.strip(), candidate.defect, tuple(candidate.failures)
+                )
+                duplicate = attempt > 1 and signature == last_signature
+                last_signature = signature
+                # Only when one ARRIVED. A cases-only reply leaves the program
+                # in hand standing, and forgetting it here would make the very
+                # next correction unattributable to any program at all.
+                if now_code:
+                    last_code = now_code
+                    last_program_reply = reply
                 if revised:
                     agreed = revised
                 if best is None or candidate.score > best.score:
@@ -1067,6 +1120,29 @@ class VerifyingSolver:
                             if best is not None and best.code.strip()
                             else "asking elsewhere"
                         )
+                    )
+                    break
+                if duplicate:
+                    # Same program, same failures: the round changed nothing and
+                    # the next one has no new information to change it with.
+                    #
+                    # This is checked HERE, below the branches that know more
+                    # about an empty reply than "it matches the last one" --
+                    # a tab gone unreadable, a model still writing -- so their
+                    # honest reporting and their recovery, carrying the repair
+                    # to a fresh conversation among it, still come first.
+                    #
+                    # Without the round count it is also the only thing standing
+                    # between a broken tab and a spin. `send` normally blocks on
+                    # the model for tens of seconds, so the budget is a real
+                    # bound on the rounds; a read that returns STALE text
+                    # returns it at once, and the loop would resend the same
+                    # repair at machine speed for the whole budget, hammering
+                    # the site from an account the operator is signed in to.
+                    print(
+                        f"[verify] {provider or 'this model'} sent back the same "
+                        f"program and the same failures after being shown them; "
+                        f"stopping rather than asking again"
                     )
                     break
                 if not candidate.defect and not candidate.failures:

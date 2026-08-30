@@ -1171,9 +1171,32 @@ the answer **cache** is gated on `not failures` as well — caching one of those
 re-serves a wrong answer for every later task with the same statement.
 
 So `self_passed` is kept in its own field. It never touches `passed`/`total`,
-`verified` stays False, and the answer is never cached: one wrong answer that
-matched its own wrong cases must not be re-served for every later task with the
+`verified` is earned by the validator's examples alone — with none shipped it
+stays False however many of its own cases a program passes. The answer cache is
+gated on `verified` **and** on having no outstanding failures, so an answer that
+cleared the examples and still disagrees with its own cases is not cached
+either: one wrong answer must not be re-served for every later task with the
 same statement.
+
+Two rules keep the bar honest, and they are the same rule at two moments:
+
+- **The program turn cannot bring its own bar.** Cases written beside a program
+  are back-filled from what it happens to do, so they agree with its bugs. A
+  `json` block in turn 2 is refused and turn 1's cases stand. Measured before
+  this existed: turn 1 wrote a case that *caught* the bug, turn 2 sent the buggy
+  program with two cases of its own, round 1 reported the real failure and then
+  adopted them, and round 2 re-graded the same buggy program against the bar it
+  had brought with it — `self=2/2`, no failures, loop over, buggy program
+  submitted as passing everything.
+- **A repair cannot pass a bar it rewrote in the same breath.** A reply that
+  changes the program *and* the cases is graded against the bar as it stood
+  before it arrived; its cases apply from the next round.
+
+A repair reply that corrects a case and leaves the program alone is the one the
+prompt asks for, and it may arrive **without the program** — a `json` array and
+nothing else. The program already in hand is then re-graded against the
+corrected bar. Re-graded, not assumed to pass: there is no rewrite to launder
+because there is no new program.
 
 The repair wording changes with it. Not *"your solution is WRONG"* — these cases
 came from the model, so a disagreement proves only that two things it wrote
