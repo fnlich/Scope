@@ -95,6 +95,11 @@ DIGITS = SolveTask(
 
 WRONG = "```python\ndef g(n):\n    s = 0\n    while n > 9:\n        s += n % 10\n        n //= 10\n    return s\n```"
 RIGHT = "```python\ndef g(n):\n    s = 0\n    while n > 0:\n        s += n % 10\n        n //= 10\n    return s\n```"
+# What turn 1 sends back when a test needs the cases turn to produce cases
+# rather than be wasted on a stray code block. `WRONG` FAILS this one -- it
+# stops at `n > 9`, so 12345 sums to 14 -- which is what makes a repair round
+# in these tests real rather than decorative.
+CASES = '```json\n[{"name": "all five digits", "args": [12345], "expected": 15}]\n```'
 
 
 class _Chat:
@@ -144,7 +149,27 @@ def _never_archive_into_the_operators_corpus(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_reply_passes_every_validator_acceptance_check():
     miner_kp, validator_kp = keypair.create_from_uri("//Bob"), keypair.create_from_uri("//Alice")
-    solver = _solver([WRONG, RIGHT])
+    prompts: list[str] = []
+
+    class _Recording(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            return await super().send(text, timeout_s)
+
+    class _Recorded(_Backend):
+        async def open(self, avoid=None):
+            return _Recording(self._replies, self._provider)
+
+    # Three replies, not two, and the third is the point. This test used to read
+    # `_solver([WRONG, RIGHT])` and end on "the repaired answer, not the first
+    # draft" -- but the cases turn (`two_phase`, on by default) eats the first
+    # reply, so `WRONG` answered turn 1, `RIGHT` answered turn 2, and no repair
+    # round ever ran. The assertion passed because RIGHT was simply next in the
+    # list. The one test covering the wire path proved nothing about the loop
+    # that decides what goes ON that wire.
+    solver = VerifyingSolver(
+        _Recorded([CASES, WRONG, RIGHT]), reserve_s=0, max_budget_s=120
+    )
     metagraph = SimpleNamespace(
         hotkeys=[validator_kp.ss58_address], validator_permit=[True], S=[0.0]
     )
@@ -188,7 +213,97 @@ def test_reply_passes_every_validator_acceptance_check():
     #    over, so checking the wrong one here would pass a reply that is thrown
     #    away on arrival.
     assert len(response.content) <= Settings().miner_max_response_bytes
-    assert "while n > 0" in payload.code  # the repaired answer, not the first draft
+    # 5. ...and the answer is the REPAIRED one. Both halves are asserted: the
+    #    code that shipped, and that a repair round is what produced it.
+    assert "while n > 0" in payload.code, payload.code
+    assert len(prompts) == 3, f"expected cases, program, repair; got {len(prompts)}"
+    assert "I ran" in prompts[2], f"turn 3 was not a repair: {prompts[2]!r}"
+
+
+def test_the_correction_ships_on_chain_and_lands_in_the_archive(tmp_path):
+    """The rule -- THE LATEST VERSION WINS -- carried through `/solve` to the
+    file an operator reads, in the shape live traffic actually has.
+
+    Three things make this the case that matters, and all three are how the
+    original bug hid:
+
+    * `public_examples=[]`. All 97 archived requests carry none, so the model's
+      OWN cases are the only bar. That is the path the repair loop runs on in
+      production.
+    * THE CORRECTION IS TOO LATE TO GRADE. `_grade` declines below
+      `GRADE_FLOOR_S`, so phase 3 arrives carrying no evidence at all, and
+      `Candidate.score` puts the same 0 in the self-tests slot for "failed
+      them" and for "was never run". The draft passed 1 of its 3 and scores
+      (0,1,1,1); the correction scores (0,0,1,1) and LOSES to the answer it was
+      correcting. A correction that can be graded is picked by either rule --
+      only this one tells them apart.
+    * IT ASSERTS THE ARCHIVED FILE. The report was "the solution file holds
+      phase 2's code", and that file is written by `save_solution` after
+      `fit_response`, two hops past anything a `solve_task`-level test sees.
+
+    Betting on the ungraded correction is right rather than merely safe:
+    payment is all-or-nothing, so a program known to fail one of its own cases
+    is a certain zero, while an ungraded correction is at worst the same zero
+    and was written by a model that had just been shown what was wrong.
+    """
+    miner_kp = keypair.create_from_uri("//Bob")
+    validator_kp = keypair.create_from_uri("//Alice")
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "single", "args": [7], "expected": 7},\n'
+             ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    draft = "```python\ndef g(n):\n    return 0\n```"            # passes 1 of 3
+    fixed = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+             "        t += n % 10\n        n //= 10\n    return t\n```")
+    prompts: list[str] = []
+
+    class _Slow(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            # The correction takes most of the budget to arrive, so by the time
+            # it is graded there is less than GRADE_FLOOR_S left.
+            if len(prompts) == 3:
+                await asyncio.sleep(7.0)
+            return await super().send(text, timeout_s)
+
+    class _SlowBackend(_Backend):
+        async def open(self, avoid=None):
+            return _Slow(self._replies, self._provider)
+
+    miner = CustomMiner(
+        DemoMinerSettings(_env_file=None),
+        VerifyingSolver(_SlowBackend([cases, draft, fixed]), reserve_s=0,
+                        max_budget_s=20, second_opinion=False),
+        wallet=SimpleNamespace(hotkey=miner_kp), subtensor=None, metagraph=None,
+    )
+    request = TaskRequest(
+        problem_id="live-shape-1", language="python",
+        statement="Return the sum of the decimal digits of n.",
+        entrypoint="g", public_examples=[],
+    )
+    body = request.model_dump_json().encode()
+    headers = sign_message(validator_kp, body, signed_for=miner_kp.ss58_address)
+    headers["Content-Type"] = "application/json"
+
+    with TestClient(build_demo_miner_app(miner)) as client:
+        response = client.post("/solve", content=body, headers=headers)
+
+    assert response.status_code == 200
+    payload = SolutionPayload.model_validate_json(response.content)
+    # The repair round happened at all: cases, program, correction.
+    assert len(prompts) == 3, f"expected cases, program, repair; got {len(prompts)}"
+    assert "I ran" in prompts[2], f"turn 3 was not a repair: {prompts[2]!r}"
+    # What went out is phase 3, not the phase-2 draft it corrects.
+    assert "while n > 0" in payload.code, (
+        f"submitted the program the repair round corrected: {payload.code!r}"
+    )
+
+    archived = tmp_path / "solutions" / "live-shape-1.py"
+    assert archived.is_file(), (
+        f"nothing archived: {sorted((tmp_path / 'solutions').glob('*'))}"
+    )
+    assert archived.read_text() == payload.code, (
+        f"the file is not the submission: {archived.read_text()!r}"
+    )
 
 
 def test_a_long_transcript_is_trimmed_to_what_the_validator_will_read():
