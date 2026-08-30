@@ -10870,7 +10870,7 @@ def test_the_cases_turn_asks_for_the_common_path_before_the_boundaries():
 
     for language, entry in (("python", "g"), ("rust", "main")):
         p = build_tests_prompt(language, "Sum the digits of n.", entry, [])
-        classes = ["THREE ordinary cases", "THE EMPTY VALUE", "ONE:",
+        classes = ["ONE ordinary case", "THE EMPTY VALUE", "ONE:",
                    "THE BOUNDARY", "LIKELY TO BE GOT WRONG"]
         at = []
         for name in classes:

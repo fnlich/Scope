@@ -1279,7 +1279,7 @@ Turn 1 is asked for the shape the classes actually break on, with counts stated
 on the easy classes:
 
 ```
-1. THREE ordinary cases         the common path, which an all-boundary
+1. ONE ordinary case            the common path, which an all-boundary
                                 suite never checks at all
 2. then 2–10 cases per class:   zero and the empty input · one and two ·
                                 every limit the statement names, at it,
@@ -1346,8 +1346,13 @@ of time:
 
 `MAX_SELF_TESTS = 20` is the cap the model is told about *and* the cap the miner
 enforces, and over-long arrays are thinned by keeping the first three and then
-striding — a head-slice would keep the three ordinary cases and throw away every
-boundary, discarding exactly what the mechanism exists to run.
+striding — a head-slice would keep only the cheap opening cases and throw away
+every boundary, discarding exactly what the mechanism exists to run. The head is
+three because that is where the first three classes sit (the ordinary case, the
+empty value, and one), not because the ordinary case is asked for three times:
+turn 1 asks for exactly ONE of those. Three runs of the common path are three
+runs of the same code, paid for out of the solve's own deadline and re-paid on
+every repair round.
 
 ### A short deadline must still get an answer
 

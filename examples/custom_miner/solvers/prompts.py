@@ -252,10 +252,19 @@ WHOLE_PROGRAM = (
 
 # Turn 1. The cases, before the program exists.
 #
-# The ordering is the user's and it is right: three ordinary cases first, so the
+# The ordering is the user's and it is right: the ordinary case first, so the
 # common path is checked at all, then the boundaries where implementations
 # actually break. Counts are stated per class rather than as a total, because a
 # total invites a model to spend it all on the easy classes.
+#
+# ONE ordinary case, not three. Three of them are three runs of the same code
+# path: the common path is either right or it is not, and a second and third
+# typical input almost never disagree with the first. They are not free either
+# -- every case is an executor run inside the solve's own deadline, a
+# subprocess for Python and a container for Rust, and the repair loop re-runs
+# the whole suite on every round. Two of those runs were buying a re-answer to
+# a question already answered. The classes below are where implementations
+# actually break, and the budget belongs to them.
 #
 # "You have not written the program yet, and that is deliberate" is the whole
 # argument for splitting the turns. Cases written ALONGSIDE a program can be
@@ -278,8 +287,8 @@ runs.
 
 Write, in this order:
 
-1. THREE ordinary cases. Typical inputs, nothing special about them. These are
-   the common path, and a suite that tests only boundaries never checks it.
+1. ONE ordinary case. A typical input, nothing special about it. It is the
+   common path, and a suite that tests only boundaries never checks it.
 2. THE EMPTY VALUE, or zero: an empty list, an empty string, `0`, `{{}}` —
    whichever of them this statement allows.
 3. ONE: a single element, `n = 1`, the smallest legal input.
@@ -315,8 +324,8 @@ runs.
 
 Write, in this order:
 
-1. THREE ordinary cases. Typical inputs, nothing special about them. These are
-   the common path, and a suite that tests only boundaries never checks it.
+1. ONE ordinary case. A typical input, nothing special about it. It is the
+   common path, and a suite that tests only boundaries never checks it.
 2. THE EMPTY VALUE, or zero: the smallest legal input, a count of zero, and an
    empty payload after the count if the format allows one.
 3. ONE: a single element, `n = 1`.
@@ -696,14 +705,18 @@ def _thin(cases: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
     """At most ``limit`` cases, keeping the SHAPE of the coverage.
 
     A head-slice was what this used to do, and the turn-1 prompt inverts the
-    assumption that made it safe. Cases now arrive ordinary-first by explicit
-    instruction, so `cases[:limit]` keeps the three easy ones and throws away
-    the boundaries -- discarding exactly the cases the whole mechanism exists to
+    assumption that made it safe. Cases now arrive easiest-first by explicit
+    instruction, so `cases[:limit]` keeps the cheap ones and throws away the
+    boundaries -- discarding exactly the cases the whole mechanism exists to
     run, and doing it silently.
 
-    The first three are kept because the prompt puts the common path there, and
-    the rest are sampled at an even stride so no class is dropped wholesale
-    whatever order the model actually used.
+    The first three are kept because that is where the prompt's first three
+    classes sit -- the ordinary case, the empty value, and one -- and the rest
+    are sampled at an even stride so no class is dropped wholesale whatever
+    order the model actually used. Three stays right now that only ONE of them
+    is the ordinary case: the head is the common path plus the two degenerate
+    inputs every implementation has to survive, which is the smallest set worth
+    protecting from the stride.
     """
     if len(cases) <= limit:
         return list(cases)
