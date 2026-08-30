@@ -103,6 +103,14 @@ GRADE_FLOOR_S = 15.0
 # loop stops and the last version in hand goes out as it stands.
 ROUND_TRIP_FLOOR_S = 12.0
 
+# Under this, a round did not involve the model. `send` blocks on a chat UI
+# until the reply finishes -- tens of seconds, normally -- so a round that came
+# back in under a couple of seconds read something that was already on the page.
+# It is the difference between a model that answered the same way twice and a
+# tab that is handing back the previous answer forever, and only the second is
+# a reason to stop correcting.
+STALE_ROUND_S = 2.0
+
 
 class Conversation(Protocol):
     """One live, isolated model conversation.
@@ -1186,7 +1194,11 @@ class VerifyingSolver:
                 # No `extend_to_s`: `left` already runs to the point the
                 # answer stops being deliverable, so there is nothing past it to
                 # extend into.
+                round_started = time.monotonic()
                 reply = await conversation.send(prompt, max(1.0, left))
+                # How long the round trip actually took. Used only by the
+                # duplicate branch below, and only to tell a model from a tab.
+                round_s = time.monotonic() - round_started
                 # A repair reply may carry a CORRECTED case array: the repair
                 # prompt offers it outright ("or, if the case was wrong rather
                 # than the program, a `json` array holding ALL of the cases").
@@ -1399,31 +1411,46 @@ class VerifyingSolver:
                     )
                     break
                 if duplicate:
-                    # Same program, same failures: the round changed nothing,
-                    # and asking this conversation the same question again has
-                    # no new information to change it with. It is also the only
-                    # thing standing between a broken tab and a spin -- `send`
-                    # normally blocks on the model for tens of seconds, so the
-                    # budget bounds the rounds, but a read returning STALE text
-                    # returns it at once and the loop would resend the same
-                    # repair at machine speed for the whole budget.
-                    #
-                    # So: change something, rather than stop. Correcting runs
-                    # until the answer passes or the deadline stops it, and a
-                    # FRESH conversation is a real change where a re-ask is not
-                    # -- it is the same move the unreadable branch makes, for
-                    # the same reason, and `_resume_elsewhere` is that move.
-                    # Only when there is nowhere left to carry it does the loop
-                    # end, and it ends holding the best answer it ever had.
+                    # Same program, same failures: the round changed nothing.
+                    # Change something rather than re-ask -- a FRESH
+                    # conversation is a real change where a re-ask is not, and
+                    # `_resume_elsewhere` is that move.
                     carried = await _resume_elsewhere(
                         f"{provider or 'this model'} sent back the same program "
                         f"and the same failures after being shown them",
                         avoid=provider,
                     )
-                    if carried is None:
+                    if carried is not None:
+                        conversation, provider, prompt = carried
+                        continue
+                    # Nowhere left to carry it. Whether that ends the loop turns
+                    # on WHY the round changed nothing, and those are two
+                    # different things wearing one shape.
+                    #
+                    # A round that cost no time did not involve the model: the
+                    # read returned text that was already on the page. Re-asking
+                    # that spins at machine speed for the rest of the budget,
+                    # and this branch is the only thing standing between a
+                    # broken tab and that spin. Stop.
+                    #
+                    # A round that took a real round trip is the other thing
+                    # entirely -- the model answered, and answered the same.
+                    # Stopping there ended solves with the whole budget unspent:
+                    # measured, a model repeating itself once ended the loop at
+                    # 0.2s of a 60s budget, throwing away every round the clock
+                    # would still have paid for. Correcting runs until the
+                    # answer passes or the deadline stops it, and a model is
+                    # stochastic -- the next ask is a real chance, not a
+                    # certainty, and a real chance is what the remaining budget
+                    # is for. Fall through and ask again.
+                    if round_s < STALE_ROUND_S:
+                        print(
+                            f"[verify] {provider or 'this model'} returned the same "
+                            f"program in {round_s:.1f}s without being asked again — "
+                            f"the tab is replaying an old reply rather than "
+                            f"answering; submitting the last version"
+                        )
                         break
-                    conversation, provider, prompt = carried
-                    continue
                 if not candidate.defect and not candidate.failures:
                     break  # nothing actionable to report (no examples shipped)
                 # Kept apart, not merged into one list of "problems": a defect

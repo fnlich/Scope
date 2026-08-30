@@ -7457,6 +7457,100 @@ def test_a_fragment_does_not_displace_the_whole_program_above_it():
     assert _supersedes(fragment, Candidate(code="", raw=""), False)
 
 
+def test_a_model_repeating_itself_keeps_being_corrected_while_time_remains(monkeypatch):
+    """Correcting runs until the answer passes or the deadline stops it. A model
+    that answers the same way twice is not the deadline.
+
+    The duplicate guard used to end the loop outright once there was nowhere to
+    carry the repair — measured, a model repeating itself once ended a solve at
+    0.2s of a 60s budget and shipped `return 0`, throwing away every round the
+    clock would still have paid for. Models are stochastic: the next ask is a
+    real chance, and a real chance is what the remaining budget is for.
+
+    The budget below is under `RESUME_FLOOR_S`, so carrying the repair to a
+    fresh conversation is not on the table and the duplicate branch is what
+    decides. Each round takes a real round trip."""
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "STALE_ROUND_S", 0.3)
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    stuck = "```python\ndef g(n):\n    return 0\n```"
+    right = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+             "        t += n % 10\n        n //= 10\n    return t\n```")
+    sent: list[str] = []
+
+    class _Repeats(_Chat):
+        async def send(self, text, timeout_s):
+            sent.append(text)
+            if len(sent) == 1:
+                return cases
+            await asyncio.sleep(0.5)     # a real exchange, not a stale read
+            return right if len(sent) >= 5 else stuck
+
+    class _Backend2(_Backend):
+        async def open(self, avoid=None):
+            return _Repeats(self._replies, self._provider)
+
+    task = SolveTask(problem_id="stuck", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=30.0)
+    solver = verify.VerifyingSolver(_Backend2([]), reserve_s=0, max_budget_s=30,
+                                    second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=30.0))
+
+    assert len(sent) == 5, f"gave up while the clock was still running: {len(sent)}"
+    assert "while n > 0" in answer.code, answer.code
+    assert "replaying an old reply" not in log.getvalue(), (
+        "called a real round trip a stale read"
+    )
+
+
+def test_a_tab_replaying_an_old_reply_stops_instead_of_spinning(monkeypatch):
+    """The other side of it, and the reason the guard exists at all.
+
+    `send` blocks on the chat UI until the reply finishes, so a round that comes
+    back instantly read something already on the page. Re-asking that does not
+    cost a round trip — it costs nothing — and the loop would resend the same
+    repair at machine speed until the budget was gone, thousands of times, for
+    one answer that never changes.
+
+    Time is what tells the two apart, not the count: the model answering the
+    same way twice is worth another ask, and a tab that never asked anything is
+    not."""
+    from solvers import verify
+
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    stale = "```python\ndef g(n):\n    return 0\n```"
+    sent: list[str] = []
+
+    class _Stale(_Chat):
+        async def send(self, text, timeout_s):
+            sent.append(text)
+            return cases if len(sent) == 1 else stale    # instantly, every time
+
+    class _Backend2(_Backend):
+        async def open(self, avoid=None):
+            return _Stale(self._replies, self._provider)
+
+    task = SolveTask(problem_id="stale", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=30.0)
+    solver = verify.VerifyingSolver(_Backend2([]), reserve_s=0, max_budget_s=30,
+                                    second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=30.0))
+    out = log.getvalue()
+
+    assert len(sent) <= 4, f"spun on a tab that was not answering: {len(sent)}"
+    assert "replaying an old reply" in out, out
+    # The last version still goes out. A stale tab is a reason to stop asking,
+    # never a reason to submit nothing.
+    assert answer.code.strip() == "def g(n):\n    return 0", answer.code
+
+
 def test_an_answer_that_passed_every_case_it_had_is_reported_as_such():
     """`verified=False` is the only thing a live solve can print, and on its own
     it says nothing.
