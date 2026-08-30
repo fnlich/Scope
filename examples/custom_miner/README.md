@@ -1839,8 +1839,8 @@ without the dot: `--profile ~/hone-chrome/9222`.
 **3. The repository.**
 
 ```bash
-git clone https://github.com/fnlich/hone-subnet.git
-cd hone-subnet
+git clone https://github.com/fnlich/Scope.git
+cd Scope
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e '.[miner,dev]'
 pip install playwright          # no `playwright install` — you start the browser
@@ -1882,7 +1882,7 @@ open new ones, or add `&`.
 **6. Tell the miner about both.** From the repository root:
 
 ```bash
-cd /path/to/hone-subnet
+cd /path/to/Scope
 cat >> .env <<'EOF'
 CLAUDE_CDP=9222
 CHATGPT_CDP=9223
@@ -2072,7 +2072,7 @@ daemon it cannot reach is reported exactly like a daemon that is not running.
 Then **pull** the sandbox image. Do not build it:
 
 ```bash
-cd /path/to/hone-subnet
+cd /path/to/Scope
 docker pull "$(python -c 'from rlvr.policy import RELEASE_POLICY; print(RELEASE_POLICY.rust_image)')"
 ```
 
