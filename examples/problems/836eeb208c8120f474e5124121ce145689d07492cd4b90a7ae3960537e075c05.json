@@ -1,0 +1,17 @@
+{
+  "problem_id": "836eeb208c8120f474e5124121ce145689d07492cd4b90a7ae3960537e075c05",
+  "request": {
+    "problem_id": "836eeb208c8120f474e5124121ce145689d07492cd4b90a7ae3960537e075c05",
+    "language": "python",
+    "statement": "I’m building a tiny reactive runtime simulator that must preserve call-cohort and lifecycle behavior under overlapping subscriptions.\n\nDefine `simulate_runtime(objects, operations)`.\n\n`objects` is a list of `(object_id, methods)`. Each `methods` value is a list of `(method_name, capability)`, where capability is `\"ok\"`, `\"blocked\"`, or `\"missing\"`. Object IDs are distinct integers, and method names are distinct per object.\n\nEach operation is one of:\n\n- `(\"sub\", subscriber_id, object_id, kind, method_name)`\n- `(\"drop\", subscriber_id)`\n- `(\"enter\", call_id, object_id, method_name, arguments)`\n- `(\"leave\", call_id, arguments)`\n- `(\"start\", object_id)`\n- `(\"finish\", object_id)`\n\n`kind` is `\"before\"`, `\"after\"`, `\"dealloc_start\"`, or `\"dealloc_finish\"`. For lifecycle kinds, `method_name` is `None`. `arguments` is a sequence of integers.\n\nReturn subscribers in `sub` order as `(subscriber_id, events)`. Every event is one of:\n\n- `(\"before\", call_id, tuple(arguments))`\n- `(\"after\", call_id, tuple(arguments))`\n- `(\"dealloc_start\",)`\n- `(\"dealloc_finish\",)`\n- `(\"complete\",)`\n- `(\"error\", capability)`\n\nRules:\n\n1. Each object-method pair has one shared, initially unattempted interception registration. Its first `before` or `after` subscription attempts registration. `\"ok\"` succeeds permanently; another capability fails permanently. A subscription to a failed pair immediately receives `error` and terminates. A call is captured only if registration had succeeded before its `enter` operation.\n2. A captured `enter` publishes `before` to the corresponding subscribers active then. Its `leave` publishes `after`, using the leave arguments, only to corresponding subscribers that were already active at that call’s `enter` and remain active through its `leave`. Thus an `after` subscription created during a call cannot observe that call. Overlapping calls have independent eligibility.\n3. `dealloc_start` replays its latest event: `start` publishes it, and later subscribers receive it immediately. Other streams do not replay.\n4. `finish` first publishes `dealloc_finish`, then sends `complete` to every active subscription on that object. A subscription created after `finish` immediately receives only `complete`; this takes precedence over registration failure and replay.\n5. `drop` silently terminates that subscription. Errors, completion, and dropping prevent all later events.\n6. Subscriptions created after `start` but before `finish` remain legal. Calls do not occur during that interval.\n\nOperations are valid: subscriber and call IDs are unique; calls are properly paired; every `leave` precedes its object’s `start`; lifecycle operations occur at most once and in order; invoked methods are listed and not `\"missing\"`.\n\nThere are at most 200,000 objects, methods, and operations each, at most 20 integers per argument sequence, and at most 400,000 returned events. Use only the Python standard library; perform no I/O.",
+    "entrypoint": "simulate_runtime",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 627271482
+  },
+  "response": {
+    "problem_id": "836eeb208c8120f474e5124121ce145689d07492cd4b90a7ae3960537e075c05",
+    "code": "",
+    "raw_response": ""
+  }
+}

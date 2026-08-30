@@ -1,0 +1,17 @@
+{
+  "problem_id": "0238d37f82db1786496b399505cd9d4494f13b5c3076c6f3165328d903e7ca2d",
+  "request": {
+    "problem_id": "0238d37f82db1786496b399505cd9d4494f13b5c3076c6f3165328d903e7ca2d",
+    "language": "python",
+    "statement": "Implement `analyze_probe(stdout_chunks, exit_code, timed_out)`.\n\n`stdout_chunks` is a list of strings whose concatenation is a subprocess transcript, split arbitrarily, with total length at most 4,000,000 characters. Return one dictionary as specified below.\n\nDivide the concatenated transcript at `\\n`; the final unterminated line is also a line. Remove one trailing `\\r` per line. A protocol line starts exactly with `@probe `; its remainder must be one complete standard JSON object with no duplicate object keys. Everything else is noise.\n\nAn object is recognized only if `run` is a nonempty string, `kind` is `start`, `batch`, `done`, or `error`, and `seq` is a nonnegative integer; booleans are not integers. Process recognized events in line order.\n\nEach run has at most one active epoch. A `start` discards its active epoch. It is valid only with `seq` 0 and exactly either the keys `run, kind, seq`, or those keys plus `base`, where `base` is a nonempty string. Without `base`, the epoch starts empty. With `base`, it inherits all names from the latest valid `done` epoch previously completed by that base run. If none exists, the start is invalid. An invalid recognized start leaves its run poisoned until another start. Completed `done` snapshots remain available despite later starts or errors, including when `base` equals `run`.\n\nA valid epoch expects sequence numbers 1, 2, ... . A recognized non-start event is ignored without an active unpoisoned epoch. Otherwise, any violation poisons it:\n- `seq` must be expected.\n- `batch` has exactly `run, kind, seq, names, total`. `names` is a nonempty list of distinct nonempty strings, none already present, including inherited names. `total` is a nonnegative integer equal to the resulting number of names.\n- `done` has exactly `run, kind, seq, count`, where `count` is a nonnegative integer equal to the current number of names. It completes the epoch and replaces that run's saved snapshot.\n- `error` has exactly `run, kind, seq, type, message`, where `type` is a nonempty string and `message` is a string. It completes the epoch but does not replace any snapshot.\n\nIncrement the expected sequence only after a valid batch. Among completed epochs, the terminal event occurring last is the final payload.\n\nReturn exactly:\n- `{\"category\": \"timeout\"}` if `timed_out` is true.\n- `{\"category\": \"missing_payload\"}` if no final payload exists, a final `done` has nonzero `exit_code`, or a final `error` has zero `exit_code`.\n- For a consistent `done`, category `empty_discovery` when count is zero, otherwise `success`, plus `run` and `count`.\n- For a consistent `error`, category `reported_exception`, plus `run`, `type`, and the first 200 Unicode code points of `message`.\n\nInputs have the stated types. Use only the Python standard library and perform no I/O.",
+    "entrypoint": "analyze_probe",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 1755241114
+  },
+  "response": {
+    "problem_id": "0238d37f82db1786496b399505cd9d4494f13b5c3076c6f3165328d903e7ca2d",
+    "code": "",
+    "raw_response": ""
+  }
+}

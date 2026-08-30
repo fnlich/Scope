@@ -1,0 +1,17 @@
+{
+  "problem_id": "5b5976e568b872844ed6ae69aa3a4e81eb91dc89e7ff9a7233767d23e243e498",
+  "request": {
+    "problem_id": "5b5976e568b872844ed6ae69aa3a4e81eb91dc89e7ff9a7233767d23e243e498",
+    "language": "python",
+    "statement": "Define `convert_profiles(payloads, profiles, queries)`.\n\nA profile is `(pcs, channels, forward, inverse)`. `pcs` is `\"XYZ\"` or `\"Lab\"`, `channels` is 1 through 6, and the pipelines are lists of payload indices. A forward pipeline maps `channels` values to 3 PCS values; an inverse pipeline maps 3 PCS values to `channels` values.\n\nEach payload is one stage:\n\n* `(\"C\", tables)`: one table per current channel, each containing 2 through 4097 samples in `[0,1]`. For input `x`, linearly interpolate at `u=x*(n-1)`.\n* `(\"M\", rows)`: with `c` current channels, each row has `c+1` floats and produces `row[c] + sum(row[j]*x[j] for j in range(c))`. The row count becomes the channel count.\n* `(\"L\", shape, outputs, data)`: `shape` contains one grid size from 2 through 17 per current channel. `data` contains `product(shape)` tuples of length `outputs`, with values in `[0,1]`. At coordinates `x[j]*(shape[j]-1)`, use multilinear interpolation over surrounding vertices. Flatten indices in row-major order, last dimension fastest.\n\nClamp every result independently to `[0,1]` after every stage. Payloads may be shared.\n\nPCS values use D50 white `(0.9642,1,0.8249)`. XYZ triples are direct. For encoded Lab `p`, let `L=100*p[0]`, `a=255*p[1]-128`, `b=255*p[2]-128`, `fy=(L+16)/116`, `fx=fy+a/500`, and `fz=fy-b/200`. With `d=6/29`, let `g(u)=u**3` if `u>d`, otherwise `3*d*d*(u-4/29)`. Decode to `(0.9642*g(fx),g(fy),0.8249*g(fz))`.\n\nTo encode XYZ as Lab, divide by the matching white component and apply `f(t)=t**(1/3)` if `t>d**3`, otherwise `t/(3*d*d)+4/29`. Then `L=116*f(Y)-16`, `a=500*(f(X)-f(Y))`, and `b=200*(f(Y)-f(Z))`; encode `(L/100,(a+128)/255,(b+128)/255)`. Clamp every encoded PCS component before an inverse pipeline.\n\nEach profile has an initially unset current-color register. A query is `(source, destination, color)`, where `color` is either a byte-integer sequence or `None`. An explicit color with wrong source channel count produces `None` and changes no register. `None` uses the source register; if unset, it likewise produces `None` with no change. Otherwise, a valid explicit color first replaces the source register.\n\nNormalize the resolved color by 255, run the source forward pipeline, convert through XYZ into the destination PCS, and run its inverse pipeline. Quantize each result as `floor(255*clamp(x)+0.5)`. This tuple is the output and replaces the destination register, including when source equals destination.\n\nFor every valid query, convert the quantized result back directly through the destination and source profiles. This diagnostic conversion does not change registers. Count an exact round trip when every returned byte equals the resolved source color.\n\nReturn `(outputs, exact_count)` in query order. Inputs and pipeline dimensions are valid. There are at most 200 profiles, 300,000 stored samples, 12 stages per pipeline, and 50,000 queries. No final value is within `1e-10` of a quantization half-boundary.",
+    "entrypoint": "convert_profiles",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 875363529
+  },
+  "response": {
+    "problem_id": "5b5976e568b872844ed6ae69aa3a4e81eb91dc89e7ff9a7233767d23e243e498",
+    "code": "",
+    "raw_response": ""
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "problem_id": "497978ea013b61ad1670276b404231fe553508984ec5bb97a7fd7da78f276e54",
+  "request": {
+    "problem_id": "497978ea013b61ad1670276b404231fe553508984ec5bb97a7fd7da78f276e54",
+    "language": "rust",
+    "statement": "## Dynamic Adapter Snapshot Fusion\n\nWrite one complete Rust program containing `fn main()` that maintains a fused view of `K` network-adapter statistics fields. Only the Rust standard library may be used.\n\n### Input\n\nThe first line contains `K E LP LF B`, where `1 <= K,E <= 500000`. `LP` and `LF` are preferred and fallback freshness lifetimes, and `B` is the preferred provider's quarantine duration. All are positive integers.\n\nThe next token is a length-`K` binary string describing the preferred provider's initial field capabilities.\n\nThen follow `E` events. Each starts with timestamp `t`; timestamps are nondecreasing.\n\n- `t P i x` — preferred reading `x` for field `i`.\n- `t F i x` — fallback reading `x` for field `i`.\n- `t C l r b` — set preferred capability to `b` for every field from `l` through `r`, inclusive.\n- `t X` — preferred-provider failure.\n- `t Q` — query the fused snapshot.\n\nFields are numbered from `1` to `K`; `b` is `0` or `1`. Values are unsigned 64-bit integers. Timestamps, lifetimes, quarantine durations, and their required sums fit in unsigned 64-bit integers.\n\nBefore every event, all readings expiring at its timestamp are removed and any completed quarantine ends. Events with equal timestamps are then processed in input order.\n\nA reading accepted at time `s` is fresh exactly for timestamps `t` satisfying `s <= t < s + L`, using its provider's lifetime. A newer accepted reading replaces the previous reading from that provider for that field, including at the same timestamp.\n\nInitially the preferred provider is active with zero failures. While active, a `P` event is accepted only if its field is currently preferred-capable; an accepted `P` resets the failure count. An active `X` increments the count. On the third failure since the last accepted `P`, quarantine begins immediately and lasts throughout `[t,t+B)`. While quarantined, `P` and `X` events are ignored. When quarantine ends, the failure count becomes zero.\n\nCapability changes and fallback readings are always processed. Changing capability does not erase stored preferred readings: a still-fresh reading can become selectable again after capability is restored. Quarantine also does not erase readings.\n\nFor each field at a query:\n\n1. If the preferred provider is active, the field is currently preferred-capable, and its preferred reading is fresh, select that reading.\n2. Otherwise, select its fresh fallback reading if present.\n3. Otherwise, the field is missing.\n\n### Output\n\nFor every `Q`, print:\n\n`PC FC M C/K H`\n\n`PC` and `FC` are fields selected from preferred and fallback, `M` is missing fields, and `C = PC + FC`. `C/K` is the literal unreduced fraction. `H` is `sum(i * selected_value_i) mod 1000000007` using one-based field numbers.\n\nOutput is compared by splitting only on ASCII whitespace bytes `0x09` through `0x0D` and `0x20`, then comparing tokens exactly.",
+    "entrypoint": "main",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 1858044614
+  },
+  "response": {
+    "problem_id": "497978ea013b61ad1670276b404231fe553508984ec5bb97a7fd7da78f276e54",
+    "code": "",
+    "raw_response": ""
+  }
+}

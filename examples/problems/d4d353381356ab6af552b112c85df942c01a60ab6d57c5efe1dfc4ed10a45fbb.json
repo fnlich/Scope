@@ -1,0 +1,17 @@
+{
+  "problem_id": "d4d353381356ab6af552b112c85df942c01a60ab6d57c5efe1dfc4ed10a45fbb",
+  "request": {
+    "problem_id": "d4d353381356ab6af552b112c85df942c01a60ab6d57c5efe1dfc4ed10a45fbb",
+    "language": "rust",
+    "statement": "I'm implementing an expiring, versioned IP-indicator matcher in Rust and need an efficient deterministic solution.\n\nWrite one complete Rust program containing `fn main()` using only the standard library. Do not use unsafe code.\n\nInput begins with an integer `Q`, followed by `Q` commands, numbered from `1` through `Q`:\n\n- `SET id digest expiry k p1 ... pk`\n- `DEL id`\n- `ASK address`\n\n`id` is an integer from `1` to `10^9`. `digest` is a nonempty lowercase alphanumeric string of length at most 32. `expiry` is a command number satisfying the current command number `<= expiry <= 10^18`. Each `pi` is an IPv4 or IPv6 prefix written as `address/length`. Host bits are ignored. IPv4 uses dotted decimal without leading zeroes. IPv6 uses hexadecimal groups with at most one `::`; zone identifiers and embedded dotted-decimal suffixes are absent. All input is valid.\n\nAt the beginning of every command numbered `t`, every rule whose stored expiry is less than `t` is automatically removed with all its prefix memberships.\n\nA `SET` creates or refreshes one rule:\n\n1. If the rule is currently active and its stored digest equals `digest`, the entire refresh is ignored, including the supplied expiry and prefix list.\n2. Otherwise, all memberships of its old version are detached, and the supplied digest, expiry, and prefix list become active.\n3. The resulting version remains active through the end of command `expiry`, unless replaced or deleted earlier.\n4. Duplicate normalized prefixes within one `SET` count only once.\n5. Different rules may share a prefix. Removing, replacing, or expiring one rule must not affect any other rule, including a newer version whose ID reused an earlier version's ID.\n\n`DEL` removes the currently active rule and all its memberships. Deleting an absent rule does nothing.\n\nNormalize IPv4 into IPv6-mapped space: IPv4 address `a.b.c.d` becomes `::ffff:a.b.c.d`, and IPv4 prefix length `L` becomes `96+L`. Native IPv6 values are unchanged. Thus an IPv4 prefix may coincide with a native IPv6 prefix covering the same mapped bits.\n\nFor `ASK`, normalize the address likewise. Among all active normalized prefixes containing it, select the greatest prefix length. Output all rule IDs attached to that single prefix in increasing order. Shorter prefixes contribute nothing. If none matches, output `0`; otherwise output the number of IDs followed by those IDs.\n\nConstraints:\n\n- `1 <= Q <= 300000`\n- The sum of all `k` values is at most `600000`.\n- The total number of printed IDs is at most `600000`.\n\nPrint one line per `ASK`. Output is judged by splitting only on ASCII whitespace bytes `0x09` through `0x0D` and `0x20`, then comparing tokens exactly.",
+    "entrypoint": "main",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 680364346
+  },
+  "response": {
+    "problem_id": "d4d353381356ab6af552b112c85df942c01a60ab6d57c5efe1dfc4ed10a45fbb",
+    "code": "",
+    "raw_response": ""
+  }
+}

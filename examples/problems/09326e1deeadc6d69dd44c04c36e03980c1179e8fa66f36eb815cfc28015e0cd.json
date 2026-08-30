@@ -1,0 +1,17 @@
+{
+  "problem_id": "09326e1deeadc6d69dd44c04c36e03980c1179e8fa66f36eb815cfc28015e0cd",
+  "request": {
+    "problem_id": "09326e1deeadc6d69dd44c04c36e03980c1179e8fa66f36eb815cfc28015e0cd",
+    "language": "python",
+    "statement": "A controller receives a compressed stream of conversion records from two ADC units. Each unit has one shared integer smoother and threshold monitor. A threshold crossing emits a hardware pulse that immediately resets that unit’s smoother, so one compressed run may contain many crossings.\n\nImplement `adc_crossings(initial, reset, strength, mode, bound, enabled_masks, runs)`.\n\nThe first six arguments are length-2 integer sequences indexed by unit.\n\n- `initial[u]` and `reset[u]` are in `0..10^9`. They are respectively the state before the stream and the state loaded by a crossing pulse.\n- `1 <= strength[u] <= 30`.\n- `mode[u]` is `1` for an upper monitor, `-1` for a lower monitor, or `0` for a disabled monitor.\n- `bound[u]` is in `0..10^9` and is ignored when disabled.\n- Bit `c` of `enabled_masks[u]` states whether channel `c` is enabled, for channels `0..31`.\n\nEach element of `runs` is `(count, unit, channel, tag_unit, tag_channel, arbitration_lost, raw)` and represents `count` consecutive identical records. Here `1 <= count`, unit fields are 0 or 1, channel fields are in `0..31`, `arbitration_lost` is 0 or 1, and `raw` is in `0..10^9`. There are at most 200,000 runs, and the sum of counts is at most `10^18`.\n\nA record is accepted exactly when its channel is enabled, both tags equal its unit and channel, and either its unit is 1 or `arbitration_lost` is 0. Valid inputs always have `arbitration_lost == 0` for unit 1. Rejected records have no effect.\n\nFor an accepted value `x`, state `y` becomes\n\n`x + trunc((y - x) / 2**strength[u])`,\n\nwhere `trunc` rounds toward zero. The updated state satisfies the monitor when it is at least `bound[u]` in upper mode or at most `bound[u]` in lower mode.\n\nA crossing occurs when this update changes the condition from false to true. Its expanded-stream position is recorded, then the same unit’s state is immediately replaced by `reset[u]`. The triggering sample is not processed again. The monitor condition for the next accepted sample is determined from that reset state. Disabled monitors never cross or reset. True-to-false changes are not recorded.\n\nReturn one tuple `(first, period, amount)` for every input run containing crossings, in run order. `first` is the 1-based expanded-stream position of that run’s first crossing, and `amount` is its number of crossings. If `amount == 1`, `period` must be 0; otherwise all crossings in that run occur at `first + k*period` for `k = 0..amount-1`. Rejected records still count toward positions. Return no tuple for a run without crossings.\n\nThe function must be deterministic, use only the Python standard library, and perform no input/output.",
+    "entrypoint": "adc_crossings",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 1632813819
+  },
+  "response": {
+    "problem_id": "09326e1deeadc6d69dd44c04c36e03980c1179e8fa66f36eb815cfc28015e0cd",
+    "code": "",
+    "raw_response": ""
+  }
+}

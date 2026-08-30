@@ -1,0 +1,17 @@
+{
+  "problem_id": "3e9729d1e7235c78347ed0d7726c8daf9a84d56f74701651a2a69b3a8ee68e1e",
+  "request": {
+    "problem_id": "3e9729d1e7235c78347ed0d7726c8daf9a84d56f74701651a2a69b3a8ee68e1e",
+    "language": "python",
+    "statement": "Define `serialize_literal_collection(values, width, indent_even, indent_odd)`.\n\n`values` is a list of at most 100,000 elements, each either a string or `None`. The total number of characters in its strings is at most 1,000,000. Strings contain no carriage-return or newline characters. `width` is an integer from 2 through 10^9. `indent_even` and `indent_odd` are integers satisfying `0 <= indent_even, indent_odd < width`. The input additionally satisfies `len(values) * max(indent_even, indent_odd) <= 1,000,000`.\n\nDiscard every `None` and empty string, preserving the order of all remaining values. Convert each retained value into a literal by replacing every single quote `'` with two single quotes `''`, then surrounding the result with single quotes. Backslashes and all other characters remain unchanged. Widths are measured in Unicode code points.\n\nIf no literals remain, return `@()`.\n\nFirst form the compact representation `@(` followed by the literals separated by comma-space, followed by `)`. If its width is at most `width`, return it.\n\nOtherwise return a multiline representation. Its first line is `@(` and its last line is `)`. Between them, partition the literals into nonempty consecutive content lines. Number content lines from zero. An even-numbered content line begins with exactly `indent_even` spaces; an odd-numbered line begins with exactly `indent_odd` spaces. Each line separates its literals with comma-space. Every content line except the last ends with a comma; the last does not.\n\nA content line is valid if its width is at most `width`. A wider line is valid only when it contains exactly one literal. Thus every partition into singleton lines is valid.\n\nThe score of a valid partition is the sum, over its content lines, of `(width - line_width) ** 2`. A permitted over-width singleton contributes zero instead.\n\nChoose a partition of minimum score. If several partitions have the same score, list each partition's content-line starting indices from its last line backward, using zero-based indices among retained literals. Choose the partition whose resulting sequence is lexicographically largest.\n\nReturn the selected lines joined by `\\n`. The function must be deterministic, use only the Python standard library, and access no filesystem or external state.",
+    "entrypoint": "serialize_literal_collection",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 1382490570
+  },
+  "response": {
+    "problem_id": "3e9729d1e7235c78347ed0d7726c8daf9a84d56f74701651a2a69b3a8ee68e1e",
+    "code": "",
+    "raw_response": ""
+  }
+}

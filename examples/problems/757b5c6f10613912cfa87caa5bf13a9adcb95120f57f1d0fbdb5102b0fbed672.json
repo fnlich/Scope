@@ -1,0 +1,17 @@
+{
+  "problem_id": "757b5c6f10613912cfa87caa5bf13a9adcb95120f57f1d0fbdb5102b0fbed672",
+  "request": {
+    "problem_id": "757b5c6f10613912cfa87caa5bf13a9adcb95120f57f1d0fbdb5102b0fbed672",
+    "language": "python",
+    "statement": "Implement `resolve_workflow(parent, rules, selections)`.\n\nEvent types form a rooted hierarchy. `parent` has length `n`, `parent[0] == -1`, and `0 <= parent[i] < i` for every `i > 0`.\n\nEach catalog rule is `[node, entity, first, last, priority]`:\n- `node` is an event type.\n- `entity` is a nonempty string.\n- The rule's time window includes selection indices `first` through `last`.\n- While applicable, it covers `node` and every descendant of `node`.\n- `priority` is an integer.\n\nEvery rule has an enabled switch, initially on. Each selection is `[event, add_conditions, add_actions, toggles]`, where `toggles` contains distinct rule indices. Before resolving that selection, flip each listed rule's enabled switch. Toggling does not alter its time window.\n\nAt selection index `t`, a rule is applicable when all of these hold:\n- its switch is enabled after that selection's toggles;\n- `first <= t <= last`;\n- its `node` is an ancestor of the selected `event`, including equality.\n\nThe inferred entity comes from the applicable rule chosen by, in order:\n1. greatest hierarchy depth of `node`;\n2. greatest `priority`;\n3. smallest index in `rules`.\n\nIf no rule is applicable, the inferred entity is `None`.\n\nThe editor initially has inferred entity `None` and empty ordered condition and action lists. For each selection:\n1. Apply its toggles and resolve the new inferred entity.\n2. If that entity differs from the preceding inferred entity, discard all stored conditions and actions. A reset occurred exactly when at least one item was discarded.\n3. Add the stated numbers of conditions and actions. These items are valid for the newly inferred entity. Both counts are guaranteed to be zero when it is `None`.\n\nReturn one entry per selection:\n`[entity, reset, discarded_conditions, discarded_actions]`.\n\n`entity` is a string or `None`; `reset` is Boolean. Discarded counts include only items removed in step 2, not items added by the current selection. Merely toggling rules does not itself cause a reset unless the resolved entity changes.\n\nConstraints:\n- `1 <= n <= 100_000`\n- `0 <= len(rules) <= 100_000`\n- `1 <= len(selections) <= 100_000`\n- `0 <= first <= last < len(selections)` for every rule\n- Every toggle index is valid.\n- Priorities and addition counts fit signed 32-bit integers; addition counts are nonnegative.\n- `n + len(rules) + len(selections) +` the total number of toggle occurrences is at most `250_000`.\n\nUse only the Python standard library. Return the result directly. Do not perform I/O, access files or networks, mutate arguments, or depend on global state.",
+    "entrypoint": "resolve_workflow",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 800679050
+  },
+  "response": {
+    "problem_id": "757b5c6f10613912cfa87caa5bf13a9adcb95120f57f1d0fbdb5102b0fbed672",
+    "code": "",
+    "raw_response": ""
+  }
+}

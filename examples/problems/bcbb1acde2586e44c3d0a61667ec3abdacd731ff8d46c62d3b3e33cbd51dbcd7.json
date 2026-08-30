@@ -1,0 +1,17 @@
+{
+  "problem_id": "bcbb1acde2586e44c3d0a61667ec3abdacd731ff8d46c62d3b3e33cbd51dbcd7",
+  "request": {
+    "problem_id": "bcbb1acde2586e44c3d0a61667ec3abdacd731ff8d46c62d3b3e33cbd51dbcd7",
+    "language": "python",
+    "statement": "Implement `solve_status_index(facilities, assigned, queries)`.\n\nAll values are exact 32-bit status words. A word representation is an integer from `-2147483648` through `4294967295`; negative values are interpreted as signed 32-bit and normalized to the same low 32 bits.\n\n`facilities` is a list of `(name, priority, severity_mask, ranges)`.\n\n- `name` is a unique nonempty string.\n- `priority` is an integer.\n- `severity_mask` is an integer from 0 through 15; bit `s` enables severity `s`.\n- Severity of normalized word `w` is `(w >> 30) & 3`.\n- `ranges` is a list of `(start, end, exclusions)`.\n- `exclusions` is a list of `(start, end)` word-representation pairs applying only to that enclosing range.\n- The total number of enclosing ranges plus exclusion ranges is at most 200,000.\n\nEvery range and exclusion is an inclusive cyclic unsigned interval. If normalized `start <= end`, it contains that ordinary interval. Otherwise it contains `start` through `0xffffffff` and `0` through `end`.\n\nAn enclosing range claims `w` exactly when:\n\n1. it contains `w`;\n2. `w`'s severity is enabled by the facility mask; and\n3. none of that range's exclusions contains `w`.\n\nOverlapping exclusions have union semantics. Exclusions may extend outside their enclosing range.\n\nA range's `claim_size` is the exact number of distinct 32-bit words it claims after both severity filtering and exclusions. A zero-size range makes no claims. Multiple ranges, including ranges from one facility, may claim the same word.\n\nThe winning claim for `w` has the minimum key\n`(claim_size, -priority, facility_position, range_position)`.\nPositions are zero-based input positions, with range position local to its facility.\n\n`assigned` is a list of `(facility_name, symbol, value)`:\n\n- `symbol` is a nonempty string;\n- at most 200,000 records are present;\n- every `(facility_name, normalized_value)` pair is unique;\n- the named facility has at least one claim on that value.\n\nAssignments in nonwinning facilities are hidden.\n\n`queries` contains at most 200,000 word representations; repetitions are allowed. Return a list aligned with `queries`:\n\n- no claim: `(\"OUTSIDE\",)`\n- winning facility without an assignment at that word: `(\"RESERVED\", facility_name)`\n- winning facility with an assignment: `(\"ASSIGNED\", facility_name, symbol)`\n\nEmpty inputs are permitted. Do not mutate inputs. Enumeration of status words is forbidden. Performance must support all maximum totals.\n\nPython contract: define `solve_status_index`; accept positional or keyword arguments; use only the standard library; perform no I/O, filesystem or network access, global-state dependence, or nondeterministic behavior.",
+    "entrypoint": "solve_status_index",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 711666365
+  },
+  "response": {
+    "problem_id": "bcbb1acde2586e44c3d0a61667ec3abdacd731ff8d46c62d3b3e33cbd51dbcd7",
+    "code": "",
+    "raw_response": ""
+  }
+}

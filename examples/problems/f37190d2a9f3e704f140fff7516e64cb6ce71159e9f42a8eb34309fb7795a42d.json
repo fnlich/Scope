@@ -1,0 +1,17 @@
+{
+  "problem_id": "f37190d2a9f3e704f140fff7516e64cb6ce71159e9f42a8eb34309fb7795a42d",
+  "request": {
+    "problem_id": "f37190d2a9f3e704f140fff7516e64cb6ce71159e9f42a8eb34309fb7795a42d",
+    "language": "rust",
+    "statement": "Write one complete Rust program containing fn main(). Only the Rust standard library may be used.\n\nThe input describes N transactional metadata actions. The first token is N. Action i, numbered from 1, contains:\n\nparent schema P partition_1 ... partition_P U key_1 value_1 ... key_U value_U R removed_key_1 ... removed_key_R\n\nHere 0 <= parent < i. Parent 0 has no schema and an empty property map. If schema is =, the parent’s schema is inherited; otherwise it replaces it. Property updates are applied to the parent’s map in input order, then all listed keys are removed, so removal wins. Partition columns are replaced, not inherited.\n\nAll items are nonempty ASCII whitespace-separated tokens. Counts and parent indices are correctly formatted. Input length is at most 2,000,000 bytes and N <= 200,000. Counting an inherited schema each time it is used, the sum of top-level field counts over all actions is at most 1,000,000.\n\nA schema has grammar:\n\nType := i | s | b | a<Type> | r<Field[,Field...]>\nField := Name#Id:Type\n\nName matches [A-Za-z_][A-Za-z0-9_]*. Id is from 1 through 1,000,000,000. The effective outermost type must be r<...>. Angle-bracket nesting is at most 200.\n\nAn action is invalid if its parent is invalid, it has no effective schema, or any following condition holds:\n- an explicit schema violates the grammar;\n- within any r<...>, field names duplicate after ASCII lowercasing;\n- any field name lowercases to _row_id or _commit_version;\n- a partition is not a Name, duplicates another partition after ASCII lowercasing, or does not match exactly one top-level field case-insensitively;\n- update keys are not distinct, removal keys are not distinct, or any such key fails [a-z][a-z0-9_.]*;\n- the final mapping property is neither name nor id;\n- in id mode, two fields anywhere have the same Id.\n\nThe mode is the final mapping value, or name if absent. An invalid action has no usable state, so every action naming it as parent is invalid.\n\nValid actions are equivalent as follows. Top-level partition fields are separated from data fields. Partition order is ignored; data-field order and every nested field order remain significant. In name mode, fields are identified by ASCII-lowercased names and Ids are ignored. In id mode, fields are identified by Ids and names are ignored. Types and recursive structure must agree.\n\nProperties ignore input order. mapping is represented by the effective mode, making absent mapping equivalent to mapping=name. Keys beginning tmp. are ignored. Other keys and values compare byte-for-byte.\n\nNumber valid equivalence classes by first appearance, starting at 1. Print 0 for invalid actions and otherwise their class number, in action order.\n\nOutput is judged by splitting only on ASCII whitespace bytes and comparing tokens exactly.",
+    "entrypoint": "main",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 1186563340
+  },
+  "response": {
+    "problem_id": "f37190d2a9f3e704f140fff7516e64cb6ce71159e9f42a8eb34309fb7795a42d",
+    "code": "",
+    "raw_response": ""
+  }
+}

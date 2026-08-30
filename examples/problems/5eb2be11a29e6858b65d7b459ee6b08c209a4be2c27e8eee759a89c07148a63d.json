@@ -1,0 +1,17 @@
+{
+  "problem_id": "5eb2be11a29e6858b65d7b459ee6b08c209a4be2c27e8eee759a89c07148a63d",
+  "request": {
+    "problem_id": "5eb2be11a29e6858b65d7b459ee6b08c209a4be2c27e8eee759a89c07148a63d",
+    "language": "rust",
+    "statement": "Write one complete Rust program containing `fn main()` that manages a mutable ordered feed and answers pagination requests. Use only the Rust standard library.\n\nInput begins with `N Q`, where `1 <= N,Q <= 200000`. Records have immutable identifiers `1..N` and initially occur in that order. The next token is a binary string `S` of length `N`; record `i` is initially visible iff `S[i]='1'`.\n\nThen follow `Q` operations:\n\n- `SET l r b`: set the visibility of every record currently at feed positions `l..r` to `b`, where `b` is `0` or `1`.\n- `FLIP l r`: toggle visibility for every record currently at positions `l..r`.\n- `REV l r`: reverse the order of all records currently at positions `l..r`. Visibility moves with each record.\n- `COUNT`: output the current number of visible records.\n- `PAGE c t e x`: request a page, where `1 <= c <= 10^18`, `0 <= t < c`, `e` is `0` or `1`, and `x` is one whitespace-delimited token.\n\nAll operation ranges satisfy `1 <= l <= r <= N`. Visible records are listed in their current feed order. Let their count be `n`. Ordinarily they form consecutive pages containing at most `c` visible records. If there are at least two ordinary pages and the last ordinary page contains from `1` through `t` records, merge that entire page into its predecessor. The resulting final page may contain more than `c` records.\n\nIf `n=0`, then `e=0` produces zero pages, while `e=1` produces one empty page.\n\nThe token `x` is a valid integer token exactly when it consists of an optional `+` or `-` followed by one or more ASCII decimal digits. Its mathematical value is unbounded. Process it in this order:\n\n- Invalid token: output `INVALID`.\n- Value at most zero: output `LOW`.\n- Zero pages: output `EMPTY`.\n- Otherwise, select page `x` when it exists; if `x` exceeds the page count, select the final page.\n\nFor a selected nonempty page output:\n\n`status p pages prev next start end first last`\n\n`status` is `EXACT` if page `x` existed and `FALLBACK` otherwise. `p` is the selected one-based page; `prev` and `next` are `1` exactly when such neighboring pages exist. `start` and `end` are one-based positions in the visible-record sequence. `first` and `last` are the immutable identifiers of those endpoint records.\n\nFor the unique empty page, use the same format with `start end first last` all `0`.\n\nOutput is compared by splitting on ASCII whitespace bytes and comparing all tokens exactly.",
+    "entrypoint": "main",
+    "public_examples": [],
+    "deadline_s": 300.0,
+    "prompt_variant": 1220407640
+  },
+  "response": {
+    "problem_id": "5eb2be11a29e6858b65d7b459ee6b08c209a4be2c27e8eee759a89c07148a63d",
+    "code": "",
+    "raw_response": ""
+  }
+}
