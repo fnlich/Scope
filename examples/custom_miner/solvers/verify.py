@@ -557,6 +557,42 @@ class VerifyingSolver:
         # ...and so is a deadline being cut short by our own configuration.
         self._warned_short_deadline = False
 
+    def _next_pass_blocked_by(
+        self, best: Candidate, attempt_no: int, remaining: float
+    ) -> Optional[str]:
+        """Why the pass after this one will not happen, or None if it will.
+
+        Asked in TWO places, and it has to answer the same in both: at the top
+        of the next iteration, which ACTS on it, and at the bottom of this one,
+        which ANNOUNCES it. They were separate expressions and they drifted --
+        the announcement asked only `attempt_no < passes` and knew nothing
+        about the clock, so a solve that had spent its entire budget printed
+
+            [verify] claude returned nothing; asking another model
+            [verify] -0s left; not enough to ask anyone else, submitting empty
+
+        one line apart. Nobody was asked. An operator reading that goes looking
+        for a second provider's failure that never happened, while the real one
+        -- a program turn that ran the budget out -- sits three lines above it
+        wearing no emphasis at all.
+        """
+        empty_handed = not best.code.strip()
+        if not empty_handed and attempt_no >= SECOND_OPINION_PASSES:
+            # There is an answer in hand and it has already had its second
+            # opinion. `MAX_PASSES` is for the empty case only: spending it
+            # here would double or quadruple what every failing task costs a
+            # real account's quota, to improve on something already worth
+            # submitting.
+            return "the answer in hand has already had its second opinion"
+        floor_s = EMPTY_HANDED_FLOOR_S if empty_handed else SECOND_OPINION_FLOOR_S
+        if remaining < floor_s:
+            return (
+                "not enough to ask anyone else, submitting empty"
+                if empty_handed
+                else "no time for a second opinion"
+            )
+        return None
+
     # -- the Solver interface custom_miner.py expects ---------------------- #
     async def solve_task(self, task, timeout_s: float) -> Answer:
         started = time.monotonic()
@@ -646,26 +682,13 @@ class VerifyingSolver:
             # The first pass always runs, however little is left: bailing here
             # would return nothing having asked nobody.
             if attempt_no:
-                empty_handed = not best.code.strip()
-                if not empty_handed and attempt_no >= SECOND_OPINION_PASSES:
-                    # There is an answer in hand and it has already had its
-                    # second opinion. `MAX_PASSES` is for the empty case only:
-                    # spending it here would double or quadruple what every
-                    # failing task costs a real account's quota, to improve on
-                    # something already worth submitting.
-                    break
-                floor_s = (
-                    EMPTY_HANDED_FLOOR_S if empty_handed else SECOND_OPINION_FLOOR_S
-                )
-                if remaining < floor_s:
-                    print(
-                        f"[verify] {remaining:.0f}s left; "
-                        + (
-                            "not enough to ask anyone else, submitting empty"
-                            if empty_handed
-                            else "no time for a second opinion"
-                        )
-                    )
+                blocked = self._next_pass_blocked_by(best, attempt_no, remaining)
+                if blocked is not None:
+                    # `max(0, ...)`: the budget can be a hair past spent by the
+                    # time this reads it, and "-0s left" reads as a bug in the
+                    # arithmetic rather than as a solve that used everything it
+                    # had.
+                    print(f"[verify] {max(0.0, remaining):.0f}s left; {blocked}")
                     break
             attempt_no += 1
             candidate, provider = await self._attempt(
@@ -688,10 +711,24 @@ class VerifyingSolver:
             # because two ungradeable candidates tie at `score` and `>` loses a
             # tie. Twice the time and twice the quota for no information at all.
             if best.total == 0:
-                if best.from_self_tests:
-                    # Not ungradeable after all: the model shipped cases and
-                    # they ran. The warning below is about having NOTHING to
-                    # run and would be false here.
+                if best.from_self_tests or not best.code.strip():
+                    # Two ways this warning would be a lie, and the second was
+                    # printed against a solve whose cases turn had worked
+                    # perfectly.
+                    #
+                    # `from_self_tests`: the model shipped cases and they ran,
+                    # so there was something to grade after all.
+                    #
+                    # NO CODE: `_run_self_tests` is gated on `code.strip()`, so
+                    # an empty candidate reports `from_self_tests=False`
+                    # whatever turn 1 produced -- and the warning then blames
+                    # the cases turn for the PROGRAM turn's failure. Measured:
+                    # a Rust solve whose cases turn returned usable cases in
+                    # silence, whose program turn then spent the whole 285s
+                    # budget still writing, and which reported "the model sent
+                    # no usable cases of its own either". Nothing can be graded
+                    # because there is no ANSWER, and the lines that say the
+                    # answer is missing already say so, about the right turn.
                     pass
                 elif not self._warned_ungradeable:
                     self._warned_ungradeable = True
@@ -712,7 +749,9 @@ class VerifyingSolver:
                 # whole payment.
                 if best.code.strip():
                     break
-            if attempt_no < passes:
+            if attempt_no < passes and self._next_pass_blocked_by(
+                best, attempt_no, budget - (time.monotonic() - started)
+            ) is None:
                 print(
                     f"[verify] {provider or 'first'} "
                     + (

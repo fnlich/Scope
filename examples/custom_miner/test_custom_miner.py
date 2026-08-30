@@ -7047,6 +7047,82 @@ def test_a_gradeable_failure_still_buys_a_second_opinion():
     assert len(asked) == 2, "a rankable failure should still ask the other model"
 
 
+def test_a_solve_that_used_its_whole_budget_does_not_promise_another_model(capsys):
+    """Both halves of a real log, from a Rust solve that submitted nothing.
+
+        [verify] claude was still writing when the budget ran out; nothing
+                 arrived to submit rather than interrupting it with a repair
+                 prompt
+        [verify] no public examples shipped with this task, and the model sent
+                 no usable cases of its own either, so nothing can be graded
+                 locally...
+        [verify] claude returned nothing; asking another model
+        [verify] -0s left; not enough to ask anyone else, submitting empty
+
+    Two of those four lines are false, and both point the reader away from what
+    actually went wrong -- a program turn that spent the entire 285s budget with
+    the model still writing.
+
+    "asking another model" was decided by `attempt_no < passes` alone, which
+    knows nothing about the clock; the loop head then re-decided it WITH the
+    clock and asked nobody. `_next_pass_blocked_by` is now the single answer
+    both lines read.
+
+    "the model sent no usable cases of its own either" was decided by
+    `from_self_tests`, which `_run_self_tests` only ever sets when there was
+    code to run the cases against. The cases turn here worked perfectly -- it
+    is the reply BELOW it that never arrived -- so an empty answer always
+    libelled turn 1 for turn 2's failure.
+    """
+    burned: list[str] = []
+
+    class _StillWriting(_Chat):
+        still_writing = False
+
+        async def send(self, text, timeout_s):
+            burned.append(text)
+            reply = await super().send(text, timeout_s)
+            if len(burned) >= 2:
+                # The program turn: the model is thinking, and it is still
+                # thinking when the budget is gone.
+                self.still_writing = True
+                self.empty_reason = "unfinished"
+                await asyncio.sleep(4.0)
+                return ""
+            return reply
+
+    class _Backend2(_Backend):
+        async def open(self, avoid=None):
+            return _StillWriting(self._replies, self._provider)
+
+    task = SolveTask(
+        problem_id="burned", language="python",
+        statement="Return the sum of the decimal digits of n.", entrypoint="g",
+        public_examples=[], deadline_s=3.0,
+    )
+    # `CASES` first, so turn 1 genuinely produces usable cases -- the whole
+    # point of the second assertion below.
+    solver = VerifyingSolver(_Backend2([CASES, ""]), reserve_s=0, max_budget_s=3,
+                             second_opinion=True)
+    answer = asyncio.run(solver.solve_task(task, timeout_s=3.0))
+    out = capsys.readouterr().out
+
+    assert not answer.code.strip(), "this reproduction is meant to submit nothing"
+    assert len(burned) == 2, f"expected a cases turn and a program turn: {len(burned)}"
+    assert "still writing when the budget ran out" in out, out
+    # 1. Nobody was asked, so nobody may be promised.
+    assert "asking another model" not in out, (
+        "promised a second model with the budget already spent:\n" + out
+    )
+    assert "not enough to ask anyone else" in out, out
+    # 2. Turn 1 delivered cases. The failure was turn 2's.
+    assert "no usable cases of its own" not in out, (
+        "blamed the cases turn for the program turn's failure:\n" + out
+    )
+    # 3. A budget that is a hair past spent reads as spent, not as negative.
+    assert "-0s left" not in out, out
+
+
 def test_the_archive_line_names_a_directory_you_can_find(tmp_path, monkeypatch, capsys):
     """`SOLVER_SOLUTION_DIR` defaults to the relative "solutions", so the line
     read "archived under solutions/" and left the reader to work out which
