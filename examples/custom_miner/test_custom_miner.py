@@ -8893,6 +8893,89 @@ def test_a_corrected_case_counts_as_progress_even_with_the_program_untouched():
     assert len(sent) == 3, [s[:40] for s in sent]
 
 
+def test_a_correction_too_late_to_grade_still_beats_the_answer_it_corrects():
+    """The bug this exists for, end to end: phase 3 returned the RIGHT program
+    and phase 2's wrong one was submitted.
+
+    `score` puts a 0 in the self-tests slot for a candidate that FAILED them and
+    for one that was never RUN, and those are not the same thing. `_grade`
+    declines to grade below `GRADE_FLOOR_S` — there may be no time — so a
+    correction that arrives late scores (0,0,1,1) against the wrong program's
+    (0,1,1,1) and loses to the answer it was correcting.
+
+    Betting on the correction is right rather than merely safe: a program known
+    to fail one of its own cases is a certain zero, payment being
+    all-or-nothing, while an ungraded correction is at worst the same zero and
+    was written by a model that had just been shown what was wrong."""
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "single", "args": [7], "expected": 7},\n'
+             ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    wrong = "```python\ndef g(n):\n    return 0\n```"          # passes 1 of 3
+    right = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+             "        t += n % 10\n        n //= 10\n    return t\n```")
+
+    class _Chat:
+        provider = "claude"
+        still_writing = False
+
+        def __init__(self):
+            self.n = -1
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            self.n += 1
+            # The correction takes most of the budget to arrive, so by the time
+            # it is graded there is less than GRADE_FLOOR_S left.
+            await asyncio.sleep(28.0 if self.n == 2 else 0.0)
+            return [cases, wrong, right][min(self.n, 2)]
+
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None, timeout_s=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    task = SolveTask(problem_id="p", language="python",
+                     statement="Sum the digits of n.", entrypoint="g",
+                     public_examples=[], deadline_s=40.0)
+    with contextlib.redirect_stdout(io.StringIO()):
+        answer = asyncio.run(
+            VerifyingSolver(_Fleet(), safety_margin_s=0, max_budget_s=40.0,
+                            second_opinion=False).solve_task(task, timeout_s=40.0))
+
+    assert "while n > 0" in answer.code, (
+        f"submitted the program the repair round corrected: {answer.code!r}"
+    )
+
+
+def test_an_ungraded_answer_never_displaces_one_that_passed():
+    """The other side of it. "Unknown beats known-bad" must not become "unknown
+    beats known-good": a candidate that passed everything it was graded on keeps
+    its higher score, and the first rule holds it in place."""
+    from solvers.verify import Candidate, _supersedes
+
+    passing = Candidate(code="def g(n): return n", raw="", self_passed=3,
+                        self_total=3, from_self_tests=True)
+    failing = Candidate(code="def g(n): return 0", raw="", self_passed=1,
+                        self_total=3, failures=["case 2 ..."], from_self_tests=True)
+    ungraded = Candidate(code="def g(n): return n + 0", raw="")
+    empty = Candidate(code="", raw="")
+    broken = Candidate(code="def g(", raw="", defect="not valid Python")
+
+    assert _supersedes(ungraded, failing, False), "a correction lost to a failure"
+    assert not _supersedes(ungraded, passing, False), "unknown displaced known-good"
+    # An ungraded NON-answer is not a correction of anything.
+    assert not _supersedes(empty, failing, False)
+    assert not _supersedes(broken, failing, False)
+    # A graded better answer still wins outright, and a tie still goes later.
+    assert _supersedes(passing, failing, False)
+    assert _supersedes(failing, failing, False), "a tie must go to the later one"
+    # ...except while the model is still writing, where a fragment must not
+    # displace the finished program above it.
+    assert not _supersedes(failing, failing, True)
+    assert not _supersedes(ungraded, failing, True)
+
+
 def test_a_repair_may_send_the_corrected_cases_ALONE():
     """The reply the repair prompt asks for by name, and the one the miner had
     no answer to.

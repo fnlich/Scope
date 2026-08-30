@@ -142,6 +142,21 @@ class Candidate:
         return self.defect is None and self.total > 0 and self.passed == self.total
 
     @property
+    def graded(self) -> bool:
+        """Was anything actually RUN on this candidate?
+
+        `score` cannot tell "failed its tests" from "was never tested" -- both
+        put 0 in the same slot -- and the difference decides which answer ships.
+        See `_supersedes`.
+        """
+        return self.total > 0 or self.self_total > 0
+
+    @property
+    def failing(self) -> bool:
+        """Graded, and something came back wrong. A certain zero on chain."""
+        return self.graded and bool(self.failures)
+
+    @property
     def score(self) -> tuple[int, int, int, int]:
         """Ranking key for 'best so far' — the validator's examples, then the
         model's own cases, then non-empty, then runnable.
@@ -174,6 +189,56 @@ class Candidate:
             1 if self.code.strip() else 0,
             0 if self.defect else 1,
         )
+
+
+def _supersedes(candidate: Candidate, best: Candidate, still_writing: bool) -> bool:
+    """Should `candidate` replace `best` as the answer that ships?
+
+    Three rules, in order.
+
+    SCORES HIGHER wins, which is the ordinary case.
+
+    A TIE goes to the LATER candidate, and that is not a coin toss: this one was
+    written after seeing the failure report, so it is the model's considered
+    revision of the one already in hand. Strict `>` made every repair round a
+    no-op whenever the score could not move -- and the score cannot move when a
+    CASE is wrong. Measured: turn 1 wrote a case no correct program can pass,
+    attempt 1 scored 1/2, the model rewrote the program properly, the rewrite
+    tied at 1/2 and was thrown away, and the first draft shipped.
+
+    UNKNOWN BEATS KNOWN-BAD, and this is the one that had to be added. `score`
+    puts a 0 in the self-tests slot for a candidate that FAILED them and for one
+    that was never RUN, and those are not the same thing. So a correction that
+    arrived too late in the budget to grade -- `_grade` declines below
+    `GRADE_FLOOR_S` -- scored (0,0,1,1) against the wrong program's (0,1,1,1)
+    and LOST to the answer it was correcting. Reproduced end to end: phase 3
+    returned the right program, `self=1/3` went out, and the file held phase 2's
+    code. That is precisely what a repair loop exists to prevent.
+
+    Betting on the correction is right rather than merely safe. A program known
+    to fail one of its own cases is a certain zero -- payment here is
+    all-or-nothing -- while an ungraded correction is at worst the same zero,
+    and it was written by a model that had just been shown what was wrong. It
+    must still be an ANSWER: non-empty, and past the structural checks, which
+    run whatever the budget says.
+
+    A best that passed everything it was graded on is never displaced this way.
+    Its `score` is higher, so the first rule keeps it.
+    """
+    if still_writing:
+        # A fragment of an answer rather than a revision of one. It must not
+        # displace the finished program above it, on a tie or on a guess.
+        return candidate.score > best.score
+    if candidate.score > best.score:
+        return True
+    if candidate.score == best.score:
+        return True
+    return (
+        not candidate.graded
+        and best.failing
+        and candidate.defect is None
+        and bool(candidate.code.strip())
+    )
 
 
 class _Grader:
@@ -1070,30 +1135,10 @@ class VerifyingSolver:
                     last_program_reply = reply
                 if revised:
                     agreed = revised
-                if best is None or candidate.score > best.score:
-                    best, best_provider = candidate, provider
-                elif candidate.score == best.score and not getattr(
-                    conversation, "still_writing", False
+                if best is None or _supersedes(
+                    candidate, best,
+                    getattr(conversation, "still_writing", False),
                 ):
-                    # A TIE goes to the later candidate, and that is not a
-                    # coin toss: this one was written after seeing the failure
-                    # report, so it is the model's considered revision of the
-                    # one already in hand.
-                    #
-                    # Strict `>` made every repair round a no-op whenever the
-                    # score could not move -- and the score cannot move when a
-                    # case is WRONG. Measured: turn 1 wrote a case no correct
-                    # program can pass, attempt 1 scored 1/2, the model then
-                    # rewrote the program properly, and the rewrite tied at 1/2
-                    # and was thrown away. The miner submitted the first draft
-                    # and the model's last word never left the tab. With three
-                    # bogus cases pinning a solve at 17/20, that is every
-                    # remaining round.
-                    #
-                    # Not when the model was STILL WRITING, though. What
-                    # arrived there is a fragment of an answer rather than a
-                    # revision of one, and a fragment that happens to parse and
-                    # tie must not displace the finished program above it.
                     best, best_provider = candidate, provider
                 if candidate.verified and not candidate.failures:
                     break
