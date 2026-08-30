@@ -8948,10 +8948,19 @@ def test_a_correction_too_late_to_grade_still_beats_the_answer_it_corrects():
     )
 
 
-def test_an_ungraded_answer_never_displaces_one_that_passed():
-    """The other side of it. "Unknown beats known-bad" must not become "unknown
-    beats known-good": a candidate that passed everything it was graded on keeps
-    its higher score, and the first rule holds it in place."""
+def test_the_latest_version_is_the_one_that_ships():
+    """The whole rule. No score is compared.
+
+    A round only happens because the one before it was wrong — the loop ends the
+    moment there is no defect and no failure — so every candidate after the
+    first exists BECAUSE the model was shown what was wrong and asked to correct
+    it. The later program is the corrected one, and ranking them against each
+    other asks a question that has already been answered.
+
+    Scoring them did real damage: `score` cannot tell "failed its tests" from
+    "was never tested", so a correction too late in the budget to grade lost to
+    the answer it was correcting. Every refinement of the comparison was another
+    way to get that wrong; not comparing cannot."""
     from solvers.verify import Candidate, _supersedes
 
     passing = Candidate(code="def g(n): return n", raw="", self_passed=3,
@@ -8959,21 +8968,51 @@ def test_an_ungraded_answer_never_displaces_one_that_passed():
     failing = Candidate(code="def g(n): return 0", raw="", self_passed=1,
                         self_total=3, failures=["case 2 ..."], from_self_tests=True)
     ungraded = Candidate(code="def g(n): return n + 0", raw="")
-    empty = Candidate(code="", raw="")
     broken = Candidate(code="def g(", raw="", defect="not valid Python")
 
+    # Later wins, in every direction, whatever was or was not run on either.
     assert _supersedes(ungraded, failing, False), "a correction lost to a failure"
-    assert not _supersedes(ungraded, passing, False), "unknown displaced known-good"
-    # An ungraded NON-answer is not a correction of anything.
-    assert not _supersedes(empty, failing, False)
-    assert not _supersedes(broken, failing, False)
-    # A graded better answer still wins outright, and a tie still goes later.
-    assert _supersedes(passing, failing, False)
-    assert _supersedes(failing, failing, False), "a tie must go to the later one"
-    # ...except while the model is still writing, where a fragment must not
-    # displace the finished program above it.
-    assert not _supersedes(failing, failing, True)
-    assert not _supersedes(ungraded, failing, True)
+    assert _supersedes(ungraded, passing, False), "a later version was ranked out"
+    assert _supersedes(failing, passing, False)
+    assert _supersedes(broken, passing, False)
+    assert _supersedes(failing, failing, False)
+
+    # In a real solve the second of those cannot arise: a candidate that passed
+    # everything ENDS the loop, so nothing later is ever asked for.
+    assert not passing.failures and passing.self_passed == passing.self_total
+
+
+def test_nothing_arriving_is_not_a_later_version():
+    """The one thing that is not a version of the answer, and it is not a
+    judgement about how good the code is. An empty capture is the ABSENCE of an
+    answer — a dead tab, a reply that rendered as prose, a read that timed out —
+    and it must never displace a program already in hand."""
+    from solvers.verify import Candidate, _supersedes
+
+    program = Candidate(code="def g(n): return 0", raw="", self_passed=1,
+                        self_total=3, failures=["case 2 ..."], from_self_tests=True)
+    empty = Candidate(code="", raw="")
+    whitespace = Candidate(code="   \n  ", raw="")
+
+    assert not _supersedes(empty, program, False)
+    assert not _supersedes(whitespace, program, False)
+    # ...but it is still better than nothing at all.
+    assert _supersedes(program, empty, False)
+
+
+def test_a_fragment_of_a_reply_still_being_written_is_not_a_version():
+    """The other exception, and the same kind of thing: what arrived is a
+    fragment of a REPLY rather than a revision of one. A fragment that happens
+    to parse must not displace the finished program above it."""
+    from solvers.verify import Candidate, _supersedes
+
+    finished = Candidate(code="def g(n): return 0", raw="", self_passed=1,
+                         self_total=3, failures=["case 2 ..."], from_self_tests=True)
+    fragment = Candidate(code="def g(n):\n    t = 0\n    while n > 0:", raw="")
+
+    assert not _supersedes(fragment, finished, True)
+    # Unless there is nothing to displace: half an answer beats none.
+    assert _supersedes(fragment, Candidate(code="", raw=""), True)
 
 
 def test_a_repair_may_send_the_corrected_cases_ALONE():

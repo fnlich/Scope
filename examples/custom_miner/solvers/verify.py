@@ -142,24 +142,15 @@ class Candidate:
         return self.defect is None and self.total > 0 and self.passed == self.total
 
     @property
-    def graded(self) -> bool:
-        """Was anything actually RUN on this candidate?
-
-        `score` cannot tell "failed its tests" from "was never tested" -- both
-        put 0 in the same slot -- and the difference decides which answer ships.
-        See `_supersedes`.
-        """
-        return self.total > 0 or self.self_total > 0
-
-    @property
-    def failing(self) -> bool:
-        """Graded, and something came back wrong. A certain zero on chain."""
-        return self.graded and bool(self.failures)
-
-    @property
     def score(self) -> tuple[int, int, int, int]:
         """Ranking key for 'best so far' — the validator's examples, then the
         model's own cases, then non-empty, then runnable.
+
+        Used BETWEEN PASSES only, where two models answered the same problem
+        independently and neither saw the other -- there, grading is the only
+        thing that can separate them. Within one pass the rounds are corrections
+        of each other and the latest simply wins; see `_supersedes`, and the
+        damage this ranking did when it was applied there too.
 
         A defect ranks BELOW clean code that merely could not be graded, and
         that is not cosmetic. Without a defect term at all, a first answer with
@@ -194,51 +185,37 @@ class Candidate:
 def _supersedes(candidate: Candidate, best: Candidate, still_writing: bool) -> bool:
     """Should `candidate` replace `best` as the answer that ships?
 
-    Three rules, in order.
+    THE LATEST VERSION WINS. No score is compared, and that is the whole rule.
 
-    SCORES HIGHER wins, which is the ordinary case.
+    A round only happens because the one before it was wrong: the loop ends the
+    moment there is no defect and no failure, so every candidate after the first
+    exists BECAUSE the model was shown what was wrong with its predecessor and
+    asked to correct it. The later program is the corrected one. Ranking them
+    against each other asks a question that has already been answered.
 
-    A TIE goes to the LATER candidate, and that is not a coin toss: this one was
-    written after seeing the failure report, so it is the model's considered
-    revision of the one already in hand. Strict `>` made every repair round a
-    no-op whenever the score could not move -- and the score cannot move when a
-    CASE is wrong. Measured: turn 1 wrote a case no correct program can pass,
-    attempt 1 scored 1/2, the model rewrote the program properly, the rewrite
-    tied at 1/2 and was thrown away, and the first draft shipped.
+    Scoring them did real damage. `Candidate.score` cannot tell "failed its
+    tests" from "was never tested" -- both put 0 in the same slot -- so a
+    correction that arrived too late in the budget to grade scored (0,0,1,1)
+    against the wrong program's (0,1,1,1) and LOST to the answer it was
+    correcting. Reproduced end to end: phase 3 returned the right program,
+    `self=1/3` went out, and the file held phase 2's code. Every refinement of
+    the comparison was another way to get that wrong; not comparing cannot.
 
-    UNKNOWN BEATS KNOWN-BAD, and this is the one that had to be added. `score`
-    puts a 0 in the self-tests slot for a candidate that FAILED them and for one
-    that was never RUN, and those are not the same thing. So a correction that
-    arrived too late in the budget to grade -- `_grade` declines below
-    `GRADE_FLOOR_S` -- scored (0,0,1,1) against the wrong program's (0,1,1,1)
-    and LOST to the answer it was correcting. Reproduced end to end: phase 3
-    returned the right program, `self=1/3` went out, and the file held phase 2's
-    code. That is precisely what a repair loop exists to prevent.
+    Two things are still not versions of the answer, and neither is a judgement
+    about how good the code is:
 
-    Betting on the correction is right rather than merely safe. A program known
-    to fail one of its own cases is a certain zero -- payment here is
-    all-or-nothing -- while an ungraded correction is at worst the same zero,
-    and it was written by a model that had just been shown what was wrong. It
-    must still be an ANSWER: non-empty, and past the structural checks, which
-    run whatever the budget says.
-
-    A best that passed everything it was graded on is never displaced this way.
-    Its `score` is higher, so the first rule keeps it.
+    * NOTHING ARRIVED. An empty capture is the absence of an answer rather than
+      a worse one -- a dead tab, a reply that rendered as prose, a read that
+      timed out. It must never displace a program already in hand.
+    * THE MODEL IS STILL WRITING. What arrived is a fragment of a reply rather
+      than a revision of one, and a fragment that happens to parse must not
+      displace the finished program above it.
     """
+    if not candidate.code.strip():
+        return False
     if still_writing:
-        # A fragment of an answer rather than a revision of one. It must not
-        # displace the finished program above it, on a tie or on a guess.
-        return candidate.score > best.score
-    if candidate.score > best.score:
-        return True
-    if candidate.score == best.score:
-        return True
-    return (
-        not candidate.graded
-        and best.failing
-        and candidate.defect is None
-        and bool(candidate.code.strip())
-    )
+        return not best.code.strip()
+    return True
 
 
 class _Grader:

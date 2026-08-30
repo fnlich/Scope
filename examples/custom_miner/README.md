@@ -995,6 +995,42 @@ that had to succeed.
 the time the answer needs to be graded, archived, signed and put on the wire
 before the validator stops listening.
 
+### The latest version is the one that ships
+
+No score is compared between the rounds of a solve. A round only happens because
+the one before it was wrong — the loop ends the moment there is no defect and no
+failure — so every candidate after the first exists *because* the model was
+shown what was wrong and asked to correct it. The later program is the corrected
+one, and ranking them against each other asks a question that has already been
+answered.
+
+Scoring them did real damage. `Candidate.score` cannot tell *"failed its tests"*
+from *"was never tested"* — both put `0` in the same slot:
+
+```
+phase 2, graded, fails 2 of 3 : (0, 1, 1, 1)
+phase 3, corrected, NOT graded: (0, 0, 1, 1)   ← ranks LOWER
+```
+
+so a correction that arrived too late in the budget to grade lost to the answer
+it was correcting. Reproduced end to end: phase 3 returned the right program,
+`self=1/3` went out, and the file held phase 2's code. Every refinement of the
+comparison was another way to get that wrong; not comparing cannot.
+
+Two things are still not versions of the answer, and neither is a judgement
+about how good the code is:
+
+- **Nothing arrived.** An empty capture is the *absence* of an answer rather
+  than a worse one — a dead tab, a reply that rendered as prose, a read that
+  timed out. It never displaces a program already in hand.
+- **The model is still writing.** What arrived is a fragment of a reply rather
+  than a revision of one, and a fragment that happens to parse must not displace
+  the finished program above it.
+
+`score` still decides **between passes**, where two models answered the same
+problem independently and neither saw the other. There, grading is the only
+thing that can separate them.
+
 ### A repair carries the error and nothing else
 
 The correction prompt is the evidence plus one sentence naming what may come
