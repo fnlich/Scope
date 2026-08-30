@@ -98,7 +98,6 @@ def build_solver(browsers: Optional[Sequence[Browser]] = None) -> VerifyingSolve
         # turns a nearly-right answer into a paid one, and there is no partial
         # credit for stopping early. Set it to cap the rounds anyway.
         max_attempts=int(os.environ.get("SOLVER_MAX_ATTEMPTS", "0")),
-        safety_margin_s=float(os.environ.get("SOLVER_SAFETY_MARGIN_S", "20")),
         # The largest deadline the protocol allows (`TaskRequest.deadline_s` is
         # `le=3600`), so it cannot bind on a spec-compliant request: the budget
         # is the deadline the validator advertised, minus what delivering the

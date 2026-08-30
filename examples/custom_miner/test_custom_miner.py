@@ -115,7 +115,7 @@ class _Backend:
 
 
 def _solver(replies, **kw):
-    kw.setdefault("safety_margin_s", 0)
+    kw.setdefault("reserve_s", 0)
     kw.setdefault("max_budget_s", 120)
     return VerifyingSolver(_Backend(replies), **kw)
 
@@ -302,7 +302,7 @@ class _SlowBackend:
 
 
 def test_a_solve_never_outruns_its_advertised_deadline():
-    solver = VerifyingSolver(_SlowBackend(), max_attempts=9, safety_margin_s=0, max_budget_s=30)
+    solver = VerifyingSolver(_SlowBackend(), max_attempts=9, reserve_s=0, max_budget_s=30)
     started = time.monotonic()
     result = asyncio.run(solver.solve_task(DIGITS, timeout_s=30))
     assert time.monotonic() - started < 30
@@ -310,7 +310,7 @@ def test_a_solve_never_outruns_its_advertised_deadline():
 
 
 def test_the_safety_margin_is_held_back_from_the_advertised_deadline():
-    solver = VerifyingSolver(_SlowBackend(), max_attempts=9, safety_margin_s=15, max_budget_s=240)
+    solver = VerifyingSolver(_SlowBackend(), max_attempts=9, reserve_s=15, max_budget_s=240)
     started = time.monotonic()
     asyncio.run(solver.solve_task(DIGITS, timeout_s=40))
     assert time.monotonic() - started < 30  # 40s advertised minus a 15s margin
@@ -322,7 +322,7 @@ def test_a_dead_backend_yields_an_empty_answer_rather_than_an_exception():
         async def aclose(self): pass
         def stats(self): return {}
     result = asyncio.run(
-        VerifyingSolver(Broken(), safety_margin_s=0, max_budget_s=60).solve_task(DIGITS, 60)
+        VerifyingSolver(Broken(), reserve_s=0, max_budget_s=60).solve_task(DIGITS, 60)
     )
     assert isinstance(result, Answer) and result.code == ""
 
@@ -396,7 +396,7 @@ async def _use_dead_tab(pool: BrowserFleet) -> None:
         def stats(self): return pool.stats()
 
     await VerifyingSolver(
-        LeaseOnly(), max_attempts=1, safety_margin_s=0, max_budget_s=30,
+        LeaseOnly(), max_attempts=1, reserve_s=0, max_budget_s=30,
         second_opinion=False,   # this is about tab replacement, not two models
     ).solve_task(DIGITS, timeout_s=30)
     await _settle(pool)
@@ -1035,7 +1035,7 @@ def test_a_second_opinion_asks_the_other_model_only_when_the_first_fails():
 
     # First model gets it right: one provider asked.
     seen.clear()
-    solver = VerifyingSolver(_Fleet([[RIGHT], [RIGHT]]), safety_margin_s=0, max_budget_s=120)
+    solver = VerifyingSolver(_Fleet([[RIGHT], [RIGHT]]), reserve_s=0, max_budget_s=120)
     answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
     assert answer.verified and seen == ["claude"], seen
     assert solver.stats()["providers"]["claude"]["verified"] == 1
@@ -1043,7 +1043,7 @@ def test_a_second_opinion_asks_the_other_model_only_when_the_first_fails():
     # First model keeps failing: the other one is asked and wins.
     seen.clear()
     solver = VerifyingSolver(
-        _Fleet([[WRONG, WRONG, WRONG], [RIGHT]]), safety_margin_s=0, max_budget_s=120
+        _Fleet([[WRONG, WRONG, WRONG], [RIGHT]]), reserve_s=0, max_budget_s=120
     )
     answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
     assert answer.verified and seen == ["claude", "chatgpt"], seen
@@ -1067,7 +1067,7 @@ def test_an_ungradeable_task_does_not_pay_for_a_second_opinion():
         entrypoint="g", public_examples=[], deadline_s=120.0,
     )
     solver = VerifyingSolver(
-        _Counting([RIGHT]), safety_margin_s=0, max_budget_s=120, second_opinion=True
+        _Counting([RIGHT]), reserve_s=0, max_budget_s=120, second_opinion=True
     )
     answer = asyncio.run(solver.solve_task(task, 120.0))
     assert answer.code, "the answer still comes back"
@@ -1098,7 +1098,7 @@ def test_an_ungradeable_task_still_buys_a_second_opinion_when_the_first_is_empty
         entrypoint="g", public_examples=[], deadline_s=120.0,
     )
     solver = VerifyingSolver(
-        _Silent([""]), safety_margin_s=0, max_budget_s=120, second_opinion=True
+        _Silent([""]), reserve_s=0, max_budget_s=120, second_opinion=True
     )
     answer = asyncio.run(solver.solve_task(task, 120.0))
     assert calls == ["first", "claude"], f"never fell back: {calls}"
@@ -1117,7 +1117,7 @@ def test_the_second_opinion_can_be_turned_off():
         def stats(self): return {}
 
     solver = VerifyingSolver(
-        _Fleet(), max_attempts=1, safety_margin_s=0, max_budget_s=120, second_opinion=False
+        _Fleet(), max_attempts=1, reserve_s=0, max_budget_s=120, second_opinion=False
     )
     asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
     assert seen == [None], seen
@@ -2513,7 +2513,7 @@ def test_the_repair_round_hears_about_the_defect_not_about_the_examples():
         _Backend2(['```json\n[{"name": "n", "args": ["\\n"], "expected": "42"}]\n```',
                    "```rust\nfn helper() {}\n```",
                    '```rust\nfn main() { println!("42"); }\n```']),
-        safety_margin_s=0, max_budget_s=120,
+        reserve_s=0, max_budget_s=120,
     )
     answer = asyncio.run(solver.solve_task(task, 120.0))
 
@@ -4250,7 +4250,7 @@ def test_the_log_names_which_model_produced_the_answer(capsys):
 
     # chatgpt answers correctly and is never followed up.
     backend = _TwoModels([("chatgpt", [RIGHT])])
-    asyncio.run(VerifyingSolver(backend, safety_margin_s=0, max_budget_s=120)
+    asyncio.run(VerifyingSolver(backend, reserve_s=0, max_budget_s=120)
                 .solve_task(task, 60.0))
     logged = capsys.readouterr().out
     assert "provider=chatgpt" in logged, f"the log cannot say who answered: {logged!r}"
@@ -4263,7 +4263,7 @@ def test_the_log_names_which_model_produced_the_answer(capsys):
     backend = _TwoModels([("chatgpt", [WRONG, WRONG, WRONG]),
                           ("claude", ["no code here"]),
                           ("claude", ["no code here"])])
-    asyncio.run(VerifyingSolver(backend, safety_margin_s=0, max_budget_s=120)
+    asyncio.run(VerifyingSolver(backend, reserve_s=0, max_budget_s=120)
                 .solve_task(task, 60.0))
     logged = capsys.readouterr().out
     assert backend.seen[0] == "chatgpt" and "claude" in backend.seen, backend.seen
@@ -4345,10 +4345,9 @@ def test_every_round_reads_against_everything_that_is_left():
 
     source = inspect.getsource(VerifyingSolver._attempt)
     assert "first_share" not in source, "the private slice is back"
-    # `left` is the whole of what remains, and `spare` is the margin's grading
-    # share -- not a reserve carved out of the budget, and spent only on a model
-    # that is still writing. See `_read`.
-    assert "_read(conversation, prompt, left, spare)" in source, source[:200]
+    # `left` is the whole of what remains: one reserve is taken out of the
+    # deadline, and it is taken out before `budget` is computed.
+    assert "conversation.send(prompt, max(1.0, left))" in source, source[:200]
 
 
 def test_the_examples_decide_when_the_statement_is_ambiguous():
@@ -5011,7 +5010,7 @@ def test_a_missing_executor_says_the_same_thing_on_live_traffic(capsys):
         async def aclose(self): pass
         def stats(self): return {}
 
-    solver = VerifyingSolver(_Unused(), max_attempts=1, safety_margin_s=0)
+    solver = VerifyingSolver(_Unused(), max_attempts=1, reserve_s=0)
 
     def unavailable(*a, **kw):
         raise RuntimeError("DockerExecutor could not contact the Docker daemon")
@@ -5035,7 +5034,7 @@ def _stub_solver():
         async def aclose(self): pass
         def stats(self): return {"tabs": 1}
 
-    return VerifyingSolver(_Unused(), max_attempts=1, safety_margin_s=0)
+    return VerifyingSolver(_Unused(), max_attempts=1, reserve_s=0)
 
 
 def test_a_box_with_neither_rust_check_says_so_before_it_costs_anything(capsys):
@@ -5317,7 +5316,7 @@ def test_a_win_is_not_credited_to_a_model_that_did_not_produce_it():
         def stats(self): return {}
 
     solver = VerifyingSolver(
-        _Anonymous(), max_attempts=1, safety_margin_s=0, max_budget_s=120
+        _Anonymous(), max_attempts=1, reserve_s=0, max_budget_s=120
     )
     answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
     assert answer.verified, "the second pass was supposed to win"
@@ -5552,7 +5551,7 @@ def test_opening_a_tab_is_bounded_by_the_solve_budget():
         async def aclose(self): pass
         def stats(self): return {}
 
-    solver = VerifyingSolver(_Slow(), safety_margin_s=0, max_budget_s=40,
+    solver = VerifyingSolver(_Slow(), reserve_s=0, max_budget_s=40,
                              second_opinion=False)
     asyncio.run(solver.solve_task(
         SolveTask(problem_id="p", language="python", statement="s", entrypoint="g",
@@ -5574,7 +5573,7 @@ def test_a_backend_without_a_lease_timeout_is_still_bounded():
         async def aclose(self): pass
         def stats(self): return {}
 
-    solver = VerifyingSolver(_TwoArg(), safety_margin_s=0, max_budget_s=12,
+    solver = VerifyingSolver(_TwoArg(), reserve_s=0, max_budget_s=12,
                              second_opinion=False)
     started = time.monotonic()
     answer = asyncio.run(solver.solve_task(
@@ -6165,7 +6164,7 @@ def _rehearsal_solver(reply, provider="claude"):
     backend = _Backend()
 
     def factory():
-        return VerifyingSolver(backend, max_attempts=1, safety_margin_s=0,
+        return VerifyingSolver(backend, max_attempts=1, reserve_s=0,
                                max_budget_s=60, second_opinion=False)
 
     return factory, backend
@@ -6876,7 +6875,7 @@ def test_an_ungradeable_answer_does_not_buy_a_second_opinion(capsys):
         async def aclose(self): pass
         def stats(self): return {}
 
-    solver = VerifyingSolver(_Backend(), max_attempts=1, safety_margin_s=0,
+    solver = VerifyingSolver(_Backend(), max_attempts=1, reserve_s=0,
                              max_budget_s=60, second_opinion=True)
 
     def unavailable(*a, **kw):
@@ -6905,7 +6904,7 @@ def test_an_empty_ungradeable_answer_still_buys_a_second_opinion():
         async def aclose(self): pass
         def stats(self): return {}
 
-    solver = VerifyingSolver(_Backend(), max_attempts=1, safety_margin_s=0,
+    solver = VerifyingSolver(_Backend(), max_attempts=1, reserve_s=0,
                              max_budget_s=60, second_opinion=True)
     solver._grader.check = lambda *a, **kw: (_ for _ in ()).throw(
         RuntimeError("no docker")
@@ -6927,7 +6926,7 @@ def test_a_gradeable_failure_still_buys_a_second_opinion():
         async def aclose(self): pass
         def stats(self): return {}
 
-    solver = VerifyingSolver(_Backend(), max_attempts=1, safety_margin_s=0,
+    solver = VerifyingSolver(_Backend(), max_attempts=1, reserve_s=0,
                              max_budget_s=60, second_opinion=True)
     asyncio.run(solver.solve_task(DIGITS, timeout_s=60))
     assert len(asked) == 2, "a rankable failure should still ask the other model"
@@ -7380,7 +7379,7 @@ def test_a_conversation_that_cannot_answer_is_not_asked_to_repair_itself(reason)
         def stats(self): return {}
 
     solver = VerifyingSolver(
-        _Fleet(), max_attempts=3, safety_margin_s=0, max_budget_s=120,
+        _Fleet(), max_attempts=3, reserve_s=0, max_budget_s=120,
         second_opinion=False,
     )
     answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
@@ -7416,7 +7415,7 @@ def test_a_reply_that_arrived_without_code_is_still_repaired_in_place():
         def stats(self): return {}
 
     solver = VerifyingSolver(
-        _Fleet(), max_attempts=3, safety_margin_s=0, max_budget_s=120,
+        _Fleet(), max_attempts=3, reserve_s=0, max_budget_s=120,
         second_opinion=False,
     )
     answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
@@ -7444,7 +7443,7 @@ def test_an_empty_answer_keeps_asking_while_the_clock_allows_it():
     # Three tabs in a row capture nothing; the fourth answers.
     solver = VerifyingSolver(
         _Fleet([["nope"], ["nope"], ["nope"], [RIGHT]]),
-        max_attempts=1, safety_margin_s=0, max_budget_s=120,
+        max_attempts=1, reserve_s=0, max_budget_s=120,
     )
     answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
     assert answer.verified, (
@@ -7467,7 +7466,7 @@ def test_the_run_of_asks_is_capped_so_a_dead_fleet_cannot_spin():
         def stats(self): return {}
 
     solver = VerifyingSolver(
-        _Fleet(), max_attempts=1, safety_margin_s=0, max_budget_s=120,
+        _Fleet(), max_attempts=1, reserve_s=0, max_budget_s=120,
     )
     answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
     assert answer.code == ""
@@ -7629,7 +7628,7 @@ def test_a_wrong_answer_still_gets_exactly_one_second_opinion():
         def stats(self): return {}
 
     solver = VerifyingSolver(
-        _Fleet(), max_attempts=1, safety_margin_s=0, max_budget_s=120,
+        _Fleet(), max_attempts=1, reserve_s=0, max_budget_s=120,
     )
     answer = asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
     assert answer.code, "the wrong answer is still submitted; it may pass the hidden suite"
@@ -8119,7 +8118,7 @@ def test_a_model_still_writing_is_never_sent_a_repair_prompt(captured, what):
         def stats(self): return {}
 
     solver = VerifyingSolver(
-        _Fleet(), max_attempts=3, safety_margin_s=0, max_budget_s=120,
+        _Fleet(), max_attempts=3, reserve_s=0, max_budget_s=120,
         second_opinion=False,
     )
     asyncio.run(solver.solve_task(DIGITS, timeout_s=120))
@@ -8172,7 +8171,7 @@ def test_a_backend_that_cannot_wait_is_never_asked_to():
             def stats(self): return {}
 
         answer = asyncio.run(
-            VerifyingSolver(_Fleet(), safety_margin_s=0, max_budget_s=120)
+            VerifyingSolver(_Fleet(), reserve_s=0, max_budget_s=120)
             .solve_task(DIGITS, timeout_s=120)
         )
         assert answer.verified, f"{backend.__name__} stopped producing answers"
@@ -8353,7 +8352,7 @@ def test_every_deadline_the_protocol_allows_leaves_room_to_answer(deadline):
     from solvers.browser_pool import tail_budget
 
     solver = VerifyingSolver(object())
-    budget = min(deadline, solver._max_budget) - solver._margin
+    budget = min(deadline, solver._max_budget) - solver._reserve
     if budget <= 5.0:
         budget = max(1.0, deadline * 0.5)
     attempt_budget = max(1.0, budget)
@@ -8943,7 +8942,7 @@ def test_a_correction_too_late_to_grade_still_beats_the_answer_it_corrects():
                      public_examples=[], deadline_s=40.0)
     with contextlib.redirect_stdout(io.StringIO()):
         answer = asyncio.run(
-            VerifyingSolver(_Fleet(), safety_margin_s=0, max_budget_s=40.0,
+            VerifyingSolver(_Fleet(), reserve_s=0, max_budget_s=40.0,
                             second_opinion=False).solve_task(task, timeout_s=40.0))
 
     assert "while n > 0" in answer.code, (
@@ -8951,105 +8950,7 @@ def test_a_correction_too_late_to_grade_still_beats_the_answer_it_corrects():
     )
 
 
-def test_a_model_seconds_from_finishing_is_waited_for_into_the_margin(monkeypatch):
-    """From a real solve: turn 1 took 49s, turn 2 was 215s in and still writing
-    when the read stopped at the working budget, and the miner submitted
-    NOTHING against a 300s deadline.
 
-    Waiting is close to free and giving up is a certain zero. The validator
-    reads until `deadline_s + 10`, and its payment rule has no deadline term at
-    all — correctness is a hard gate and speed is a relative multiplier floored
-    at 0.95, so the same answer a minute later is still worth 95%.
-
-    So the safety margin is split. `budget` is what every phase plans against;
-    `DELIVERY_RESERVE_S` is what the answer needs to be archived, signed and put
-    on the wire. The difference is the share that was reserved for GRADING, and
-    a read that ends holding nothing has nothing to grade — so a model still
-    writing is waited for into it."""
-    from solvers import verify as V
-
-    scale = 0.05
-    monkeypatch.setattr(V, "DELIVERY_RESERVE_S", 12.0 * scale)
-
-    class _Chat:
-        provider = "claude"
-
-        def __init__(self):
-            self.n = -1
-            self.still_writing = False
-            self.empty_reason = None
-
-        async def send(self, text, timeout_s, extend_to_s=None):
-            self.n += 1
-            need = (49.0 if self.n == 0 else 215.0) * scale
-            allowed = max(timeout_s, extend_to_s or 0.0)
-            if need > allowed:
-                await asyncio.sleep(allowed)
-                self.still_writing, self.empty_reason = True, "unfinished"
-                return ""
-            await asyncio.sleep(need)
-            self.still_writing, self.empty_reason = False, None
-            return ('```json\n[{"name": "one", "args": [1], "expected": 1}]\n```'
-                    if self.n == 0 else
-                    "```python\ndef solve_terminal_editor(*a, **k):\n    return []\n```")
-
-        async def close(self): pass
-
-    class _Fleet:
-        def __init__(self): self.chat = _Chat()
-        async def open(self, avoid=None, timeout_s=None): return self.chat
-        async def aclose(self): pass
-        def stats(self): return {}
-
-    # 49 + 215 = 264 against a 260s working budget, on a 280s deadline. The
-    # margin's grading share is what closes the gap.
-    task = SolveTask(problem_id="p", language="python", statement="s",
-                     entrypoint="solve_terminal_editor", public_examples=[],
-                     deadline_s=300.0 * scale)
-    with contextlib.redirect_stdout(io.StringIO()):
-        answer = asyncio.run(
-            V.VerifyingSolver(_Fleet(), safety_margin_s=20.0 * scale,
-                              max_budget_s=3600.0, second_opinion=False)
-            .solve_task(task, timeout_s=280.0 * scale))
-
-    assert "solve_terminal_editor" in answer.code, (
-        "submitted nothing while the model was seconds from finishing"
-    )
-
-
-def test_the_wait_never_eats_what_delivery_needs():
-    """The other half: `DELIVERY_RESERVE_S` is a floor, not a suggestion. Past
-    it the answer could not be archived, signed and put on the wire before the
-    validator stops reading, so waiting longer would trade a late answer for no
-    answer."""
-    from solvers.verify import DELIVERY_RESERVE_S
-
-    # It is smaller than the default margin -- otherwise there is nothing to
-    # lend -- and large enough for `send`'s post-read tail (FULL_TAIL_S = 11s)
-    # plus signing and transport.
-    from solvers.browser_pool import FULL_TAIL_S
-
-    assert FULL_TAIL_S <= DELIVERY_RESERVE_S < 20.0, DELIVERY_RESERVE_S
-
-
-def test_a_backend_that_cannot_wait_longer_is_never_asked_to():
-    """`Backend.open`'s protocol has always been the two-argument `send`. A
-    keyword a backend outside this package does not take would be a TypeError
-    inside the one call the whole solve depends on."""
-    seen = []
-
-    class _TwoArg:
-        provider = "claude"
-        async def send(self, text, timeout_s):
-            seen.append(timeout_s)
-            return "```python\ndef g(n):\n    return n\n```"
-        async def close(self): pass
-
-    from solvers.verify import _read
-
-    got = asyncio.run(_read(_TwoArg(), "solve it", 30.0, spare=12.0))
-    assert "def g" in got, got
-    assert seen == [30.0], seen
 
 
 def test_the_latest_version_is_the_one_that_ships():
@@ -9538,19 +9439,14 @@ def test_the_cases_turn_does_not_shrink_the_read_the_program_gets():
     # instantly, so turn 2 still opens on essentially the whole budget.
     assert slices[1] > 200.0, f"the program only got {slices[1]:.0f}s"
 
-    # What each read may extend to is NOT a repair reserve -- there is none, and
-    # a slice that was a share of the budget is exactly what this test exists to
-    # refuse. It is the safety margin's GRADING share, offered only to a model
-    # that is still writing, and it stops where delivery begins.
-    from solvers.verify import DELIVERY_RESERVE_S
-
-    for i, (slice_s, cap) in enumerate(zip(slices, caps)):
-        assert cap is not None and cap > slice_s, (
-            f"turn {i + 1} cannot wait out a model that is still writing"
-        )
-        assert cap <= 300.0 - DELIVERY_RESERVE_S + 0.01, (
-            f"turn {i + 1} would wait past the point the answer can be "
-            f"delivered: {cap:.0f}s of a 300s deadline"
+    # Nothing is held back from either read, so there is nothing to extend
+    # into: one reserve, `DELIVERY_RESERVE_S`, and the budget already runs right
+    # up to it. A cap here would mean a slice that is a SHARE of the budget,
+    # which is exactly what this test exists to refuse.
+    for i, cap in enumerate(caps):
+        assert cap is None or cap <= slices[i] + 0.01, (
+            f"turn {i + 1} is reading against a share of the budget rather than "
+            f"the whole of it"
         )
 
 

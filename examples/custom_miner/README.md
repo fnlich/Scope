@@ -991,7 +991,7 @@ throws the answer away. Measured: a tab spent its whole 135-second slice while
 the remaining 90 seconds of a 225-second budget went unused, on the one attempt
 that had to succeed.
 
-`SOLVER_SAFETY_MARGIN_S` stays, because it is not a deadline on the model: it is
+`DELIVERY_RESERVE_S` stays, because it is not a deadline on the model: it is
 the time the answer needs to be graded, archived, signed and put on the wire
 before the validator stops listening.
 
@@ -1139,7 +1139,7 @@ cut the whole solve by 20 seconds. Neither was visible as anything except
 answers that arrived unfinished.
 
 What remains is not a deadline but the **cost of delivering**:
-`SOLVER_SAFETY_MARGIN_S` covers `send`'s post-read phases (5 + 4 + 2 = 11s) plus
+`DELIVERY_RESERVE_S` covers `send`'s post-read phases (5 + 4 + 2 = 11s) plus
 grading, archiving, signing and transmission. The budget is the advertised
 deadline minus that, and nothing else.
 
@@ -1439,7 +1439,7 @@ Everything above 300s belongs to the validator:
  -11s send tail: copy 5 + stream 4 + postmortem 2, all AFTER the read
  -~9s grade, archive, sign, put on the wire
 ----
-280s  the last moment a read can still end   ← SOLVER_SAFETY_MARGIN_S = 20
+285s  the last moment a read can still end   ← DELIVERY_RESERVE_S = 15
 ```
 
 A model needing 300s misses by 20; one needing 360s misses by 80. The only
@@ -1581,35 +1581,45 @@ is not `_counted_with`, the count comparison is not made at all. `_explain_empty
 reports the latched selector too, so its diagnosis names the selector the read
 actually used.
 
-### The safety margin lends its grading share to a model still writing
+### One reserve, and it is what delivery needs
 
-From a real solve: turn 1 took 49s, turn 2 was 215s in and **still writing**
-when the read stopped, and the miner submitted nothing — against a 300s
-deadline.
+`handle_request` wraps the **whole** solve — including `fit_response`,
+`save_solution` and `save_exchange` — in a single
 
-Waiting is close to free and giving up is a certain zero. The validator reads
-until `deadline_s + 10`, and `rlvr/scoring/payment.py` has **no deadline term at
-all**: correctness is a hard gate and speed is a relative multiplier floored at
-`0.95`, so the same answer arriving a minute later is still worth 95%.
+```python
+asyncio.wait_for(solve_with_slot(), timeout=min(deadline_s, GLM_REQUEST_TIMEOUT_S))
+```
 
-So `SOLVER_SAFETY_MARGIN_S` is split into the two things it was paying for:
+and a solve that overruns it is cancelled and answered **504 with nothing**. Not
+a late answer: no answer. So everything after the last read has to fit inside
+one reserve, and that is what `DELIVERY_RESERVE_S` (15s) is: `send`'s post-read
+phases (copy, stream, post-mortem — 11s, scaled down on short deadlines by
+`tail_budget`), then the archive writes and the response.
 
-| | |
-|---|---|
-| `budget` | what every phase plans against — `deadline − margin` |
-| `DELIVERY_RESERVE_S` (12s) | what the answer needs after the read: `send`'s post-read tail (11s), then archiving, signing and the wire |
+There used to be a second reserve as well, `SOLVER_SAFETY_MARGIN_S` at 20s,
+which also held time back for **grading**. Two reserves for one deadline is one
+too many — the working budget was 20s short of the limit while the true limit
+was 15s short, and the difference bought nothing but arithmetic. One number now,
+and it is the real one:
 
-The difference between them is the share reserved for **grading** — and a read
-that ends holding nothing has nothing to grade. So a model still writing at the
-working budget is waited for into it, down to the delivery floor and no further.
-`send` returns the moment the model finishes, so a promptly-answered prompt never
-touches it.
+```
+300s   deadline_s
+285s   budget            ← every phase plans against this, and it runs to the limit
+296s   read + tail
+300s   504 here
+```
+
+A 300s deadline gives the reads **285s** where it used to give 280s. Checked
+across the whole legal range — `TaskRequest.deadline_s` is `le=3600` — including
+the small end where `solve_task` falls back to half the request and
+`tail_budget` scales the tail down with it.
 
 ⚠ Check `GLM_REQUEST_TIMEOUT_S` before blaming any of this. It bounds the whole
-solve at `min(deadline_s, GLM_REQUEST_TIMEOUT_S)` and the reference miner's docs
-put it at **280** — below the 300s this subnet advertises, so it silently costs
-20 seconds of every solve. The code defaults it to `3600` precisely so it cannot
-bind; a value in your `.env` overrides that. The miner says so once per run:
+solve at `min(deadline_s, GLM_REQUEST_TIMEOUT_S)`, and the reference miner's
+docs put it at **280** — below the 300s this subnet advertises, so it silently
+costs 20 seconds of every solve. `.env.example` now ships `3600`, which
+`TaskRequest.deadline_s`'s own `le=3600` makes structurally incapable of
+binding. The miner says so once per run:
 
 ```
 [verify] the validator offered 300s but this miner caps the solve at 280s, so
@@ -1717,7 +1727,6 @@ fresh conversation.
 | Variable | Default | Meaning |
 |---|---|---|
 | `SOLVER_MAX_ATTEMPTS` | `0` | Rounds per solve, `0` meaning **unlimited** — correct until it passes or the request's deadline stops it. A count here is a second, private deadline under the only real one, and there is no partial credit for stopping early. Set a number to cap it anyway |
-| `SOLVER_SAFETY_MARGIN_S` | `20` | Headroom kept before the cutoff, for `send`'s post-deadline phases and for grading, signing and transport |
 | `SOLVER_MAX_BUDGET_S` | `3600` | The protocol's own maximum for `deadline_s`, so it cannot bind on a spec-compliant request. Lowering it below the advertised deadline throws away answers the validator would still pay for |
 | `SOLVER_VERIFY_EXECUTOR` | `subprocess` | Python grading backend; Rust always uses Docker |
 | `SOLVER_EXECUTOR_RETRY_S` | `300` | How long an executor that could not be BUILT stays unavailable before a solve tries again. Without a daemon, building the Rust executor runs `docker info` — 60ms against a missing socket, up to 20s against a hung one — and it used to run once per Rust task, inside the solve's budget. A hold rather than a verdict: a daemon started after the miner is picked up on its own |
