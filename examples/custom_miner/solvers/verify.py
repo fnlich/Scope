@@ -621,7 +621,7 @@ class VerifyingSolver:
         self._cache: dict[str, tuple[str, str]] = {}
         self._cache_size = max(0, int(cache_size))
         self._counts = {
-            "solved": 0, "verified": 0, "self_verified": 0, "cache_hits": 0,
+            "solved": 0, "verified": 0, "verified_on_local": 0, "cache_hits": 0,
             "empty": 0,
         }
         self._by_provider: dict[str, dict[str, int]] = {}
@@ -857,12 +857,13 @@ class VerifyingSolver:
         if best.verified:
             self._counts["verified"] += 1
         elif best.self_verified:
-            # Counted apart from `verified`, never inside it. On live traffic
-            # this is the only counter of the two that can ever move, so a
-            # `/solver-status` showing verified=0 over a whole run is the
-            # ordinary reading rather than the alarming one -- and this is the
-            # number that says whether the answers were any good.
-            self._counts["self_verified"] += 1
+            # Counted apart from `verified`, never inside it, and named as
+            # the log line names it. On live traffic this is the only counter
+            # of the two that can ever move, so a `/solver-status` showing
+            # verified=0 over a whole run is the ordinary reading rather than
+            # the alarming one -- and this is the number that says whether the
+            # answers were any good.
+            self._counts["verified_on_local"] += 1
         if best.code.strip():
             self._counts["solved"] += 1
             # `not best.failures` as well as `verified`: with both suites run,
@@ -889,8 +890,8 @@ class VerifyingSolver:
             # about one that was never run. This says which, without ever
             # claiming the word `verified` for a model agreeing with itself.
             + (
-                f"(self-verified: passed all {best.self_total} of its own "
-                f"cases; no public examples exist to confirm it) "
+                f"(verified on local: passed all {best.self_total} of its "
+                f"own cases; no public examples exist to confirm it) "
                 if best.self_verified
                 else ""
             )

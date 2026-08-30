@@ -668,11 +668,11 @@ def _summarise(
     # Without this the line above was the whole verdict on a replay, and it
     # could not tell an answer that passed every case it had from one that was
     # never run.
-    self_verified = (solver_stats or {}).get("solver", {}).get("self_verified", 0)
-    if self_verified:
-        print(f"  {self_verified}/{total} passed every case the model wrote "
-              f"for itself  (weaker than a public example, and all a live "
-              f"solve ever gets)")
+    local = (solver_stats or {}).get("solver", {}).get("verified_on_local", 0)
+    if local:
+        print(f"  {local}/{total} verified on local: passed every case the "
+              f"model wrote for itself  (weaker than a public example, and all "
+              f"a live solve ever gets)")
     # Said either way, because it is the measurement a replay actually makes.
     # An empty answer is the failure this miner has most of: of 97 archived
     # solves, 32 submitted nothing at all. Whether a build changes that number

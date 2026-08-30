@@ -6764,15 +6764,16 @@ def test_a_replay_with_no_tests_still_reports_what_the_solver_could_check(capsys
     results = [(p, rehearse.UNKNOWN, "no tests came with this problem")
                for p in problems]
 
-    rehearse._summarise(results, {"solver": {"self_verified": 2, "empty": 0}})
+    rehearse._summarise(results, {"solver": {"verified_on_local": 2, "empty": 0}})
     out = capsys.readouterr().out
-    assert "2/3 passed every case the model wrote for itself" in out, out
+    assert "2/3 verified on local" in out, out
+    assert "passed every case the model wrote for itself" in out, out
     assert "weaker than a public example" in out, out
     assert "would have scored" not in out, "a self-check was reported as a score"
 
     # A solver that checked nothing claims nothing -- no line at all, rather
     # than a zero that reads as a failure.
-    rehearse._summarise(results, {"solver": {"self_verified": 0}})
+    rehearse._summarise(results, {"solver": {"verified_on_local": 0}})
     assert "wrote for itself" not in capsys.readouterr().out
 
     # ...and a stats() that is missing, broken or shaped differently is a
@@ -7578,7 +7579,7 @@ def test_an_answer_that_passed_every_case_it_had_is_reported_as_such():
         answer = asyncio.run(solver.solve_task(task, timeout_s=60.0))
     out = log.getvalue()
 
-    assert "self-verified" in out, out
+    assert "verified on local" in out, out
     assert "passed all 3 of its own cases" in out, out
     assert "no public examples exist to confirm it" in out, (
         "claimed more than the evidence supports:\n" + out
@@ -7592,7 +7593,7 @@ def test_an_answer_that_passed_every_case_it_had_is_reported_as_such():
     # Counted apart, so `/solver-status` showing verified=0 over a live run
     # reads as the ordinary case rather than as a catastrophe.
     counts = solver.stats()["solver"]
-    assert counts["self_verified"] == 1 and counts["verified"] == 0, counts
+    assert counts["verified_on_local"] == 1 and counts["verified"] == 0, counts
 
 
 def test_a_self_check_that_failed_a_case_is_not_reported_as_verified():
