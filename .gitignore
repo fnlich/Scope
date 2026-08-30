@@ -18,3 +18,11 @@ venv/
 /cache/
 /data/
 /build
+
+# A local rehearsal's output. `solvers.rehearse --solutions --log` writes the
+# answers and the run log here, and neither is repository content. The 43
+# archived submissions already committed under solutions/ stay tracked -- git
+# ignores untracked files, never tracked ones -- so the regression fixture they
+# form is unaffected.
+/solutions/
+/logs/

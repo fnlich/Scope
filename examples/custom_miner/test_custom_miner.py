@@ -5777,6 +5777,22 @@ def test_carrying_imports_does_not_resurrect_the_usage_demo():
     assert value == 4 and "print(g(" not in code, code
 
 
+# The 43 committed submissions in `solutions/` are the exact bytes the validator
+# received, which makes them a regression fixture rather than a hypothetical.
+# Matched by NAME, not by globbing the directory: `solvers.rehearse --solutions`
+# writes a local run's answers there too, and a rehearsal that happened to
+# produce a truncated Rust program would otherwise fail a test about production
+# history. A real problem_id is a sha256 hex digest; a challenge name is not.
+_ARCHIVED_NAME = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _committed_archives(pattern: str) -> list:
+    import pathlib
+
+    where = pathlib.Path(__file__).resolve().parents[2] / "solutions"
+    return sorted(f for f in where.glob(pattern) if _ARCHIVED_NAME.match(f.stem))
+
+
 def test_a_truncated_rust_program_is_caught_without_a_compiler():
     """The check Python gets from `ast.parse` and `_always_returns`, and Rust
     had only from a compiler that is allowed not to be there.
@@ -5883,8 +5899,7 @@ def test_every_archived_rust_answer_is_judged_the_same_way_as_rustc():
 
     from solvers.prompts import rust_defect
 
-    archive = pathlib.Path(__file__).resolve().parents[2] / "solutions"
-    answers = sorted(archive.glob("*.rs"))
+    answers = _committed_archives("*.rs")
     if not answers:
         pytest.skip("the archived submissions are not checked out")
 
@@ -5996,10 +6011,7 @@ def test_the_parse_gate_asks_what_the_grader_will_ask():
 
     # Nothing that compiles today may start failing: the archived submissions
     # are the exact bytes the validator received.
-    import pathlib
-
-    archive = pathlib.Path(__file__).resolve().parents[2] / "solutions"
-    for f in sorted(archive.glob("*.py")):
+    for f in _committed_archives("*.py"):
         src = f.read_text()
         try:
             _ast.parse(src)
@@ -6502,6 +6514,98 @@ def test_showing_every_case_says_the_grade_cannot_fail():
     problem = rehearse._from_challenges(["extent-journal"], 99, 300.0)[0]
     assert len(problem.request.public_examples) == len(problem.tests)
     assert "cannot fail" in problem.tests_are
+
+
+def test_your_own_problems_directory_wins_over_the_shipped_samples(tmp_path):
+    """`examples/problems` is where an operator drops their own problems, and it
+    is found with no flag and no environment variable. The shipped samples are
+    the fallback so a fresh checkout still has something to run."""
+    from solvers.challenges import challenge_dir, names
+
+    root = tmp_path / "repo"
+    mine = root / "examples" / "problems" / "my-problem"
+    shipped = root / "examples" / "sample_challenges" / "extent-journal"
+    for d in (mine, shipped):
+        d.mkdir(parents=True)
+        (d / "PROBLEM.md").write_text("statement")
+        (d / "cases.json").write_text(
+            '{"language": "python", "entrypoint": "g", "cases": []}'
+        )
+    start = root / "examples" / "custom_miner" / "solvers"
+    start.mkdir(parents=True)
+
+    found = challenge_dir(start)
+    assert found == root / "examples" / "problems", found
+    assert names(found) == ["my-problem"]
+
+
+def test_an_empty_problems_directory_does_not_shadow_the_samples(tmp_path):
+    """A directory created and not yet filled must not silently take over and
+    report "(none found)" — which is what a plain `is_dir()` test would do, and
+    the directory ships with only a README in it."""
+    from solvers.challenges import challenge_dir
+
+    root = tmp_path / "repo"
+    (root / "examples" / "problems").mkdir(parents=True)
+    (root / "examples" / "problems" / "README.md").write_text("drop them here")
+    shipped = root / "examples" / "sample_challenges" / "extent-journal"
+    shipped.mkdir(parents=True)
+    (shipped / "PROBLEM.md").write_text("statement")
+    (shipped / "cases.json").write_text(
+        '{"language": "python", "entrypoint": "g", "cases": []}'
+    )
+    start = root / "examples" / "custom_miner" / "solvers"
+    start.mkdir(parents=True)
+
+    assert challenge_dir(start) == root / "examples" / "sample_challenges"
+
+
+def test_a_local_run_can_be_told_where_to_archive_and_logged_verbatim(
+    tmp_path, capsys, monkeypatch
+):
+    """The two things a local run has to leave behind: the answers where the
+    operator asked for them, and the output — the SAME lines the on-chain miner
+    prints, because it is the same code printing them.
+
+    `SOLVER_SOLUTION_DIR` is relative to the working directory and this package
+    runs from `examples/custom_miner`, so the default lands beside the miner
+    rather than at the repository root. An operator went looking in the wrong
+    one; `--solutions` settles it."""
+    import os
+
+    from solvers import rehearse
+
+    log = tmp_path / "runs" / "local.log"          # a directory that must be made
+    with rehearse._tee(str(log)):
+        print("[verify] python entrypoint=g provider=claude examples=0/0")
+        print("[rehearse] DOES NOT SCORE: nothing was submitted")
+
+    written = log.read_text()
+    assert "[verify] python entrypoint=g" in written, written
+    assert "DOES NOT SCORE" in written, written
+    assert str(log.resolve()) in written, "the log does not say where it is"
+    # ...and the terminal still had it live. A log that only exists afterwards
+    # is no use while a run is going wrong.
+    assert "DOES NOT SCORE" in capsys.readouterr().out
+
+    # No --log, no file, and nothing swallowed.
+    with rehearse._tee(None):
+        print("[rehearse] still on the terminal")
+    assert "still on the terminal" in capsys.readouterr().out
+
+    # `--solutions` is the archive directory, set before the solve reaches it.
+    where = tmp_path / "answers"
+    # Scoped: `archive_to` sets a process-wide environment variable, and every
+    # other test that archives reads it.
+    monkeypatch.setenv("SOLVER_SOLUTION_DIR", "unset")
+    rehearse.archive_to(str(where))
+    assert os.environ["SOLVER_SOLUTION_DIR"] == str(where)
+    from solution_archive import archive_dir
+    assert archive_dir() == where
+
+    # ...and no --solutions leaves it exactly where it was.
+    rehearse.archive_to(None)
+    assert os.environ["SOLVER_SOLUTION_DIR"] == str(where)
 
 
 def test_a_challenge_name_cannot_read_outside_the_challenge_directory(tmp_path):

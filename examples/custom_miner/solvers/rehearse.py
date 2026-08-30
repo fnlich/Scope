@@ -38,7 +38,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -656,12 +658,85 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--show", type=int, default=20, metavar="N",
         help="how many lines of the answer to print (default: 20)",
     )
+    parser.add_argument(
+        "--solutions", metavar="DIR",
+        help="where the answers are archived. The miner's own `save_solution` "
+             "writes them, so this is `SOLVER_SOLUTION_DIR` -- which is "
+             "RELATIVE TO THE WORKING DIRECTORY, and this package is run from "
+             "examples/custom_miner, so the default lands beside the miner "
+             "rather than at the repository root. An operator went looking in "
+             "the wrong one; naming it here settles which",
+    )
+    parser.add_argument(
+        "--log", metavar="FILE",
+        help="also write everything printed to FILE, verbatim. The same lines "
+             "the on-chain miner prints, because it is the same code printing "
+             "them -- a run here is comparable to a run there line for line",
+    )
     args = parser.parse_args(argv)
+    archive_to(args.solutions)
     try:
-        return asyncio.run(run(args))
+        with _tee(args.log):
+            return asyncio.run(run(args))
     except KeyboardInterrupt:
         print("\n[rehearse] stopped")
         return 130
+
+
+def archive_to(directory: Optional[str]) -> None:
+    """Point `save_solution` at ``directory``, or leave it where it was.
+
+    `SOLVER_SOLUTION_DIR` is read per call from inside the solve, so setting it
+    here -- before `run` -- is early enough. It is RELATIVE to the working
+    directory, and this package runs from `examples/custom_miner`, so the
+    default lands beside the miner rather than at the repository root. An
+    operator went looking in the wrong one.
+    """
+    if directory:
+        os.environ["SOLVER_SOLUTION_DIR"] = str(Path(directory).expanduser())
+
+
+@contextlib.contextmanager
+def _tee(path: Optional[str]):
+    """Print to the terminal AND to ``path``, or just the terminal.
+
+    Both, not either. A run over five challenges takes long enough that nobody
+    watches all of it, and a log that only exists after the fact is no use while
+    it is going wrong -- so the terminal keeps its live output and the file gets
+    the same bytes for afterwards.
+
+    Line-buffered and flushed per write, so a run killed half way through still
+    leaves everything it had printed. The whole point of the file is the run
+    that did not finish.
+    """
+    if not path:
+        yield
+        return
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    class _Fork:
+        def __init__(self, *streams):
+            self._streams = streams
+
+        def write(self, text):
+            for stream in self._streams:
+                stream.write(text)
+                stream.flush()
+            return len(text)
+
+        def flush(self):
+            for stream in self._streams:
+                stream.flush()
+
+        def isatty(self):
+            return False
+
+    with target.open("w", encoding="utf-8") as handle:
+        fork = _Fork(sys.stdout, handle)
+        with contextlib.redirect_stdout(fork), contextlib.redirect_stderr(fork):
+            print(f"[rehearse] logging this run to {target.resolve()}")
+            yield
 
 
 if __name__ == "__main__":
