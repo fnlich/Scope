@@ -7407,6 +7407,107 @@ def test_a_fragment_does_not_displace_the_whole_program_above_it():
     assert _supersedes(fragment, Candidate(code="", raw=""), False)
 
 
+def test_the_deadline_ending_the_loop_ships_the_last_version_and_says_so(monkeypatch):
+    """The ordinary way a correction loop ends, and it used to end in silence.
+
+    `max_attempts` defaults to 0 -- unlimited -- so the clock is what stops the
+    loop on nearly every real solve. `attempt > 1 and left < ROUND_TRIP_FLOOR_S`
+    was a bare `break`: the last version went out, correctly, with nothing in
+    the log to say the deadline was why or that it was going out ungraded. An
+    operator reading that saw a solve stop mid-correction for no stated reason.
+
+    What must be true, and all three are asserted: the repair prompt is NOT sent
+    (there is no time for the round trip), the last version in hand IS submitted
+    rather than nothing, and the line says both -- deadline, and unverified."""
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "ROUND_TRIP_FLOOR_S", 8.0)
+    prompts: list[str] = []
+    one_case = '```json\n[{"name": "carry", "args": [12345], "expected": 15}]\n```'
+    draft = "```python\ndef g(n):\n    return 0\n```"
+    never_sent = "```python\ndef g(n):\n    return 15\n```"
+
+    class _Slow(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            if len(prompts) == 2:       # the program turn eats the budget
+                await asyncio.sleep(2.0)
+            return await super().send(text, timeout_s)
+
+    class _SlowBackend(_Backend):
+        async def open(self, avoid=None):
+            return _Slow(self._replies, self._provider)
+
+    # 8s budget, 2s spent on the program turn: 6s left is enough to GRADE the
+    # draft (one case, `VERIFY_TIMEOUT_S` each) and not enough for another round
+    # trip. Both halves matter -- an ungraded draft would leave the loop by a
+    # different door, and this test is about the door the clock closes.
+    task = SolveTask(problem_id="clock", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=8.0)
+    solver = verify.VerifyingSolver(_SlowBackend([one_case, draft, never_sent]),
+                                    reserve_s=0, max_budget_s=8,
+                                    second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=8.0))
+    out = log.getvalue()
+
+    assert len(prompts) == 2, f"a repair went out with no time for it: {len(prompts)}"
+    assert "not enough for another correction round" in out, out
+    assert "submitting the last version unverified" in out, out
+    # The answer still goes out. An unverified answer can still be right; an
+    # answer never sent is a certain zero.
+    assert answer.code.strip() == "def g(n):\n    return 0", answer.code
+    assert answer.verified is False
+
+
+def test_running_out_before_the_models_own_cases_could_run_says_which(monkeypatch):
+    """`_grade` explains an ungraded answer -- and gated that explanation on
+    `task.public_examples`, which is the one thing live traffic never has.
+
+    Every archived request ships zero public examples, so on every real solve
+    that ran out of time the single line explaining why the answer went out
+    ungraded was the single line that never printed. Worse, `solve_task` then
+    filled the silence with the wrong reason: `from_self_tests` is only set when
+    the cases RAN, so a solve whose cases turn worked perfectly and simply had
+    no budget left to run them reported "the model sent no usable cases of its
+    own either" -- sending the reader to fix a prompt that is working."""
+    from solvers import verify
+
+    prompts: list[str] = []
+    one_case = '```json\n[{"name": "carry", "args": [12345], "expected": 15}]\n```'
+    draft = "```python\ndef g(n):\n    return 0\n```"
+
+    class _Slow(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            if len(prompts) == 2:
+                await asyncio.sleep(2.0)
+            return await super().send(text, timeout_s)
+
+    class _SlowBackend(_Backend):
+        async def open(self, avoid=None):
+            return _Slow(self._replies, self._provider)
+
+    task = SolveTask(problem_id="unrun", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=6.0)
+    solver = verify.VerifyingSolver(_SlowBackend([one_case, draft]), reserve_s=0,
+                                    max_budget_s=6, second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=6.0))
+    out = log.getvalue()
+
+    assert "out of budget before" in out and "own case(s) could be run" in out, out
+    assert "submitting the answer unverified" in out, out
+    assert "no usable cases of its own" not in out, (
+        "blamed the cases turn for the clock:\n" + out
+    )
+    assert answer.code.strip() == "def g(n):\n    return 0", answer.code
+    assert answer.verified is False
+    assert "verified=False" in out, out
+
+
 def test_a_corrected_case_stays_the_bar_for_every_later_round():
     """The bar is the LAST version of the cases, not turn 1's, and it stays that
     way for every round after the one that corrected it.

@@ -98,6 +98,11 @@ OPEN_FLOOR_S = 5.0
 # The most `_grade` will insist on before it declines to run anything at all.
 GRADE_FLOOR_S = 15.0
 
+# The least a correction round can be worth starting with: one prompt out, one
+# reply back, and something read from the page at the end of it. Below this the
+# loop stops and the last version in hand goes out as it stands.
+ROUND_TRIP_FLOOR_S = 12.0
+
 
 class Conversation(Protocol):
     """One live, isolated model conversation.
@@ -156,6 +161,12 @@ class Candidate:
     self_passed: int = 0
     self_total: int = 0
     from_self_tests: bool = False
+    # How many of the model's own cases were IN HAND for this candidate,
+    # whether or not there was time to run them. `from_self_tests` says they
+    # ran; this says they existed. Keeping only the first made "no time to run
+    # the cases" indistinguishable from "the model never sent any", and the
+    # warning in `solve_task` said the second when the truth was the first.
+    self_cases: int = 0
     # This reply is part of a program rather than a program: it uses something
     # only the round above it defined. Kept beside `defect` rather than folded
     # into it because `_supersedes` has to tell this apart from every other way
@@ -747,6 +758,14 @@ class VerifyingSolver:
                     # because there is no ANSWER, and the lines that say the
                     # answer is missing already say so, about the right turn.
                     pass
+                elif best.self_cases:
+                    # A THIRD way it would be a lie, and the one the deadline
+                    # produces: the cases turn worked, the cases are right
+                    # here, and there was no budget left to run them. Saying
+                    # "the model sent no usable cases" sends the reader to fix
+                    # a prompt that is working. `_grade` has already named this
+                    # one on the line above, so there is nothing to add.
+                    pass
                 elif not self._warned_ungradeable:
                     self._warned_ungradeable = True
                     why = (
@@ -1057,10 +1076,8 @@ class VerifyingSolver:
             attempt = 0
             while True:
                 attempt += 1
-                if self._max_attempts and attempt > self._max_attempts:
-                    break
                 left = budget - (time.monotonic() - started)
-                if attempt > 1 and left < 12.0:
+                if attempt > 1 and left < ROUND_TRIP_FLOOR_S:
                     # Not enough left to be worth another ROUND TRIP -- which is
                     # what this has always been about, and it never should have
                     # gated the first one. It did: below a 32-second deadline
@@ -1069,6 +1086,31 @@ class VerifyingSolver:
                     # without a single line of log to say why. The first attempt
                     # always runs, however little there is, exactly as the first
                     # pass does in `solve_task`.
+                    #
+                    # And this branch itself used to be the silent one. The
+                    # deadline is the ordinary way a correction loop ends -- it
+                    # runs until the answer passes or the clock stops it -- so
+                    # it is the last thing that should happen without a word.
+                    print(
+                        f"[verify] {max(0.0, left):.0f}s left, not enough for "
+                        f"another correction round; submitting the last version"
+                        + (
+                            " unverified"
+                            if best is None or not best.verified
+                            else ""
+                        )
+                    )
+                    break
+                if self._max_attempts and attempt > self._max_attempts:
+                    print(
+                        f"[verify] SOLVER_MAX_ATTEMPTS={self._max_attempts} "
+                        f"reached; submitting the last version"
+                        + (
+                            " unverified"
+                            if best is None or not best.verified
+                            else ""
+                        )
+                    )
                     break
                 # Every round reads against EVERYTHING that is left. Earlier
                 # builds handed the first attempt a fraction (60% with public
@@ -1473,7 +1515,7 @@ class VerifyingSolver:
         cases: Optional[list] = None, previous: str = "",
     ) -> Candidate:
         code = extract_code(reply, task.entrypoint, task.language)
-        candidate = Candidate(code=code, raw=reply)
+        candidate = Candidate(code=code, raw=reply, self_cases=len(cases or []))
         defect = (
             rust_defect(code)
             if task.language == "rust"
@@ -1542,10 +1584,19 @@ class VerifyingSolver:
             # rather than late. The check would be paid for with the answer it
             # was checking. The structural checks above already ran; they cost
             # microseconds and are what ranks this candidate.
+            # Gated on `task.public_examples` until now, which is every
+            # live task: production ships none, so the one line explaining why
+            # an answer went out ungraded was the one line that never printed.
+            # What could not be run is what to name.
+            unrun = []
             if task.public_examples:
+                unrun.append(f"the {len(task.public_examples)} public example(s)")
+            if cases:
+                unrun.append(f"the model's {len(cases)} own case(s)")
+            if unrun:
                 print(
-                    "[verify] out of budget before the examples could be run; "
-                    "submitting the answer unverified"
+                    f"[verify] out of budget before {' or '.join(unrun)} could be "
+                    f"run; submitting the answer unverified"
                 )
             return candidate
 
