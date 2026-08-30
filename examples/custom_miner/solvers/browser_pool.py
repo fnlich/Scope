@@ -699,6 +699,8 @@ class _Tab:
         self._warned_relatch = False
         self._warned_stream = False
         self._warned_stream_diff = False
+        # Which assistant candidate `_fingerprint`'s count was taken with.
+        self._counted_with: Optional[str] = None
         # Counted rather than flagged. A once-per-tab bool reported two
         # incidents across 56 solves -- exactly one per tab, which is what it
         # reports whether it happened twice or forty times. Every one of
@@ -1061,6 +1063,7 @@ class _Tab:
         # different candidate once the reply renders, and comparing a count taken
         # from one selector against a count taken from another is meaningless.
         self._assistant = None
+        self._counted_with = None
         self._reply_index = None
         self._reply_key = None
         # Reserve a slice of the caller's budget for getting the prompt in;
@@ -1704,10 +1707,36 @@ class _Tab:
         better candidate once the DOM settles.
 
         The latch is dropped in exactly one case: the candidate it holds matches
-        nothing at all. There is no count to corrupt at zero, and the
-        alternative is reading nothing for the rest of the send.
+        nothing at all. "There is no count to corrupt at zero" was the reason
+        given, and it was wrong: `before[0]` was counted with the OLD candidate,
+        and `_new_reply` compares the new one's count against it directly. On
+        chatgpt.com the two shipped candidates count on different scales -- an
+        A/B pair is two messages inside one article -- so after a re-resolve the
+        comparison is meaningless and no reply is ever found. Measured:
+        before=(2,'m2') under the message selector, one transient zero, and then
+        `reply: None` on every poll for the rest of the send.
+
+        Two things follow, and they are below rather than here: `_counted_with`
+        remembers which candidate the baseline was taken with, and the fallback
+        is RE-EXAMINED rather than held -- the moment the earlier, more specific
+        candidate matches again it is taken back, which restores the selector
+        the baseline belongs to.
         """
         if self._assistant is not None:
+            # An earlier candidate is more specific by construction -- the list
+            # is ordered that way -- so if one that precedes the latch is
+            # matching now, it is the better reading AND, when it is the one the
+            # baseline was counted with, the only reading the baseline fits.
+            better = None
+            for selector in self.site.assistant:
+                if selector == self._assistant:
+                    break
+                if await self._page.locator(selector).count() > 0:
+                    better = selector
+                    break
+            if better is not None:
+                self._assistant = better
+                return self._page.locator(better)
             found = self._page.locator(self._assistant)
             if await found.count() > 0:
                 return found
@@ -1735,6 +1764,10 @@ class _Tab:
     async def _fingerprint(self) -> tuple[int, Optional[str]]:
         """How the conversation looked before we submitted."""
         messages = await self._messages()
+        # WHICH candidate that count belongs to. A count is only a number; it
+        # means "messages" under one selector and "turns" under another, and
+        # comparing across the two is how a re-resolve loses a whole send.
+        self._counted_with = self._assistant
         if messages is None:
             return 0, None
         count = await messages.count()
@@ -1793,6 +1826,14 @@ class _Tab:
         if self._reply_index is not None:
             return messages.nth(self._reply_index) if count > self._reply_index else None
 
+        # The baseline was counted with a DIFFERENT selector, so `count_before`
+        # is not a number this count can be compared to. The id and index
+        # latches above still work -- they identify a node, not a quantity -- so
+        # this only reaches here before anything has been latched, and then
+        # waiting for the original candidate to come back (which `_messages`
+        # now takes at the first opportunity) is the only sound move.
+        if self._counted_with is not None and self._assistant != self._counted_with:
+            return None
         if count > count_before:
             if count - count_before > 1 and not self._warned_branches:
                 self._warned_branches = True
@@ -1813,7 +1854,16 @@ class _Tab:
             return fresh
         # Some sites replace the last message rather than appending one, so a
         # changed id still means a new reply even when the count did not move.
-        if self.site.message_id_attr:
+        #
+        # `count >= count_before` is what makes that sound. When the list has
+        # SHRUNK the last message is an OLDER one wearing a different id, and
+        # latching it answers this prompt with a previous turn's program --
+        # silently, with `empty_reason` left at None, so nothing downstream
+        # questions it. Reproduced: before=(2,'id-B'), the DOM re-rendered down
+        # to one message, and `send` returned the program from branch A of the
+        # turn before. A shorter list means the page is mid-re-render, and
+        # waiting one poll is what every other unresolved state here does.
+        if self.site.message_id_attr and count >= count_before:
             last = messages.nth(count - 1)
             mid = await last.get_attribute(self.site.message_id_attr)
             if mid is not None and mid != id_before:
@@ -1885,7 +1935,12 @@ class _Tab:
         in four DOM queries, and only right now.
         """
         try:
-            resolved = await self._first_match(self.site.assistant)
+            # The LATCHED candidate, not whatever matches now. Re-resolving from
+            # scratch let the post-mortem count one selector and quote
+            # `before[0]`, which was counted with another -- so it could report
+            # "matched 2 message(s), the same as before the prompt was sent" of
+            # two different things, about a page holding the finished answer.
+            resolved = self._assistant or await self._first_match(self.site.assistant)
             count = 0
             if resolved is not None:
                 count = await self._page.locator(resolved).count()

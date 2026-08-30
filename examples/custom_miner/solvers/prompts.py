@@ -63,6 +63,26 @@ def fenced_blocks(markdown: str) -> list[str]:
     blocks: list[str] = []
     body: Optional[list[str]] = None
     fence = ""
+    # How far the OPENING fence was indented. Markdown requires that
+    # indentation of every line inside a block nested under a list item, and it
+    # is not part of the source:
+    #
+    #     1. Sort, then sum:
+    #
+    #        ```python
+    #        import math
+    #
+    #        def solve(nums):
+    #            return sum(sorted(nums)[-2:])
+    #        ```
+    #
+    # Keeping it handed `extract_code` a block whose every line began with three
+    # spaces; `.strip()` then removed them from the FIRST line only, and the
+    # result was `unexpected indent, line 3` on a program the model had written
+    # correctly. CommonMark strips exactly this, and never more than the fence
+    # itself had -- so a line the author genuinely indented further keeps the
+    # difference.
+    indent = 0
     for line in markdown.splitlines():
         stripped = line.strip()
         if body is None:
@@ -87,17 +107,35 @@ def fenced_blocks(markdown: str) -> list[str]:
             )
             if opener:
                 fence = opener.group(1)
+                indent = len(line) - len(line.lstrip(" "))
                 body = []
             continue
         if re.fullmatch(re.escape(fence[0]) + "{%d,}" % len(fence), stripped):
             if "\n".join(body).strip():
                 blocks.append("\n".join(body) + "\n")
-            body, fence = None, ""
+            body, fence, indent = None, "", 0
             continue
-        body.append(line)
+        body.append(_unindent(line, indent))
     if body is not None and "\n".join(body).strip():
         blocks.append("\n".join(body) + "\n")
     return blocks
+
+
+def _unindent(line: str, indent: int) -> str:
+    """Drop up to ``indent`` leading SPACES -- never more, never a tab.
+
+    Never more, because a line the author indented past the fence keeps the
+    difference. Never a tab, because a tab cannot be partially removed and
+    guessing its width would corrupt source that a chat UI does render with
+    them; a block opened at column zero, which is every unnested block, is
+    returned untouched either way.
+    """
+    if indent <= 0:
+        return line
+    kept = 0
+    while kept < indent and kept < len(line) and line[kept] == " ":
+        kept += 1
+    return line[kept:]
 
 
 # Characters that only ever arrive from a RENDERED page, never from source a
@@ -938,7 +976,45 @@ def _carry_imports(block: str, earlier: list[str], language: str) -> str:
         missing -= set(bindings)
     if not carried:
         return block
-    return "\n".join(carried) + "\n\n" + block
+    return _splice_imports(block, carried)
+
+
+def _splice_imports(block: str, carried: list[str]) -> str:
+    """Put ``carried`` at the top of ``block`` -- but below what must be first.
+
+    `from __future__` has to be the first statement in the file, after at most a
+    docstring, and `import math` above it is a file `ast.parse` accepts and the
+    grader's import rejects:
+
+        SyntaxError: from __future__ imports must occur at the beginning of the
+        file
+
+    Nothing downstream noticed, so it went out as a confident answer and scored
+    zero. Anything the module may legally open with -- its docstring, a
+    `__future__` import, a comment, a shebang, an encoding line -- stays where
+    it is and the carried imports follow it.
+    """
+    try:
+        tree = ast.parse(block)
+    except SyntaxError:
+        # No tree to ask, so no claim to make about what must come first.
+        return "\n".join(carried) + "\n\n" + block
+    after = 0
+    for node in tree.body:
+        docstring = (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        )
+        future = isinstance(node, ast.ImportFrom) and node.module == "__future__"
+        if not (docstring or future):
+            break
+        after = node.end_lineno or after
+    if not after:
+        return "\n".join(carried) + "\n\n" + block
+    lines = block.splitlines()
+    head, tail = lines[:after], lines[after:]
+    return "\n".join(head + [""] + carried + [""] + [t for t in tail if True]).rstrip("\n") + "\n"
 
 
 def _defines(code: str, entrypoint: str, language: str = "python") -> bool:
@@ -989,10 +1065,25 @@ NO_CODE = "the reply contained no code"
 # `MOD = 10**9 + 7` -- so no allowlist can be written that does not reject real
 # code. What CAN be named there is the short list of things a tool call opens
 # with.
-_SHELL_OPENER_RE = re.compile(
-    r"^[ \t]*(?:[$#>]\s|cat|cd|mkdir|echo|ls|rm|cp|mv|touch|chmod|export|sudo"
+_SHELL_COMMANDS = (
+    r"cat|cd|mkdir|echo|ls|rm|cp|mv|touch|chmod|export|sudo"
     r"|apt|apt-get|yum|brew|pip3?|python3?|rustc|cargo|npm|yarn|git|curl|wget"
-    r"|bash|sh|zsh|make|which|pytest|node)\b"
+    r"|bash|sh|zsh|make|which|pytest|node"
+)
+# `$ ` and `> ` open no Python statement, so a bare prompt character is enough.
+# `#` is different and the difference cost real answers: it is a ROOT shell
+# prompt and it is also how a great many Python programs begin. `# Sliding
+# window over the log lines.` matched `[$#>]\s` and the whole block was declared
+# "not source at all" -- so `extract_code` fell past it and submitted the
+# model's own one-line usage example instead. Deleting only that comment made
+# the same reply return the program.
+#
+# So `#` counts only when a command follows it, which is what a root prompt
+# actually looks like and what no comment does. The bare command alternatives
+# below still catch an unprompted command line.
+_SHELL_OPENER_RE = re.compile(
+    r"^[ \t]*(?:[$>]\s|\#\s*(?:" + _SHELL_COMMANDS + r")\b|(?:"
+    + _SHELL_COMMANDS + r")\b)"
 )
 
 
@@ -1131,9 +1222,20 @@ def python_defect(code: str, entrypoint: str) -> Optional[str]:
     if not code.strip():
         return NO_CODE
     try:
+        # `compile`, not `ast.parse`. The validator IMPORTS this source, and
+        # import compiles it -- so `ast.parse` is the wrong question by exactly
+        # the set of programs that parse and will not compile. `from __future__`
+        # in the wrong place is the one that reached a validator: `ast.parse`
+        # said fine, the import raised `SyntaxError: from __future__ imports
+        # must occur at the beginning of the file`, and this function had
+        # reported the answer clean. Same exception, same message shape, one
+        # more class of certain zero caught before it ships.
         tree = ast.parse(code)
+        compile(code, "<solution>", "exec")
     except SyntaxError as exc:
         return f"the code is not valid Python ({exc.msg}, line {exc.lineno})"
+    except ValueError as exc:  # noqa: BLE001 - null bytes and the like
+        return f"the code is not valid Python ({exc})"
     # A top-level statement that is just a bare name runs at import time and
     # raises NameError, so every hidden test fails. It is never meaningful code,
     # and it is exactly what a leaked language chip looks like once it parses.

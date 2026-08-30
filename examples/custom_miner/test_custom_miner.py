@@ -1570,6 +1570,136 @@ def test_a_dead_tab_is_not_driven_again():
     assert page.typed == [], "it typed into a tab it knew was dead"
 
 
+def test_a_shorter_message_list_is_a_re_render_not_a_new_reply():
+    """`_new_reply` treated "the last message's id changed" as proof of a new
+    reply. That holds when the list grew or held steady; when it SHRANK, the
+    last message is an OLDER one wearing a different id — so this prompt was
+    answered with a previous turn's program, silently, `empty_reason=None`.
+
+    Reproduced: before=(2, 'id-B'), the DOM re-rendered down to one message, and
+    `send` returned branch A of the turn before."""
+    site = _site(message_id_attr="data-message-id")
+    old_a = _Node(text="OLD A", code=["def pong():\n    return 'OLD-BRANCH-A'"],
+                  attrs={"data-message-id": "id-A"})
+    old_b = _Node(text="OLD B", code=["def pong():\n    return 'OLD-BRANCH-B'"],
+                  attrs={"data-message-id": "id-B"})
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()],
+                      "#assistant": [old_a, old_b]})
+    # The click re-renders the list DOWN to one message and never grows it: the
+    # answer to this prompt has not been painted yet.
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [old_a])
+
+    got = asyncio.run(_tab(page, site).send("solve it", 0.4))
+    assert "OLD-BRANCH-A" not in got, (
+        f"answered this prompt with a previous turn's program: {got!r}"
+    )
+
+    # ...and the case the branch exists for still works: a site that REPLACES
+    # the last message rather than appending one.
+    replaced = _Node(text="new", code=["def pong():\n    return 'THE ANSWER'"],
+                     attrs={"data-message-id": "id-NEW"})
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()],
+                      "#assistant": [old_a, old_b]})
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [old_a, replaced])
+    got = asyncio.run(_tab(page, site).send("solve it", 0.4))
+    assert "THE ANSWER" in got, f"stopped seeing a replaced last message: {got!r}"
+
+
+def test_a_transient_selector_miss_does_not_strand_the_send_on_a_coarser_one():
+    """`_messages` dropped its latch when the candidate matched nothing,
+    reasoning "there is no count to corrupt at zero". There is: `before[0]` was
+    counted with the OLD candidate, and `_new_reply` compares the new one's
+    count against it directly. chatgpt.com ships two candidates that count on
+    different scales — an A/B pair is two messages inside one article — so after
+    a re-resolve the comparison is meaningless and no reply is ever found.
+
+    Measured on the code this replaces, step by step:
+
+        before = (2, 'm2') latched: #msg
+        note: assistant selector '#msg' stopped matching mid-answer; re-resolving
+        after the blink, latched: #article
+        once #msg matches again, latched: #article      <- never re-examined
+        reply found: False
+    """
+    MSG, ART = "#msg", "#article"
+    site = _site(assistant=(MSG, ART), message_id_attr="data-message-id")
+    m1 = _Node(text="old one", attrs={"data-message-id": "m1"})
+    m2 = _Node(text="old two", attrs={"data-message-id": "m2"})
+    answer = _Node(text="here", code=["def g(n):\n    return n * 7"],
+                   attrs={"data-message-id": "m3"})
+    art = _Node(text="one article holds every message")
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()],
+                      MSG: [m1, m2], ART: [art]})
+    tab = _tab(page, site)
+
+    async def go():
+        before = await tab._fingerprint()
+        assert before == (2, "m2") and tab._assistant == MSG, (before, tab._assistant)
+
+        page.dom[MSG] = []                       # the candidate blinks out
+        await tab._messages()
+
+        page.dom[MSG] = [m1, m2, answer]         # ...and the answer lands
+        await tab._messages()
+        assert tab._assistant == MSG, (
+            f"stayed on the coarser candidate: {tab._assistant} — the baseline "
+            f"was counted with {MSG} and the two count on different scales"
+        )
+        reply = await tab._new_reply(before)
+        assert reply is not None, "never found the reply after the blink"
+        assert await tab._read(reply) is not None
+
+    asyncio.run(go())
+
+
+def test_a_count_taken_with_one_selector_is_never_compared_against_another():
+    """The other half. While the latch is NOT the candidate the baseline was
+    counted with, the count comparison is meaningless and is not made at all —
+    `_new_reply` waits for the original to come back rather than guessing from
+    numbers on two different scales."""
+    MSG, ART = "#msg", "#article"
+    site = _site(assistant=(MSG, ART))          # no message id: counts only
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()],
+                      MSG: [_Node(text="a"), _Node(text="b")],
+                      ART: [_Node(text="t1"), _Node(text="t2"), _Node(text="t3")]})
+    tab = _tab(page, site)
+
+    async def go():
+        before = await tab._fingerprint()
+        assert before[0] == 2 and tab._counted_with == MSG
+
+        page.dom[MSG] = []                       # forced onto the coarser one
+        await tab._messages()
+        assert tab._assistant == ART
+        # ART's count is 3 against a baseline of 2 taken under MSG. Reading that
+        # as "a new message arrived" is how a whole send was lost.
+        assert await tab._new_reply(before) is None, (
+            "compared a count taken with one selector against another"
+        )
+
+    asyncio.run(go())
+
+
+def test_the_post_mortem_names_the_selector_the_read_actually_used(capsys):
+    """`_explain_empty` re-resolved from scratch, so it could count one selector
+    and quote `before[0]`, which was counted with another — reporting "matched 2
+    message(s), the same as before the prompt was sent" of two different things,
+    about a page holding the finished answer."""
+    MSG, ART = "#msg", "#article"
+    site = _site(assistant=(MSG, ART))
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()],
+                      MSG: [], ART: [_Node(text="a turn")]})
+    tab = _tab(page, site)
+    asyncio.run(tab._messages())          # latches ART, the only one matching
+    assert tab._assistant == ART
+
+    page.dom[MSG] = [_Node(text="x"), _Node(text="y")]
+    asyncio.run(tab._explain_empty((1, None)))
+    out = capsys.readouterr().out
+    assert ART in out, f"the post-mortem named a selector the read never used: {out}"
+    assert MSG not in out, out
+
+
 def test_the_echo_guard_reads_the_whole_message_not_the_code_block():
     """`_read` prefers the last `pre code`, and task statements routinely contain
     fenced code — so comparing the extracted block against the prompt would never
@@ -5762,6 +5892,120 @@ def test_every_archived_rust_answer_is_judged_the_same_way_as_rustc():
                  if (rust_defect(f.read_text()) or "").find("unclosed") >= 0]
     assert len(truncated) == 1, truncated
     assert truncated[0].startswith("f8fe7918"), truncated
+
+
+def test_a_commented_first_line_is_python_not_a_root_shell_prompt():
+    r"""`_SHELL_OPENER_RE` opened with `[$#>]\s`, where `#` meant a root shell
+    prompt. In Python `# ` is a comment, and a commented first line is one of
+    the commonest ways a program starts — so the whole block was declared "not
+    source at all", `extract_code` fell past it, and the model's own one-line
+    usage example was submitted instead. Deleting only the comment made the same
+    reply return the program."""
+    from solvers.prompts import plausible_source
+
+    answer = ("# Sliding window over the log lines.\n"
+              "def g(lines):\n    best = 0\n    for ln in lines:\n"
+              "        if ln.startswith('E'):\n            best += 1\n    return best\n")
+    assert plausible_source(answer, "python"), "a commented answer is not source"
+
+    reply = f"```python\n{answer}```\n\nExample:\n\n```python\nprint(g(['E1']))\n```\n"
+    got = extract_code(reply, "g", "python")
+    assert "def g(lines)" in got, f"submitted the demo instead of the answer: {got!r}"
+    assert "print(g(" not in got, got
+
+    # ...and the thing the `#` alternative was there for still fails: a root
+    # prompt is a prompt CHARACTER followed by a command, which no comment is.
+    for tool_call in ("# cat > main.rs << 'EOF'\nfn main() {}\n",
+                      "# pip install numpy\n",
+                      "$ python3 solve.py\n",
+                      "> npm run build\n",
+                      "cd /home/claude && python sol.py\n",
+                      '{"command": "mkdir -p /home/claude"}\n'):
+        assert not plausible_source(tool_call, "python"), tool_call
+
+
+def test_a_code_block_nested_under_a_list_item_still_parses():
+    """Markdown REQUIRES the indentation of every line inside a block nested
+    under a list item, and it is not part of the source. Keeping it handed
+    `extract_code` a block whose every line began with three spaces; `.strip()`
+    then removed them from the first line only, and a program the model wrote
+    correctly came back as `unexpected indent, line 3`."""
+    from solvers.prompts import fenced_blocks
+
+    reply = ("Plan:\n\n"
+             "1. Sort the distinct values.\n"
+             "2. Sum the top two:\n\n"
+             "   ```python\n"
+             "   import math\n"
+             "\n"
+             "   def solve(nums):\n"
+             "       vals = sorted(set(nums), reverse=True)\n"
+             "       return sum(vals[:2]) if len(vals) >= 2 else 0\n"
+             "   ```\n")
+    got = extract_code(reply, "solve", "python")
+    assert python_defect(got, "solve") is None, python_defect(got, "solve")
+    assert got.startswith("import math"), got
+
+    # Never MORE than the fence had: a line the author indented further keeps
+    # the difference, which is the whole of the program's own structure.
+    assert fenced_blocks("  ```py\n  a\n      b\n  ```\n") == ["a\n    b\n"]
+    # An unnested block — every ordinary reply — is untouched.
+    assert fenced_blocks("```py\ndef g():\n    return 1\n```\n") == [
+        "def g():\n    return 1\n"
+    ]
+    # A tab is never partially removed; guessing its width would corrupt source.
+    assert fenced_blocks(" ```py\n\tdef g():\n\t\treturn 1\n ```\n") == [
+        "\tdef g():\n\t\treturn 1\n"
+    ]
+
+
+def test_a_carried_import_never_displaces_a_future_import():
+    """`from __future__` must be the first statement in the file, after at most
+    a docstring. `import math` above it is source `ast.parse` accepts and the
+    grader's import rejects — so it was reported CLEAN and scored zero."""
+    reply = ("```python\nimport math\n```\n\n"
+             "```python\nfrom __future__ import annotations\n\n"
+             "def g(n):\n    return math.isqrt(n)\n```\n")
+    got = extract_code(reply, "g", "python")
+    assert got.lstrip().startswith("from __future__"), got
+    assert "import math" in got, got
+    compile(got, "<solution>", "exec")          # the question the grader asks
+    assert python_defect(got, "g") is None
+
+    # A docstring may precede it, and has the same must-be-first rule.
+    with_doc = ('```python\nimport math\n```\n\n```python\n"""Solve it."""\n'
+                "from __future__ import annotations\n\ndef g(n):\n    return math.isqrt(n)\n```\n")
+    got = extract_code(with_doc, "g", "python")
+    compile(got, "<solution>", "exec")
+    assert got.lstrip().startswith('"""Solve it."""'), got
+
+    # With nothing that must come first, the import still goes to the top.
+    plain = "```python\nimport math\n```\n\n```python\ndef g(n):\n    return math.isqrt(n)\n```\n"
+    assert extract_code(plain, "g", "python").startswith("import math"), plain
+
+
+def test_the_parse_gate_asks_what_the_grader_will_ask():
+    """The validator IMPORTS this source, and import COMPILES it — so
+    `ast.parse` is the wrong question by exactly the set of programs that parse
+    and will not compile."""
+    bad = "import math\nfrom __future__ import annotations\ndef g(n):\n    return n\n"
+    import ast as _ast
+    _ast.parse(bad)                              # parses...
+    defect = python_defect(bad, "g")             # ...and is caught anyway
+    assert defect and "not valid Python" in defect, defect
+
+    # Nothing that compiles today may start failing: the archived submissions
+    # are the exact bytes the validator received.
+    import pathlib
+
+    archive = pathlib.Path(__file__).resolve().parents[2] / "solutions"
+    for f in sorted(archive.glob("*.py")):
+        src = f.read_text()
+        try:
+            _ast.parse(src)
+        except SyntaxError:
+            continue
+        compile(src, "<archived>", "exec")
 
 
 def test_a_rust_preamble_split_into_its_own_block_is_carried_too():

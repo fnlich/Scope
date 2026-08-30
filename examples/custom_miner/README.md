@@ -1473,6 +1473,78 @@ all, still leaves the page in charge and only says so.
 `*_STREAM_FIRST=1` is unchanged: it makes the wire the primary outright, for an
 operator who has watched it agree on their own accounts.
 
+### Five ways the reader threw away an answer it had
+
+Found by a 29-agent adversarial hunt over the reading paths, each reproduced
+against the real modules before it was believed.
+
+**A leading `#` comment was read as a root shell prompt.** `_SHELL_OPENER_RE`
+opened with `[$#>]\s`, and `#` is how a great many Python programs start:
+
+```
+plausible_source("# Sliding window over the log lines.\ndef g(lines): ...") -> False
+extract_code(that reply + a demo block)  -> "print(g(['E1','I2']))"
+```
+
+The answer was declared "not source at all", `extract_code` fell past it, and
+the model's own one-line usage example went to the validator. Deleting only the
+comment made the same reply return the program. `#` now counts only when a
+command follows it — which is what a root prompt is and what no comment is.
+`$ ` and `> ` keep their bare form; neither opens a Python statement.
+
+**A code block nested under a list item was extracted unparseable.** Markdown
+*requires* that indentation, and it is not part of the source. `fenced_blocks`
+kept it and `extract_code`'s `.strip()` then removed it from the first line
+only, so a correct program came back as `unexpected indent, line 3`. The opening
+fence's indentation is now removed from every body line — never more than the
+fence itself had, so a line the author indented further keeps the difference,
+and a tab is never partially removed.
+
+**A carried import landed above `from __future__`.** That has to be the first
+statement in the file, and `import math` above it is source `ast.parse` accepts
+and the grader's import rejects:
+
+```
+python_defect -> None                    <- reported CLEAN
+compile(...)  -> SyntaxError: from __future__ imports must occur at the beginning
+```
+
+Carried imports now go below anything that must come first — a docstring, a
+`__future__` import. And `python_defect` asks `compile()` rather than
+`ast.parse`, because the validator *imports* this source and import compiles it:
+`ast.parse` is the wrong question by exactly the set of programs that parse and
+will not compile. None of the 43 archived submissions is newly rejected.
+
+**A momentarily shorter message list latched a previous turn's answer.**
+`_new_reply` read "the last message's id changed" as proof of a new reply. True
+when the list grew or held steady; when it *shrank*, the last message is an
+older one wearing a different id — so the prompt was answered with the previous
+turn's program, silently, `empty_reason=None`. The branch now requires
+`count >= count_before`; a shorter list means the page is mid-re-render, and
+waiting one poll is what every other unresolved state here does.
+
+**A transient selector miss stranded the whole send on a coarser candidate.**
+`_messages` dropped its latch when the candidate matched nothing, on the grounds
+that *"there is no count to corrupt at zero"*. There is: `before[0]` was counted
+with the **old** candidate, and `_new_reply` compares the new one's count
+against it. chatgpt.com ships two candidates that count on different scales — an
+A/B pair is two messages inside one article. Measured:
+
+```
+before = (2, 'm2') latched: #msg
+note: assistant selector '#msg' stopped matching mid-answer; re-resolving
+after the blink, latched: #article
+once #msg matches again, latched: #article      <- never re-examined
+reply found: False
+```
+
+Three things now hold it together: `_counted_with` remembers which candidate the
+baseline belongs to; the fallback is **re-examined** rather than held, so the
+earlier candidate is taken back the moment it matches again; and while the latch
+is not `_counted_with`, the count comparison is not made at all. `_explain_empty`
+reports the latched selector too, so its diagnosis names the selector the read
+actually used.
+
 ### A model still writing is waited for, never interrupted
 
 The slice a read is given is an internal **allocation**, not a deadline. Where a
