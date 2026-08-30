@@ -52,7 +52,7 @@ from typing import Any  # noqa: E402
 
 from custom_miner import CustomMiner  # noqa: E402
 from rlvr.neurons.demo_miner import DemoMinerSettings, build_demo_miner_app  # noqa: E402
-from solvers.config import find_env_file, load_env_file  # noqa: E402
+from solvers.config import load_miner_env  # noqa: E402
 from solvers.roster import build_solver, describe, roster, warm_up  # noqa: E402
 
 
@@ -61,9 +61,11 @@ def main() -> None:
     # the file directly and never touches os.environ — so backend knobs written
     # there (CLAUDE_CDP, CHATGPT_CDP, selector overrides) would otherwise be
     # silently ignored. Real environment variables still win.
-    env_file = find_env_file()
-    if load_env_file(env_file):
-        print(f"[miner] loaded {env_file}")
+    #
+    # `load_miner_env`, not the two calls it wraps: this entry point did the
+    # loading and skipped `apply_solve_timeout_default`, and so ran every solve
+    # 20 seconds shorter than the rehearsal that is supposed to reproduce it.
+    load_miner_env("miner")
     settings = DemoMinerSettings()
     # Read the roster once: building it twice would repeat its warnings, and
     # the printed summary must describe the fleet the solver actually got.

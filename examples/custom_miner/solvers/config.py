@@ -61,6 +61,34 @@ def apply_solve_timeout_default() -> None:
     os.environ.setdefault("GLM_REQUEST_TIMEOUT_S", DEFAULT_SOLVE_TIMEOUT_S)
 
 
+def load_miner_env(label: str) -> Optional[Path]:
+    """Everything an entry point must do before building ``DemoMinerSettings``.
+
+    Four steps in a fixed order -- find the file, load it into ``os.environ``,
+    fill in the solve-timeout default, say which file was read -- and the order
+    matters twice over: ``apply_solve_timeout_default`` uses ``setdefault``, so
+    an operator's ``.env`` value has to be in the environment before it runs, and
+    pydantic-settings has to be constructed after both.
+
+    It lives here because it was open-coded in three entry points and one of
+    them lost a step. `run_miner.py` -- the on-chain miner -- did the finding,
+    the loading and the printing and never applied the default, so with nothing
+    in the environment it ran every solve at `glm_request_timeout_s=280` while
+    `rehearse.py` ran the same solve at 3600. On a 300s deadline that is a
+    replay measuring 300 seconds of budget against a miner that had 280:
+    twenty seconds of divergence, in the direction that flatters the replay.
+
+    A helper rather than a comment, because the comment was already there --
+    right above `apply_solve_timeout_default` -- and being right did not make
+    the third caller remember it.
+    """
+    env_file = find_env_file()
+    if load_env_file(env_file):
+        print(f"[{label}] loaded {env_file}")
+    apply_solve_timeout_default()
+    return env_file
+
+
 def selectors(env: str, default: Sequence[str]) -> tuple[str, ...]:
     """Candidate selectors for one role, overridable as ``a|b|c``.
 

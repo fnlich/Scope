@@ -7175,6 +7175,61 @@ def test_a_solve_that_used_its_whole_budget_does_not_promise_another_model(capsy
     assert "-0s left" not in out, out
 
 
+def test_every_entry_point_gives_a_solve_the_same_budget(monkeypatch, capsys):
+    """A replay is only evidence if it runs the solve production runs.
+
+    `handle_request` bounds the whole solve at
+    `min(deadline_s, glm_request_timeout_s)`, and `DemoMinerSettings` defaults
+    that to 280 -- below the 300s this subnet advertises.
+    `apply_solve_timeout_default` fills in 3600 instead, which
+    `TaskRequest.deadline_s`'s own `le=3600` makes structurally incapable of
+    binding, so the request's deadline is the only deadline.
+
+    It was called by `custom_miner.run_custom_miner` and by `rehearse`, and NOT
+    by `run_miner.py` -- the on-chain entry point. With nothing in the
+    environment the replay therefore ran every solve at 300s of a 300s deadline
+    while the miner it was rehearsing ran at 280: twenty seconds of divergence,
+    in the direction that flatters the replay. `config.py`'s own docstring said
+    the opposite ("The miner and the rehearsal both call it").
+
+    `load_miner_env` is the fix and this is the test that it stays fixed: the
+    steps are in one function now, so a fourth entry point cannot lose one."""
+    from solvers import config
+
+    monkeypatch.delenv("GLM_REQUEST_TIMEOUT_S", raising=False)
+    config.load_miner_env("miner")
+    assert os.environ["GLM_REQUEST_TIMEOUT_S"] == config.DEFAULT_SOLVE_TIMEOUT_S
+
+    settings = DemoMinerSettings(_env_file=None)
+    assert settings.glm_request_timeout_s == float(config.DEFAULT_SOLVE_TIMEOUT_S)
+    # The number that actually matters: what a 300s request gets to spend.
+    assert min(300.0, settings.glm_request_timeout_s) == 300.0, (
+        "a spec-compliant deadline was cut short by the miner's own default"
+    )
+
+    # Every entry point calls it. Read from the source rather than trusted,
+    # because the whole failure was one caller quietly not doing so.
+    here = Path(__file__).resolve().parent
+    for name in ("run_miner.py", "custom_miner.py", "solvers/rehearse.py"):
+        text = (here / name).read_text(encoding="utf-8")
+        assert "load_miner_env(" in text, f"{name} builds its settings by hand"
+        assert "apply_solve_timeout_default()" not in text, (
+            f"{name} still open-codes a step of the sequence"
+        )
+
+
+def test_an_operators_own_solve_timeout_is_never_overwritten(monkeypatch):
+    """`setdefault`, not assignment. The default exists to stop a bare
+    environment costing 20s a solve, not to overrule someone who chose a value
+    -- and a knob that ignores what you set it to is worse than no knob."""
+    from solvers import config
+
+    monkeypatch.setenv("GLM_REQUEST_TIMEOUT_S", "120")
+    config.load_miner_env("miner")
+    assert os.environ["GLM_REQUEST_TIMEOUT_S"] == "120"
+    assert DemoMinerSettings(_env_file=None).glm_request_timeout_s == 120.0
+
+
 def test_the_archive_line_names_a_directory_you_can_find(tmp_path, monkeypatch, capsys):
     """`SOLVER_SOLUTION_DIR` defaults to the relative "solutions", so the line
     read "archived under solutions/" and left the reader to work out which

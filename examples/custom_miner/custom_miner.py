@@ -260,12 +260,9 @@ def run_custom_miner(solver: Optional[Solver] = None) -> None:
     # never populates os.environ. MY_APP_URL is read from os.environ below and
     # is not one of its fields, so without this a MY_APP_URL written into .env —
     # exactly as the README says to — was silently ignored.
-    from solvers.config import apply_solve_timeout_default, find_env_file, load_env_file
+    from solvers.config import load_miner_env
 
-    env_file = find_env_file()
-    if load_env_file(env_file):
-        print(f"[custom-miner] loaded {env_file}")
-    apply_solve_timeout_default()
+    load_miner_env("custom-miner")
     settings = DemoMinerSettings()
     if solver is None:
         solver = HttpAppSolver(os.environ.get("MY_APP_URL", ""))
