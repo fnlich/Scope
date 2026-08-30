@@ -4345,7 +4345,10 @@ def test_every_round_reads_against_everything_that_is_left():
 
     source = inspect.getsource(VerifyingSolver._attempt)
     assert "first_share" not in source, "the private slice is back"
-    assert "conversation.send(prompt, left)" in source, source[:200]
+    # `left` is the whole of what remains, and `spare` is the margin's grading
+    # share -- not a reserve carved out of the budget, and spent only on a model
+    # that is still writing. See `_read`.
+    assert "_read(conversation, prompt, left, spare)" in source, source[:200]
 
 
 def test_the_examples_decide_when_the_statement_is_ambiguous():
@@ -8948,6 +8951,107 @@ def test_a_correction_too_late_to_grade_still_beats_the_answer_it_corrects():
     )
 
 
+def test_a_model_seconds_from_finishing_is_waited_for_into_the_margin(monkeypatch):
+    """From a real solve: turn 1 took 49s, turn 2 was 215s in and still writing
+    when the read stopped at the working budget, and the miner submitted
+    NOTHING against a 300s deadline.
+
+    Waiting is close to free and giving up is a certain zero. The validator
+    reads until `deadline_s + 10`, and its payment rule has no deadline term at
+    all — correctness is a hard gate and speed is a relative multiplier floored
+    at 0.95, so the same answer a minute later is still worth 95%.
+
+    So the safety margin is split. `budget` is what every phase plans against;
+    `DELIVERY_RESERVE_S` is what the answer needs to be archived, signed and put
+    on the wire. The difference is the share that was reserved for GRADING, and
+    a read that ends holding nothing has nothing to grade — so a model still
+    writing is waited for into it."""
+    from solvers import verify as V
+
+    scale = 0.05
+    monkeypatch.setattr(V, "DELIVERY_RESERVE_S", 12.0 * scale)
+
+    class _Chat:
+        provider = "claude"
+
+        def __init__(self):
+            self.n = -1
+            self.still_writing = False
+            self.empty_reason = None
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            self.n += 1
+            need = (49.0 if self.n == 0 else 215.0) * scale
+            allowed = max(timeout_s, extend_to_s or 0.0)
+            if need > allowed:
+                await asyncio.sleep(allowed)
+                self.still_writing, self.empty_reason = True, "unfinished"
+                return ""
+            await asyncio.sleep(need)
+            self.still_writing, self.empty_reason = False, None
+            return ('```json\n[{"name": "one", "args": [1], "expected": 1}]\n```'
+                    if self.n == 0 else
+                    "```python\ndef solve_terminal_editor(*a, **k):\n    return []\n```")
+
+        async def close(self): pass
+
+    class _Fleet:
+        def __init__(self): self.chat = _Chat()
+        async def open(self, avoid=None, timeout_s=None): return self.chat
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    # 49 + 215 = 264 against a 260s working budget, on a 280s deadline. The
+    # margin's grading share is what closes the gap.
+    task = SolveTask(problem_id="p", language="python", statement="s",
+                     entrypoint="solve_terminal_editor", public_examples=[],
+                     deadline_s=300.0 * scale)
+    with contextlib.redirect_stdout(io.StringIO()):
+        answer = asyncio.run(
+            V.VerifyingSolver(_Fleet(), safety_margin_s=20.0 * scale,
+                              max_budget_s=3600.0, second_opinion=False)
+            .solve_task(task, timeout_s=280.0 * scale))
+
+    assert "solve_terminal_editor" in answer.code, (
+        "submitted nothing while the model was seconds from finishing"
+    )
+
+
+def test_the_wait_never_eats_what_delivery_needs():
+    """The other half: `DELIVERY_RESERVE_S` is a floor, not a suggestion. Past
+    it the answer could not be archived, signed and put on the wire before the
+    validator stops reading, so waiting longer would trade a late answer for no
+    answer."""
+    from solvers.verify import DELIVERY_RESERVE_S
+
+    # It is smaller than the default margin -- otherwise there is nothing to
+    # lend -- and large enough for `send`'s post-read tail (FULL_TAIL_S = 11s)
+    # plus signing and transport.
+    from solvers.browser_pool import FULL_TAIL_S
+
+    assert FULL_TAIL_S <= DELIVERY_RESERVE_S < 20.0, DELIVERY_RESERVE_S
+
+
+def test_a_backend_that_cannot_wait_longer_is_never_asked_to():
+    """`Backend.open`'s protocol has always been the two-argument `send`. A
+    keyword a backend outside this package does not take would be a TypeError
+    inside the one call the whole solve depends on."""
+    seen = []
+
+    class _TwoArg:
+        provider = "claude"
+        async def send(self, text, timeout_s):
+            seen.append(timeout_s)
+            return "```python\ndef g(n):\n    return n\n```"
+        async def close(self): pass
+
+    from solvers.verify import _read
+
+    got = asyncio.run(_read(_TwoArg(), "solve it", 30.0, spare=12.0))
+    assert "def g" in got, got
+    assert seen == [30.0], seen
+
+
 def test_the_latest_version_is_the_one_that_ships():
     """The whole rule. No score is compared.
 
@@ -9430,19 +9534,24 @@ def test_the_cases_turn_does_not_shrink_the_read_the_program_gets():
         f"the cases turn was allocated {slices[0]:.0f}s of a 300s deadline — it "
         f"is supposed to read against the whole budget, not a share of it"
     )
-    assert caps[0] is None or caps[0] <= slices[0] + 0.01, (
-        "nothing is held back from the cases turn, so there is nothing to "
-        "extend into"
-    )
     # A fast cases turn costs the program almost nothing: these fakes reply
     # instantly, so turn 2 still opens on essentially the whole budget.
     assert slices[1] > 200.0, f"the program only got {slices[1]:.0f}s"
-    # And nothing extends into it either, because nothing is held back from it:
-    # the program turn is given everything left, exactly as turn 1 is.
-    assert caps[1] is None or caps[1] <= slices[1] + 0.01, (
-        "a reserve is back — the program's read is a share of the budget "
-        "rather than the whole of it"
-    )
+
+    # What each read may extend to is NOT a repair reserve -- there is none, and
+    # a slice that was a share of the budget is exactly what this test exists to
+    # refuse. It is the safety margin's GRADING share, offered only to a model
+    # that is still writing, and it stops where delivery begins.
+    from solvers.verify import DELIVERY_RESERVE_S
+
+    for i, (slice_s, cap) in enumerate(zip(slices, caps)):
+        assert cap is not None and cap > slice_s, (
+            f"turn {i + 1} cannot wait out a model that is still writing"
+        )
+        assert cap <= 300.0 - DELIVERY_RESERVE_S + 0.01, (
+            f"turn {i + 1} would wait past the point the answer can be "
+            f"delivered: {cap:.0f}s of a 300s deadline"
+        )
 
 
 def test_every_deadline_asks_for_the_cases_first():

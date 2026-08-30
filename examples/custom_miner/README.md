@@ -1581,6 +1581,41 @@ is not `_counted_with`, the count comparison is not made at all. `_explain_empty
 reports the latched selector too, so its diagnosis names the selector the read
 actually used.
 
+### The safety margin lends its grading share to a model still writing
+
+From a real solve: turn 1 took 49s, turn 2 was 215s in and **still writing**
+when the read stopped, and the miner submitted nothing — against a 300s
+deadline.
+
+Waiting is close to free and giving up is a certain zero. The validator reads
+until `deadline_s + 10`, and `rlvr/scoring/payment.py` has **no deadline term at
+all**: correctness is a hard gate and speed is a relative multiplier floored at
+`0.95`, so the same answer arriving a minute later is still worth 95%.
+
+So `SOLVER_SAFETY_MARGIN_S` is split into the two things it was paying for:
+
+| | |
+|---|---|
+| `budget` | what every phase plans against — `deadline − margin` |
+| `DELIVERY_RESERVE_S` (12s) | what the answer needs after the read: `send`'s post-read tail (11s), then archiving, signing and the wire |
+
+The difference between them is the share reserved for **grading** — and a read
+that ends holding nothing has nothing to grade. So a model still writing at the
+working budget is waited for into it, down to the delivery floor and no further.
+`send` returns the moment the model finishes, so a promptly-answered prompt never
+touches it.
+
+⚠ Check `GLM_REQUEST_TIMEOUT_S` before blaming any of this. It bounds the whole
+solve at `min(deadline_s, GLM_REQUEST_TIMEOUT_S)` and the reference miner's docs
+put it at **280** — below the 300s this subnet advertises, so it silently costs
+20 seconds of every solve. The code defaults it to `3600` precisely so it cannot
+bind; a value in your `.env` overrides that. The miner says so once per run:
+
+```
+[verify] the validator offered 300s but this miner caps the solve at 280s, so
+every answer gets 20s less than it could.
+```
+
 ### A model still writing is waited for, never interrupted
 
 The slice a read is given is an internal **allocation**, not a deadline. Where a

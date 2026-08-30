@@ -70,6 +70,17 @@ EXECUTOR_RETRY_S = float(os.environ.get("SOLVER_EXECUTOR_RETRY_S", "300"))
 # is warm.
 RESUME_FLOOR_S = 40.0
 
+# What must be left when a read finally stops, for the answer to reach the
+# validator at all: `send`'s post-read phases (copy, stream, post-mortem --
+# `FULL_TAIL_S`, 11s) plus archiving, signing and putting it on the wire.
+#
+# Smaller than `SOLVER_SAFETY_MARGIN_S`, and the difference is deliberate. The
+# margin also reserves time to GRADE, and grading is exactly what a read that
+# ends holding nothing has nothing to do. So a model still writing when the
+# working budget runs out is waited for into the margin, down to this -- see
+# `_hard_stop`.
+DELIVERY_RESERVE_S = 12.0
+
 # The least a lease wait may be cut to. Below this, waiting is pointless and
 # failing fast lets the pass end while another tab might still be tried.
 OPEN_FLOOR_S = 5.0
@@ -216,6 +227,30 @@ def _supersedes(candidate: Candidate, best: Candidate, still_writing: bool) -> b
     if still_writing:
         return not best.code.strip()
     return True
+
+
+async def _read(conversation, prompt: str, slice_s: float, spare: float) -> str:
+    """Send, and wait past the slice only while the model is still writing.
+
+    `spare` is the part of the safety margin reserved for GRADING, which a read
+    that ends holding nothing has nothing to do with. Offering it as
+    `extend_to_s` lets `send` keep reading a reply that is still arriving rather
+    than return empty -- and `send` returns the moment the model finishes, so a
+    prompt that is answered promptly never touches it.
+
+    Offered, not passed blindly: `Backend.open`'s protocol has always been the
+    two-argument `send`, and a keyword a backend outside this package does not
+    take would be a TypeError inside the one call the whole solve depends on.
+    """
+    slice_s = max(1.0, slice_s)
+    if spare <= 0:
+        return await conversation.send(prompt, slice_s)
+    try:
+        return await conversation.send(
+            prompt, slice_s, extend_to_s=slice_s + spare
+        )
+    except TypeError:
+        return await conversation.send(prompt, slice_s)
 
 
 class _Grader:
@@ -554,6 +589,21 @@ class VerifyingSolver:
         # validator -- which would have paid 96% for the same answer arriving at
         # six minutes. Correctness is worth 100%; speed is worth at most 5%.
         budget = min(float(timeout_s), self._max_budget) - self._margin
+        # How long a read may run when the model is STILL WRITING and stopping
+        # would mean submitting nothing. `budget` is the working figure every
+        # phase plans against; this is the point past which the answer could not
+        # be delivered even if it arrived. The gap between them is the part of
+        # the safety margin that was reserved for grading -- which a read
+        # holding nothing does not need.
+        #
+        # Waiting is close to free and giving up is a certain zero. The
+        # validator reads until `deadline_s + 10` and its payment rule has no
+        # deadline term at all: correctness is a hard gate and speed is a
+        # relative multiplier floored at 0.95, so the same answer arriving a
+        # minute later is still worth 95%. Measured on a real solve: turn 1 took
+        # 49s, turn 2 was 208s in and still writing when the read stopped at
+        # 260s of a 300s deadline, and the miner submitted nothing.
+        hard_stop = min(float(timeout_s), self._max_budget) - DELIVERY_RESERVE_S
         if budget <= 5.0:
             # Too short for the whole margin, so keep the SHAPE of the promise
             # instead of its size: half the request, which leaves the other half
@@ -641,7 +691,8 @@ class VerifyingSolver:
                     break
             attempt_no += 1
             candidate, provider = await self._attempt(
-                task, remaining, avoid=asked[-1] if asked else None, plan=plan
+                task, remaining, avoid=asked[-1] if asked else None, plan=plan,
+                spare=max(0.0, hard_stop - budget),
             )
             if provider:
                 asked.append(provider)
@@ -735,7 +786,7 @@ class VerifyingSolver:
             verified=best.verified, passed=best.passed, total=best.total,
         )
 
-    async def _ask_for_cases(self, conversation, task, left: float):
+    async def _ask_for_cases(self, conversation, task, left: float, spare: float = 0.0):
         """Turn 1: the model's cases, before it has written the program.
 
         Returns the cases, or ``[]`` when the reply carried none usable, or
@@ -751,9 +802,10 @@ class VerifyingSolver:
         prompt = build_tests_prompt(
             task.language, task.statement, task.entrypoint, task.public_examples
         )
-        # No `extend_to_s`: the slice already IS everything left, so there is
-        # nothing to extend to and nothing being held back to extend into.
-        reply = await conversation.send(prompt, slice_s)
+        # The slice IS everything left of the working budget. What is offered
+        # past it is the grading share of the safety margin, and only while the
+        # model is still writing -- see `_read`.
+        reply = await _read(conversation, prompt, slice_s, spare)
         if getattr(conversation, "still_writing", False) or getattr(
             conversation, "empty_reason", None
         ) in ("unreadable", "unfinished"):
@@ -776,6 +828,7 @@ class VerifyingSolver:
         remaining: float,
         avoid: Optional[str],
         plan: Optional["_Plan"] = None,
+        spare: float = 0.0,
     ) -> tuple[Optional[Candidate], Optional[str]]:
         """One model, one conversation: initial answer plus repair rounds.
 
@@ -822,7 +875,8 @@ class VerifyingSolver:
             two_phase = plan is None or plan.two_phase
             if self._self_tests and two_phase:
                 cases = await self._ask_for_cases(
-                    conversation, task, budget - (time.monotonic() - started)
+                    conversation, task, budget - (time.monotonic() - started),
+                    spare,
                 )
                 if cases is None:
                     # The tab could not be read, or the model was still writing.
@@ -1000,7 +1054,12 @@ class VerifyingSolver:
                 # nothing being held back to extend into. Passing one equal to
                 # the slice makes `send`'s extension a no-op by construction and
                 # only reads as though a reserve existed.
-                reply = await conversation.send(prompt, left)
+                # `left` is the slice; `left + spare` is where the answer
+                # stops being deliverable. They differ only by the part of the
+                # safety margin reserved for grading, and `send` spends the
+                # difference ONLY while the model is still writing -- it returns
+                # the moment the reply finishes, so a prompt read is unaffected.
+                reply = await _read(conversation, prompt, left, spare)
                 # A repair reply may carry a CORRECTED case array: the repair
                 # prompt offers it outright ("or, if the case was wrong rather
                 # than the program, a `json` array holding ALL of the cases").
