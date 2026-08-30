@@ -56,9 +56,10 @@ from solution_archive import save_exchange, save_solution  # noqa: E402
 # whole point is to say why instead.
 require_linux("The custom miner")
 
+import asyncio  # noqa: E402
 import os  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
-from typing import Any, Optional, Protocol  # noqa: E402
+from typing import Any, Mapping, Optional, Protocol  # noqa: E402
 
 import httpx  # noqa: E402
 
@@ -67,7 +68,7 @@ from rlvr.neurons.demo_miner import (
     DemoMinerSettings,
     build_demo_miner_app,
 )
-from rlvr.protocol import SolutionPayload, TaskRequest
+from rlvr.protocol import SolutionPayload, TaskRequest, verify_signature
 
 
 # --------------------------------------------------------------------------- #
@@ -203,6 +204,35 @@ def fit_response(payload: SolutionPayload, limit: Optional[int] = None) -> Solut
     return stripped
 
 
+# How far past `deadline_s` this miner is willing to keep solving.
+#
+# The validator does not stop listening at `deadline_s`. `_dispatch_committed`
+# bounds the whole exchange at `deadline_s + _MINER_RESPONSE_GRACE_S`
+# (rlvr/neurons/decentralized.py:505-511, with the constant 10.0 at :51), and
+# that outer `asyncio.wait_for` is the real ceiling -- HTTPX's own timeout at
+# rlvr/neurons/live.py:148 is a per-phase inactivity bound, which the code
+# there says outright.
+#
+# The reference `handle_request` cancels our solve at `deadline_s` flat and
+# answers 504 with nothing, so every solve handed back seconds the validator
+# was still waiting for. There is no lateness term to fear on the other side:
+# `rlvr/scoring/payment.py` gates on `all_passed` and then applies a relative
+# speed multiplier with a 180s half-life floored at 0.95, so an answer arriving
+# five minutes after the fastest still earns 96.6%, and an unfinished one earns
+# nothing at all.
+#
+# NOT all ten seconds, and the reason is measured rather than cautious. That
+# grace is also the window the RESPONSE has to cross the wire, and the
+# validator's clock starts before our request even arrives, so some of it is
+# transit we never see. Everything on OUR side after the last read --
+# `fit_response`, both archive writes, and signing a maximum-size 128 KB
+# payload -- costs 2.4 ms median and 3.2 ms worst over thirty runs. So the ten
+# seconds is essentially all network, and five is a deliberate half of it.
+#
+# `MINER_RESPONSE_GRACE_S=0` restores the reference behaviour exactly.
+RESPONSE_GRACE_S = float(os.environ.get("MINER_RESPONSE_GRACE_S", "5"))
+
+
 class CustomMiner(DemoMiner):
     """A DemoMiner whose answers come from your Solver instead of GLM."""
 
@@ -247,6 +277,59 @@ class CustomMiner(DemoMiner):
             payload.model_dump(mode="json"),
         )
         return payload
+
+    async def handle_request(
+        self, headers: Mapping[str, str], body: bytes
+    ) -> tuple[int, SolutionPayload | dict[str, str]]:
+        """`DemoMiner.handle_request` with one number changed: the cutoff.
+
+        Every check below is the same call the parent makes, in the same order,
+        against the same primitives -- and because a copy drifts, a differential
+        test drives this and `DemoMiner.handle_request` over every rejection
+        path (bad signature, replay, unauthorized signer, unparseable body) and
+        requires identical status codes. Overriding rather than editing
+        `rlvr/` on purpose: that tree is upstream and this fork has never
+        touched it.
+
+        What differs is the last line. The parent cancels the solve at
+        `deadline_s`; the validator listens until `deadline_s + 10`. See
+        `RESPONSE_GRACE_S` above for how much of that gap is safe to use and
+        why.
+
+        `min` with `glm_request_timeout_s` is kept: an operator who sets that
+        knob DOWN is asking for a shorter solve, and the grace must not
+        overrule them.
+        """
+        expected_recipient = self.hotkey_address or None
+        if not verify_signature(headers, body, expected_signed_for=expected_recipient):
+            return 401, {"error": "invalid signature"}
+
+        if not self.nonces.check_and_add(headers.get("Epistula-Uuid", "")):
+            return 409, {"error": "replayed request"}
+
+        signed_by = headers.get("Epistula-Signed-By", "")
+        if self.metagraph is not None and not self.authorize(signed_by):
+            return 403, {"error": "unauthorized signer"}
+
+        try:
+            request = TaskRequest.model_validate_json(body)
+        except Exception:  # noqa: BLE001
+            return 400, {"error": "invalid task request"}
+
+        timeout_s = min(
+            request.deadline_s + max(0.0, RESPONSE_GRACE_S),
+            self.settings.glm_request_timeout_s,
+        )
+
+        async def solve_with_slot() -> SolutionPayload:
+            async with self.solve_slots:
+                return await self.solve(request, timeout_s)
+
+        try:
+            payload = await asyncio.wait_for(solve_with_slot(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            return 504, {"error": "solve deadline exceeded"}
+        return 200, payload
 
     async def aclose(self) -> None:
         await self._solver.aclose()
