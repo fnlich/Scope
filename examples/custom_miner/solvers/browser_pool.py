@@ -699,6 +699,12 @@ class _Tab:
         self._warned_relatch = False
         self._warned_stream = False
         self._warned_stream_diff = False
+        # Counted rather than flagged. A once-per-tab bool reported two
+        # incidents across 56 solves -- exactly one per tab, which is what it
+        # reports whether it happened twice or forty times. Every one of
+        # these is an answer that would have gone out truncated, so the
+        # NUMBER is the thing an operator needs.
+        self._cut_short_stream = 0
         # Highest network record seen before this send's prompt went out, so a
         # reply is never reconstructed out of the PREVIOUS answer's stream.
         self._stream_before = 0
@@ -1304,7 +1310,7 @@ class _Tab:
                 # shorter one is older. Take the fuller one. Anything else --
                 # a difference in the middle, which is what a highlighter
                 # artefact looks like -- leaves the copy in charge as before.
-                lost = self._copy_was_cut_short(rendered or [], copied)
+                lost = self._cut_short_by(rendered or [], copied)
                 if lost:
                     self._cut_short_count += 1
                     if self._cut_short_count == 1:
@@ -1497,16 +1503,61 @@ class _Tab:
                 f"({len(streamed)} chars captured). Nothing to submit."
             )
             return ""
-        if blocks and page_blocks and not self._warned_stream_diff:
-            gap = self._first_difference(page_blocks, blocks, "the page", "the wire")
-            if gap:
-                self._warned_stream_diff = True
-                print(
-                    f"[{self.site.name}] note: tab {self.label}: what the page shows and "
-                    f"what came off the wire are not the same — {gap}. Using the page. "
-                    f"If the wire is the one that is right, set "
-                    f"{self.site.env_prefix}_STREAM_FIRST=1."
-                )
+        if blocks and page_blocks:
+            # The page against the wire, asked the same question the copy
+            # control is asked: is one of these the other CUT SHORT?
+            #
+            # It wins on FIDELITY and has no authority at all on COMPLETENESS,
+            # and the two are different questions. The rule existed for the
+            # copy-vs-page pair and was never carried to this one, so this pair
+            # got the comparison, a printed note, and no decision. Measured on a
+            # live solve, in the operator's own log:
+            #
+            #   what the page shows and what came off the wire are not the same
+            #   — they differ at character 5605: the page nothing (it ends
+            #   here), the wire ' ' (U+0020). Using the page.
+            #
+            # The page ENDED at 5605 and the wire carried on. The page was the
+            # answer cut short, the wire held the whole of it, this code knew,
+            # said so, and submitted the truncation.
+            #
+            # The prefix test is what makes taking the wire safe here. The
+            # stream reconstruction is a heuristic over an undocumented private
+            # format, and the thing to fear from it is a reading that picked up
+            # the CONVERSATION rather than the reply -- but such a reading
+            # cannot have the page as its prefix. Any other disagreement, a
+            # difference in the middle above all, still leaves the page in
+            # charge exactly as before.
+            lost = self._cut_short_by(blocks, page_blocks)
+            if lost:
+                self._cut_short_stream += 1
+                if self._cut_short_stream == 1:
+                    print(
+                        f"[{self.site.name}] note: tab {self.label}: the page has the "
+                        f"answer CUT SHORT — {lost} character(s) fewer than came off "
+                        f"the wire, and the wire's version starts with all of it. "
+                        f"Submitting what came off the wire. This is a page read "
+                        f"taken before the last of the answer rendered, and every "
+                        f"one of these is an answer that would have gone out "
+                        f"truncated."
+                    )
+                else:
+                    print(
+                        f"[{self.site.name}] tab {self.label}: the page was CUT SHORT "
+                        f"again, {lost} character(s) missing "
+                        f"(#{self._cut_short_stream} on this tab)"
+                    )
+                return "\n".join(self._fence(b) for b in blocks)
+            if not self._warned_stream_diff:
+                gap = self._first_difference(page_blocks, blocks, "the page", "the wire")
+                if gap:
+                    self._warned_stream_diff = True
+                    print(
+                        f"[{self.site.name}] note: tab {self.label}: what the page shows "
+                        f"and what came off the wire are not the same — {gap}. Using "
+                        f"the page. If the wire is the one that is right, set "
+                        f"{self.site.env_prefix}_STREAM_FIRST=1."
+                    )
         if self.site.stream_first and blocks:
             return "\n".join(self._fence(b) for b in blocks)
         return best
@@ -1917,28 +1968,32 @@ class _Tab:
     _CUT_SHORT_SLACK = 4
 
     @staticmethod
-    def _copy_was_cut_short(rendered: list[str], copied: list[str]) -> int:
-        """Characters the copy is missing, when it is the same answer cut short.
+    def _cut_short_by(whole: list[str], part: list[str]) -> int:
+        """Characters `part` is missing, when it is `whole` CUT SHORT. Else 0.
 
-        Zero unless the copied source is a strict PREFIX of the rendered source
-        with whitespace ignored, which is what distinguishes the two ways these
-        readings disagree. A copy taken while the reply was still streaming is
-        the beginning of the answer and nothing else. A highlighter artefact --
-        the measured one was a Private Use Area character inside a Python
-        program -- is a difference in the MIDDLE, so the prefix test fails and
-        the copy keeps its authority, which is the whole reason it is preferred.
+        The one question worth asking whenever two readings of the same answer
+        disagree, and it has two callers because there are two such pairs: the
+        copy control against the page, and the page against the network stream.
+
+        Zero unless `part` is a strict PREFIX of `whole` with whitespace
+        ignored, which is what separates the two ways readings disagree. A
+        reading taken while the reply was still streaming is the beginning of
+        the answer and nothing else -- the shorter one is simply older, and the
+        fuller one wins. A rendering artefact -- the measured one was a Private
+        Use Area character inside a Python program -- is a difference in the
+        MIDDLE, so the prefix test fails and the usual precedence stands.
 
         Whitespace is ignored on both sides so that indentation rebuilt by the
         renderer, or the newline a copy control trims, is never mistaken for
         lost code.
         """
-        if not rendered or not copied:
+        if not whole or not part:
             return 0
-        whole = "".join("".join(b.split()) for b in rendered)
-        part = "".join("".join(b.split()) for b in copied)
-        if len(part) >= len(whole) or not whole.startswith(part):
+        full = "".join("".join(b.split()) for b in whole)
+        head = "".join("".join(b.split()) for b in part)
+        if len(head) >= len(full) or not full.startswith(head):
             return 0
-        missing = len(whole) - len(part)
+        missing = len(full) - len(head)
         return missing if missing > _Tab._CUT_SHORT_SLACK else 0
 
     def _disagreement(self, dom: list[str], copied: list[str]) -> Optional[str]:

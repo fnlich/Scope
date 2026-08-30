@@ -5234,6 +5234,83 @@ def test_the_wire_is_used_when_the_page_has_nothing_at_all():
     assert "def g(n)" in got, f"the wire rescue stopped working: {got!r}"
 
 
+def test_a_page_read_taken_before_the_answer_finished_never_beats_the_wire(capsys):
+    """The rule the copy control has always had, on the pair that never got it.
+
+    A reading wins on FIDELITY and has no authority at all on COMPLETENESS, and
+    the two are different questions. `_cut_short_by` decided that for copy vs
+    page; page vs wire got the comparison, a printed note, and no decision.
+    Measured on a live solve, in the operator's own log:
+
+        what the page shows and what came off the wire are not the same — they
+        differ at character 5605: the page nothing (it ends here), the wire ' '
+        (U+0020). Using the page.
+
+    The page ENDED at 5605 and the wire carried on. The page was the answer cut
+    short, the wire held the whole of it, and the truncation was submitted."""
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "solve it"
+    whole = "def g(n):\n    t = 0\n    while n > 0:\n        t += n % 10\n        n //= 10\n    return t"
+
+    async def wire():
+        return f"```python\n{whole}\n```\n"
+
+    tab._streamed_markdown = wire
+    # What the page had when the deadline landed: the same answer, cut off.
+    cut = "def g(n):\n    t = 0\n    while n > 0:\n        t"
+    got = asyncio.run(tab._reconcile_stream((0, None), _Tab._fence(cut), [cut]))
+
+    assert "return t" in got, f"submitted the page's truncation: {got!r}"
+    log = capsys.readouterr().out
+    assert "CUT SHORT" in log and "came off the wire" in log, log
+    # And the count is a count, not a once-per-tab flag: every one of these is
+    # an answer that would have gone out truncated, so the NUMBER is the thing.
+    assert tab._cut_short_stream == 1
+
+
+def test_the_wire_wins_only_when_the_page_is_its_PREFIX(capsys):
+    """The other half, and the reason the wire does not simply win.
+
+    Both stream formats are private, undocumented and free to change on any
+    deploy, and the reconstruction is a heuristic over their JSON. The one thing
+    to fear is a reading that picked up the CONVERSATION rather than the reply —
+    and such a reading cannot have the page as its prefix. So a difference in
+    the MIDDLE leaves the page in charge exactly as before, and only says so."""
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "solve it"
+    page = "def g(n):\n    return n + 1"
+
+    async def different_in_the_middle():
+        return "```python\ndef g(n):\n    return n + 2\n```\n"
+
+    tab._streamed_markdown = different_in_the_middle
+    got = asyncio.run(tab._reconcile_stream((0, None), _Tab._fence(page), [page]))
+
+    assert "n + 1" in got, f"a mid-answer disagreement handed the wire the answer: {got!r}"
+    log = capsys.readouterr().out
+    assert "Using the page" in log, log
+    assert "CUT SHORT" not in log, log
+    assert tab._cut_short_stream == 0
+
+
+def test_a_wire_shorter_than_the_page_never_replaces_it(capsys):
+    """The direction that must never fire. A stream capture that started late
+    holds the END of the answer, not the whole of it, and the page is then the
+    fuller reading — the prefix test is what tells the two apart."""
+    tab = _tab(None, _site(stream=True))
+    tab._sent = "solve it"
+    page = "def g(n):\n    t = 0\n    for d in str(n):\n        t += int(d)\n    return t"
+
+    async def truncated_wire():
+        return "```python\ndef g(n):\n    t = 0\n```\n"
+
+    tab._streamed_markdown = truncated_wire
+    got = asyncio.run(tab._reconcile_stream((0, None), _Tab._fence(page), [page]))
+
+    assert "return t" in got, f"took a wire reading shorter than the page: {got!r}"
+    assert tab._cut_short_stream == 0
+
+
 def test_nothing_anywhere_still_submits_nothing(capsys):
     """The streamed text is never handed back raw — a chat stream carries the
     conversation, and two of the miner's own prompts reached a validator as Rust
@@ -5392,12 +5469,150 @@ def test_carrying_imports_does_not_resurrect_the_usage_demo():
     assert value == 4 and "print(g(" not in code, code
 
 
-def test_rust_is_left_to_its_compiler():
-    """`use` has the same shape, but a Rust answer is put through rustc, which
-    says so in a message a repair round can act on."""
+def test_a_truncated_rust_program_is_caught_without_a_compiler():
+    """The check Python gets from `ast.parse` and `_always_returns`, and Rust
+    had only from a compiler that is allowed not to be there.
+
+    `rust_defect`'s other two tests both PASS a truncation: the first line still
+    opens like Rust and `fn main` still begins a line. Measured on a real
+    archived submission — 10,608 bytes, 75 `{` against 71 `}`, ending
+    mid-identifier four blocks deep. `rustc` calls it `error: this file contains
+    an unclosed delimiter`; nothing here did, and it went out as a confident
+    answer that cannot compile."""
+    from solvers.prompts import rust_defect
+
+    cut = ("fn main() {\n    for i in 0..10 {\n        if i > 3 {\n"
+           "            let x = i * 2;\n            i")
+    defect = rust_defect(cut)
+    assert defect and "unclosed" in defect, defect
+    assert "cut off mid-answer" in defect, defect
+
+    assert rust_defect('fn main() {\n    println!("ok");\n}\n') is None
+
+
+def test_the_rust_truncation_check_does_not_fire_on_valid_rust():
+    """A false positive here does not merely cost a repair round: a block
+    carrying a defect loses `extract_code`'s "last gradeable" preference, so a
+    trailing usage example can outrank the real answer. Every construct below is
+    one a naive delimiter counter gets wrong."""
+    from solvers.prompts import _rust_unclosed, rust_defect
+
+    valid = {
+        "brace in a string": 'fn main() { println!("}{ not real"); }',
+        "brace in a char": "fn main() { let c = '}'; let d = '{'; }",
+        "escaped quote char": "fn main() { let q = '\\''; let b = '\\\\'; }",
+        "lifetime": 'struct S<\'a> { s: &\'a str }\nfn main() { let _ = S { s: "h" }; }',
+        "loop label": "fn main() { 'outer: loop { break 'outer; } }",
+        "raw string": 'fn main() { let s = r#"he said "}" loudly"#; }',
+        "nested block comment": "fn main() { /* a /* b { */ c */ let x = 1; }",
+        "line comment": "fn main() { // } not real\n    let x = 1;\n}",
+        "byte string and byte char": 'fn main() { let b = b"}"; let c = b\'{\'; }',
+        "raw identifier": "fn main() { let r#type = 1; let _ = r#type; }",
+        "unicode escape char": "fn main() { let e = '\\u{1F600}'; }",
+        "closure": 'fn main() { let f = |x: i32| { x + 1 }; println!("{}", f(1)); }',
+    }
+    for label, src in valid.items():
+        assert rust_defect(src) is None, f"{label}: {rust_defect(src)}"
+
+    # And it gives UP rather than guessing when the scan meets something it
+    # cannot account for — an unterminated string or comment is as likely to be
+    # this scanner misreading Rust as it is to be a broken program.
+    assert _rust_unclosed('fn main() {\n    println!("unterminated') is None
+    assert _rust_unclosed("fn main() {\n    /* thinking about it") is None
+
+
+def test_a_loop_with_an_else_that_returns_is_not_a_truncation():
+    """`_always_returns` handled `If`, `With`, `Try`, `while True` and `Match`,
+    and fell through to False for every `For`. So the ordinary "search, else
+    report not found" shape was reported as *can reach the end of its body
+    without returning ... which is what a reply cut off mid-answer looks like*,
+    about a correct program.
+
+    A loop's `else` runs on every exit that is not a `break`, so an `else` that
+    always returns leaves no way to fall through — the same rule `while True:`
+    already had, decided by the same helper."""
+    from solvers.prompts import python_defect
+
+    found = ("def g(n):\n    for i in range(n):\n        if i == 3:\n"
+             "            return i\n    else:\n        return -1\n")
+    assert python_defect(found, "g") is None, python_defect(found, "g")
+
+    while_else = "def g(n):\n    while n:\n        n -= 1\n    else:\n        return n\n"
+    assert python_defect(while_else, "g") is None, python_defect(while_else, "g")
+
+    # A `break` bound to the loop SKIPS the else, so control can still fall
+    # through — and a bare loop with no else says nothing either way.
+    breaks = ("def g(n):\n    for i in range(n):\n        if i == 3:\n"
+              "            break\n    else:\n        return -1\n")
+    assert python_defect(breaks, "g"), "a break past the else was not noticed"
+    bare = "def g(n):\n    for i in range(n):\n        pass\n"
+    assert python_defect(bare, "g"), "a bare loop stopped being a truncation signal"
+
+
+def test_a_generator_is_reported_as_a_generator_not_as_a_truncation():
+    """Still a defect — the grader compares RETURN VALUES structurally, so what
+    it receives is a generator object rather than the answer. But it is not a
+    reply that was cut off, and saying so sent the model looking for a
+    truncation that was not there."""
+    from solvers.prompts import python_defect
+
+    gen = "def g(n):\n    for i in range(n):\n        yield i\n"
+    defect = python_defect(gen, "g")
+    assert defect and "generator" in defect, defect
+    assert "cut off" not in defect, defect
+
+    # A nested helper that yields makes IT a generator, not `g`.
+    nested = "def g(n):\n    def h():\n        yield 1\n    return list(h())\n"
+    assert python_defect(nested, "g") is None, python_defect(nested, "g")
+
+
+def test_every_archived_rust_answer_is_judged_the_same_way_as_rustc():
+    """The 43 committed submissions in `solutions/` are the exact bytes the
+    validator received, which makes them a regression fixture rather than a
+    hypothetical. Exactly one is truncated; the structural check has to find
+    that one and leave the other seventeen alone."""
+    import pathlib
+
+    from solvers.prompts import rust_defect
+
+    archive = pathlib.Path(__file__).resolve().parents[2] / "solutions"
+    answers = sorted(archive.glob("*.rs"))
+    if not answers:
+        pytest.skip("the archived submissions are not checked out")
+
+    truncated = [f.name for f in answers
+                 if (rust_defect(f.read_text()) or "").find("unclosed") >= 0]
+    assert len(truncated) == 1, truncated
+    assert truncated[0].startswith("f8fe7918"), truncated
+
+
+def test_a_rust_preamble_split_into_its_own_block_is_carried_too():
+    """Rust used to be left to its compiler here: `use` has the same shape as
+    `import`, and a Rust answer is put through rustc, which says so.
+
+    The compiler is allowed not to be there. With no local `rustc`, or with
+    `SOLVER_RUST_COMPILE=0`, nothing says so at all — and on the operator's own
+    host every Rust solve went out ungraded for want of a Docker daemon. So the
+    `use` lines are carried, on the same argument as the Python path.
+
+    Narrower than the Python path, though, because Rust name resolution is not
+    something to guess at: the earlier block has to be NOTHING but `use` lines,
+    attributes and comments, and the chosen block has to have no `use` of its
+    own."""
     got = extract_code("```rust\nuse std::io;\n```\n\n"
                        "```rust\nfn main() {\n    println!(\"x\");\n}\n```", "main", "rust")
-    assert got.strip().startswith("fn main()"), got
+    assert "use std::io;" in got, f"lost the preamble the program needs: {got!r}"
+    assert got.rstrip().endswith("}"), got
+
+    # A block with its own `use` is complete; nothing is prepended to it.
+    own = extract_code("```rust\nuse std::io;\n```\n\n"
+                       "```rust\nuse std::fmt;\nfn main() {}\n```", "main", "rust")
+    assert "std::io" not in own, f"stacked a preamble onto a complete program: {own!r}"
+
+    # An earlier block that is a PROGRAM is not a preamble, and is left alone.
+    prog = extract_code("```rust\nfn helper() {}\n```\n\n"
+                        "```rust\nfn main() {}\n```", "main", "rust")
+    assert prog.strip() == "fn main() {}", prog
 
 
 def test_a_fence_that_ends_a_line_of_prose_still_opens_a_block():
@@ -7413,7 +7628,7 @@ def test_a_copy_that_differs_in_the_middle_still_wins():
     complete and authoritative. Only a copy that is the same answer cut short
     loses. A plain "is it shorter" test would hand every highlighter bug back
     to the DOM, which is the damage the copy control exists to avoid."""
-    cut = _Tab._copy_was_cut_short
+    cut = _Tab._cut_short_by
 
     whole = ["def g(n):\n    total = 1 + 2\n    return total"]
     # Truncated: a strict prefix, materially shorter -> the render wins.

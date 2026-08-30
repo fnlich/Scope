@@ -883,6 +883,19 @@ def _unbound(code: str) -> set[str]:
     return used - bound - _BUILTIN_NAMES
 
 
+_RUST_USE_RE = re.compile(r"^[ \t]*(?:pub\s+)?use\s", re.MULTILINE)
+# A preamble block: `use` lines, `extern crate`, inner/outer attributes and
+# comments, and nothing else. Anything with a body is a program, not a preamble.
+_RUST_PREAMBLE_LINE_RE = re.compile(
+    r"^[ \t]*(?:(?:pub\s+)?use\s.*;|extern\s+crate\s.*;|#!?\[.*\]|//.*)?[ \t]*$"
+)
+
+
+def _is_rust_preamble(block: str) -> bool:
+    lines = [ln for ln in block.splitlines() if ln.strip()]
+    return bool(lines) and all(_RUST_PREAMBLE_LINE_RE.fullmatch(ln) for ln in lines)
+
+
 def _carry_imports(block: str, earlier: list[str], language: str) -> str:
     """Bring forward an imports-only block the chosen one turns out to need.
 
@@ -895,11 +908,24 @@ def _carry_imports(block: str, earlier: list[str], language: str) -> str:
 
     Narrow on purpose. Only top-level `import` statements are eligible, only
     the ones binding a name this block reads and never binds are taken, and a
-    block that needs nothing is returned untouched. Rust is left alone: `use` has the
-    same shape, but a Rust answer is put through the compiler, which says so.
+    block that needs nothing is returned untouched.
+
+    Rust used to be left alone on the grounds that `use` has the same shape but
+    a Rust answer goes through the compiler, which says so. The compiler is
+    allowed not to be there -- no local `rustc`, or `SOLVER_RUST_COMPILE=0` --
+    and then nothing says so at all, exactly as with `_rust_unclosed`. Narrower
+    still than the Python path, because Rust name resolution is not something to
+    guess at: an earlier block that is NOTHING but `use` lines and attributes is
+    a preamble the model split off, and it is carried only when the chosen block
+    has no `use` of its own.
     """
     if language == "rust":
-        return block
+        if _RUST_USE_RE.search(block):
+            return block
+        carried = [b.strip() for b in earlier if _is_rust_preamble(b)]
+        if not carried:
+            return block
+        return "\n".join(carried) + "\n\n" + block
     missing = _unbound(block)
     if not missing:
         return block
@@ -989,6 +1015,19 @@ def plausible_source(code: str, language: str = "python") -> bool:
     return not _SHELL_OPENER_RE.match(first)
 
 
+def _is_generator(fn) -> bool:
+    """Does THIS function yield? Not one nested inside it."""
+    stack: list = list(fn.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.Yield, ast.YieldFrom)):
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue  # a yield in there makes IT a generator, not us
+        stack.extend(ast.iter_child_nodes(node))
+    return False
+
+
 def _always_returns(body: list) -> bool:
     """Does this statement list guarantee a `return` or a `raise`?
 
@@ -996,10 +1035,21 @@ def _always_returns(body: list) -> bool:
     Python one. Only the LAST statement matters: anything before it can be
     skipped, so only the tail decides whether control can fall off the end.
 
-    Conservative in the direction that costs least. A `for` loop is never
+    Conservative in the direction that costs least. A bare `for` loop is never
     treated as guaranteeing a return even when it obviously does, because the
     price of being wrong here is one repair round, while the price of missing a
     truncated answer is the whole solve.
+
+    A loop with an `else`, though, is not a guess: the clause runs on every exit
+    that is not a `break`, so an `else` that always returns leaves no way to
+    fall through -- unless a `break` bound to THIS loop skips it. That is the
+    same rule `while True:` already gets, and the same helper decides it.
+    Without this, the ordinary "search, else report not found" shape was
+    reported as `can reach the end of its body without returning ... which is
+    what a reply cut off mid-answer looks like`, about a correct program. The
+    cost is not only the wasted round: a block carrying a defect loses
+    `extract_code`'s gradeable preference, and a trailing usage example can then
+    outrank the answer.
     """
     if not body:
         return False
@@ -1023,10 +1073,21 @@ def _always_returns(body: list) -> bool:
         # `while True:` with no way out never falls through to the end.
         if isinstance(last.test, ast.Constant) and last.test.value is True:
             return not _breaks_out_of(last)
-        return False
+        return _loop_else_returns(last)
+    if isinstance(last, (ast.For, ast.AsyncFor)):
+        return _loop_else_returns(last)
     if isinstance(last, ast.Match):
         return bool(last.cases) and all(_always_returns(c.body) for c in last.cases)
     return False
+
+
+def _loop_else_returns(loop) -> bool:
+    """A loop whose `else` always returns, and which cannot `break` past it."""
+    return (
+        bool(loop.orelse)
+        and _always_returns(loop.orelse)
+        and not _breaks_out_of(loop)
+    )
 
 
 def _breaks_out_of(loop) -> bool:
@@ -1078,6 +1139,16 @@ def python_defect(code: str, entrypoint: str) -> Optional[str]:
             )
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == entrypoint:
+            if _is_generator(node):
+                # Also a defect, and a real one -- the grader compares RETURN
+                # VALUES structurally, so what it receives here is a generator
+                # object rather than the answer. But it is not a truncation, and
+                # the sentence below would tell the model its reply was cut off.
+                return (
+                    f"`{entrypoint}` is a generator: it yields instead of "
+                    f"returning, so the grader is handed a generator object "
+                    f"rather than the answer"
+                )
             if not _always_returns(node.body):
                 # `ast.parse` is Python's version of grepping for `fn main`: it
                 # is happy with source that was CUT OFF, because a reply
@@ -1125,6 +1196,115 @@ _RUST_OPENER_RE = re.compile(
 )
 
 
+# `r"..."`, `r#"..."#`, `b"..."`, `br#"..."#`. The quote is required, which is
+# what keeps a raw IDENTIFIER (`r#type`, `r#match`) from being read as one.
+_RUST_RAW_RE = re.compile(r'b?r(#*)"')
+_IDENT_CH = re.compile(r"[A-Za-z0-9_]")
+
+
+def _rust_unclosed(code: str) -> Optional[str]:
+    """The delimiter a truncated Rust program leaves open, or None.
+
+    The check Python gets from `ast.parse` and `_always_returns`, and Rust had
+    only from a compiler that is allowed not to be there. `rust_defect`'s two
+    other tests both pass a truncation -- the first line still opens like Rust
+    and `fn main` still begins a line -- so an answer the deadline cut in half
+    went out as a confident one. Measured on a real submission: 10,608 bytes,
+    75 `{` against 71 `}`, ending mid-identifier four blocks deep. `rustc` says
+    `error: this file contains an unclosed delimiter`; nothing here did.
+
+    Conservative in the one direction that matters. A false positive does not
+    merely cost a repair round: a block carrying a defect loses `extract_code`'s
+    "last gradeable" preference, and a trailing usage example can then outrank
+    the real answer -- which is the damage `_breaks_out_of` was written for. So
+    this reports ONLY a delimiter still open at the end of the input, and gives
+    up (returns None) the moment the scan meets anything it cannot account for:
+    a mismatched closer, a closer with nothing open, a string or comment that
+    never ends. Each of those is at least as likely to be this function
+    misreading Rust as it is to be a broken program.
+    """
+    stack: list[tuple[str, int]] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    i, n, line = 0, len(code), 1
+    while i < n:
+        c = code[i]
+        if c == "\n":
+            line += 1
+            i += 1
+            continue
+        if c == "/" and i + 1 < n:
+            if code[i + 1] == "/":
+                while i < n and code[i] != "\n":
+                    i += 1
+                continue
+            if code[i + 1] == "*":
+                # Rust nests block comments, unlike C.
+                depth, i = 1, i + 2
+                while i < n and depth:
+                    if code.startswith("/*", i):
+                        depth, i = depth + 1, i + 2
+                    elif code.startswith("*/", i):
+                        depth, i = depth - 1, i + 2
+                    else:
+                        line += code[i] == "\n"
+                        i += 1
+                if depth:
+                    return None  # ran off the end inside a comment
+                continue
+        raw = _RUST_RAW_RE.match(code, i)
+        if raw and not (i and _IDENT_CH.match(code[i - 1])):
+            close = '"' + raw.group(1)
+            end = code.find(close, raw.end())
+            if end < 0:
+                return None
+            line += code.count("\n", i, end)
+            i = end + len(close)
+            continue
+        if c == '"':
+            i += 1
+            while i < n and code[i] != '"':
+                line += code[i] == "\n"
+                i += 2 if code[i] == "\\" else 1
+            if i >= n:
+                return None
+            i += 1
+            continue
+        if c == "'":
+            # A char literal, or a lifetime/loop label. `'a'` is a literal;
+            # `'a` in `&'a str` or `'outer: loop` is not, and reading it as one
+            # would swallow the rest of the line looking for a closing quote.
+            nxt = code[i + 1] if i + 1 < n else ""
+            after = code[i + 2] if i + 2 < n else ""
+            if nxt and nxt != "\\" and _IDENT_CH.match(nxt) and after != "'":
+                i += 1  # a lifetime: skip the tick, scan the name as code
+                continue
+            j = i + 1
+            if j < n and code[j] == "\\":
+                j += 1
+            while j < n and code[j] != "'":
+                line += code[j] == "\n"
+                j += 1
+            if j >= n:
+                return None
+            i = j + 1
+            continue
+        if c in "([{":
+            stack.append((c, line))
+        elif c in pairs:
+            if not stack or stack[-1][0] != pairs[c]:
+                return None  # more likely this scanner than a broken program
+            stack.pop()
+        i += 1
+    if not stack:
+        return None
+    opener, where = stack[0]
+    return (
+        f"the program ends with {len(stack)} unclosed `{opener}` — the outermost "
+        f"opens on line {where} and is never closed, which is what a reply cut "
+        f"off mid-answer looks like"
+    )
+
+
 def rust_defect(code: str) -> Optional[str]:
     """Cheap structural check before paying for a compile.
 
@@ -1157,4 +1337,7 @@ def rust_defect(code: str) -> Optional[str]:
         )
     if not _RUST_MAIN_RE.search(code):
         return "the program does not define `fn main()`"
-    return None
+    # Last, because it is the only one of the three that a program which IS
+    # Rust can fail. See `_rust_unclosed` for why it only ever reports a
+    # delimiter left open at the end.
+    return _rust_unclosed(code)

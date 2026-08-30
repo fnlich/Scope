@@ -1445,6 +1445,34 @@ once-per-tab flag. That distinction matters: a once-per-tab flag reported two
 incidents across 56 solves on two tabs — exactly one per tab, which is what it
 reports whether it happened twice or forty times.
 
+### …and neither does the page, against the wire
+
+There are **two** pairs of readings that can disagree, and the rule above was
+written for one of them. The page against the network stream got the same
+comparison, a printed note, and no decision. From the same operator's log:
+
+```
+what the page shows and what came off the wire are not the same — they differ at
+character 5605: the page nothing (it ends here), the wire ' ' (U+0020).
+Using the page.
+```
+
+The page **ended** at 5605 and the wire carried on. The page was a read taken
+before the last of the answer rendered, the wire held the whole of it, the miner
+knew, said so, and submitted the truncation.
+
+Both pairs now ask `_cut_short_by(whole, part)` the one question worth asking:
+is one of these the other cut short? When the page is a strict prefix of the
+wire, the wire wins and the count says how much was missing. The prefix test is
+what makes that safe. The stream reconstruction is a heuristic over a private,
+undocumented format, and the thing to fear from it is a reading that picked up
+the *conversation* rather than the reply — but such a reading cannot have the
+page as its prefix. Any other disagreement, a difference in the middle above
+all, still leaves the page in charge and only says so.
+
+`*_STREAM_FIRST=1` is unchanged: it makes the wire the primary outright, for an
+operator who has watched it agree on their own accounts.
+
 ### A model still writing is waited for, never interrupted
 
 The slice a read is given is an internal **allocation**, not a deadline. Where a
