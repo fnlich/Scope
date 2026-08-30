@@ -38,7 +38,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -131,6 +133,27 @@ def _from_challenges(which: Optional[list[str]], shown: Optional[int],
             tuple(str(case.get("name", "")) for case in challenge.cases),
         ))
     return problems
+
+
+def _from_archive(path: str) -> list[Problem]:
+    """Every request under ``path``: one file, or a whole directory of them.
+
+    A directory is the off-chain regression run. `save_exchange` writes one
+    record per solve, so a directory of them is a corpus of exactly what this
+    miner was asked in production -- the statements, the entrypoints, the
+    deadlines, and the fact that no public examples shipped with any of them.
+    Replaying it end to end answers the only question that matters between
+    deploys: does this build produce an answer where the last one did not.
+
+    Sorted by name, so two runs are comparable line for line.
+    """
+    where = Path(path).expanduser()
+    if not where.is_dir():
+        return [_from_file(str(where))]
+    files = sorted(where.glob("*.json"))
+    if not files:
+        raise SystemExit(f"{where}: no .json requests in that directory")
+    return [_from_file(str(f)) for f in files]
 
 
 def _from_file(path: str) -> Problem:
@@ -448,7 +471,7 @@ async def run(
         which = None if args.challenge == ["all"] else args.challenge
         problems = _from_challenges(which, args.examples, args.timeout)
     elif args.source_file:
-        problems = [_from_file(args.source_file)]
+        problems = _from_archive(args.source_file)
     elif args.lease:
         problems = [await _from_lease(args.insecure)]
     else:
@@ -605,8 +628,36 @@ def _summarise(results: list[tuple[Problem, str, str]]) -> None:
         head = (f"  {mark}  {problem.request.problem_id:<{width}}  "
                 f"{problem.request.language:<7} ")
         print(head + _fit(why, max(24, ROW_WIDTH - len(head))))
+    total = len(results)
     scored = sum(1 for _, verdict, _ in results if verdict == SCORED)
-    print(f"\n  {scored}/{len(results)} would have scored")
+    # Whether any tests EXISTED, not whether any verdict was reached. "nothing
+    # was submitted" and "it does not compile" are findings that need no tests,
+    # so counting verdicts would call a corpus gradeable on the strength of its
+    # failures alone.
+    if any(problem.tests for problem, _, _ in results):
+        print(f"\n  {scored}/{total} would have scored")
+    else:
+        # Nothing here COULD score, and saying "0/97 would have scored" of a
+        # corpus with no tests in it reads as a catastrophe rather than as a
+        # missing yardstick. Live traffic ships no public examples -- all 97 of
+        # the archived requests carry zero -- so this is the ordinary case for
+        # a replay, not an edge one.
+        print(f"\n  none of the {total} could be graded here: no tests came "
+              f"with them")
+    # Said either way, because it is the measurement a replay actually makes.
+    # An empty answer is the failure this miner has most of: of 97 archived
+    # solves, 32 submitted nothing at all. Whether a build changes that number
+    # is the question a rehearsal over a corpus exists to answer, and it needs
+    # no tests to answer it.
+    empty = sum(1 for _, _, why in results if why == "nothing was submitted")
+    print(f"  {total - empty}/{total} produced an answer"
+          + (f"  ({empty} submitted nothing)" if empty else ""))
+    broken = sum(1 for _, _, why in results if "does not compile" in why)
+    rust = sum(1 for problem, _, _ in results
+               if problem.request.language == "rust")
+    if rust:
+        print(f"  {rust - broken}/{rust} rust answer(s) compile"
+              + (f"  ({broken} will not)" if broken else ""))
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -622,8 +673,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         help=f"a built-in problem: {', '.join(sorted(SAMPLES))} (default: python)",
     )
     source.add_argument(
-        "--from", dest="source_file", metavar="FILE",
-        help="replay an archived request (what `save_exchange` writes)",
+        "--from", dest="source_file", metavar="PATH",
+        help="replay an archived request (what `save_exchange` writes). A "
+             "DIRECTORY replays every .json in it, sorted, one by one -- the "
+             "off-chain regression run over a corpus of what this miner was "
+             "actually asked",
     )
     source.add_argument(
         "--lease", action="store_true",
@@ -656,12 +710,85 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--show", type=int, default=20, metavar="N",
         help="how many lines of the answer to print (default: 20)",
     )
+    parser.add_argument(
+        "--solutions", metavar="DIR",
+        help="where the answers are archived. The miner's own `save_solution` "
+             "writes them, so this is `SOLVER_SOLUTION_DIR` -- which is "
+             "RELATIVE TO THE WORKING DIRECTORY, and this package is run from "
+             "examples/custom_miner, so the default lands beside the miner "
+             "rather than at the repository root. An operator went looking in "
+             "the wrong one; naming it here settles which",
+    )
+    parser.add_argument(
+        "--log", metavar="FILE",
+        help="also write everything printed to FILE, verbatim. The same lines "
+             "the on-chain miner prints, because it is the same code printing "
+             "them -- a run here is comparable to a run there line for line",
+    )
     args = parser.parse_args(argv)
+    archive_to(args.solutions)
     try:
-        return asyncio.run(run(args))
+        with _tee(args.log):
+            return asyncio.run(run(args))
     except KeyboardInterrupt:
         print("\n[rehearse] stopped")
         return 130
+
+
+def archive_to(directory: Optional[str]) -> None:
+    """Point `save_solution` at ``directory``, or leave it where it was.
+
+    `SOLVER_SOLUTION_DIR` is read per call from inside the solve, so setting it
+    here -- before `run` -- is early enough. It is RELATIVE to the working
+    directory, and this package runs from `examples/custom_miner`, so the
+    default lands beside the miner rather than at the repository root. An
+    operator went looking in the wrong one.
+    """
+    if directory:
+        os.environ["SOLVER_SOLUTION_DIR"] = str(Path(directory).expanduser())
+
+
+@contextlib.contextmanager
+def _tee(path: Optional[str]):
+    """Print to the terminal AND to ``path``, or just the terminal.
+
+    Both, not either. A run over five challenges takes long enough that nobody
+    watches all of it, and a log that only exists after the fact is no use while
+    it is going wrong -- so the terminal keeps its live output and the file gets
+    the same bytes for afterwards.
+
+    Line-buffered and flushed per write, so a run killed half way through still
+    leaves everything it had printed. The whole point of the file is the run
+    that did not finish.
+    """
+    if not path:
+        yield
+        return
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    class _Fork:
+        def __init__(self, *streams):
+            self._streams = streams
+
+        def write(self, text):
+            for stream in self._streams:
+                stream.write(text)
+                stream.flush()
+            return len(text)
+
+        def flush(self):
+            for stream in self._streams:
+                stream.flush()
+
+        def isatty(self):
+            return False
+
+    with target.open("w", encoding="utf-8") as handle:
+        fork = _Fork(sys.stdout, handle)
+        with contextlib.redirect_stdout(fork), contextlib.redirect_stderr(fork):
+            print(f"[rehearse] logging this run to {target.resolve()}")
+            yield
 
 
 if __name__ == "__main__":

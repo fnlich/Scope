@@ -5777,6 +5777,31 @@ def test_carrying_imports_does_not_resurrect_the_usage_demo():
     assert value == 4 and "print(g(" not in code, code
 
 
+# `examples/problems` holds 97 archived exchanges -- the exact request the
+# validator sent and the exact answer that went back. That makes the answers a
+# regression fixture rather than a hypothetical: they are what this miner
+# actually produced, including the ways it went wrong. 65 of the 97 carry an
+# answer at all; the other 32 submitted nothing, which is the failure the
+# reading-path work exists to reduce.
+#
+# Read from the archives rather than from `solutions/`, which is where a local
+# rehearsal WRITES and is therefore not a record of anything.
+def _archived_answers(language: str) -> list:
+    import json
+    import pathlib
+
+    where = pathlib.Path(__file__).resolve().parents[2] / "examples" / "problems"
+    out = []
+    for f in sorted(where.glob("*.json")):
+        record = json.loads(f.read_text(encoding="utf-8"))
+        if record.get("request", {}).get("language") != language:
+            continue
+        code = (record.get("response") or {}).get("code", "")
+        if code.strip():
+            out.append((f.stem, code))
+    return out
+
+
 def test_a_truncated_rust_program_is_caught_without_a_compiler():
     """The check Python gets from `ast.parse` and `_always_returns`, and Rust
     had only from a compiler that is allowed not to be there.
@@ -5883,15 +5908,18 @@ def test_every_archived_rust_answer_is_judged_the_same_way_as_rustc():
 
     from solvers.prompts import rust_defect
 
-    archive = pathlib.Path(__file__).resolve().parents[2] / "solutions"
-    answers = sorted(archive.glob("*.rs"))
+    answers = _archived_answers("rust")
     if not answers:
-        pytest.skip("the archived submissions are not checked out")
+        pytest.skip("the archived exchanges are not checked out")
+    assert len(answers) > 30, f"only {len(answers)} rust answers to check"
 
-    truncated = [f.name for f in answers
-                 if (rust_defect(f.read_text()) or "").find("unclosed") >= 0]
-    assert len(truncated) == 1, truncated
-    assert truncated[0].startswith("f8fe7918"), truncated
+    # Exactly the one rustc calls truncated, and no others. Verified against
+    # `rustc --edition=2021` over all of them: 39 agree, 0 disagree.
+    truncated = [name for name, code in answers
+                 if "unclosed" in (rust_defect(code) or "")]
+    assert truncated == ["252c5febd7c1eacb670775cc5bbc99e4e2b180c15b64c81648fe3cb89afcb3ca"], (
+        truncated
+    )
 
 
 def test_a_commented_first_line_is_python_not_a_root_shell_prompt():
@@ -5994,18 +6022,17 @@ def test_the_parse_gate_asks_what_the_grader_will_ask():
     defect = python_defect(bad, "g")             # ...and is caught anyway
     assert defect and "not valid Python" in defect, defect
 
-    # Nothing that compiles today may start failing: the archived submissions
-    # are the exact bytes the validator received.
-    import pathlib
-
-    archive = pathlib.Path(__file__).resolve().parents[2] / "solutions"
-    for f in sorted(archive.glob("*.py")):
-        src = f.read_text()
+    # Nothing that compiles today may start failing: the archived answers are
+    # the exact bytes the validator received.
+    checked = 0
+    for _, src in _archived_answers("python"):
         try:
             _ast.parse(src)
         except SyntaxError:
             continue
         compile(src, "<archived>", "exec")
+        checked += 1
+    assert checked > 20, f"only {checked} archived python answers were checked"
 
 
 def test_a_rust_preamble_split_into_its_own_block_is_carried_too():
@@ -6502,6 +6529,185 @@ def test_showing_every_case_says_the_grade_cannot_fail():
     problem = rehearse._from_challenges(["extent-journal"], 99, 300.0)[0]
     assert len(problem.request.public_examples) == len(problem.tests)
     assert "cannot fail" in problem.tests_are
+
+
+def test_a_directory_of_archived_requests_replays_every_one(tmp_path):
+    """`save_exchange` writes one record per solve, so a directory of them is a
+    corpus of exactly what this miner was asked in production — the statements,
+    the entrypoints, the deadlines, and the fact that no public examples shipped
+    with any of them. Replaying it is the off-chain regression run.
+
+    Sorted by name, so two runs are comparable line for line."""
+    import json
+
+    from solvers.rehearse import _from_archive
+
+    for i, language in enumerate(["python", "rust", "python"]):
+        (tmp_path / f"{i}-problem.json").write_text(json.dumps({
+            "problem_id": f"{i}-problem",
+            "request": {
+                "problem_id": f"{i}-problem", "language": language,
+                "statement": "do a thing", "entrypoint": "g" if language == "python" else "main",
+                "public_examples": [], "deadline_s": 300.0,
+            },
+            # The answer the miner gave LAST time is in the file too, and it is
+            # not part of the request. Replaying it would grade the old answer.
+            "response": {"problem_id": f"{i}-problem",
+                         "code": "def g():\n    return 'THE OLD ANSWER'",
+                         "raw_response": "..."},
+        }))
+
+    problems = _from_archive(str(tmp_path))
+    assert [p.request.problem_id for p in problems] == [
+        "0-problem", "1-problem", "2-problem"
+    ], "not sorted, so two runs are not comparable"
+    assert [p.request.language for p in problems] == ["python", "rust", "python"]
+    assert all(not p.request.public_examples for p in problems)
+
+    # ONLY the request. The stored answer never reaches the solve.
+    assert not any("THE OLD ANSWER" in p.request.statement for p in problems)
+
+    # A single file still works, and so does a bare TaskRequest.
+    one = _from_archive(str(tmp_path / "1-problem.json"))
+    assert len(one) == 1 and one[0].request.language == "rust"
+
+    empty = tmp_path / "nothing"
+    empty.mkdir()
+    with pytest.raises(SystemExit) as caught:
+        _from_archive(str(empty))
+    assert "no .json requests" in str(caught.value)
+
+
+def test_a_corpus_with_no_tests_is_not_reported_as_a_catastrophe(capsys):
+    """Every archived request carries zero public examples — that is the live
+    condition this miner was built for, and it means nothing in the corpus CAN
+    score. Saying "0/97 would have scored" of it reads as a disaster rather than
+    as a missing yardstick.
+
+    What a replay does measure without any tests: whether an answer came back at
+    all, and whether a Rust answer compiles. An empty answer is the failure this
+    miner has most of — of 97 archived solves, 32 submitted nothing."""
+    from solvers import rehearse
+
+    def _p(language, tests=()):
+        return rehearse.Problem(
+            SolveTask(problem_id="p", language=language, statement="s",
+                      entrypoint="g", public_examples=[], deadline_s=300.0),
+            list(tests), "the archive", "nothing to check it against",
+        )
+
+    rehearse._summarise([
+        (_p("python"), rehearse.UNKNOWN, "no tests came with this problem"),
+        (_p("python"), rehearse.FAILED, "nothing was submitted"),
+        (_p("rust"), rehearse.UNKNOWN, "no tests came with this problem"),
+        (_p("rust"), rehearse.FAILED, "it does not compile: unclosed delimiter"),
+    ])
+    out = capsys.readouterr().out
+    assert "would have scored" not in out, out
+    assert "none of the 4 could be graded here" in out, out
+    assert "3/4 produced an answer" in out, out
+    assert "(1 submitted nothing)" in out, out
+    assert "1/2 rust answer(s) compile" in out, out
+
+    # ...and when tests DID come with the problem, the old line is still the
+    # headline. A SCORED verdict is only reachable when they did.
+    graded = _p("python", tests=[TestCase(args=[1], kwargs={}, expected=1)])
+    rehearse._summarise([(graded, rehearse.SCORED, "passed all 3 test(s)")])
+    out = capsys.readouterr().out
+    assert "1/1 would have scored" in out, out
+    assert "1/1 produced an answer" in out, out
+
+
+def test_your_own_problems_directory_wins_over_the_shipped_samples(tmp_path):
+    """`examples/problems` is where an operator drops their own problems, and it
+    is found with no flag and no environment variable. The shipped samples are
+    the fallback so a fresh checkout still has something to run."""
+    from solvers.challenges import challenge_dir, names
+
+    root = tmp_path / "repo"
+    mine = root / "examples" / "problems" / "my-problem"
+    shipped = root / "examples" / "sample_challenges" / "extent-journal"
+    for d in (mine, shipped):
+        d.mkdir(parents=True)
+        (d / "PROBLEM.md").write_text("statement")
+        (d / "cases.json").write_text(
+            '{"language": "python", "entrypoint": "g", "cases": []}'
+        )
+    start = root / "examples" / "custom_miner" / "solvers"
+    start.mkdir(parents=True)
+
+    found = challenge_dir(start)
+    assert found == root / "examples" / "problems", found
+    assert names(found) == ["my-problem"]
+
+
+def test_an_empty_problems_directory_does_not_shadow_the_samples(tmp_path):
+    """A directory created and not yet filled must not silently take over and
+    report "(none found)" — which is what a plain `is_dir()` test would do, and
+    the directory ships with only a README in it."""
+    from solvers.challenges import challenge_dir
+
+    root = tmp_path / "repo"
+    (root / "examples" / "problems").mkdir(parents=True)
+    (root / "examples" / "problems" / "README.md").write_text("drop them here")
+    shipped = root / "examples" / "sample_challenges" / "extent-journal"
+    shipped.mkdir(parents=True)
+    (shipped / "PROBLEM.md").write_text("statement")
+    (shipped / "cases.json").write_text(
+        '{"language": "python", "entrypoint": "g", "cases": []}'
+    )
+    start = root / "examples" / "custom_miner" / "solvers"
+    start.mkdir(parents=True)
+
+    assert challenge_dir(start) == root / "examples" / "sample_challenges"
+
+
+def test_a_local_run_can_be_told_where_to_archive_and_logged_verbatim(
+    tmp_path, capsys, monkeypatch
+):
+    """The two things a local run has to leave behind: the answers where the
+    operator asked for them, and the output — the SAME lines the on-chain miner
+    prints, because it is the same code printing them.
+
+    `SOLVER_SOLUTION_DIR` is relative to the working directory and this package
+    runs from `examples/custom_miner`, so the default lands beside the miner
+    rather than at the repository root. An operator went looking in the wrong
+    one; `--solutions` settles it."""
+    import os
+
+    from solvers import rehearse
+
+    log = tmp_path / "runs" / "local.log"          # a directory that must be made
+    with rehearse._tee(str(log)):
+        print("[verify] python entrypoint=g provider=claude examples=0/0")
+        print("[rehearse] DOES NOT SCORE: nothing was submitted")
+
+    written = log.read_text()
+    assert "[verify] python entrypoint=g" in written, written
+    assert "DOES NOT SCORE" in written, written
+    assert str(log.resolve()) in written, "the log does not say where it is"
+    # ...and the terminal still had it live. A log that only exists afterwards
+    # is no use while a run is going wrong.
+    assert "DOES NOT SCORE" in capsys.readouterr().out
+
+    # No --log, no file, and nothing swallowed.
+    with rehearse._tee(None):
+        print("[rehearse] still on the terminal")
+    assert "still on the terminal" in capsys.readouterr().out
+
+    # `--solutions` is the archive directory, set before the solve reaches it.
+    where = tmp_path / "answers"
+    # Scoped: `archive_to` sets a process-wide environment variable, and every
+    # other test that archives reads it.
+    monkeypatch.setenv("SOLVER_SOLUTION_DIR", "unset")
+    rehearse.archive_to(str(where))
+    assert os.environ["SOLVER_SOLUTION_DIR"] == str(where)
+    from solution_archive import archive_dir
+    assert archive_dir() == where
+
+    # ...and no --solutions leaves it exactly where it was.
+    rehearse.archive_to(None)
+    assert os.environ["SOLVER_SOLUTION_DIR"] == str(where)
 
 
 def test_a_challenge_name_cannot_read_outside_the_challenge_directory(tmp_path):

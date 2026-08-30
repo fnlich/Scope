@@ -35,7 +35,14 @@ from pathlib import Path
 from typing import Any, NamedTuple, Optional, Sequence
 
 DIRECTORY_ENV = "SOLVER_CHALLENGE_DIR"
-_RELATIVE = Path("examples") / "sample_challenges"
+# Where problems are looked for, in order. `examples/problems` is yours: drop a
+# directory per problem into it -- `PROBLEM.md` beside a `cases.json` -- and
+# every entry point here finds them without a flag or an environment variable.
+# `examples/sample_challenges` is the five that ship with the repository, and it
+# is the fallback so a checkout with nothing dropped in still has something to
+# run. `SOLVER_CHALLENGE_DIR` overrides both.
+_RELATIVE = Path("examples") / "problems"
+_FALLBACK = Path("examples") / "sample_challenges"
 
 
 class Challenge(NamedTuple):
@@ -70,10 +77,14 @@ def challenge_dir(start: str | os.PathLike[str] | None = None) -> Optional[Path]
         path = Path(override).expanduser()
         return path if path.is_dir() else None
     here = Path(start or Path(__file__).resolve()).resolve()
-    for directory in (here, *here.parents):
-        candidate = directory / _RELATIVE
-        if candidate.is_dir():
-            return candidate
+    # `examples/problems` wins wherever it holds a problem, and an EMPTY one is
+    # not a match: a directory created and not yet filled would otherwise
+    # silently shadow the samples and report "(none found)".
+    for relative in (_RELATIVE, _FALLBACK):
+        for directory in (here, *here.parents):
+            candidate = directory / relative
+            if candidate.is_dir() and names(candidate):
+                return candidate
     return None
 
 

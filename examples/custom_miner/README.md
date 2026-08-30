@@ -1737,6 +1737,66 @@ to pick it up again.
   and the pinned image; without those, grading is skipped and Rust candidates
   come back unverified.
 
+## Replaying what the validator actually asked
+
+`examples/problems` holds 97 archived exchanges — the exact request that came in
+and the exact answer that went back, as `save_exchange` wrote them. Only the
+**request** half is replayed; the stored answer is dropped before the miner sees
+anything, so a replay is a fresh solve rather than a grading of the old one.
+
+```bash
+cd examples/custom_miner
+python -m solvers.rehearse --from ../../examples/problems \
+    --solutions ../../solutions \
+    --log ../../logs/offchain.log
+```
+
+Every `.json` in the directory is replayed, sorted by name so two runs are
+comparable line for line. `--from` still takes a single file.
+
+It goes through `CustomMiner`'s own HTTP handler, so the replay exercises the
+signature check, the concurrency slot, the deadline that answers 504 rather than
+late, the two-phase prompts, the repair loop, the browser fleet, `fit_response`'s
+byte cap and the solution archive — the same objects in the same order a real
+request meets. The log lines are identical to the on-chain miner's because it is
+the same code printing them.
+
+**What this corpus can and cannot tell you.** All 97 requests carry **zero**
+public examples, which is the live condition this miner was built for — so
+nothing in it can be graded, and the summary says so rather than reporting
+"0/97 would have scored". What a replay does measure without any tests:
+
+```
+  none of the 97 could be graded here: no tests came with them
+  86/97 produced an answer  (11 submitted nothing)
+  43/49 rust answer(s) compile  (6 will not)
+```
+
+An empty answer is the failure this miner has most of — **32 of the 97 archived
+solves submitted nothing at all** — so whether a build moves that number is the
+question the replay exists to answer. The model's own test cases still run on
+every solve, and `self=n/n` on each `[verify]` line is the other signal.
+
+Two knobs matter here. `--solutions DIR` is `SOLVER_SOLUTION_DIR`, which is
+relative to the working directory — and this package runs from
+`examples/custom_miner`, so the default lands beside the miner rather than at the
+repository root. `--log FILE` tees stdout and stderr to a file while keeping the
+terminal live, flushed per line, so a run killed half way through still leaves
+everything it printed.
+
+The archived answers are also a **regression fixture**: the suite runs all 39
+Rust ones through `rust_defect` and asserts it flags exactly the one `rustc`
+calls truncated, and runs the 26 Python ones through `compile()` to prove the
+parse gate never starts rejecting source that already shipped.
+
+### Your own problems
+
+Drop a directory per problem into `examples/problems` — `PROBLEM.md` beside a
+`cases.json` — and `--challenge all` finds them with no flag and no environment
+variable. While it holds no such directory the five in
+`examples/sample_challenges` are used instead, so a fresh checkout still has
+something to run. `SOLVER_CHALLENGE_DIR` overrides both.
+
 ## Trying it all without a wallet, off-chain
 
 Nothing below touches the chain, and none of it needs a registered hotkey. The
