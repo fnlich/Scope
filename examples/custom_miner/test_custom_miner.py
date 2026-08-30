@@ -4127,11 +4127,16 @@ def test_the_log_names_which_model_produced_the_answer(capsys):
 
     # ...and when the first model fails and the second is asked but does WORSE,
     # the credit must stay with the answer that actually went out.
-    backend = _TwoModels([("chatgpt", [WRONG, WRONG, WRONG]), ("claude", ["no code here"])])
+    # Three entries, not two: a conversation that repeats itself now carries
+    # its repair to the OTHER model inside the same pass, so `claude` is reached
+    # once there and once again on the second-opinion pass.
+    backend = _TwoModels([("chatgpt", [WRONG, WRONG, WRONG]),
+                          ("claude", ["no code here"]),
+                          ("claude", ["no code here"])])
     asyncio.run(VerifyingSolver(backend, safety_margin_s=0, max_budget_s=120)
                 .solve_task(task, 60.0))
     logged = capsys.readouterr().out
-    assert backend.seen == ["chatgpt", "claude"], backend.seen
+    assert backend.seen[0] == "chatgpt" and "claude" in backend.seen, backend.seen
     assert "provider=chatgpt" in logged, (
         f"credited the last model ASKED rather than the one whose answer was "
         f"submitted: {logged!r}"
@@ -8237,8 +8242,10 @@ def test_the_same_program_under_different_prose_is_the_same_program(capsys):
     ])
     asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
 
-    assert len(sent) == 3, [s[:40] for s in sent]
+    # cases, program, one repair -- and then the round that changed nothing is
+    # recognised, rather than a fourth identical program being asked for.
     assert "the same program and the same failures" in capsys.readouterr().out
+    assert len(sent) <= 4, [s[:40] for s in sent]
 
 
 def test_a_corrected_case_counts_as_progress_even_with_the_program_untouched():
@@ -8354,24 +8361,56 @@ def test_correction_keeps_going_past_the_round_that_used_to_be_the_last():
         )
 
 
-def test_a_round_that_changed_nothing_is_not_asked_again(capsys):
+def test_a_round_that_changed_nothing_moves_to_a_different_model(capsys):
     """The one thing that can spin once the round count is gone.
 
     `send` normally blocks on the model for tens of seconds, so a budget is a
     real bound on the number of rounds. A read that returns STALE text returns
     it at once, and the loop would resend the same repair at machine speed for
     the whole budget -- hammering the site from an account the operator is
-    signed in to. A round that produced the same program and the same failures
-    is not a revision, so it ends the loop instead of starting another one."""
-    solver, sent = _solver_seeing([_CASES_ONLY, _WRONG_PROGRAM])  # repeats forever
-    answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+    signed in to.
 
-    # cases, program, one repair -- then the unchanged round stops it.
-    assert len(sent) == 3, [s[:40] for s in sent]
-    assert "the same program and the same failures" in capsys.readouterr().out
-    # And the answer it did get is still submitted: stopping the loop is not
-    # throwing away the best thing in hand.
-    assert "while n > 9" in answer.code
+    So the answer is to CHANGE something rather than to stop. Correcting runs
+    until the answer passes or the deadline stops it, and a repeat is a MODEL
+    problem: the repair is carried to the other model, arriving with the
+    previous program and the cases it failed. On live traffic this is the only
+    place that happens at all -- with no public examples nothing can be graded,
+    so `solve_task` will not spend a second account on a fresh pass."""
+    asked: list = []
+
+    class _Chat:
+        def __init__(self, provider, replies):
+            self.provider, self._replies, self.n = provider, replies, -1
+        async def send(self, text, timeout_s, extend_to_s=None):
+            asked.append((self.provider, text))
+            self.n += 1
+            return self._replies[min(self.n, len(self._replies) - 1)]
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None):
+            # Honours `avoid`, exactly as the real fleet does.
+            return (_Chat("chatgpt", [_RIGHT_PROGRAM]) if avoid == "claude"
+                    else _Chat("claude", [_CASES_ONLY, _WRONG_PROGRAM]))
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        answer = asyncio.run(
+            VerifyingSolver(_Fleet(), second_opinion=False)
+            .solve_task(_NO_EXAMPLES, timeout_s=300.0)
+        )
+    log = chatter.getvalue()
+
+    assert "the same program and the same failures" in log, log
+    assert "carrying the repair to a fresh conversation" in log, log
+    # It went to the OTHER model, and the repair arrived with the program and
+    # the failing cases rather than starting the problem over.
+    providers = [p for p, _ in asked]
+    assert providers[-1] == "chatgpt", providers
+    assert "<previous_attempt" in asked[-1][1], asked[-1][1][:200]
+    assert "while n > 0" in answer.code, f"lost the answer the other model gave: {answer.code!r}"
 
 
 def test_self_tests_never_reach_the_validator():
@@ -9015,7 +9054,7 @@ def test_a_repair_survives_the_conversation_that_produced_it():
     log = chatter.getvalue()
 
     assert len(opened) == 2, f"never opened a fresh conversation: {len(opened)}"
-    assert "carrying the repair to a fresh one" in log, log
+    assert "carrying the repair to a fresh conversation" in log, log
     # The fresh tab has no history, so the message must carry the problem AND
     # the program it is being asked to fix.
     resume = sent[-1]

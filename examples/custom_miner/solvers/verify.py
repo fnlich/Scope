@@ -743,9 +743,20 @@ class VerifyingSolver:
         best: Optional[Candidate] = None
         conversation = None
         provider: Optional[str] = None
+        # Which provider produced `best` -- not which one this pass is talking
+        # to NOW. They part company the moment a repair is carried elsewhere:
+        # the pass then ends holding an answer from the first model and a
+        # conversation with the second, and returning the latter credits the
+        # wrong account. That is the one question the per-provider tally exists
+        # to answer, so it follows `best` rather than the conversation.
+        #
+        # Bound out here beside `provider`, for the same reason: `open()` can
+        # raise, the handler below catches it, and the return then reads a name
+        # the try block never got to bind.
+        best_provider: Optional[str] = None
         try:
             conversation = await self._backend.open(avoid=avoid)
-            provider = getattr(conversation, "provider", None)
+            provider = best_provider = getattr(conversation, "provider", None)
             # Turn 1: the cases, before the program exists. Cases written
             # ALONGSIDE a program can be back-filled from what the program
             # happens to do, and then they agree with its bugs; cases written
@@ -820,7 +831,7 @@ class VerifyingSolver:
                         print(f"[verify] {left_after:.0f}s left; not asking for "
                               f"cases again this task, the remaining attempts "
                               f"go straight to the program")
-                    return best, provider
+                    return best, best_provider
             prompt = build_code_prompt(
                 task.language, task.statement, task.entrypoint,
                 task.public_examples, cases=cases,
@@ -844,6 +855,65 @@ class VerifyingSolver:
             # the failing cases -- so a round that changed nothing can be told
             # from one that did. See `duplicate` below.
             last_signature: Optional[tuple] = None
+            async def _resume_elsewhere(why: str, avoid: Optional[str] = None):
+                """Carry the repair to a FRESH conversation, or None.
+
+                The one move available when a conversation will not produce a
+                new answer -- because it is unreadable, or because it just
+                repeated itself. Both are the same situation from here: nothing
+                more is coming from this tab, and the repair is still worth
+                making somewhere else.
+
+                `avoid` is what separates the two. An unreadable tab is a TAB
+                problem -- the model is fine and any tab will do, so it passes
+                none. A conversation that repeated itself is a MODEL problem,
+                and the answer to that is the other model: it arrives holding
+                the previous program and the cases it failed, which is a far
+                better start than the fresh pass `solve_task` would give it.
+                On live traffic that pass does not happen at all -- with no
+                public examples nothing can be graded, and `solve_task` breaks
+                rather than spend a second account on an answer it cannot
+                compare. So this is the only place the other model gets asked.
+
+                Once per pass. A second tab that also fails is a fleet problem
+                rather than something to keep paying for, and the caller then
+                ends the loop holding the best answer it ever had.
+
+                Returns `(conversation, provider, prompt)` for the caller to
+                install, so the loop's own bindings stay the single source of
+                truth for what it is talking to.
+                """
+                nonlocal resumed
+                left_now = budget - (time.monotonic() - started)
+                if (
+                    resumed
+                    or best is None
+                    or not best.code.strip()
+                    or not (best.failures or best.defect)
+                    or left_now < RESUME_FLOOR_S
+                ):
+                    return None
+                resumed = True
+                print(
+                    f"[verify] {why}; carrying the repair to a fresh "
+                    f"conversation with {left_now:.0f}s left"
+                )
+                try:
+                    await conversation.close()
+                except Exception:  # noqa: BLE001 - it may already be broken
+                    pass
+                fresh = await self._backend.open(avoid=avoid)
+                return (
+                    fresh,
+                    getattr(fresh, "provider", provider),
+                    build_resume_prompt(
+                        task.language, task.statement, task.entrypoint,
+                        task.public_examples, agreed, best.code,
+                        best.failures, defect=best.defect,
+                        from_self_tests=best.from_self_tests,
+                    ),
+                )
+
             attempt = 0
             while True:
                 attempt += 1
@@ -987,7 +1057,7 @@ class VerifyingSolver:
                 if revised:
                     agreed = revised
                 if best is None or candidate.score > best.score:
-                    best = candidate
+                    best, best_provider = candidate, provider
                 elif candidate.score == best.score and not getattr(
                     conversation, "still_writing", False
                 ):
@@ -1010,7 +1080,7 @@ class VerifyingSolver:
                     # arrived there is a fragment of an answer rather than a
                     # revision of one, and a fragment that happens to parse and
                     # tie must not displace the finished program above it.
-                    best = candidate
+                    best, best_provider = candidate, provider
                 if candidate.verified and not candidate.failures:
                     break
 
@@ -1071,43 +1141,20 @@ class VerifyingSolver:
                     # structural checks reject empty source exactly as they
                     # reject a broken program. Only the tab knows.
                     reason = getattr(conversation, "empty_reason", "?")
-                    left_now = budget - (time.monotonic() - started)
-                    if (
-                        reason == "unreadable"
-                        and not resumed
-                        and best is not None
-                        and best.code.strip()
-                        and (best.failures or best.defect)
-                        and left_now >= RESUME_FLOOR_S
-                    ):
+                    if reason == "unreadable":
                         # The conversation is gone; the REPAIR is not. Carry it
                         # to a fresh tab rather than submitting an answer whose
                         # failures nobody asked the model to fix. Measured over
                         # a production run: fifteen solves ended exactly here,
                         # each holding a candidate that failed its own cases,
                         # with an average of 129 seconds still on the clock.
-                        #
-                        # Once per pass. A tab that dies on the resume too is a
-                        # fleet problem, not something to keep paying for.
-                        resumed = True
-                        print(
-                            f"[verify] {provider or 'this model'} returned nothing "
-                            f"and that conversation is unreadable; carrying the "
-                            f"repair to a fresh one with {left_now:.0f}s left"
+                        carried = await _resume_elsewhere(
+                            f"{provider or 'this model'} returned nothing and "
+                            f"that conversation is unreadable"
                         )
-                        try:
-                            await conversation.close()
-                        except Exception:  # noqa: BLE001 - it is already broken
-                            pass
-                        conversation = await self._backend.open(avoid=None)
-                        provider = getattr(conversation, "provider", provider)
-                        prompt = build_resume_prompt(
-                            task.language, task.statement, task.entrypoint,
-                            task.public_examples, agreed, best.code,
-                            best.failures, defect=best.defect,
-                            from_self_tests=best.from_self_tests,
-                        )
-                        continue
+                        if carried is not None:
+                            conversation, provider, prompt = carried
+                            continue
                     # No repair to carry, or nothing left to carry it with. Say
                     # which -- this line used to promise that somebody else
                     # would be asked, and when an answer was already in hand
@@ -1123,28 +1170,31 @@ class VerifyingSolver:
                     )
                     break
                 if duplicate:
-                    # Same program, same failures: the round changed nothing and
-                    # the next one has no new information to change it with.
+                    # Same program, same failures: the round changed nothing,
+                    # and asking this conversation the same question again has
+                    # no new information to change it with. It is also the only
+                    # thing standing between a broken tab and a spin -- `send`
+                    # normally blocks on the model for tens of seconds, so the
+                    # budget bounds the rounds, but a read returning STALE text
+                    # returns it at once and the loop would resend the same
+                    # repair at machine speed for the whole budget.
                     #
-                    # This is checked HERE, below the branches that know more
-                    # about an empty reply than "it matches the last one" --
-                    # a tab gone unreadable, a model still writing -- so their
-                    # honest reporting and their recovery, carrying the repair
-                    # to a fresh conversation among it, still come first.
-                    #
-                    # Without the round count it is also the only thing standing
-                    # between a broken tab and a spin. `send` normally blocks on
-                    # the model for tens of seconds, so the budget is a real
-                    # bound on the rounds; a read that returns STALE text
-                    # returns it at once, and the loop would resend the same
-                    # repair at machine speed for the whole budget, hammering
-                    # the site from an account the operator is signed in to.
-                    print(
-                        f"[verify] {provider or 'this model'} sent back the same "
-                        f"program and the same failures after being shown them; "
-                        f"stopping rather than asking again"
+                    # So: change something, rather than stop. Correcting runs
+                    # until the answer passes or the deadline stops it, and a
+                    # FRESH conversation is a real change where a re-ask is not
+                    # -- it is the same move the unreadable branch makes, for
+                    # the same reason, and `_resume_elsewhere` is that move.
+                    # Only when there is nowhere left to carry it does the loop
+                    # end, and it ends holding the best answer it ever had.
+                    carried = await _resume_elsewhere(
+                        f"{provider or 'this model'} sent back the same program "
+                        f"and the same failures after being shown them",
+                        avoid=provider,
                     )
-                    break
+                    if carried is None:
+                        break
+                    conversation, provider, prompt = carried
+                    continue
                 if not candidate.defect and not candidate.failures:
                     break  # nothing actionable to report (no examples shipped)
                 # Kept apart, not merged into one list of "problems": a defect
@@ -1167,7 +1217,7 @@ class VerifyingSolver:
                     await conversation.close()
                 except Exception:  # noqa: BLE001 - cleanup must not mask a result
                     pass
-        return best, provider
+        return best, best_provider
 
     async def _graded(
         self, reply: str, task, left: float, cases: Optional[list] = None
