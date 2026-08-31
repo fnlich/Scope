@@ -10775,6 +10775,79 @@ def test_a_suite_read_off_the_rendered_page_survives_its_invisible_characters():
         assert len(cases) == 1, f"{name} discarded the whole suite"
 
 
+def test_a_bracket_in_the_prose_does_not_steal_the_corrected_suite():
+    """Found by an adversarial audit of the fix above, and it is the commonest
+    shape there is.
+
+    The most natural way a model corrects one of its own cases is to quote that
+    case's INPUT — and for this miner an input is a list literal. The span
+    search took the FIRST `[` and stopped there, so `[3, 1, 2]` in the prose won
+    and the corrected suite below it scored zero: the exact failure the fix was
+    written to eliminate, reintroduced by the fix itself."""
+    from solvers.prompts import extract_self_tests
+
+    arr = ('[{"name": "ordinary", "args": [[3, 1, 2]], "expected": 6},\n'
+           ' {"name": "empty", "args": [[]], "expected": 0}]')
+    for prose in (
+        'You are right, for the input [3, 1, 2] the sum is 6, not 5. Corrected:',
+        "Case [2] was wrong.",
+        "- [x] fixed the off-by-one",
+        "nums[0] should be counted.",
+    ):
+        cases = extract_self_tests(f"{prose}\n{arr}", "g", "python")
+        assert len(cases) == 2, f"a bracket in {prose[:24]!r} ate the suite"
+
+    # Bounded: a reply is prose, not a haystack, and the search must not become
+    # the solve's own budget.
+    from solvers.prompts import _MAX_SPAN_TRIES, _array_spans
+    assert len(_array_spans("[1] " * 500)) <= _MAX_SPAN_TRIES
+
+
+def test_an_unfenced_program_is_never_mined_for_its_own_test_cases():
+    """Invariant A, and the audit broke it against my own change.
+
+    The no-fence fallback exists for a model that ignored the fence contract and
+    typed its corrected array bare. A model that ignored it and typed the
+    PROGRAM bare is answering the other half of the repair prompt — and a module
+    whose leading constant is a list of dicts carrying `expected` (a routing
+    table, a fixture, a spec) was read as the suite. The program was then graded
+    against data lifted out of itself, which can only agree."""
+    from solvers.prompts import extract_self_tests
+
+    for program in (
+        'ROUTES = [{"name": "a", "args": [1], "expected": 2}]\n'
+        "def g(v):\n    return sum(v)\n",
+        'SPEC = [{"expected": 0}]\n\n\ndef g(v):\n    return 0\n',
+    ):
+        assert extract_self_tests(program, "g", "python") == [], (
+            "graded a program against a constant lifted out of itself"
+        )
+
+    # ...and the shape the fallback is FOR still works: a bare array, no program.
+    assert len(extract_self_tests(
+        'Here are all of them:\n[{"name": "a", "args": [[1]], "expected": 1}]',
+        "g", "python",
+    )) == 1
+
+
+def test_an_abandoned_draft_inside_the_reasoning_is_not_the_suite():
+    """`extract_code` strips `<think>` before matching; `extract_self_tests`
+    did not. A draft the model tried and ABANDONED is still text on the page,
+    and one holding `expected: 999` became the bar the program was graded
+    against — beating the real answer written below it."""
+    from solvers.prompts import extract_self_tests
+
+    only_draft = ('<think>Maybe [{"name": "draft", "args": [[9]], "expected": 999}] '
+                  "— no, that is wrong.</think>\n"
+                  "The program was right; I have nothing to correct.")
+    assert extract_self_tests(only_draft, "g", "python") == []
+
+    beaten = ('<think>[{"name": "draft", "args": [[9]], "expected": 999}]</think>\n'
+              '[{"name": "final", "args": [[1]], "expected": 1}]')
+    cases = extract_self_tests(beaten, "g", "python")
+    assert [c["name"] for c in cases] == ["final"], cases
+
+
 def test_a_cases_block_is_not_offered_as_the_program():
     """`_converse` tells "the model corrected its cases" from "the model rewrote
     both" by asking whether any CODE arrived. A json array answered to that

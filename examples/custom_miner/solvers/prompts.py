@@ -695,6 +695,11 @@ def extract_self_tests(
     # invisible character dropped an entire corrected suite. That fallback is in
     # the log this was found from.
     reply = sanitize_code(reply)
+    # ...and drop the model's own reasoning, for the same reason `extract_code`
+    # drops it: a draft the model tried and ABANDONED is still text on the page.
+    # Measured -- a `<think>` block holding `expected: 999` became the bar the
+    # program was graded against, beating the real answer written below it.
+    reply = _OPEN_THINK_RE.sub("", _THINK_RE.sub("", reply))
     fenced = fenced_blocks(reply)
     for block in fenced:
         # The program is skipped by `_parse_cases` rather than by an
@@ -717,6 +722,22 @@ def extract_self_tests(
     # `_parse_cases`'s structural gate is what decides, not the fence. Measured:
     # a corrected suite sent as bare text scored zero cases, so the same wrong
     # case broke the program on every remaining round.
+    #
+    # Unless the bare reply is a PROGRAM, in which case it is the answer to the
+    # other half of the repair prompt and not a suite at all. A module whose
+    # leading constant is a list of dicts carrying `expected` -- a routing
+    # table, a fixture, a spec -- otherwise parsed as the model's own test
+    # cases, and the program was then graded against data lifted out of itself.
+    # `python_defect`/`rust_defect` is the same question `extract_code` asks on
+    # its own no-fence path, so "is this source" means one thing in both.
+    bare = reply.strip()
+    if bare:
+        defect = (
+            rust_defect(bare) if language == "rust"
+            else python_defect(bare, entrypoint)
+        )
+        if defect is None:
+            return []
     return _thin(_parse_cases(reply, language, scan_prose=True), MAX_SELF_TESTS)
 
 
@@ -827,7 +848,41 @@ def _loads_cases(text: str) -> Any:
     return None
 
 
-def _array_span(text: str) -> Optional[str]:
+# How many bracketed spans to try before giving up. A reply is prose, not a
+# haystack: a handful covers "the model quoted a list or two while explaining
+# itself", and the cap is what stops a pathological block turning the search
+# into the solve's own budget.
+_MAX_SPAN_TRIES = 8
+
+
+def _array_spans(text: str) -> list[str]:
+    """Every bracketed span in `text`, outermost-first, up to `_MAX_SPAN_TRIES`.
+
+    Taking only the FIRST `[` was wrong, and wrong on the commonest shape there
+    is: the most natural way a model corrects one of its own cases is to quote
+    that case's INPUT, and for this miner an input is a list literal.
+
+        You are right, for the input [3, 1, 2] the sum is 6, not 5.
+        Here are ALL of the cases, corrected:
+        [{"name": "ordinary", ...}, ...]
+
+    The first span is `[3, 1, 2]`, which holds no case dicts, and the search
+    stopped there -- so the corrected suite below it scored zero, which is
+    exactly the failure this was written to fix. `Case [2]`, `- [x] fixed` and
+    `nums[0]` all do the same.
+    """
+    spans: list[str] = []
+    at = 0
+    while len(spans) < _MAX_SPAN_TRIES:
+        span = _array_span(text, at)
+        if span is None:
+            break
+        spans.append(span)
+        at = text.find(span, at) + 1
+    return spans
+
+
+def _array_span(text: str, start_at: int = 0) -> Optional[str]:
     """The first bracketed array in `text`, brackets included, or None.
 
     A model answers "send back ALL of the cases" with prose around the array
@@ -839,7 +894,7 @@ def _array_span(text: str) -> Optional[str]:
     reason `_scrub_json` is: an expected value of `"]"` ends the array under any
     cheaper rule.
     """
-    start = text.find("[")
+    start = text.find("[", start_at)
     if start == -1:
         return None
     depth = 0
@@ -962,10 +1017,27 @@ def _parse_cases(
         # stricter reading but no reading at all -- a model that ignored the
         # fence entirely still answered, and the structural gate below is what
         # decides whether what it wrote is a suite.
-        span = _array_span(text)
-        raw = _loads_cases(span) if span else None
+        for span in _array_spans(text):
+            candidate = _loads_cases(span)
+            if isinstance(candidate, list) and _case_items(candidate, language):
+                raw = candidate
+                break
     if not isinstance(raw, list):
         return []
+    return _case_items(raw, language)
+
+
+def _case_items(raw: list, language: str) -> list[dict[str, Any]]:
+    """The structural gate, and the only thing that decides what a case is.
+
+    Kept apart from the parsing above because the span search has to ask this
+    question too: "did this bracketed span actually hold cases, or should I look
+    at the next one?" is the same question as "is this a suite".
+
+    An item counts only if it is a dict carrying `expected`. No amount of
+    dialect tolerance upstream touches that -- it is what keeps a program, a
+    prompt echo or a stray list of numbers from being read as a suite.
+    """
     cases: list[dict[str, Any]] = []
     for item in raw:
         if not isinstance(item, dict) or "expected" not in item:
