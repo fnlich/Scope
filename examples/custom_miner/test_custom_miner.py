@@ -10622,6 +10622,222 @@ def test_a_repair_may_correct_a_case_the_first_turn_got_wrong():
     assert "ALL of the cases" in prompts[2]
 
 
+def test_a_correction_survives_every_dialect_a_model_actually_writes():
+    """The bug, from a live 290-second solve that submitted nothing.
+
+    `_parse_cases` was strict JSON and required the text to start with `[`. On a
+    repair round the array it dropped was the CORRECTED cases, so the same wrong
+    case failed again on the next round, and the round after that — the model
+    kept sending the fix and the miner kept not reading it, until the deadline
+    ran out. The log showed 20 own cases, nothing graded, 290.1s of 290s.
+
+    Every shape below was measured returning zero cases. None of them is exotic:
+    they are what a model writes when it is thinking in Python, or being helpful,
+    or was cut off."""
+    from solvers.prompts import extract_self_tests
+
+    ok = ('[{"name": "a", "args": [[1]], "expected": 1},'
+          ' {"name": "b", "args": [[2]], "expected": 2}]')
+    shapes = {
+        "trailing comma": '```json\n[{"name": "a", "args": [[1]], "expected": 1},]\n```',
+        "// comment": '```json\n// corrected the carry case\n' + ok + '\n```',
+        "# comment": '```json\n# corrected\n' + ok + '\n```',
+        "wrapped in an object": '```json\n{"cases": ' + ok + '}\n```',
+        "wrapped under tests": '```json\n{"tests": ' + ok + '}\n```',
+        "single quotes": "```json\n[{'name': 'a', 'args': [[1]], 'expected': 1}]\n```",
+        "python True": '```json\n[{"name": "a", "args": [[1]], "expected": True}]\n```',
+        "python None": '```json\n[{"name": "a", "args": [[1]], "expected": None}]\n```',
+        "no fence at all": "Here are all the cases, corrected:\n\n" + ok,
+    }
+    for name, reply in shapes.items():
+        cases = extract_self_tests(reply, "g", "python")
+        assert cases, f"{name}: the correction was dropped silently"
+
+    # ...and the strict path is untouched, because it is the common one.
+    assert len(extract_self_tests(f"```json\n{ok}\n```", "g", "python")) == 2
+
+
+def test_a_correction_cut_off_mid_array_keeps_what_arrived():
+    """A twenty-case array is long and the ways a reply gets cut short are
+    ordinary: a deadline stops the model mid-sentence, or the copy control fails
+    and the DOM read returns only what had rendered. `json.loads` then sees an
+    array with no `]` and returns nothing — nineteen good corrected cases thrown
+    away because the twentieth did not arrive.
+
+    That copy-control fallback is in the log this was found from."""
+    from solvers.prompts import extract_self_tests
+
+    whole = [f'{{"name": "c{i}", "args": [[{i}]], "expected": {i}}}' for i in range(20)]
+    cut = "```json\n[" + ",".join(whole[:19]) + ',{"name": "c19", "arg'
+    cases = extract_self_tests(cut, "g", "python")
+    assert len(cases) == 19, f"salvaged {len(cases)} of the 19 complete cases"
+    assert [c["expected"] for c in cases] == list(range(19))
+    # Nothing invented past the cut.
+    assert all(c["name"] != "c19" for c in cases)
+
+
+def test_the_looser_parser_still_refuses_what_is_not_a_suite():
+    """Every shape the tolerance must NOT reach. Each one would grade a program
+    against cases nobody wrote, which is worse than grading it against none."""
+    from solvers.prompts import extract_self_tests
+
+    program = "```python\ndef g(v):\n    return sum(v)\n```"
+    assert extract_self_tests(program, "g", "python") == [], "read a program as cases"
+
+    # A list of dicts with no `expected` is data, not a suite.
+    assert extract_self_tests(
+        '```json\n[{"name": "a", "args": [[1]]}]\n```', "g", "python"
+    ) == []
+
+    # A module whose top level IS a list literal.
+    assert extract_self_tests(
+        '```python\nROUTES = [{"name": "a", "args": [1]}]\ndef g(v): return v\n```',
+        "g", "python",
+    ) == []
+
+    # Prose INSIDE a fence: the model was discussing an array, not sending one.
+    assert extract_self_tests(
+        '```\nhere are my cases\n[{"name": "z", "args": [0], "expected": 0}]\n```',
+        "g", "python",
+    ) == []
+
+    # ...and because it used a fence at all, the reply-level scan stays shut.
+    assert extract_self_tests(
+        '```python\ndef g(v): return v\n```\n\n'
+        'for reference the examples were [{"name": "z", "args": [0], "expected": 0}]',
+        "g", "python",
+    ) == []
+
+
+def test_scrubbing_never_reaches_inside_a_string():
+    """`//` and `#` and `,]` are comment and trailing-comma syntax outside a
+    string and ordinary characters inside one — and inside one is exactly where
+    a test case keeps its data. A string-blind scrub trades a silent drop for a
+    silent corruption, which is strictly worse: the cases still run, against
+    values nobody wrote."""
+    from solvers.prompts import extract_self_tests
+
+    tricky = (
+        '```json\n[{"name": "url", "args": ["http://x//y"], "expected": "a//b"},\n'
+        ' {"name": "hash", "args": ["# 1"], "expected": "#tag"},\n'
+        ' {"name": "brackets", "args": ["a,]"], "expected": "]"}]\n```'
+    )
+    cases = extract_self_tests(tricky, "g", "python")
+    assert len(cases) == 3, f"lost a case to scrubbing: {cases}"
+    assert cases[0]["args"] == ["http://x//y"] and cases[0]["expected"] == "a//b"
+    assert cases[1]["args"] == ["# 1"] and cases[1]["expected"] == "#tag"
+    assert cases[2]["args"] == ["a,]"] and cases[2]["expected"] == "]"
+
+
+def test_scrubbing_knows_both_quote_characters():
+    """`_scrub_json` runs before `ast.literal_eval` as well as before
+    `json.loads`, so by the time it sees the text it may be Python — and a model
+    reasoning in Python single-quotes its strings.
+
+    Tracking only `"` ate the `#` out of `'a#b'` and the `//` out of
+    `'http://x'`, which turned a silent drop into a silent corruption. That is
+    strictly worse: the cases still run, against values nobody wrote."""
+    from solvers.prompts import _scrub_json, extract_code, extract_self_tests
+
+    assert _scrub_json("[{'expected': 'a#b'}]") == "[{'expected': 'a#b'}]"
+    assert _scrub_json("[{'e': 'http://x'}]") == "[{'e': 'http://x'}]"
+
+    # The shape that needs BOTH: a comment (so the raw parses fail) around a
+    # single-quoted array (so only the scrubbed text is left to read).
+    reply = ("```json\n// corrected the second case\n"
+             "[{'name': 'a', 'args': [1], 'expected': 'a#b'}]\n```")
+    cases = extract_self_tests(reply, "g", "python")
+    assert len(cases) == 1 and cases[0]["expected"] == "a#b", cases
+    assert extract_code(reply, "g", "python") == "", "handed the array back as code"
+
+
+def test_a_suite_read_off_the_rendered_page_survives_its_invisible_characters():
+    """`extract_code` has always run `sanitize_code` first; `extract_self_tests`
+    never did, and passed the raw block straight to a JSON parser.
+
+    It matters on exactly the path the report came from. When the copy control
+    fails the reply is read off the RENDERED PAGE, which carries the page's own
+    characters — a non-breaking space where the model typed a space, a
+    zero-width joiner from a syntax highlighter. Neither `json.loads` nor
+    `ast.literal_eval` accepts one as whitespace, so a single invisible
+    character discarded an entire corrected suite."""
+    from solvers.prompts import extract_self_tests
+
+    clean = '```json\n[{"name": "a", "args": [1], "expected": 2}]\n```'
+    assert len(extract_self_tests(clean, "g", "python")) == 1
+
+    for name, bad in (
+        ("non-breaking space", clean.replace(" ", "\u00a0", 1)),
+        ("zero-width space", clean.replace('[{"name"', '[{\u200b"name"')),
+        ("zero-width joiner", clean.replace("expected", "expec\u200dted")),
+    ):
+        cases = extract_self_tests(bad, "g", "python")
+        assert len(cases) == 1, f"{name} discarded the whole suite"
+
+
+def test_a_cases_block_is_not_offered_as_the_program():
+    """`_converse` tells "the model corrected its cases" from "the model rewrote
+    both" by asking whether any CODE arrived. A json array answered to that
+    question makes a reply that changed no code look like a rewrite, and the
+    corrected cases are then deferred to a round the solve may not have."""
+    from solvers.prompts import extract_code, extract_self_tests
+
+    ok = '[{"name": "a", "args": [[1]], "expected": 1}]'
+    cases_only = f"You are right, the case was wrong:\n\n```json\n{ok}\n```"
+    assert extract_code(cases_only, "g", "python") == "", "cases read as a program"
+    assert len(extract_self_tests(cases_only, "g", "python")) == 1
+
+    # Both in one reply: the program is still found, and so are the cases.
+    both = f"```json\n{ok}\n```\n\n```python\ndef g(v):\n    return sum(v)\n```"
+    assert "def g(v)" in extract_code(both, "g", "python")
+    assert len(extract_self_tests(both, "g", "python")) == 1
+
+
+def test_a_dirty_correction_is_adopted_by_the_real_repair_loop(monkeypatch):
+    """End to end, in the shape the report came in: the corrected cases arrive
+    with a trailing comma and a comment, and the loop must still adopt them,
+    re-grade the program it already has against the corrected bar, and stop."""
+    import json as _json
+
+    cases = [{"name": f"c{i}", "args": [[i]], "expected": i} for i in range(3)]
+    cases.append({"name": "bad", "args": [[1, 2]], "expected": 99})   # wrong
+    fixed = list(cases)
+    fixed[-1] = {"name": "bad", "args": [[1, 2]], "expected": 3}
+
+    CASES = "```json\n" + _json.dumps(cases) + "\n```"
+    PROGRAM = "```python\ndef g(v):\n    return sum(v)\n```"
+    # A comment and a trailing comma — both fatal to the old parser.
+    DIRTY = ("```json\n// the carry case was wrong, sorry\n"
+             + _json.dumps(fixed)[:-1] + ",]\n```")
+
+    sent = []
+
+    class _Recording(_Chat):
+        async def send(self, text, timeout_s):
+            sent.append(text)
+            return [CASES, PROGRAM, DIRTY][min(len(sent) - 1, 2)]
+
+    class _Recorded(_Backend):
+        async def open(self, avoid=None):
+            return _Recording(self._replies, self._provider)
+
+    task = SolveTask(problem_id="dirty", language="python", statement="Sum it.",
+                     entrypoint="g", public_examples=[], deadline_s=90.0)
+    solver = VerifyingSolver(_Recorded([]), reserve_s=0, max_budget_s=90,
+                             second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=90.0))
+    out = log.getvalue()
+
+    assert len(sent) == 3, f"expected cases, program, one correction: {len(sent)}"
+    assert "return sum(v)" in answer.code
+    assert "self=4/4" in out, (
+        "the corrected cases were dropped, so the program never cleared its bar:\n"
+        + out
+    )
+    assert answer.self_verified is True
+
+
 def test_a_leaked_language_chip_does_not_cost_the_corrected_cases():
     """`_parse_cases` fast-paths on a leading `[`, and a copy control that hands
     back its own language label ahead of the array fails that test.
