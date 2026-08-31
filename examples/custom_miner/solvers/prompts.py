@@ -687,7 +687,21 @@ def extract_self_tests(
     """
     if not reply or not entrypoint:
         return []
-    for block in fenced_blocks(reply):
+    # `sanitize_code` first, as `extract_code` has always done. A reply read off
+    # the RENDERED PAGE -- which is what happens whenever the copy control fails
+    # -- carries the page's own characters: a non-breaking space where the model
+    # typed a space, a zero-width joiner from a syntax highlighter. Neither
+    # `json.loads` nor `ast.literal_eval` accepts one as whitespace, so a single
+    # invisible character dropped an entire corrected suite. That fallback is in
+    # the log this was found from.
+    reply = sanitize_code(reply)
+    # ...and drop the model's own reasoning, for the same reason `extract_code`
+    # drops it: a draft the model tried and ABANDONED is still text on the page.
+    # Measured -- a `<think>` block holding `expected: 999` became the bar the
+    # program was graded against, beating the real answer written below it.
+    reply = _OPEN_THINK_RE.sub("", _THINK_RE.sub("", reply))
+    fenced = fenced_blocks(reply)
+    for block in fenced:
         # The program is skipped by `_parse_cases` rather than by an
         # is-this-the-program check, and that is deliberate. Such a check has no
         # reachable upside -- no Python or Rust program starts with `[` -- and a
@@ -698,7 +712,33 @@ def extract_self_tests(
         cases = _parse_cases(block, language)
         if cases:
             return _thin(cases, MAX_SELF_TESTS)
-    return []
+    if fenced:
+        # It used fences and none of them was a suite, so it did not send one.
+        # Digging through the prose AROUND a block a model deliberately fenced
+        # would read an array it was discussing as cases it meant to run.
+        return []
+    # NO fence anywhere. The contract asks for one, and a reply that ignores it
+    # entirely is still a reply -- the array is right there in the text, and
+    # `_parse_cases`'s structural gate is what decides, not the fence. Measured:
+    # a corrected suite sent as bare text scored zero cases, so the same wrong
+    # case broke the program on every remaining round.
+    #
+    # Unless the bare reply is a PROGRAM, in which case it is the answer to the
+    # other half of the repair prompt and not a suite at all. A module whose
+    # leading constant is a list of dicts carrying `expected` -- a routing
+    # table, a fixture, a spec -- otherwise parsed as the model's own test
+    # cases, and the program was then graded against data lifted out of itself.
+    # `python_defect`/`rust_defect` is the same question `extract_code` asks on
+    # its own no-fence path, so "is this source" means one thing in both.
+    bare = reply.strip()
+    if bare:
+        defect = (
+            rust_defect(bare) if language == "rust"
+            else python_defect(bare, entrypoint)
+        )
+        if defect is None:
+            return []
+    return _thin(_parse_cases(reply, language, scan_prose=True), MAX_SELF_TESTS)
 
 
 def _thin(cases: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -728,14 +768,210 @@ def _thin(cases: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
     return head + [rest[int(i * stride)] for i in range(room)]
 
 
-def _parse_cases(block: str, language: str) -> list[dict[str, Any]]:
+def _scrub_json(text: str) -> str:
+    """Strip line comments and trailing commas, leaving strings untouched.
+
+    Both are things a model writes and JSON forbids, and both are cheap to undo
+    -- but only with a scanner that knows where the strings are. `re.sub` on
+    `//` corrupts an expected value of `"http://x"`, and on `,\s*]` corrupts
+    `"a,]"`. Those are exactly the values a test case is made of, so a
+    string-blind scrubber trades one silent drop for a silent corruption.
+    """
+    out: list[str] = []
+    quote = ""          # the character that opened the string we are inside
+    escaped = False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = ""
+            i += 1
+            continue
+        # BOTH quote characters, because by the time this runs the text may be
+        # Python rather than JSON -- `ast.literal_eval` is one of the parsers
+        # downstream, and a model reasoning in Python single-quotes its strings.
+        # Tracking only `"` ate the `#` out of `'a#b'` and the `//` out of
+        # `'http://x'`, turning a silent drop into a silent corruption, which is
+        # worse: the cases still run, against values nobody wrote.
+        if ch in "\"'":
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        # A line comment, in either of the two spellings a model reaches for.
+        if text.startswith("//", i) or ch == "#":
+            end = text.find("\n", i)
+            i = n if end == -1 else end
+            continue
+        if ch == ",":
+            # Trailing comma: the next non-space character closes a container.
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "]}":
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _loads_cases(text: str) -> Any:
+    """`json.loads`, then the two dialects a model actually writes. Never raises.
+
+    Strict JSON first, because it is the common case and the cheapest. What
+    follows is not permissiveness for its own sake -- each fallback was a
+    measured way a real correction was thrown away:
+
+    * comments and trailing commas -- JSON forbids both, models write both;
+    * `True` / `False` / `None` and single-quoted strings -- a model reasoning
+      in Python writes Python, and `ast.literal_eval` reads exactly that
+      dialect. It evaluates literals only: no names, no calls, no attribute
+      access, so a hostile array cannot execute anything.
+    """
+    for attempt in (text, _scrub_json(text)):
+        try:
+            return json.loads(attempt)
+        except Exception:  # noqa: BLE001 - a model wrote it; anything is possible
+            pass
+    for attempt in (text, _scrub_json(text)):
+        try:
+            return ast.literal_eval(attempt)
+        except Exception:  # noqa: BLE001 - not a literal either, then
+            pass
+    return None
+
+
+# How many bracketed spans to try before giving up. A reply is prose, not a
+# haystack: a handful covers "the model quoted a list or two while explaining
+# itself", and the cap is what stops a pathological block turning the search
+# into the solve's own budget.
+_MAX_SPAN_TRIES = 8
+
+
+def _array_spans(text: str) -> list[str]:
+    """Every bracketed span in `text`, outermost-first, up to `_MAX_SPAN_TRIES`.
+
+    Taking only the FIRST `[` was wrong, and wrong on the commonest shape there
+    is: the most natural way a model corrects one of its own cases is to quote
+    that case's INPUT, and for this miner an input is a list literal.
+
+        You are right, for the input [3, 1, 2] the sum is 6, not 5.
+        Here are ALL of the cases, corrected:
+        [{"name": "ordinary", ...}, ...]
+
+    The first span is `[3, 1, 2]`, which holds no case dicts, and the search
+    stopped there -- so the corrected suite below it scored zero, which is
+    exactly the failure this was written to fix. `Case [2]`, `- [x] fixed` and
+    `nums[0]` all do the same.
+    """
+    spans: list[str] = []
+    at = 0
+    while len(spans) < _MAX_SPAN_TRIES:
+        span = _array_span(text, at)
+        if span is None:
+            break
+        spans.append(span)
+        at = text.find(span, at) + 1
+    return spans
+
+
+def _array_span(text: str, start_at: int = 0) -> Optional[str]:
+    """The first bracketed array in `text`, brackets included, or None.
+
+    A model answers "send back ALL of the cases" with prose around the array
+    about as often as with the array alone, and a reply read off the DOM rather
+    than off the copy control arrives with its fence already gone. Both put the
+    array somewhere other than at character zero.
+
+    Bracket-matched rather than regex-matched, and string-aware for the same
+    reason `_scrub_json` is: an expected value of `"]"` ends the array under any
+    cheaper rule.
+    """
+    start = text.find("[", start_at)
+    if start == -1:
+        return None
+    depth = 0
+    closed = -1
+    quote = ""
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = ""
+            continue
+        if ch in "\"'":       # both, for the same reason `_scrub_json` does
+            quote = ch
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+            if depth == 0:
+                return text[start: i + 1]
+            if depth == 1:
+                closed = i          # a complete element ended here
+    return _truncated_span(text, start, closed)
+
+
+def _truncated_span(text: str, start: int, closed: int) -> Optional[str]:
+    """An unterminated array, cut back to its last complete element.
+
+    A twenty-case array is long, and the ways a reply gets cut short are
+    ordinary rather than exotic: a deadline stops the model mid-sentence, or the
+    copy control fails and the DOM read returns what had rendered so far. Either
+    way `json.loads` sees an array with no `]` and returns nothing at all --
+    so nineteen perfectly good corrected cases are thrown away because the
+    twentieth did not arrive.
+
+    Nineteen cases are worth more than none. The `len(revised) < len(agreed)`
+    guard in `verify.py` still refuses a set that came back SHORTER than the one
+    it replaces, so a salvage cannot quietly shrink the bar -- it only rescues
+    the case where the array was complete enough to keep.
+    """
+    if closed < 0:
+        return None
+    return text[start: closed + 1] + "]"
+
+
+# What a model names the array when it wraps it in an object instead of sending
+# it bare. `{"cases": [...]}` is a reply to "send back ALL of the cases" that
+# reads perfectly to a human and parsed to nothing here.
+_CASE_KEYS = ("cases", "tests", "test_cases", "testcases", "examples")
+
+
+def _parse_cases(
+    block: str, language: str, *, scan_prose: bool = False
+) -> list[dict[str, Any]]:
     """One block as a case list, or []. Never raises.
 
-    The `[` test is a FAST PATH, not a guard: `json.loads` on a program raises
-    and this returns [] either way. It is here because it runs against every
-    fenced block of every reply, and a program can be a hundred kilobytes -- the
-    cost of parsing one as JSON comes out of the solve's own budget. Removing it
-    changes no outcome, only how much work is done to reach the same one.
+    Strict-first and tolerant-after. The strictness that used to be the whole
+    function is still the fast path -- a program can be a hundred kilobytes and
+    parsing one as JSON comes out of the solve's own budget -- but it was also
+    the only path, and on a REPAIR round the array it dropped was the corrected
+    cases. Losing those means the same wrong case breaks the program again on
+    every remaining round, which is a solve that spends its whole deadline
+    reporting a failure the model already fixed.
+
+    Measured against the shapes a model actually sends: an array wrapped in
+    `{"cases": ...}`, a trailing comma, `//` comments, single quotes,
+    `True`/`False`/`None`, prose around the array, and no fence at all. Every
+    one of them was silently worth nothing.
+
+    What did NOT loosen is the structural gate below: an item is a case only if
+    it is a dict carrying `expected`. That is what keeps a program, a prompt
+    echo or a stray list of numbers from being read as a suite, and no amount
+    of dialect tolerance touches it.
     """
     text = block.strip()
     if not text.startswith("["):
@@ -745,17 +981,63 @@ def _parse_cases(block: str, language: str) -> list[dict[str, Any]]:
         # so losing it means the same wrong case breaks the program again on
         # every remaining round.
         head, _, rest = text.partition("\n")
-        if head.strip().casefold() not in ("json", "jsonc", "json5"):
-            return []
-        text = rest.strip()
-        if not text.startswith("["):
-            return []
-    try:
-        raw = json.loads(text)
-    except Exception:  # noqa: BLE001 - a model wrote it; anything is possible
-        return []
+        if head.strip().casefold() in ("json", "jsonc", "json5"):
+            text = rest.strip()
+    raw = _loads_cases(text)
+    if isinstance(raw, dict):
+        # Wrapped in an object. Take a named list, or the only list it holds.
+        for key in _CASE_KEYS:
+            if isinstance(raw.get(key), list):
+                raw = raw[key]
+                break
+        else:
+            lists = [v for v in raw.values() if isinstance(v, list)]
+            raw = lists[0] if len(lists) == 1 else None
+    if not isinstance(raw, list) and (text.lstrip().startswith("[") or scan_prose):
+        # Two different jobs share this call, and only the second is gated.
+        #
+        # When the text ALREADY starts with `[`, this is not digging through
+        # prose -- the model plainly sent an array and something is wrong with
+        # it, most often that it stops mid-element because the reply was cut
+        # off. `_array_span` bracket-matches it and `_truncated_span` salvages
+        # the complete prefix. Gating that behind `scan_prose` cost the whole
+        # rescue: a twenty-case correction truncated at the twentieth parsed to
+        # nothing, which is the failure this was written to fix.
+        #
+        # Digging an array out of surrounding prose is the other job, and OFF
+        # by default.
+        #
+        # Inside a fenced block prose-digging stays off because the contract asked for one
+        # block and a model that obeyed it sent the array alone: an array buried
+        # in a fence full of prose is more likely something the model was
+        # talking ABOUT than a suite it meant to send, and grading a program
+        # against cases nobody wrote is worse than grading it against none.
+        #
+        # It is on for the reply as a whole, where the alternative is not a
+        # stricter reading but no reading at all -- a model that ignored the
+        # fence entirely still answered, and the structural gate below is what
+        # decides whether what it wrote is a suite.
+        for span in _array_spans(text):
+            candidate = _loads_cases(span)
+            if isinstance(candidate, list) and _case_items(candidate, language):
+                raw = candidate
+                break
     if not isinstance(raw, list):
         return []
+    return _case_items(raw, language)
+
+
+def _case_items(raw: list, language: str) -> list[dict[str, Any]]:
+    """The structural gate, and the only thing that decides what a case is.
+
+    Kept apart from the parsing above because the span search has to ask this
+    question too: "did this bracketed span actually hold cases, or should I look
+    at the next one?" is the same question as "is this a suite".
+
+    An item counts only if it is a dict carrying `expected`. No amount of
+    dialect tolerance upstream touches that -- it is what keeps a program, a
+    prompt echo or a stray list of numbers from being read as a suite.
+    """
     cases: list[dict[str, Any]] = []
     for item in raw:
         if not isinstance(item, dict) or "expected" not in item:
@@ -828,6 +1110,15 @@ def extract_code(
         )
         return bare if defect is None else ""
     blocks = [b for b in (sanitize_code(m).strip() for m in matches) if b]
+    # A block that IS the cases is not a candidate program, and saying so here
+    # rather than downstream is what keeps a cases-only correction readable as
+    # one. `_converse` decides between "the model corrected its cases" and "the
+    # model rewrote both" by asking whether any code arrived; a `json` array
+    # answered to that question makes a reply that changed no code look like a
+    # rewrite, and the corrected cases are then deferred a round they do not
+    # have. The gate is `_parse_cases`'s own -- dicts carrying `expected` -- so
+    # nothing that could be a program is excluded by it.
+    blocks = [b for b in blocks if not _parse_cases(b, language)]
     if not blocks:
         return ""
     # With a target in hand, prefer the LAST block that would actually grade.
