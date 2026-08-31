@@ -1279,7 +1279,7 @@ Turn 1 is asked for the shape the classes actually break on, with counts stated
 on the easy classes:
 
 ```
-1. THREE ordinary cases         the common path, which an all-boundary
+1. ONE ordinary case            the common path, which an all-boundary
                                 suite never checks at all
 2. then 2–10 cases per class:   zero and the empty input · one and two ·
                                 every limit the statement names, at it,
@@ -1346,8 +1346,13 @@ of time:
 
 `MAX_SELF_TESTS = 20` is the cap the model is told about *and* the cap the miner
 enforces, and over-long arrays are thinned by keeping the first three and then
-striding — a head-slice would keep the three ordinary cases and throw away every
-boundary, discarding exactly what the mechanism exists to run.
+striding — a head-slice would keep only the cheap opening cases and throw away
+every boundary, discarding exactly what the mechanism exists to run. The head is
+three because that is where the first three classes sit (the ordinary case, the
+empty value, and one), not because the ordinary case is asked for three times:
+turn 1 asks for exactly ONE of those. Three runs of the common path are three
+runs of the same code, paid for out of the solve's own deadline and re-paid on
+every repair round.
 
 ### A short deadline must still get an answer
 
@@ -1730,6 +1735,7 @@ fresh conversation.
 | `SOLVER_MAX_BUDGET_S` | `3600` | The protocol's own maximum for `deadline_s`, so it cannot bind on a spec-compliant request. Lowering it below the advertised deadline throws away answers the validator would still pay for |
 | `SOLVER_VERIFY_EXECUTOR` | `subprocess` | Python grading backend; Rust always uses Docker |
 | `SOLVER_EXECUTOR_RETRY_S` | `300` | How long an executor that could not be BUILT stays unavailable before a solve tries again. Without a daemon, building the Rust executor runs `docker info` — 60ms against a missing socket, up to 20s against a hung one — and it used to run once per Rust task, inside the solve's budget. A hold rather than a verdict: a daemon started after the miner is picked up on its own |
+| `MINER_RESPONSE_GRACE_S` | `5` | How far past `deadline_s` the solve may run. The validator reads until `deadline_s + 10` (`_MINER_RESPONSE_GRACE_S`, `rlvr/neurons/decentralized.py`), and the reference handler stopped at `deadline_s` flat. Not all ten: the rest is the response's own trip across the wire. `0` restores the reference behaviour |
 | `GLM_REQUEST_TIMEOUT_S` | `3600` | The deadline `handle_request` answers **504** at, `min()`-ed with the validator's own. Named for the reference miner's GLM client but applied to whatever solver is plugged in. `docs/DEMO_MINER.md` documents `280` for that miner; leaving `280` in your `.env` costs the browser solver 20 seconds of every solve |
 
 `GET /solver-status` reports per-provider counters, fleet health, and a `rust`

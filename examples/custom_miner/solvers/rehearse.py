@@ -52,11 +52,7 @@ if __package__ in (None, ""):  # `python solvers/rehearse.py` as well as `-m`
 from rlvr.protocol import TaskRequest, sign_message  # noqa: E402
 from rlvr.types import TestCase  # noqa: E402
 
-from solvers.config import (  # noqa: E402
-    apply_solve_timeout_default,
-    find_env_file,
-    load_env_file,
-)
+from solvers.config import load_miner_env  # noqa: E402
 from solvers.roster import build_solver, describe, roster, warm_up  # noqa: E402
 from solvers.challenges import load_all, names as challenge_names  # noqa: E402
 from solvers.samples import SAMPLES  # noqa: E402
@@ -473,12 +469,10 @@ async def run(
     ever gets -- a switch that changed what is being rehearsed would defeat the
     purpose of rehearsing.
     """
-    env_file = find_env_file()
-    if load_env_file(env_file):
-        print(f"[rehearse] loaded {env_file}")
-    # The same default the live miner applies, so a rehearsal reproduces the
-    # budget a real validator request would get rather than a tighter one.
-    apply_solve_timeout_default()
+    # The same steps the live miner takes, through the same helper, so a
+    # rehearsal reproduces the budget a real validator request would get rather
+    # than a tighter or a looser one.
+    load_miner_env("rehearse")
 
     if args.challenge:
         which = None if args.challenge == ["all"] else args.challenge
@@ -519,6 +513,24 @@ async def run(
             print(f"\n[rehearse] COULD NOT BE CHECKED: no browser to solve with.\n"
                   f"           {_one_line(exc, limit=400)}")
             return 2
+        # Where `run_miner.py` puts it, and for its reason: neither Rust check
+        # is looked at until a Rust challenge arrives, so without this the
+        # FIRST rust problem in a replay pays `docker info` and `which rustc`
+        # out of its own budget while the live miner had paid them once at
+        # startup. A replay that charges a solve for something production does
+        # not is not measuring production.
+        #
+        # Outside the block above, not inside it: a missing toolchain is not a
+        # missing browser, and reporting it as one would send an operator to
+        # start Chrome over a Docker socket.
+        #
+        # Guarded the way `warm_up` guards `start`: `solver_factory` hands back
+        # doubles, and a `Solver` is only required to have `solve_task` and
+        # `aclose`. A replay must not fall over on a solver that has nothing to
+        # probe.
+        probe = getattr(solver, "check_rust_support", None)
+        if probe is not None:
+            await probe()
         for index, problem in enumerate(problems, 1):
             if len(problems) > 1:
                 print(f"\n{'=' * 72}\n[rehearse] {index} of {len(problems)}: "

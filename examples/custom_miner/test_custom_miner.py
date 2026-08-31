@@ -7175,6 +7175,218 @@ def test_a_solve_that_used_its_whole_budget_does_not_promise_another_model(capsy
     assert "-0s left" not in out, out
 
 
+def _grace_miner(sleep_s, *, settings=None):
+    """A miner whose solve takes exactly `sleep_s`, through the real handler."""
+    from custom_miner import SolveResult
+
+    class _Slow:
+        async def solve_task(self, task, timeout_s):
+            await asyncio.sleep(sleep_s)
+            return SolveResult(code="def g(n): return n", raw_response="r")
+
+        async def aclose(self): pass
+
+    return CustomMiner(settings or DemoMinerSettings(_env_file=None), _Slow(),
+                       wallet=None, subtensor=None, metagraph=None)
+
+
+def _signed(deadline_s, problem_id="grace"):
+    from rlvr.protocol import sign_message as _sign
+
+    request = TaskRequest(problem_id=problem_id, language="python", statement="s",
+                          entrypoint="g", public_examples=[], deadline_s=deadline_s)
+    body = request.model_dump_json().encode()
+    return _sign(keypair.create_from_uri("//Alice"), body), body
+
+
+def test_the_solve_runs_past_the_deadline_into_the_validators_grace(monkeypatch):
+    """The validator does not stop at `deadline_s`.
+
+    `_dispatch_committed` bounds the whole exchange at
+    `deadline_s + _MINER_RESPONSE_GRACE_S` — 10.0 in
+    `rlvr/neurons/decentralized.py` — and the reference `handle_request`
+    cancelled our own solve at `deadline_s` flat, answering 504 with nothing
+    while the validator was still listening. Seconds given back for free, and
+    there is nothing on the other side to fear for using them:
+    `rlvr/scoring/payment.py` gates on `all_passed` and then applies a speed
+    multiplier floored at 0.95, so late-but-correct is worth ~96% and
+    unfinished is worth 0.
+
+    Not all ten seconds — see `RESPONSE_GRACE_S`. This asserts we take the
+    part we decided was safe: a solve that runs PAST the deadline still
+    returns 200 with its answer."""
+    import custom_miner
+
+    monkeypatch.setattr(custom_miner, "RESPONSE_GRACE_S", 3.0)
+    miner = _grace_miner(1.5)
+    headers, body = _signed(deadline_s=1.0)     # solve overruns it by 0.5s
+    status, payload = asyncio.run(miner.handle_request(headers, body))
+
+    assert status == 200, f"504'd inside the validator's own grace: {payload}"
+    assert payload.code == "def g(n): return n"
+
+
+def test_the_grace_is_bounded_and_an_overrun_still_ends_in_504(monkeypatch):
+    """The grace widens the cutoff; it does not remove it. Past
+    `deadline_s + RESPONSE_GRACE_S` the validator is about to stop reading, and
+    a solve still running then is worth nothing either way — so it ends the
+    same way the reference miner ends it."""
+    import custom_miner
+
+    monkeypatch.setattr(custom_miner, "RESPONSE_GRACE_S", 1.0)
+    miner = _grace_miner(5.0)
+    headers, body = _signed(deadline_s=1.0)     # cutoff at 2.0s, solve wants 5.0
+    status, payload = asyncio.run(miner.handle_request(headers, body))
+
+    assert status == 504, f"ran past the validator's ceiling: {status}"
+
+
+def test_an_operator_asking_for_a_shorter_solve_is_not_overruled(monkeypatch):
+    """`min` with `glm_request_timeout_s` is kept. Someone who turns that knob
+    DOWN is asking for a shorter solve, and a grace that ignored it would make
+    the knob a lie."""
+    import custom_miner
+
+    monkeypatch.setattr(custom_miner, "RESPONSE_GRACE_S", 30.0)
+    settings = DemoMinerSettings(_env_file=None, glm_request_timeout_s=1.0)
+    miner = _grace_miner(3.0, settings=settings)
+    headers, body = _signed(deadline_s=60.0)
+    status, _ = asyncio.run(miner.handle_request(headers, body))
+
+    assert status == 504, "the grace overruled an explicit, lower cap"
+
+
+def test_zero_grace_is_exactly_the_reference_behaviour(monkeypatch):
+    """`MINER_RESPONSE_GRACE_S=0` puts the cutoff back on `deadline_s`, so an
+    operator who wants the upstream behaviour can have it without editing
+    code."""
+    import custom_miner
+
+    monkeypatch.setattr(custom_miner, "RESPONSE_GRACE_S", 0.0)
+    miner = _grace_miner(1.5)
+    headers, body = _signed(deadline_s=1.0)
+    status, _ = asyncio.run(miner.handle_request(headers, body))
+
+    assert status == 504
+
+
+def test_the_overridden_handler_rejects_exactly_what_the_reference_rejects():
+    """The override copies four checks, and a copy drifts.
+
+    `handle_request` is where the wire contract is enforced — signature, replay
+    nonce, signer authorization, request shape — and the only reason to
+    override it is one number in the last line. So every rejection path is
+    driven through BOTH implementations and required to answer identically. If
+    upstream tightens a check and this copy does not, this test says so rather
+    than a validator silently accepting something it should not."""
+    from rlvr.neurons.demo_miner import DemoMiner
+    from rlvr.protocol import sign_message as _sign
+
+    def _pair():
+        # Two miners over the same solver, differing only in which
+        # handle_request runs. Fresh each time: `nonces` is stateful.
+        from custom_miner import SolveResult
+
+        class _Instant:
+            async def solve_task(self, task, timeout_s):
+                return SolveResult(code="def g(n): return n", raw_response="r")
+
+            async def aclose(self): pass
+
+        settings = DemoMinerSettings(_env_file=None)
+        mine = CustomMiner(settings, _Instant(), wallet=None, subtensor=None,
+                           metagraph=None)
+        theirs = DemoMiner(settings, client=_Instant(), wallet=None,
+                           subtensor=None, metagraph=None)
+        theirs.solve = mine.solve          # same answer, different gate
+        return mine, theirs
+
+    good_headers, good_body = _signed(deadline_s=5.0, problem_id="diff")
+
+    cases = {
+        "unsigned": ({}, good_body),
+        "tampered body": (good_headers, good_body + b" "),
+        "bad signature": ({**good_headers, "Epistula-Request-Signature": "0xdead"},
+                          good_body),
+        "stale timestamp": ({**good_headers, "Epistula-Timestamp": "1"}, good_body),
+        "unparseable body": _signed_over(b'{"not": "a task"}'),
+        "accepted": (good_headers, good_body),
+    }
+    for name, (headers, body) in cases.items():
+        mine, theirs = _pair()
+        ours = asyncio.run(mine.handle_request(dict(headers), body))[0]
+        ref = asyncio.run(theirs.handle_request(dict(headers), body))[0]
+        assert ours == ref, f"{name}: override said {ours}, reference said {ref}"
+
+    # ...and the replay check, which needs the SAME miner asked twice.
+    mine, theirs = _pair()
+    assert asyncio.run(mine.handle_request(dict(good_headers), good_body))[0] == 200
+    assert asyncio.run(mine.handle_request(dict(good_headers), good_body))[0] == 409
+    assert asyncio.run(theirs.handle_request(dict(good_headers), good_body))[0] == 200
+    assert asyncio.run(theirs.handle_request(dict(good_headers), good_body))[0] == 409
+
+
+def _signed_over(body: bytes):
+    from rlvr.protocol import sign_message as _sign
+
+    return _sign(keypair.create_from_uri("//Alice"), body), body
+
+
+def test_every_entry_point_gives_a_solve_the_same_budget(monkeypatch, capsys):
+    """A replay is only evidence if it runs the solve production runs.
+
+    `handle_request` bounds the whole solve at
+    `min(deadline_s, glm_request_timeout_s)`, and `DemoMinerSettings` defaults
+    that to 280 -- below the 300s this subnet advertises.
+    `apply_solve_timeout_default` fills in 3600 instead, which
+    `TaskRequest.deadline_s`'s own `le=3600` makes structurally incapable of
+    binding, so the request's deadline is the only deadline.
+
+    It was called by `custom_miner.run_custom_miner` and by `rehearse`, and NOT
+    by `run_miner.py` -- the on-chain entry point. With nothing in the
+    environment the replay therefore ran every solve at 300s of a 300s deadline
+    while the miner it was rehearsing ran at 280: twenty seconds of divergence,
+    in the direction that flatters the replay. `config.py`'s own docstring said
+    the opposite ("The miner and the rehearsal both call it").
+
+    `load_miner_env` is the fix and this is the test that it stays fixed: the
+    steps are in one function now, so a fourth entry point cannot lose one."""
+    from solvers import config
+
+    monkeypatch.delenv("GLM_REQUEST_TIMEOUT_S", raising=False)
+    config.load_miner_env("miner")
+    assert os.environ["GLM_REQUEST_TIMEOUT_S"] == config.DEFAULT_SOLVE_TIMEOUT_S
+
+    settings = DemoMinerSettings(_env_file=None)
+    assert settings.glm_request_timeout_s == float(config.DEFAULT_SOLVE_TIMEOUT_S)
+    # The number that actually matters: what a 300s request gets to spend.
+    assert min(300.0, settings.glm_request_timeout_s) == 300.0, (
+        "a spec-compliant deadline was cut short by the miner's own default"
+    )
+
+    # Every entry point calls it. Read from the source rather than trusted,
+    # because the whole failure was one caller quietly not doing so.
+    here = Path(__file__).resolve().parent
+    for name in ("run_miner.py", "custom_miner.py", "solvers/rehearse.py"):
+        text = (here / name).read_text(encoding="utf-8")
+        assert "load_miner_env(" in text, f"{name} builds its settings by hand"
+        assert "apply_solve_timeout_default()" not in text, (
+            f"{name} still open-codes a step of the sequence"
+        )
+
+
+def test_an_operators_own_solve_timeout_is_never_overwritten(monkeypatch):
+    """`setdefault`, not assignment. The default exists to stop a bare
+    environment costing 20s a solve, not to overrule someone who chose a value
+    -- and a knob that ignores what you set it to is worse than no knob."""
+    from solvers import config
+
+    monkeypatch.setenv("GLM_REQUEST_TIMEOUT_S", "120")
+    config.load_miner_env("miner")
+    assert os.environ["GLM_REQUEST_TIMEOUT_S"] == "120"
+    assert DemoMinerSettings(_env_file=None).glm_request_timeout_s == 120.0
+
+
 def test_the_archive_line_names_a_directory_you_can_find(tmp_path, monkeypatch, capsys):
     """`SOLVER_SOLUTION_DIR` defaults to the relative "solutions", so the line
     read "archived under solutions/" and left the reader to work out which
@@ -10658,7 +10870,7 @@ def test_the_cases_turn_asks_for_the_common_path_before_the_boundaries():
 
     for language, entry in (("python", "g"), ("rust", "main")):
         p = build_tests_prompt(language, "Sum the digits of n.", entry, [])
-        classes = ["THREE ordinary cases", "THE EMPTY VALUE", "ONE:",
+        classes = ["ONE ordinary case", "THE EMPTY VALUE", "ONE:",
                    "THE BOUNDARY", "LIKELY TO BE GOT WRONG"]
         at = []
         for name in classes:
