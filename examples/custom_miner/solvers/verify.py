@@ -429,8 +429,26 @@ class _Grader:
     def check(
         self, code: str, language: str, entrypoint: str,
         examples: list[dict[str, Any]], names: Optional[list[str]] = None,
+        budget_s: Optional[float] = None,
     ) -> tuple[int, int, list[str]]:
-        """Run ``code`` against the public examples. Returns (passed, total, failures).
+        """Run ``code`` against the examples. Returns (passed, total, failures).
+
+        ``budget_s`` bounds what the RUN may cost, and it is the difference
+        between a check and a solve-ending one. Every case gets
+        `VERIFY_TIMEOUT_S` and nothing used to bound the set, so a suite of
+        twenty cases against a program that hangs costs twenty times that:
+        measured, 100.2 seconds. `_grade`'s gate demanded only
+        `min(needed, GRADE_FLOOR_S)` = 15 seconds be left before starting it --
+        a 6.7x under-estimate, and the run then took the rest of the deadline
+        with it. Two of those and a 290-second solve grades nothing and submits
+        unverified, which is the failure this argument exists to end.
+
+        A partial run is the point, and it is what the gate's own comment
+        already promised: "a partial run that DOES fit is worth more than no
+        evidence at all". `total` stays the FULL count, so an unrun case is
+        neither a pass nor a failure but simply unknown -- and `passed < total`
+        keeps `verified` and `self_verified` false, because three of twenty
+        passing is not twenty passing.
 
         ``names`` labels each failure with the case it came from. Optional
         because the repair prompt does not want it -- the model is being shown
@@ -449,12 +467,24 @@ class _Grader:
         ]
         if not cases:
             return 0, 0, []
+        room = len(cases)
+        if budget_s is not None and VERIFY_TIMEOUT_S > 0:
+            # At least one: a check that runs nothing reports nothing, and the
+            # caller has already decided there is time for something.
+            room = max(1, min(room, int(float(budget_s) // VERIFY_TIMEOUT_S)))
+        running = cases[:room]
+        if room < len(cases):
+            print(
+                f"[verify] {room} of {len(cases)} case(s) fit in the "
+                f"{float(budget_s):.0f}s left; the rest are unrun rather than "
+                f"passed, so this answer cannot read as verified"
+            )
         results = self.executor(language).run_tests(
-            code, entrypoint, cases, VERIFY_TIMEOUT_S
+            code, entrypoint, running, VERIFY_TIMEOUT_S
         )
         failures: list[str] = []
         passed = 0
-        for index, (result, case) in enumerate(zip(results, cases)):
+        for index, (result, case) in enumerate(zip(results, running)):
             if result.passed:
                 passed += 1
                 continue
@@ -1553,6 +1583,7 @@ class VerifyingSolver:
     # ---------------------------------------------------------------------- #
     def _run_self_tests(
         self, candidate: Candidate, task, cases: Optional[list] = None,
+        left: Optional[float] = None,
     ) -> None:
         """Grade a candidate against the cases turn 1 obtained.
 
@@ -1574,7 +1605,8 @@ class VerifyingSolver:
         names = [case.get("name", "") for case in cases]
         try:
             passed, total, failures = self._grader.check(
-                candidate.code, task.language, task.entrypoint, cases, names
+                candidate.code, task.language, task.entrypoint, cases, names,
+                budget_s=left,
             )
         except Exception as exc:  # noqa: BLE001 - a broken executor loses no answer
             # Same four words as the public-examples path below, deliberately.
@@ -1634,6 +1666,16 @@ class VerifyingSolver:
             1, len(cases or []) or len(getattr(task, "public_examples", None) or [])
         )
         out_of_budget = left is not None and left < min(needed, GRADE_FLOOR_S)
+        # What the RUN may spend, as opposed to what it must have to start.
+        #
+        # Holding a round trip back from this was tried and reverted. It traded
+        # one failure for a worse one: with a short budget only the first case
+        # or two fit, they happened to pass, and a partial run with no failures
+        # in it ended the repair loop -- stopping on ignorance rather than on
+        # evidence, and never sending the correction round at all. The
+        # `out_of_budget` gate above already refuses to start a check there is
+        # no time for; past that, grading may use what is left.
+        grading_budget = left
         if defect is None and task.language == "rust" and not out_of_budget:
             # Python's check PARSED that code; Rust's only grepped it for
             # `fn main`. Ask the compiler the same question the validator will,
@@ -1706,7 +1748,8 @@ class VerifyingSolver:
         if task.public_examples:
             try:
                 passed, total, failures = self._grader.check(
-                    code, task.language, task.entrypoint, task.public_examples
+                    code, task.language, task.entrypoint, task.public_examples,
+                    budget_s=grading_budget,
                 )
             except Exception as exc:  # noqa: BLE001 - a broken grader loses no answer
                 print(f"[verify] local grading unavailable: {type(exc).__name__}: {exc}")
@@ -1723,7 +1766,12 @@ class VerifyingSolver:
         # should be and coding it wrong -- and that is objectively checkable
         # with the validator's own executor.
         if self._self_tests and code.strip():
-            self._run_self_tests(candidate, task, cases)
+            # `left` is what the SOLVE has, and the run is bounded by it. The
+            # examples above may already have spent some of it; that is
+            # deliberately not re-measured, because the two suites share one
+            # deadline and a stale-but-generous number is the safer error here
+            # -- `run_tests` still stops at `VERIFY_TIMEOUT_S` per case.
+            self._run_self_tests(candidate, task, cases, left=grading_budget)
         return candidate
 
     # -- what a Rust answer is actually checked with ----------------------- #

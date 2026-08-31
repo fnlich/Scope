@@ -10775,6 +10775,65 @@ def test_a_suite_read_off_the_rendered_page_survives_its_invisible_characters():
         assert len(cases) == 1, f"{name} discarded the whole suite"
 
 
+def test_grading_cannot_spend_more_of_the_deadline_than_is_left():
+    """Where a 290-second solve actually went.
+
+    `_grade` gated on `left >= min(needed, GRADE_FLOOR_S)` — 15 seconds for a
+    twenty-case suite — and then started a run that had no bound at all. Every
+    case gets `VERIFY_TIMEOUT_S`, so twenty cases against a program that hangs
+    cost **100.2 seconds, measured**: a 6.7x under-estimate of a check the gate
+    had just called affordable. Two of those and the deadline is gone, which is
+    exactly what the operator's log showed — 290.0s/290s, `out of budget before
+    the model's 20 own case(s) could be run`, nothing graded, answer submitted
+    unverified.
+
+    A phase-3 reply that corrects the CASES makes it worse rather than better,
+    which is why the operator saw the two together: the program in hand is then
+    re-graded against the corrected bar, so a cases-only correction buys a
+    second full-price grading pass.
+
+    The gate's own comment already promised the remedy — "a partial run that
+    DOES fit is worth more than no evidence at all" — but it capped the demand
+    rather than the spend."""
+    import time as _time
+
+    from solvers.verify import VERIFY_TIMEOUT_S, _Grader
+
+    grader = _Grader()
+    cases = [{"args": [i], "kwargs": {}, "expected": i, "name": f"c{i}"}
+             for i in range(20)]
+    hangs = "def g(n):\n    import time\n    time.sleep(30)\n    return n\n"
+
+    started = _time.monotonic()
+    passed, total, _ = grader.check(hangs, "python", "g", cases, budget_s=15.0)
+    spent = _time.monotonic() - started
+
+    assert spent < 25.0, f"a 15s budget bought {spent:.0f}s of grading"
+    assert total == 20, "an unrun case must still count against the bar"
+    assert passed == 0
+    # 15s // 5s per case = 3 cases. The rest are unrun, not passed.
+    assert spent >= VERIFY_TIMEOUT_S, "ran nothing at all, which reports nothing"
+
+
+def test_a_partial_grading_run_can_never_read_as_verified():
+    """`total` stays the FULL case count when a run is truncated, so an unrun
+    case is unknown rather than passing. Three of twenty passing is not twenty
+    passing, and `verified`/`self_verified` both turn on `passed == total`."""
+    from solvers.verify import Candidate, _Grader
+
+    grader = _Grader()
+    cases = [{"args": [1], "kwargs": {}, "expected": 1, "name": f"c{i}"}
+             for i in range(20)]
+    good = "def g(n):\n    return 1\n"
+    passed, total, failures = grader.check(good, "python", "g", cases, budget_s=10.0)
+
+    assert total == 20 and passed < total, (passed, total)
+    assert not failures, "a truncated run must not invent failures either"
+    c = Candidate(code=good, raw="", self_passed=passed, self_total=total,
+                  from_self_tests=True)
+    assert not c.self_verified, "a partial pass claimed the whole suite"
+
+
 def test_a_bracket_in_the_prose_does_not_steal_the_corrected_suite():
     """Found by an adversarial audit of the fix above, and it is the commonest
     shape there is.
