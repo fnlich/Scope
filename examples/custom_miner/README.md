@@ -70,18 +70,22 @@ sudo apt-get update && sudo apt-get install -y \
     curl xvfb x11vnc
 
 python3 -m venv .venv && . .venv/bin/activate   # needs Python 3.10-3.12
-pip install -e '.[chain,miner,dev]'             # dev brings pytest
+pip install -e '.[chain,miner,browser,dev]'     # browser brings playwright,
+                                                # dev brings pytest
 cp .env.example .env        # set NETUID, SUBTENSOR_NETWORK, WALLET_NAME,
                             # WALLET_HOTKEY, AXON_PORT, AXON_EXTERNAL_IP
 echo 'MY_APP_URL=http://127.0.0.1:9000/solve' >> .env   # Option 1 only
 python examples/custom_miner/custom_miner.py
 ```
 
-`requires-python` is `>=3.10,<3.13`. Ubuntu 24.04 ships 3.12; Ubuntu 22.04 and
-Debian 12 ship 3.10/3.11, which are fine. Include `dev` in the extras or
-`pytest` will not be installed and the bare `pytest` on your PATH will be the
-system one, running against a different interpreter with none of these
-dependencies.
+`requires-python` is `>=3.10`, and 3.10 through 3.12 are what this is tested
+on: Ubuntu 24.04 ships 3.12; Ubuntu 22.04 and Debian 12 ship 3.10/3.11. Include
+`dev` in the extras or `pytest` will not be installed and the bare `pytest` on
+your PATH will be the system one, running against a different interpreter with
+none of these dependencies. Include `browser` for `run_miner.py`: the backends
+import Playwright, which no other extra pulls in. Only the Python package --
+never run `playwright install`, because the miner attaches to a browser YOU
+started rather than launching one.
 
 Register the hotkey first (see `scripts/register_testnet.sh`), open the axon
 port to the internet, and confirm the health endpoint. `AXON_PORT` lives in
@@ -353,7 +357,8 @@ constraint, not a preference.
 ### Step by step
 
 ```bash
-pip install playwright                  # the Python package only
+# Playwright comes with the `browser` extra above; this is the same package.
+pip install -e '.[browser]'             # the Python package only
 # No `playwright install` is needed: you bring your own browser.
 sudo apt-get install -y chromium xvfb   # a browser, and a virtual screen for headless hosts
 

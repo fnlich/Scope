@@ -35,6 +35,11 @@ miner = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
 ]
+# The browser-driven solver in examples/custom_miner. Only the Python package:
+# `playwright install` is NOT needed and should not be run, because the miner
+# ATTACHES over CDP to a Chrome you started and signed in to by hand -- a
+# browser a driver launched announces itself as one and the sign-in is refused.
+browser = ["playwright>=1.44"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [tool.setuptools.packages.find]
