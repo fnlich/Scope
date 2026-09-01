@@ -10130,11 +10130,12 @@ def test_the_case_escape_hatch_stops_being_offered(monkeypatch):
         async def aclose(self): pass
         def stats(self): return {}
 
-    with contextlib.redirect_stdout(io.StringIO()):
+    with contextlib.redirect_stdout(io.StringIO()) as chatter:
         asyncio.run(
             VerifyingSolver(_Fleet(), second_opinion=False, max_attempts=6)
             .solve_task(_NO_EXAMPLES, timeout_s=300.0)
         )
+    log = chatter.getvalue()
 
     offers = [t for t in sent if "if the case was wrong" in t]
     insists = [t for t in sent if "the program is what has to" in t]
@@ -10146,6 +10147,12 @@ def test_the_case_escape_hatch_stops_being_offered(monkeypatch):
     # And once it insists it keeps insisting: the last round asked for the
     # program, not for another case.
     assert "if the case was wrong" not in sent[-1], sent[-1][-300:]
+    # The withdrawal BINDS. A reply that sends cases anyway after the offer was
+    # taken away is that same round again, and accepting it would make the
+    # withdrawal a sentence rather than a rule.
+    assert "asked for the program" in log, (
+        "cases sent after the offer was withdrawn were still accepted:\n" + log
+    )
 
 
 def test_a_correction_cannot_shrink_or_grow_the_suite():

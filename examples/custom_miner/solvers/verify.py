@@ -679,18 +679,31 @@ class _Grader:
                 # absorbs, and it sits outside `DELIVERY_RESERVE_S` besides.
                 if VERIFY_TIMEOUT_S > 0:
                     chunk = max(1, min(chunk, int(left // VERIFY_TIMEOUT_S)))
-            results.extend(
-                executor.run_tests(
-                    code, entrypoint, cases[ran:ran + chunk], VERIFY_TIMEOUT_S
-                )
+            batch = executor.run_tests(
+                code, entrypoint, cases[ran:ran + chunk], VERIFY_TIMEOUT_S
             )
+            results.extend(batch)
             ran += chunk
-        running = cases[:ran]
-        if ran < len(cases):
+            if len(batch) != chunk:
+                # An invariant both executors keep -- one result per test, on
+                # every path including the failure ones -- and chunking is what
+                # made this code DEPEND on it. A short batch shifts every result
+                # after it against the case it belongs to, so a later failure
+                # would be reported with the wrong inputs; and the executor is
+                # an operator setting (`SOLVER_VERIFY_EXECUTOR`), so a backend
+                # this file has never seen can be in the loop. Stop at the last
+                # alignment that is certainly right: the rest count as unrun,
+                # which they are.
+                break
+        # `len(results)`, not `ran`: they differ only when a batch came back
+        # short, and there the results are what actually ran.
+        running = cases[:len(results)]
+        if len(running) < len(cases):
             print(
-                f"[verify] {ran} of {len(cases)} case(s) fit in the "
-                f"{float(budget_s):.0f}s left; the rest are unrun rather than "
-                f"passed, so this answer cannot read as verified"
+                f"[verify] {len(running)} of {len(cases)} case(s) fit in the "
+                f"{float(budget_s) if budget_s is not None else 0:.0f}s left; "
+                f"the rest are unrun rather than passed, so this answer cannot "
+                f"read as verified"
             )
         failures: list[str] = []
         failed: list[dict[str, Any]] = []
@@ -746,8 +759,10 @@ def _describe(result, case: TestCase, language: str, entrypoint: str) -> str:
     if result.error:
         return f"{call} raised: {_clip(_stable(result.error), 300)}"
     actual = result.value if result.value_ok else result.actual_repr
+    # Stabilised BEFORE clipping, so a heap address truncated by the clip is
+    # not left half-written and unmatched.
     return (
-        f"{call} returned {_stable(_clip(repr(actual)))}, "
+        f"{call} returned {_clip(_stable(repr(actual)))}, "
         f"expected {_clip(repr(case.expected))}"
     )
 
@@ -1376,6 +1391,9 @@ class VerifyingSolver:
             # Consecutive rounds that left the program exactly as it was. See
             # `CASES_ONLY_ROUNDS`.
             program_unchanged = 0
+            # Whether the prompt just sent WITHDREW the offer to correct a
+            # case. A withdrawal the reply can ignore is not one.
+            program_only = False
             async def _resume_elsewhere(why: str, avoid: Optional[str] = None):
                 """Carry the repair to a FRESH conversation, or None.
 
@@ -1546,6 +1564,18 @@ class VerifyingSolver:
                         f"[verify] the program turn sent {len(revised)} case(s) "
                         f"of its own; keeping turn 1's — cases written beside a "
                         f"program are back-filled from it"
+                    )
+                    revised = []
+                if revised and program_only:
+                    # The last prompt stopped offering the case and asked for
+                    # the program, because two rounds running had corrected the
+                    # bar and left the program alone. A reply that sends cases
+                    # anyway is that same round again, and accepting it would
+                    # make the withdrawal a sentence rather than a rule.
+                    print(
+                        f"[verify] the cases came back again after the prompt "
+                        f"stopped offering them; keeping the bar as it stands — "
+                        f"this round was asked for the program"
                     )
                     revised = []
                 if revised:
@@ -1797,7 +1827,8 @@ class VerifyingSolver:
                 # means the code never ran, and the repair prompt has to say so
                 # rather than blame logic that was never executed.
                 insist = program_unchanged >= CASES_ONLY_ROUNDS
-                if insist and candidate.from_self_tests:
+                program_only = insist and candidate.from_self_tests
+                if program_only:
                     print(
                         f"[verify] {program_unchanged} round(s) running have "
                         f"corrected the cases and left the program alone; asking "

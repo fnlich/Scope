@@ -1473,7 +1473,14 @@ class _Tab:
                     f"checking the answer against the network stream in "
                     f"{STREAM_PHASE_TIMEOUT_S:.0f}s. Submitting what the page gave."
                 )
-        if not best:
+        if not best and not last_busy:
+            # `not last_busy`: only a reply the model has FINISHED. An array
+            # caught mid-stream is truncated by definition, and the one thing
+            # this recovers is a bar the program will be graded against -- half
+            # of one is worse than none. Where a site has no busy control at all
+            # this is always false and the salvage always runs, which is the
+            # same trade the read loop already makes there.
+            #
             # The one reply this class's "code blocks or nothing" rule cannot
             # read, and a repair round asks for it by name: cases corrected as
             # ordinary text. No `pre code` renders, so the page read returns
