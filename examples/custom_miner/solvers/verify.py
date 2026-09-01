@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -495,6 +496,34 @@ class _Grader:
         return passed, len(cases), failures
 
 
+# Text that changes between two runs of the SAME failure, and nothing else.
+#
+# Both sandboxes name their working directory after a random suffix --
+# `tempfile.TemporaryDirectory(prefix="rlvr_sbx_")` in the validator's own
+# subprocess executor, `prefix="hone-rustc-"` in the Rust compile check -- and
+# that directory is inside every traceback line and every rustc diagnostic. So
+# a program that crashed identically on two rounds produced two different
+# failure strings, and the loop's repeat detector, which is nothing but a
+# comparison of those strings, could never fire on a crashing program at all.
+# The default `repr` of an object carries the same problem in the form of a
+# heap address.
+#
+# Narrow on purpose. This runs over failure text that the MODEL reads, and a
+# normaliser that also rewrote returned values would hide the very difference
+# the model is being asked about -- an expected `"0xdeadbeef"` is an ordinary
+# string. The address pattern therefore matches only CPython's `<... at 0x...>`
+# form, which no test value wears by accident.
+_SANDBOX_PATH_RE = re.compile(r"(?:/[^\s\"']*/)?(?:rlvr_sbx_|hone-rustc-)[A-Za-z0-9_.-]+")
+_HEAP_ADDRESS_RE = re.compile(r"(<[^<>]*? at )0x[0-9a-fA-F]+(>)")
+
+
+def _stable(text: Optional[str]) -> Optional[str]:
+    """`text` with the per-run noise taken out, or None unchanged."""
+    if not text:
+        return text
+    return _HEAP_ADDRESS_RE.sub(r"\g<1>0x...\g<2>", _SANDBOX_PATH_RE.sub("<sandbox>", text))
+
+
 def _describe(result, case: TestCase, language: str, entrypoint: str) -> str:
     """One line of concrete evidence for the repair prompt."""
     if language == "rust":
@@ -504,9 +533,12 @@ def _describe(result, case: TestCase, language: str, entrypoint: str) -> str:
     if result.timed_out:
         return f"{call} timed out after {VERIFY_TIMEOUT_S:g}s (too slow or an infinite loop)"
     if result.error:
-        return f"{call} raised: {_clip(result.error, 300)}"
+        return f"{call} raised: {_clip(_stable(result.error), 300)}"
     actual = result.value if result.value_ok else result.actual_repr
-    return f"{call} returned {_clip(repr(actual))}, expected {_clip(repr(case.expected))}"
+    return (
+        f"{call} returned {_stable(_clip(repr(actual)))}, "
+        f"expected {_clip(repr(case.expected))}"
+    )
 
 
 def _clip(value: Any, limit: int = 160) -> str:
@@ -1733,7 +1765,7 @@ class VerifyingSolver:
             # extends into this reserve whenever the model is still writing, so
             # arriving here with nothing left is the ordinary case rather than
             # the strange one.
-            defect = compile_defect(code, left)
+            defect = _stable(compile_defect(code, left))
         if defect is not None:
             # Structurally unusable: report it without paying for execution.
             candidate.defect = defect

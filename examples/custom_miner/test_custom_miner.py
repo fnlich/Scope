@@ -10129,6 +10129,64 @@ def test_a_round_that_changed_nothing_moves_to_a_different_model(capsys):
     assert "while n > 0" in answer.code, f"lost the answer the other model gave: {answer.code!r}"
 
 
+def test_a_crash_reads_the_same_on_every_round(monkeypatch):
+    """A crashing program must look like the same failure twice, and it did not.
+
+    The validator's own executor runs each case inside
+    `tempfile.TemporaryDirectory(prefix="rlvr_sbx_")`, and that random directory
+    is in every traceback line it hands back:
+
+        File "/tmp/rlvr_sbx_76pwvhk0/_sbx_runner.py", line 85, in main
+
+    The repeat detector is a comparison of those strings, so the same crash on
+    two rounds compared as two different failures and it could never fire on a
+    crashing program at all — the loop re-reported an identical crash until the
+    deadline. Worse, the repair prompt quoting the path changed with it, so the
+    "do not send this report twice" guard missed it too.
+
+    Run against the real executor rather than a fake one, because the point is a
+    property of the executor and a fake would simply be written not to have it.
+    """
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "STALE_ROUND_S", 0.0)  # fake sends cost no time
+    cases = '```json\n[{"name": "carries", "args": [12345], "expected": 15}]\n```'
+    crashing = "```python\ndef g(n):\n    return n / 0\n```"
+    sent: list[str] = []
+
+    class _Chat:
+        provider = "claude"
+        async def send(self, text, timeout_s, extend_to_s=None):
+            sent.append(text)
+            return cases if len(sent) == 1 else crashing
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        asyncio.run(
+            VerifyingSolver(_Fleet(), second_opinion=False, max_attempts=4)
+            .solve_task(_NO_EXAMPLES, timeout_s=300.0)
+        )
+    log = chatter.getvalue()
+
+    assert "rlvr_sbx_" not in log, (
+        "a per-run sandbox path reached the failure text:\n" + log
+    )
+    assert "the same program and the same failures" in log, (
+        "the same crash twice was not recognised as a repeat:\n" + log
+    )
+    repeated = [t for t in set(sent) if sent.count(t) > 1]
+    assert not repeated, (
+        f"a repair report went out byte-identical {sent.count(repeated[0])} "
+        f"times:\n{repeated[0][:300]}"
+    )
+
+
 def test_a_repeat_that_alternates_is_never_sent_word_for_word(monkeypatch):
     """The spin this loop actually falls into, and the two things that end it.
 
