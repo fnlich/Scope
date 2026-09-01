@@ -10129,6 +10129,70 @@ def test_a_round_that_changed_nothing_moves_to_a_different_model(capsys):
     assert "while n > 0" in answer.code, f"lost the answer the other model gave: {answer.code!r}"
 
 
+def test_a_repeat_that_alternates_is_never_sent_word_for_word(monkeypatch):
+    """The spin this loop actually falls into, and the two things that end it.
+
+    The reported shape is not "the same round twice in a row". It ALTERNATES: a
+    repair round reports the failures of program P, the model answers with a
+    corrected case array the drop-guard refuses, that round grades as "nothing
+    reached me as code", and the round after is P and its failures again. No two
+    CONSECUTIVE signatures ever match, so a guard that remembers only the last
+    round never fires once — measured on a live solve, fifty-nine sends, one
+    repair prompt sent eight times byte-identical, the deadline gone and the
+    program never changed.
+
+    Two things close it. The signature is looked up across the whole pass, so
+    the alternation is seen for what it is; and a report that has already gone
+    out is never re-sent in the same words, because a conversation still holding
+    the reply it gave to those words is likeliest to give them again.
+    """
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "STALE_ROUND_S", 0.0)  # fake sends cost no time
+    short = '```json\n[{"name": "carries", "args": [12345], "expected": 15}]\n```'
+    sent: list[str] = []
+
+    def _reply(i):
+        if i == 0:
+            return _CASES_ONLY
+        # Program, refused correction, program, refused correction, ...
+        return _WRONG_PROGRAM if i % 2 else short
+
+    class _Chat:
+        provider = "claude"
+        async def send(self, text, timeout_s, extend_to_s=None):
+            sent.append(text)
+            return _reply(len(sent) - 1)
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        asyncio.run(
+            VerifyingSolver(_Fleet(), second_opinion=False, max_attempts=8)
+            .solve_task(_NO_EXAMPLES, timeout_s=300.0)
+        )
+    log = chatter.getvalue()
+
+    assert "the same program and the same failures" in log, (
+        "the alternation was never recognised as a repeat:\n" + log
+    )
+    repeated = [t for t in set(sent) if sent.count(t) > 1]
+    assert not repeated, (
+        f"{len(repeated)} prompt(s) went out byte-identical more than once; "
+        f"the first repeated {sent.count(repeated[0])} times:\n"
+        f"{repeated[0][:300]}"
+    )
+    assert any("solve it a different way" in t for t in sent), (
+        "a repeated report went out without naming the repetition:\n"
+        + "\n---\n".join(t[:200] for t in sent)
+    )
+
+
 def test_self_tests_never_reach_the_validator():
     """The output contract was ONE block for good reasons, and the JSON block
     relaxes it. `extract_code` picks the block that DEFINES the entrypoint, so

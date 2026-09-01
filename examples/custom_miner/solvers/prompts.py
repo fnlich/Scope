@@ -585,6 +585,7 @@ def build_repair_prompt(
     entrypoint: str,
     defect: Optional[str] = None,
     from_self_tests: bool = False,
+    stalled: int = 0,
 ) -> str:
     """Ask for a fix, quoting the concrete failures the local grader found.
 
@@ -614,6 +615,16 @@ def build_repair_prompt(
     graded against the bar as it stood before it arrived, and a revision that
     drops cases is refused outright. The grader keeps the promise, so the
     prompt stops asking for it.
+
+    ``stalled`` is how many times this exact report has already been sent in
+    this solve, and it is the one thing here that is not about the failure.
+    Without it the loop re-sends a byte-identical prompt into a conversation
+    that already holds the answer it produced last time, and the likeliest
+    continuation of "same context, same question" is the same reply: measured
+    on one live solve, eleven sends, one prompt repeated eight times verbatim,
+    the whole budget spent without the program changing once. Naming the
+    repetition is what makes the next round a different question -- still not
+    method, and still no advice about the problem itself.
     """
     if defect == NO_CODE:
         body = (
@@ -651,6 +662,14 @@ def build_repair_prompt(
             f"{detail}\n\n"
             f"Send back ONE fenced block, with nothing outside it: "
             f"{WHOLE_PROGRAM}."
+        )
+    if stalled:
+        how_often = "once" if stalled == 1 else f"{stalled} times"
+        body += (
+            f"\n\nYou have already been shown this exact report {how_often} in "
+            f"this conversation, and the reply came back with the same program "
+            f"each time. Do not send that program again — solve it a different "
+            f"way."
         )
     return body
 
@@ -769,7 +788,7 @@ def _thin(cases: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
 
 
 def _scrub_json(text: str) -> str:
-    """Strip line comments and trailing commas, leaving strings untouched.
+    r"""Strip line comments and trailing commas, leaving strings untouched.
 
     Both are things a model writes and JSON forbids, and both are cheap to undo
     -- but only with a scanner that knows where the strings are. `re.sub` on

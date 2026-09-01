@@ -1106,10 +1106,23 @@ class VerifyingSolver:
             last_program_reply: Optional[str] = None
             # A repair may be carried to a fresh conversation ONCE per pass.
             resumed = False
-            # What the last round AMOUNTED to -- the program, the defect and
-            # the failing cases -- so a round that changed nothing can be told
-            # from one that did. See `duplicate` below.
-            last_signature: Optional[tuple] = None
+            # What each round AMOUNTED to -- the program, the defect and the
+            # failing cases -- so a round that changed nothing can be told from
+            # one that did. See `duplicate` below.
+            #
+            # Every round of the pass, not just the one before. Comparing
+            # against the previous round only is blind to the shape this loop
+            # actually spins in, which alternates: a repair round reports
+            # failures F on program P, the next reply comes back as cases the
+            # revision guard refuses, that round grades as something else, and
+            # the round after is P and F again. No two CONSECUTIVE signatures
+            # ever matched, so the guard never fired once -- measured, fifty-
+            # nine sends inside a single solve.
+            seen_signatures: dict[tuple, int] = {}
+            # How many times each repair report has already gone out, so a
+            # prompt is never sent byte-identical twice without saying so. See
+            # `stalled` where the next prompt is built.
+            reports_sent: dict[str, int] = {}
             async def _resume_elsewhere(why: str, avoid: Optional[str] = None):
                 """Carry the repair to a FRESH conversation, or None.
 
@@ -1329,17 +1342,19 @@ class VerifyingSolver:
                     # the file that would be submitted.
                     previous=last_code or "",
                 )
-                # What this round AMOUNTED to. Compared against the round before
-                # rather than the replies themselves, because the same program
-                # under a different sentence of prose is the same program: byte
-                # equality misses that and this does not. The failures are in it
-                # so a corrected CASE reads as progress even when the program is
-                # untouched -- which is exactly what the repair prompt asks for.
+                # What this round AMOUNTED to. Compared against the rounds
+                # before rather than the replies themselves, because the same
+                # program under a different sentence of prose is the same
+                # program: byte equality misses that and this does not. The
+                # failures are in it so a corrected CASE reads as progress even
+                # when the program is untouched -- which is exactly what the
+                # repair prompt asks for.
                 signature = (
                     candidate.code.strip(), candidate.defect, tuple(candidate.failures)
                 )
-                duplicate = attempt > 1 and signature == last_signature
-                last_signature = signature
+                repeats = seen_signatures.get(signature, 0)
+                seen_signatures[signature] = repeats + 1
+                duplicate = attempt > 1 and repeats > 0
                 # Only when one ARRIVED. A cases-only reply leaves the program
                 # in hand standing, and forgetting it here would make the very
                 # next correction unattributable to any program at all.
@@ -1487,13 +1502,36 @@ class VerifyingSolver:
                 # Kept apart, not merged into one list of "problems": a defect
                 # means the code never ran, and the repair prompt has to say so
                 # rather than blame logic that was never executed.
-                prompt = build_repair_prompt(
+                report = build_repair_prompt(
                     candidate.failures,
                     task.language,
                     task.entrypoint,
                     defect=candidate.defect,
                     from_self_tests=candidate.from_self_tests,
                 )
+                # Asking the same question a second time is worth doing -- a
+                # model is stochastic and the budget is there to spend on the
+                # chance. Asking it in the same WORDS is not: the conversation
+                # still holds the reply it gave, and the likeliest continuation
+                # of an identical prompt is an identical answer. So the report
+                # goes out again, with the repetition named in it.
+                stalled = reports_sent.get(report, 0)
+                reports_sent[report] = stalled + 1
+                if stalled:
+                    print(
+                        f"[verify] this same report has now gone out "
+                        f"{stalled + 1} times; naming the repetition in it "
+                        f"rather than re-sending it word for word"
+                    )
+                    report = build_repair_prompt(
+                        candidate.failures,
+                        task.language,
+                        task.entrypoint,
+                        defect=candidate.defect,
+                        from_self_tests=candidate.from_self_tests,
+                        stalled=stalled,
+                    )
+                prompt = report
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a failed solve scores zero, never crashes
