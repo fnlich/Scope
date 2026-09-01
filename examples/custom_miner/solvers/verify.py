@@ -468,21 +468,62 @@ class _Grader:
         ]
         if not cases:
             return 0, 0, []
-        room = len(cases)
-        if budget_s is not None and VERIFY_TIMEOUT_S > 0:
-            # At least one: a check that runs nothing reports nothing, and the
-            # caller has already decided there is time for something.
-            room = max(1, min(room, int(float(budget_s) // VERIFY_TIMEOUT_S)))
-        running = cases[:room]
-        if room < len(cases):
+        executor = self.executor(language)
+        started = time.monotonic()
+        results: list[Any] = []
+        ran = 0
+        while ran < len(cases):
+            spent = time.monotonic() - started
+            left = None if budget_s is None else float(budget_s) - spent
+            chunk = len(cases) - ran
+            if left is not None:
+                if ran and left <= 0:
+                    break
+                # How many the budget could pay for if every one of them burned
+                # the full per-case timeout. Nothing else can be known before a
+                # case runs, and nothing softer is safe: the executor has no
+                # batch-level timeout, so a chunk sized on what the cases have
+                # cost SO FAR runs to completion however long it turns out to
+                # take. Measured, sizing that way: a twenty-case suite whose
+                # second half hangs spent 50 seconds of a 12-second budget,
+                # because the ten fast cases said the next eighteen would be
+                # fast too.
+                #
+                # The pessimism that used to come with the worst case is gone
+                # all the same, and not by loosening the bound -- by looping.
+                # A run used to take `budget // timeout` cases and stop, so a
+                # suite of twenty ordinary cases costing 0.75s in total had
+                # seventeen of them refused whenever the budget was under a
+                # hundred seconds, and cases refused are evidence thrown away.
+                # Now each chunk costs almost nothing, the clock barely moves,
+                # and the next chunk is the same size again: all twenty run, in
+                # 0.75s, in seven executor calls.
+                #
+                # Chunked rather than case by case because the Docker executor
+                # puts a whole batch in ONE container, so a call per case is a
+                # container start per case. The subprocess executor does not
+                # care either way -- measured, 0.2ms per case.
+                #
+                # Always at least one case, so a check never reports nothing at
+                # all, which bounds the overrun at one per-case timeout: the
+                # last chunk can be started with a second left and still cost
+                # five. That is what the round trip held back in `_grade`
+                # absorbs, and it sits outside `DELIVERY_RESERVE_S` besides.
+                if VERIFY_TIMEOUT_S > 0:
+                    chunk = max(1, min(chunk, int(left // VERIFY_TIMEOUT_S)))
+            results.extend(
+                executor.run_tests(
+                    code, entrypoint, cases[ran:ran + chunk], VERIFY_TIMEOUT_S
+                )
+            )
+            ran += chunk
+        running = cases[:ran]
+        if ran < len(cases):
             print(
-                f"[verify] {room} of {len(cases)} case(s) fit in the "
+                f"[verify] {ran} of {len(cases)} case(s) fit in the "
                 f"{float(budget_s):.0f}s left; the rest are unrun rather than "
                 f"passed, so this answer cannot read as verified"
             )
-        results = self.executor(language).run_tests(
-            code, entrypoint, running, VERIFY_TIMEOUT_S
-        )
         failures: list[str] = []
         passed = 0
         for index, (result, case) in enumerate(zip(results, running)):
@@ -1738,14 +1779,25 @@ class VerifyingSolver:
         out_of_budget = left is not None and left < min(needed, GRADE_FLOOR_S)
         # What the RUN may spend, as opposed to what it must have to start.
         #
-        # Holding a round trip back from this was tried and reverted. It traded
-        # one failure for a worse one: with a short budget only the first case
-        # or two fit, they happened to pass, and a partial run with no failures
-        # in it ended the repair loop -- stopping on ignorance rather than on
-        # evidence, and never sending the correction round at all. The
-        # `out_of_budget` gate above already refuses to start a check there is
-        # no time for; past that, grading may use what is left.
+        # A round trip is held back, and the first attempt at that was reverted
+        # for a good reason which no longer applies. It used to trade one
+        # failure for a worse one: `check` sized its run by the WORST case, so a
+        # shortened budget meant only the first case or two ran, they happened
+        # to pass, and a partial run with no failures in it ended the repair
+        # loop -- stopping on ignorance rather than on evidence. `check` now
+        # sizes each chunk by what the cases have actually cost, so an ordinary
+        # twenty-case suite finishes inside three seconds and holding twelve
+        # back costs nothing at all. What it buys is the round the evidence is
+        # FOR: without it one grading pass could spend every second that was
+        # left, and a list of failures nobody has time to report is not worth
+        # the run that produced it.
+        #
+        # Only when a round trip is actually on the table. Below that floor the
+        # loop will not start another round whatever happens, so reserving for
+        # one would simply throw the seconds away.
         grading_budget = left
+        if left is not None and left > ROUND_TRIP_FLOOR_S:
+            grading_budget = left - ROUND_TRIP_FLOOR_S
         if defect is None and task.language == "rust" and not out_of_budget:
             # Python's check PARSED that code; Rust's only grepped it for
             # `fn main`. Ask the compiler the same question the validator will,

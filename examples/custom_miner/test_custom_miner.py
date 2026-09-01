@@ -11079,21 +11079,78 @@ def test_grading_cannot_spend_more_of_the_deadline_than_is_left():
     assert spent >= VERIFY_TIMEOUT_S, "ran nothing at all, which reports nothing"
 
 
+def test_grading_leaves_room_for_the_round_the_evidence_is_for(monkeypatch):
+    """One grading pass could spend every second that was left.
+
+    A list of failures nobody has time to report is not worth the run that
+    produced it, so `_grade` holds a round trip back — and that reserve was
+    tried once before and reverted, because `check` sized its run by the worst
+    case and a shortened budget meant only the first case or two ran. Sizing by
+    iteration rather than by the worst case is what makes it safe: an ordinary
+    suite finishes well inside the shortened budget, so the reserve costs no
+    evidence at all and buys the correction round.
+    """
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "STALE_ROUND_S", 0.0)
+    seen: list[float] = []
+    real = verify._Grader.check
+
+    def spy(self, code, language, entrypoint, examples, names=None, budget_s=None):
+        if budget_s is not None:
+            seen.append(budget_s)
+        return real(self, code, language, entrypoint, examples, names, budget_s)
+
+    monkeypatch.setattr(verify._Grader, "check", spy)
+    solver, sent = _solver_seeing(
+        [_CASES_ONLY, _WRONG_PROGRAM, _RIGHT_PROGRAM], reserve_s=0, max_budget_s=60
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=60.0))
+
+    assert seen, "nothing was graded at all"
+    assert all(b <= 60.0 - verify.ROUND_TRIP_FLOOR_S for b in seen), (
+        f"a grading pass was handed the whole remainder: {seen}"
+    )
+    # And the reserve cost no evidence: three cases, all three run, the repair
+    # round sent and the corrected program submitted.
+    assert "while n > 0" in answer.code, f"lost the correction: {answer.code!r}"
+    assert answer.self_total == 3 and answer.self_passed == 3, (
+        f"the reserve truncated the run: {answer.self_passed}/{answer.self_total}"
+    )
+    assert len(sent) == 3, f"expected cases, program, repair; sent {len(sent)}"
+
+
 def test_a_partial_grading_run_can_never_read_as_verified():
     """`total` stays the FULL case count when a run is truncated, so an unrun
-    case is unknown rather than passing. Three of twenty passing is not twenty
-    passing, and `verified`/`self_verified` both turn on `passed == total`."""
+    case is unknown rather than passing. Passing what ran is not passing the
+    suite, and `verified`/`self_verified` both turn on `passed == total`.
+
+    Truncated by a case that HANGS, which is the only thing that truncates a run
+    any more. It used to be enough to hand twenty ordinary cases a short budget,
+    because the run was sized by the worst case — twenty times the per-case
+    timeout — and refused seventeen of them over a suite that costs three
+    quarters of a second in total. Sizing each chunk by what the cases have
+    actually cost ended that, and it should: cases refused are evidence thrown
+    away. So the honest version of this test makes them genuinely not fit.
+    """
     from solvers.verify import Candidate, _Grader
 
     grader = _Grader()
-    cases = [{"args": [1], "kwargs": {}, "expected": 1, "name": f"c{i}"}
+    # Half of them answer instantly; the second half never return. The budget
+    # runs out partway through, so what ran passed and the rest are unknown.
+    slow = ("def g(n):\n"
+            "    import time\n"
+            "    if n >= 10:\n"
+            "        time.sleep(30)\n"
+            "    return 1\n")
+    cases = [{"args": [i], "kwargs": {}, "expected": 1, "name": f"c{i}"}
              for i in range(20)]
-    good = "def g(n):\n    return 1\n"
-    passed, total, failures = grader.check(good, "python", "g", cases, budget_s=10.0)
+    passed, total, failures = grader.check(slow, "python", "g", cases, budget_s=12.0)
 
     assert total == 20 and passed < total, (passed, total)
-    assert not failures, "a truncated run must not invent failures either"
-    c = Candidate(code=good, raw="", self_passed=passed, self_total=total,
+    assert passed >= 10, f"lost the cases that did run and pass: {passed}"
+    c = Candidate(code=slow, raw="", self_passed=passed, self_total=total,
                   from_self_tests=True)
     assert not c.self_verified, "a partial pass claimed the whole suite"
 
