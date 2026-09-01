@@ -262,6 +262,56 @@ class Candidate:
         )
 
 
+def _inherit_evidence(candidate: Candidate, prior: Candidate) -> None:
+    """Give `candidate` what grading already established about the same source.
+
+    Evidence belongs to the CODE, not to the round that happened to run it, and
+    two rounds carrying byte-identical source are the same program however
+    differently they were read. Not a ranking, and not in tension with "the
+    latest version wins": the answer that ships is unchanged either way. What
+    changes is what is known about it.
+
+    Both losses this repairs were measured.
+
+    A round that arrives with the budget gone is not graded at all -- `_grade`'s
+    own gate refuses to start a run there is no time for -- so it reports 0 of
+    0. When the source is one an earlier round already ran, that is not "this
+    answer was never checked" but "this answer was checked and nobody wrote it
+    down": the operator's log showed `self=17/20` on one round and `self=0/0` on
+    the answer that shipped, which was the same program.
+
+    And `partial` was worse than lost, it was CLEARED. A reply that corrects
+    only the cases is graded against the program already in hand, so the
+    "previous" it is compared to is itself -- `dropped_definitions` finds
+    nothing missing, because nothing can be missing from a comparison with
+    itself. A fragment flagged one round earlier came out of that looking like a
+    whole program, which is precisely the flag `_supersedes` relies on to keep a
+    fragment from displacing one.
+    """
+    if not (candidate.total or candidate.self_total):
+        # Nothing ran for this one, so there is nothing of its own to overwrite.
+        # All of it moves together: a pass count without the failures it came
+        # with would be a reading nobody could act on.
+        #
+        # Only when nothing ran. A round that WAS graded has the current answer
+        # -- most sharply when the bar moved under it, which is the whole point
+        # of a corrected case array: the same program that failed one round
+        # passes the next, and carrying the old failures forward there would
+        # re-report a disagreement that no longer exists and cost a round trip
+        # doing it.
+        candidate.passed, candidate.total = prior.passed, prior.total
+        candidate.self_passed, candidate.self_total = prior.self_passed, prior.self_total
+        candidate.failures = list(prior.failures)
+        candidate.from_self_tests = prior.from_self_tests
+        candidate.defect = candidate.defect or prior.defect
+    if not candidate.self_cases:
+        candidate.self_cases = prior.self_cases
+    # One-way, and independent of the above. A fragment does not stop being a
+    # fragment because a later round had no round above it to miss anything
+    # from.
+    candidate.partial = candidate.partial or prior.partial
+
+
 def _supersedes(candidate: Candidate, best: Candidate, still_writing: bool) -> bool:
     """Should `candidate` replace `best` as the answer that ships?
 
@@ -1196,6 +1246,9 @@ class VerifyingSolver:
             # prompt is never sent byte-identical twice without saying so. See
             # `stalled` where the next prompt is built.
             reports_sent: dict[str, int] = {}
+            # What grading established about each program this pass has seen,
+            # by its source. See `_inherit_evidence` for what it is for.
+            judged: dict[str, Candidate] = {}
             async def _resume_elsewhere(why: str, avoid: Optional[str] = None):
                 """Carry the repair to a FRESH conversation, or None.
 
@@ -1415,6 +1468,15 @@ class VerifyingSolver:
                     # the file that would be submitted.
                     previous=last_code or "",
                 )
+                # Before anything reads it: a round that could not be graded,
+                # or one graded against itself, must not report less about a
+                # program than an earlier round already established.
+                key = candidate.code.strip()
+                if key:
+                    prior = judged.get(key)
+                    if prior is not None:
+                        _inherit_evidence(candidate, prior)
+                    judged[key] = candidate
                 # What this round AMOUNTED to. Compared against the rounds
                 # before rather than the replies themselves, because the same
                 # program under a different sentence of prose is the same

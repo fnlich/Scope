@@ -11079,6 +11079,102 @@ def test_grading_cannot_spend_more_of_the_deadline_than_is_left():
     assert spent >= VERIFY_TIMEOUT_S, "ran nothing at all, which reports nothing"
 
 
+def test_evidence_survives_a_round_that_could_not_be_graded(monkeypatch):
+    """`self=17/20` on one round and `self=0/0` on the answer that shipped —
+    the same program, twice, read once as checked and once as unchecked.
+
+    A round arriving with the budget gone is not graded at all: `_grade` refuses
+    to start a run there is no time for. When its source is one an earlier round
+    already ran, "never checked" is simply false, and it is the line the
+    operator reads to find out what the miner submitted.
+    """
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "STALE_ROUND_S", 0.0)
+    wrong = "```python\ndef g(n):\n    return 0\n```"
+    calls = {"n": 0}
+    real = verify._Grader.check
+
+    def spy(self, code, language, entrypoint, examples, names=None, budget_s=None):
+        # Grade the first round for real, then behave as a spent budget does:
+        # `_grade`'s gate stops calling this at all.
+        calls["n"] += 1
+        return real(self, code, language, entrypoint, examples, names, budget_s)
+
+    monkeypatch.setattr(verify._Grader, "check", spy)
+
+    class _Chat:
+        provider = "claude"
+        def __init__(self): self.n = -1
+        async def send(self, text, timeout_s, extend_to_s=None):
+            self.n += 1
+            return _CASES_ONLY if self.n == 0 else wrong
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(_Fleet(), second_opinion=False, max_attempts=3)
+    graded_once: dict = {}
+    real_grade = solver._grade
+
+    def once(*a, **kw):
+        candidate = real_grade(*a, **kw)
+        if graded_once:
+            # The second and later rounds land as an ungraded round does.
+            candidate.passed = candidate.total = 0
+            candidate.self_passed = candidate.self_total = 0
+            candidate.failures = []
+        graded_once["done"] = True
+        return candidate
+
+    monkeypatch.setattr(solver, "_grade", once)
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+    log = chatter.getvalue()
+
+    assert "self=0/0" not in log, (
+        "an answer already graded went out reported as never checked:\n" + log
+    )
+    assert answer.self_total == 3, (
+        f"the grading of this exact program was lost: "
+        f"{answer.self_passed}/{answer.self_total}"
+    )
+
+
+def test_a_cases_only_reply_cannot_launder_a_fragment(monkeypatch):
+    """`partial` was not merely lost across rounds, it was CLEARED.
+
+    A reply that corrects only the cases is graded against the program already
+    in hand, so the "previous" it is compared against is itself —
+    `dropped_definitions` finds nothing missing, because nothing can be missing
+    from a comparison with itself. A fragment flagged one round earlier came out
+    of that looking like a whole program, and `partial` is exactly the flag
+    `_supersedes` relies on to stop a fragment displacing one.
+    """
+    from solvers.verify import Candidate, _inherit_evidence, _supersedes
+
+    whole = Candidate(code="def helper():\n    return 1\ndef g(n):\n    return helper()",
+                      raw="", self_passed=3, self_total=3)
+    fragment = Candidate(code="def g(n):\n    return helper()", raw="", partial=True)
+    assert not _supersedes(fragment, whole, False), "a fragment displaced a program"
+
+    # The same fragment, re-graded against ITSELF by a cases-only round: nothing
+    # looks missing, so it arrives with `partial` false.
+    relaundered = Candidate(code=fragment.code, raw="", self_passed=1, self_total=1)
+    _inherit_evidence(relaundered, fragment)
+    assert relaundered.partial, "the fragment flag was cleared by a re-grade"
+    assert not _supersedes(relaundered, whole, False), (
+        "a fragment displaced a whole program after being re-graded against "
+        "itself"
+    )
+    # And its own grading is untouched — inheritance is not a ranking.
+    assert (relaundered.self_passed, relaundered.self_total) == (1, 1)
+
+
 def test_grading_leaves_room_for_the_round_the_evidence_is_for(monkeypatch):
     """One grading pass could spend every second that was left.
 
