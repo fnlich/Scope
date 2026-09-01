@@ -10775,6 +10775,93 @@ def test_a_suite_read_off_the_rendered_page_survives_its_invisible_characters():
         assert len(cases) == 1, f"{name} discarded the whole suite"
 
 
+def test_a_finished_reply_with_no_code_block_does_not_poll_out_the_deadline():
+    """Where the 290 seconds went.
+
+    The read loop could only ever settle on a CODE BLOCK: `_read` returns None
+    when the message has no `pre code` in it, and `if busy or text_now is None:
+    continue` then ran to the deadline. So a FINISHED reply carrying no code —
+    corrected test cases written as prose, an array the page did not mark up as
+    code, an answer moved into an artifact — polled for every second that was
+    left, with `still_writing=False` the whole time.
+
+    Measured end to end on the real solver before the fix: a 290s solve spent
+    4.0s on the cases turn, 4.0s on the program turn, and handed the phase-3
+    round the remaining 281.3s, which it spent in full. The model had stopped
+    writing 280 seconds earlier. Worse, the copy control and the network rescue
+    — the two paths that recover exactly this shape — run AFTER this loop, so
+    they only got to look once there was nothing left to look with.
+
+    The message text settles it: when `whole` stops changing while the tab is
+    not busy, the reply is over whatever it contains."""
+    from solvers.browser_pool import _Tab
+    from solvers.claude_web import claude_site
+
+    class _Fake(_Tab):
+        def __init__(self, has_code):
+            self.site = claude_site(); self.label = "t#1"; self.alive = True
+            self.uses = 0; self.still_writing = False; self.empty_reason = None
+            self._warned_copy = self._warned_stream = True
+            self._warned_stream_diff = True
+            self._assistant = self._counted_with = None
+            self._has_code = has_code
+
+        async def _open_turn(self, text, ui_ms): return (0, None)
+
+        async def _poll(self, before):
+            # Not busy, rendered, unchanging. A code block only if has_code.
+            return (("```\ndef g(n): return n\n```" if self._has_code else None),
+                    False, "Here are all the cases, corrected: [...]", True)
+
+        async def _copied_blocks(self, reply): return None
+        async def _streamed_markdown(self): return None
+        async def _new_reply(self, before): return None
+        async def _dom_blocks(self, reply): return []
+        async def _explain_empty(self, before): return None
+        async def _whole(self, reply): return ""
+
+    def spent(has_code, slice_s, grace):
+        tab = _Fake(has_code)
+        started = time.monotonic()
+        with contextlib.redirect_stdout(io.StringIO()):
+            asyncio.run(tab.send("prompt", slice_s))
+        return time.monotonic() - started
+
+    # `BLIND_TAB_GRACE_S` is shortened so the test costs seconds rather than a
+    # minute; the shape under test is the same, and the number itself is
+    # asserted against the module constant below.
+    from solvers import browser_pool as _bp
+
+    grace = 3.0
+    with _monkey(_bp, "BLIND_TAB_GRACE_S", grace):
+        # The whole point: the cost must not scale with the slice it was given.
+        short, long = spent(False, 20.0, grace), spent(False, 120.0, grace)
+        assert long < grace + 12.0, (
+            f"a code-free reply spent {long:.1f}s of a 120s slice"
+        )
+        assert abs(long - short) < 4.0, (
+            f"cost tracked the slice, not the reply: {short:.1f}s vs {long:.1f}s"
+        )
+        # A reply WITH a code block is unchanged — it settles without waiting
+        # out the grace at all.
+        assert spent(True, 120.0, grace) < short
+
+    # The bound a wrong guess can cost is the grace, not the deadline.
+    assert _bp.BLIND_TAB_GRACE_S == 30.0
+    assert _bp.SETTLED_WITHOUT_CODE_POLLS >= 3
+
+
+@contextlib.contextmanager
+def _monkey(module, name, value):
+    """`monkeypatch` is a fixture and this test is called from a helper."""
+    old = getattr(module, name)
+    setattr(module, name, value)
+    try:
+        yield
+    finally:
+        setattr(module, name, old)
+
+
 def test_grading_cannot_spend_more_of_the_deadline_than_is_left():
     """Where a 290-second solve actually went.
 
