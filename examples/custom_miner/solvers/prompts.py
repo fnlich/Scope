@@ -654,19 +654,26 @@ def build_repair_prompt(
         # The case escape hatch, withdrawn. It exists because the model's own
         # cases may be wrong -- turn 1 reasons its `expected` values out before
         # any program exists -- and a repair round that blames the code for a
-        # wrong case breaks a correct program. But an escape hatch taken over
-        # and over is not that: several rounds running in which the program did
-        # not change means the correcting is happening entirely on the bar,
-        # and the one thing a correction phase is for is a program that gets
-        # more correct. So the offer is made, and then it stops being made.
+        # wrong case breaks a correct program. But an escape hatch left open
+        # while nothing converges is not that: several rounds running in which
+        # the PROGRAM did not change is the one thing a correction phase cannot
+        # afford, whether those rounds spent themselves correcting the bar or
+        # re-sending the same code. So the offer is made, and then it stops
+        # being made.
+        #
+        # The sentence says the program has not changed, and nothing about what
+        # the replies contained, because only the first of those is known to be
+        # true here. Telling a model that re-sent identical code that it had
+        # "already corrected the cases" is a false premise, and a false premise
+        # is answered by arguing with it.
         detail = "\n".join(f"  - {line}" for line in failures)
         target = "the program" if language == "rust" else f"`{entrypoint}`"
         body = (
             f"I ran {target} against the test cases you sent and got:\n"
             f"{detail}\n\n"
-            f"The cases have already been corrected and the program has not "
-            f"changed, so this time the program is what has to. Send back ONE "
-            f"fenced block, with nothing outside it: {WHOLE_PROGRAM}."
+            f"The program has not changed for several rounds now, so this time "
+            f"it is the program that has to. Send back ONE fenced block, with "
+            f"nothing outside it: {WHOLE_PROGRAM}."
         )
     elif from_self_tests:
         # Deliberately not "your solution is WRONG". These cases came from the
@@ -1130,6 +1137,14 @@ def _case_items(raw: list, language: str) -> list[dict[str, Any]]:
     prompt echo or a stray list of numbers from being read as a suite.
     """
     cases: list[dict[str, Any]] = []
+    # One case per CALL. Two cases with the same arguments are either the same
+    # case twice -- an executor run bought for nothing -- or a contradiction no
+    # program can satisfy, and neither is worth carrying. It also keeps the
+    # suite key-unique, which the correction merge in `verify.py` depends on:
+    # there a case is identified by its call, so a duplicate call meant one
+    # failing case took a PASSING one off the bar with it and left room for a
+    # model-authored case to replace both. Measured on the real function.
+    seen: set[tuple] = set()
     for item in raw:
         if not isinstance(item, dict) or "expected" not in item:
             continue
@@ -1147,6 +1162,10 @@ def _case_items(raw: list, language: str) -> list[dict[str, Any]]:
                 continue
             if not isinstance(item.get("expected"), str):
                 continue
+        key = (repr(args), repr(sorted(kwargs.items(), key=repr)))
+        if key in seen:
+            continue
+        seen.add(key)
         name = item.get("name")
         cases.append({
             "args": args,

@@ -10132,13 +10132,17 @@ def test_the_case_escape_hatch_stops_being_offered(monkeypatch):
 
     with contextlib.redirect_stdout(io.StringIO()) as chatter:
         asyncio.run(
-            VerifyingSolver(_Fleet(), second_opinion=False, max_attempts=6)
+            # Enough rounds to reach the withdrawal TWICE. Carrying the repair
+            # to a fresh conversation resets the count, and rightly -- a model
+            # that has not been asked anything yet has not refused to change
+            # its program -- so the first withdrawal is spent on the resume.
+            VerifyingSolver(_Fleet(), second_opinion=False, max_attempts=9)
             .solve_task(_NO_EXAMPLES, timeout_s=300.0)
         )
     log = chatter.getvalue()
 
     offers = [t for t in sent if "if the case was wrong" in t]
-    insists = [t for t in sent if "the program is what has to" in t]
+    insists = [t for t in sent if "it is the program that has to" in t]
     assert offers, "the case was never offered as the thing that might be wrong"
     assert insists, (
         "the escape hatch was offered on every round while the program never "
@@ -10577,8 +10581,21 @@ def test_the_case_parser_survives_whatever_a_model_writes():
     assert cases('```json\n[{"args": [], "kwargs": 3, "expected": 0}]\n```')[0]["kwargs"] == {}
 
     # Capped: each case is an executor run against the solve's own budget.
-    many = ", ".join('{"args": [1], "expected": 1}' for _ in range(40))
+    # Distinct calls, because identical ones are now collapsed before the cap
+    # ever applies -- see the de-duplication assertion below.
+    many = ", ".join('{"args": [%d], "expected": %d}' % (i, i) for i in range(40))
     assert len(cases(f"```json\n[{many}]\n```")) == MAX_SELF_TESTS
+
+    # One case per CALL. Two cases with the same arguments are the same case
+    # twice -- an executor run bought for nothing -- or a contradiction no
+    # program can satisfy. It also keeps the suite key-unique, which the
+    # correction merge depends on: there a case is identified by its call, so a
+    # duplicated call let one FAILING case take a passing one off the bar with
+    # it and left room for a model-authored case to replace both.
+    twice = ('```json\n[{"name": "a", "args": [[]], "expected": []},\n'
+             ' {"name": "b", "args": [[]], "expected": 0},\n'
+             ' {"name": "c", "args": [[1]], "expected": 1}]\n```')
+    assert [c["name"] for c in cases(twice)] == ["a", "c"], cases(twice)
 
 
 def test_rust_cases_that_cannot_run_are_discarded_rather_than_run():

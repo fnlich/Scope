@@ -113,16 +113,17 @@ ROUND_TRIP_FLOOR_S = 12.0
 # a reason to stop correcting.
 STALE_ROUND_S = 2.0
 
-# How many rounds running may correct only the CASES before the repair prompt
-# stops offering that at all and asks for the program.
+# How many rounds running may leave the PROGRAM untouched before the repair
+# prompt stops offering to correct a case at all and asks for the program.
 #
 # The escape hatch is there because the model's own cases can be wrong -- turn 1
 # reasons its `expected` values out before any program exists -- and a round
-# that blames the code for a wrong case breaks a correct program. Taken twice
-# running with the program untouched it is no longer that: the correcting is
-# happening entirely on the bar, and a correction phase exists to make the
-# PROGRAM more correct. Two, not one, because the first correction is the
-# ordinary case this whole path was built for.
+# that blames the code for a wrong case breaks a correct program. Left open
+# while nothing converges it is no longer that: two rounds running without the
+# program changing is the one thing a correction phase cannot afford, whether
+# they were spent correcting the bar or re-sending the same code. Two, not one,
+# because the first correction is the ordinary case this whole path was built
+# for.
 CASES_ONLY_ROUNDS = 2
 
 
@@ -286,9 +287,15 @@ def _case_key(case: dict) -> tuple:
     additional one -- and it is why `expected` is deliberately absent from the
     key.
     """
+    # `key=repr` on the sort, not the default comparison: a kwargs dict with
+    # keys of mixed type (`{1: 2, "a": 3}`) makes `sorted` raise TypeError, and
+    # `ast.literal_eval` -- the tolerant parser a corrected array may come
+    # through -- can produce exactly that where `json.loads` cannot. The whole
+    # pass is wrapped in a handler that would report the crash as a dead
+    # backend and abandon the solve.
     return (
         repr(case.get("args", [])),
-        repr(sorted((case.get("kwargs") or {}).items())),
+        repr(sorted((case.get("kwargs") or {}).items(), key=repr)),
     )
 
 
@@ -342,7 +349,14 @@ def _merge_cases(
         merged.append(case)
         seen.add(key)
     if merged == agreed:
-        return merged, ""
+        # Nothing moved. Either the reply re-sent the suite unchanged -- the
+        # ordinary shape, and nothing to say about it -- or every case it
+        # carried matched one the program PASSES and was skipped above. The
+        # second is worth a word: it is what a correction looks like when the
+        # failing set this round was merged against is not the set the prompt
+        # actually quoted, and that has been a real bug rather than a
+        # hypothetical one.
+        return merged, "" if not failed else "NOTHING: the correction changed no case that failed"
     if len(merged) != len(agreed):
         # The suite keeps its SIZE. Only the failing cases may change, and each
         # one has to be replaced rather than simply removed -- "the program can
@@ -412,6 +426,14 @@ def _inherit_evidence(candidate: Candidate, prior: Candidate) -> None:
         candidate.passed, candidate.total = prior.passed, prior.total
         candidate.self_passed, candidate.self_total = prior.self_passed, prior.self_total
         candidate.failures = list(prior.failures)
+        # WITH the cases they came from. Splitting these was a silent hole: the
+        # inherited `failures` built a repair prompt quoting concrete cases and
+        # offering to take them back corrected, while the empty `failed_cases`
+        # left `_merge_cases` with nothing in play -- so the correction the
+        # prompt had just asked for matched an existing key, read as "it
+        # re-states a case the program passes", and was dropped without a word.
+        # The feature and its own evidence have to move together.
+        candidate.failed_cases = list(prior.failed_cases)
         candidate.from_self_tests = prior.from_self_tests
         candidate.defect = candidate.defect or prior.defect
     if not candidate.self_cases:
@@ -640,12 +662,24 @@ class _Grader:
         started = time.monotonic()
         results: list[Any] = []
         ran = 0
+        last_call_s = 0.0
         while ran < len(cases):
             spent = time.monotonic() - started
             left = None if budget_s is None else float(budget_s) - spent
             chunk = len(cases) - ran
             if left is not None:
-                if ran and left <= 0:
+                # `last_call_s` is the whole cost of the previous call, fixed
+                # overhead included, and that overhead is not small everywhere:
+                # the Docker executor adds `5 + 0.025n` seconds and a container
+                # start to EVERY call, and the Rust one adds a container and a
+                # full rustc build on top. Sizing by `VERIFY_TIMEOUT_S` alone
+                # models none of that, so a short budget -- which is exactly
+                # when this loop chunks -- issued call after call each costing
+                # far more than the arithmetic allowed for. Refusing a call the
+                # last one's own cost says will not fit is the bound that
+                # actually holds, and on the subprocess executor, where a call
+                # costs milliseconds, it never fires.
+                if ran and (left <= 0 or left < last_call_s):
                     break
                 # How many the budget could pay for if every one of them burned
                 # the full per-case timeout. Nothing else can be known before a
@@ -679,9 +713,11 @@ class _Grader:
                 # absorbs, and it sits outside `DELIVERY_RESERVE_S` besides.
                 if VERIFY_TIMEOUT_S > 0:
                     chunk = max(1, min(chunk, int(left // VERIFY_TIMEOUT_S)))
+            call_started = time.monotonic()
             batch = executor.run_tests(
                 code, entrypoint, cases[ran:ran + chunk], VERIFY_TIMEOUT_S
             )
+            last_call_s = time.monotonic() - call_started
             results.extend(batch)
             ran += chunk
             if len(batch) != chunk:
@@ -699,10 +735,18 @@ class _Grader:
         # short, and there the results are what actually ran.
         running = cases[:len(results)]
         if len(running) < len(cases):
+            # Which of the two reasons, because they call for different things
+            # from whoever reads the log. A budget that ran out is ordinary and
+            # says the deadline was tight; an executor that returned fewer
+            # results than tests is a broken backend and says so.
+            why = (
+                f"fit in the {float(budget_s):.0f}s left"
+                if budget_s is not None and len(results) == ran
+                else "came back from the executor"
+            )
             print(
-                f"[verify] {len(running)} of {len(cases)} case(s) fit in the "
-                f"{float(budget_s) if budget_s is not None else 0:.0f}s left; "
-                f"the rest are unrun rather than passed, so this answer cannot "
+                f"[verify] {len(running)} of {len(cases)} case(s) {why}; the "
+                f"rest are unrun rather than passed, so this answer cannot "
                 f"read as verified"
             )
         failures: list[str] = []
@@ -757,14 +801,35 @@ def _describe(result, case: TestCase, language: str, entrypoint: str) -> str:
     if result.timed_out:
         return f"{call} timed out after {VERIFY_TIMEOUT_S:g}s (too slow or an infinite loop)"
     if result.error:
-        return f"{call} raised: {_clip(_stable(result.error), 300)}"
+        return f"{call} raised: {_clip(_stable(_bound(result.error)), 300)}"
     actual = result.value if result.value_ok else result.actual_repr
-    # Stabilised BEFORE clipping, so a heap address truncated by the clip is
-    # not left half-written and unmatched.
+    # Bounded, then stabilised, then clipped. The middle step is the one that
+    # needs the first: `_SANDBOX_PATH_RE` costs O(slashes x run length) on a
+    # slash-dense token, and `result.value` is the candidate's return value
+    # deserialised in full with no cap on it at all -- so a program that
+    # returns a long path-like string made each failure line cost seconds,
+    # measured at 2.4s for 39KB and 47s for 180KB. All of it spent AFTER
+    # `run_tests` returned, which puts it outside `budget_s`, outside
+    # `VERIFY_TIMEOUT_S` and outside the round trip `_grade` holds back. The
+    # bound is far larger than anything `_clip` would keep, so nothing a reader
+    # or a model would have seen is lost.
+    #
+    # Clipping LAST still, so a heap address the clip cuts through is
+    # normalised before it is cut rather than left half-written.
     return (
-        f"{call} returned {_clip(_stable(repr(actual)))}, "
+        f"{call} returned {_clip(_stable(_bound(repr(actual))))}, "
         f"expected {_clip(repr(case.expected))}"
     )
+
+
+# The most text `_stable` is ever asked to scan. See `_describe`.
+_STABLE_SCAN_LIMIT = 8192
+
+
+def _bound(text: Optional[str]) -> Optional[str]:
+    if text is None or len(text) <= _STABLE_SCAN_LIMIT:
+        return text
+    return text[:_STABLE_SCAN_LIMIT]
 
 
 def _clip(value: Any, limit: int = 160) -> str:
@@ -1422,7 +1487,7 @@ class VerifyingSolver:
                 install, so the loop's own bindings stay the single source of
                 truth for what it is talking to.
                 """
-                nonlocal resumed
+                nonlocal resumed, program_only, program_unchanged, reported_failed
                 left_now = budget - (time.monotonic() - started)
                 if (
                     resumed
@@ -1433,6 +1498,22 @@ class VerifyingSolver:
                 ):
                     return None
                 resumed = True
+                # A fresh conversation is a fresh start, and three pieces of
+                # state are about the OLD one.
+                #
+                # `program_only` most of all: the resume prompt offers the case
+                # correction by name, and leaving the withdrawal set meant the
+                # loop asked the second model for a corrected case and then
+                # threw the answer away when it arrived. The one path that ever
+                # reaches a second model, spending its correction on a rule the
+                # prompt it answered never stated.
+                #
+                # `reported_failed` because the resume prompt quotes `best`'s
+                # failures, so `best`'s cases are the ones in play -- not
+                # whatever the last round happened to leave behind.
+                program_only = False
+                program_unchanged = 0
+                reported_failed = list(best.failed_cases)
                 print(
                     f"[verify] {why}; carrying the repair to a fresh "
                     f"conversation with {left_now:.0f}s left"
@@ -1601,6 +1682,9 @@ class VerifyingSolver:
                     if changed.startswith("REFUSED"):
                         print(f"[verify] {changed[len('REFUSED:'):].strip()}")
                         revised = []
+                    elif changed.startswith("NOTHING"):
+                        print(f"[verify] {changed[len('NOTHING:'):].strip()}")
+                        revised = merged
                     else:
                         if changed:
                             print(
@@ -1619,6 +1703,12 @@ class VerifyingSolver:
                         # "nothing reached me as code" and spend a round trip
                         # saying so.
                         revised = merged
+                # Whether this reply carried CASES, recorded before the
+                # branches below consume `revised` -- they set it to None once
+                # it has been applied, and reading it afterwards to decide
+                # whether the round produced anything said "nothing arrived"
+                # about the one reply the repair prompt asks for by name.
+                carried_cases = bool(revised)
                 now_code = extract_code(reply, task.entrypoint, task.language).strip()
                 # Which reply the candidate is actually graded FROM. Normally
                 # this one; see the cases-only branch below for when it is not.
@@ -1678,10 +1768,18 @@ class VerifyingSolver:
                 # Only when one ARRIVED. A cases-only reply leaves the program
                 # in hand standing, and forgetting it here would make the very
                 # next correction unattributable to any program at all.
-                program_unchanged = (
-                    0 if now_code and now_code != last_code
-                    else program_unchanged + 1
-                )
+                # A round that CHANGED the program resets it; a round that
+                # left it as it was counts. A round where nothing arrived at
+                # all does neither -- an unreadable tab or a dead read is not
+                # the model refusing to touch its program, and counting it
+                # withdrew the case offer over rounds in which the model was
+                # never heard from. The offer exists for a real reason and is
+                # taken away on evidence, not on silence.
+                if now_code or carried_cases:
+                    program_unchanged = (
+                        0 if now_code and now_code != last_code
+                        else program_unchanged + 1
+                    )
                 if now_code:
                     last_code = now_code
                     last_program_reply = reply
@@ -1830,9 +1928,9 @@ class VerifyingSolver:
                 program_only = insist and candidate.from_self_tests
                 if program_only:
                     print(
-                        f"[verify] {program_unchanged} round(s) running have "
-                        f"corrected the cases and left the program alone; asking "
-                        f"for the program this time and not offering the cases"
+                        f"[verify] the program has not changed in "
+                        f"{program_unchanged} round(s); asking for the program "
+                        f"this time and not offering the cases"
                     )
                 report = build_repair_prompt(
                     candidate.failures,
@@ -2066,6 +2164,20 @@ class VerifyingSolver:
         grading_budget = left
         if left is not None and left > ROUND_TRIP_FLOOR_S:
             grading_budget = left - ROUND_TRIP_FLOOR_S
+        # When the reserve starts running out from, so a SECOND grading pass
+        # spends what the first one left rather than the same allowance over
+        # again. Both suites can run in one `_grade` -- the validator's
+        # examples, then the model's own cases -- and handing each the full
+        # `grading_budget` made the reserve promise something it did not keep:
+        # with 100s left, up to 176s of grading, and the round trip it was
+        # holding back gone twice over. Production ships no `public_examples`,
+        # so only one pass runs there and this is the belt to that brace.
+        grading_started = time.monotonic()
+
+        def _budget_left() -> Optional[float]:
+            if grading_budget is None:
+                return None
+            return grading_budget - (time.monotonic() - grading_started)
         if defect is None and task.language == "rust" and not out_of_budget:
             # Python's check PARSED that code; Rust's only grepped it for
             # `fn main`. Ask the compiler the same question the validator will,
@@ -2161,7 +2273,7 @@ class VerifyingSolver:
             # deliberately not re-measured, because the two suites share one
             # deadline and a stale-but-generous number is the safer error here
             # -- `run_tests` still stops at `VERIFY_TIMEOUT_S` per case.
-            self._run_self_tests(candidate, task, cases, left=grading_budget)
+            self._run_self_tests(candidate, task, cases, left=_budget_left())
         return candidate
 
     # -- what a Rust answer is actually checked with ----------------------- #
