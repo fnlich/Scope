@@ -586,6 +586,7 @@ def build_repair_prompt(
     defect: Optional[str] = None,
     from_self_tests: bool = False,
     stalled: int = 0,
+    insist_on_program: bool = False,
 ) -> str:
     """Ask for a fix, quoting the concrete failures the local grader found.
 
@@ -648,6 +649,24 @@ def build_repair_prompt(
             f"I could not run your previous reply: {defect}.\n\n"
             f"Send back ONE fenced code block, with nothing outside it: "
             f"{WHOLE_PROGRAM}."
+        )
+    elif from_self_tests and insist_on_program:
+        # The case escape hatch, withdrawn. It exists because the model's own
+        # cases may be wrong -- turn 1 reasons its `expected` values out before
+        # any program exists -- and a repair round that blames the code for a
+        # wrong case breaks a correct program. But an escape hatch taken over
+        # and over is not that: several rounds running in which the program did
+        # not change means the correcting is happening entirely on the bar,
+        # and the one thing a correction phase is for is a program that gets
+        # more correct. So the offer is made, and then it stops being made.
+        detail = "\n".join(f"  - {line}" for line in failures)
+        target = "the program" if language == "rust" else f"`{entrypoint}`"
+        body = (
+            f"I ran {target} against the test cases you sent and got:\n"
+            f"{detail}\n\n"
+            f"The cases have already been corrected and the program has not "
+            f"changed, so this time the program is what has to. Send back ONE "
+            f"fenced block, with nothing outside it: {WHOLE_PROGRAM}."
         )
     elif from_self_tests:
         # Deliberately not "your solution is WRONG". These cases came from the

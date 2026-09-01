@@ -113,6 +113,18 @@ ROUND_TRIP_FLOOR_S = 12.0
 # a reason to stop correcting.
 STALE_ROUND_S = 2.0
 
+# How many rounds running may correct only the CASES before the repair prompt
+# stops offering that at all and asks for the program.
+#
+# The escape hatch is there because the model's own cases can be wrong -- turn 1
+# reasons its `expected` values out before any program exists -- and a round
+# that blames the code for a wrong case breaks a correct program. Taken twice
+# running with the program untouched it is no longer that: the correcting is
+# happening entirely on the bar, and a correction phase exists to make the
+# PROGRAM more correct. Two, not one, because the first correction is the
+# ordinary case this whole path was built for.
+CASES_ONLY_ROUNDS = 2
+
 
 class Conversation(Protocol):
     """One live, isolated model conversation.
@@ -1361,6 +1373,9 @@ class VerifyingSolver:
             # just quoted, and so the only ones the reply to it is entitled to
             # change. See `_merge_cases`.
             reported_failed: list[dict] = []
+            # Consecutive rounds that left the program exactly as it was. See
+            # `CASES_ONLY_ROUNDS`.
+            program_unchanged = 0
             async def _resume_elsewhere(why: str, avoid: Optional[str] = None):
                 """Carry the repair to a FRESH conversation, or None.
 
@@ -1633,6 +1648,10 @@ class VerifyingSolver:
                 # Only when one ARRIVED. A cases-only reply leaves the program
                 # in hand standing, and forgetting it here would make the very
                 # next correction unattributable to any program at all.
+                program_unchanged = (
+                    0 if now_code and now_code != last_code
+                    else program_unchanged + 1
+                )
                 if now_code:
                     last_code = now_code
                     last_program_reply = reply
@@ -1777,12 +1796,20 @@ class VerifyingSolver:
                 # Kept apart, not merged into one list of "problems": a defect
                 # means the code never ran, and the repair prompt has to say so
                 # rather than blame logic that was never executed.
+                insist = program_unchanged >= CASES_ONLY_ROUNDS
+                if insist and candidate.from_self_tests:
+                    print(
+                        f"[verify] {program_unchanged} round(s) running have "
+                        f"corrected the cases and left the program alone; asking "
+                        f"for the program this time and not offering the cases"
+                    )
                 report = build_repair_prompt(
                     candidate.failures,
                     task.language,
                     task.entrypoint,
                     defect=candidate.defect,
                     from_self_tests=candidate.from_self_tests,
+                    insist_on_program=insist,
                 )
                 # Asking the same question a second time is worth doing -- a
                 # model is stochastic and the budget is there to spend on the
@@ -1808,6 +1835,7 @@ class VerifyingSolver:
                         defect=candidate.defect,
                         from_self_tests=candidate.from_self_tests,
                         stalled=stalled,
+                        insist_on_program=insist,
                     )
                 prompt = report
         except asyncio.CancelledError:

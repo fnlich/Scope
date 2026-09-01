@@ -10096,6 +10096,58 @@ def test_a_correction_may_send_only_the_case_that_failed():
     assert len(prompts) == 3, f"expected cases, program, one repair: {len(prompts)}"
 
 
+def test_the_case_escape_hatch_stops_being_offered(monkeypatch):
+    """A correction phase exists to make the PROGRAM more correct.
+
+    The offer to correct the case instead is there for a good reason -- turn 1
+    reasons its `expected` values out before any program exists, so a case can
+    simply be wrong, and a round that blames the code for that breaks a correct
+    program. Taken over and over with the program untouched it stops being that:
+    the correcting is happening entirely on the bar, and nothing is converging.
+
+    So the offer is made, and then it stops being made.
+    """
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "STALE_ROUND_S", 0.0)
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    stuck = "```python\ndef g(n):\n    return 0\n```"
+    # A correction that is itself wrong, sent again and again while the program
+    # never moves.
+    nudge = '```json\n[{"name": "carry", "args": [12345], "expected": 14}]\n```'
+    sent: list[str] = []
+
+    class _Chat:
+        provider = "claude"
+        async def send(self, text, timeout_s, extend_to_s=None):
+            sent.append(text)
+            return (cases, stuck)[min(len(sent) - 1, 1)] if len(sent) < 3 else nudge
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(
+            VerifyingSolver(_Fleet(), second_opinion=False, max_attempts=6)
+            .solve_task(_NO_EXAMPLES, timeout_s=300.0)
+        )
+
+    offers = [t for t in sent if "if the case was wrong" in t]
+    insists = [t for t in sent if "the program is what has to" in t]
+    assert offers, "the case was never offered as the thing that might be wrong"
+    assert insists, (
+        "the escape hatch was offered on every round while the program never "
+        "changed:\n" + "\n---\n".join(t[-200:] for t in sent)
+    )
+    # And once it insists it keeps insisting: the last round asked for the
+    # program, not for another case.
+    assert "if the case was wrong" not in sent[-1], sent[-1][-300:]
+
+
 def test_a_correction_cannot_shrink_or_grow_the_suite():
     """The two ways a case array could be used to make a program's life easier,
     and why the size rule closes both.
