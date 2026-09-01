@@ -10045,6 +10045,51 @@ def test_a_fragment_of_a_reply_still_being_written_is_not_a_version():
     assert _supersedes(fragment, Candidate(code="", raw=""), True)
 
 
+def test_every_phase_says_when_it_ran_and_what_it_cost():
+    """One number at the end said a solve was fast or slow and nothing about
+    WHERE the time went — the single question an operator has when a
+    290-second budget comes back empty.
+
+    Numbered the way the prompts are, because that is the vocabulary: turn 1
+    asks for the cases, so the program is phase 2 and the first correction is
+    phase 3. A log that numbered them differently would be answering a question
+    nobody asked in words nobody used.
+
+    The model's time and the local check are reported apart. They fail for
+    different reasons and are fixed in different places — a slow model is an
+    account or a site problem, a slow check is a hanging test case or a cold
+    Docker daemon — and one number covering both hides whichever is smaller.
+    """
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "carry", "args": [12345], "expected": 14}]\n```')
+    program = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+               "        t += n % 10\n        n //= 10\n    return t\n```")
+    one = '```json\n[{"name": "carry", "args": [12345], "expected": 15}]\n```'
+
+    solver, _ = _solver_seeing([cases, program, one])
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+    lines = [ln for ln in chatter.getvalue().splitlines() if ln.startswith("[phase]")]
+
+    labels = [ln.split()[1:3] for ln in lines]
+    assert ["1", "cases"] in labels, lines
+    assert ["2", "program"] in labels, lines
+    assert ["3", "correction"] in labels, lines
+    assert any(ln.split()[1] == "open" for ln in lines), (
+        "leasing a tab was not timed; a fleet with no free tab has spent whole "
+        f"budgets waiting: {lines}"
+    )
+    # Wall clock, elapsed, and what is left of the budget, on every line.
+    for line in lines:
+        assert re.search(r"\d\d:\d\d:\d\d\.\d", line), f"no clock time: {line}"
+        assert re.search(r"took\s+\d+\.\d+s", line), f"no duration: {line}"
+        assert re.search(r"\d+s of \d+s left", line), f"no budget left: {line}"
+    # The model and the local check are separable on a graded phase.
+    graded = [ln for ln in lines if "program" in ln]
+    assert "model " in graded[0] and "checked " in graded[0], graded
+
+
 def test_a_correction_may_send_only_the_case_that_failed():
     """What the repair prompt now asks for, and what the miner used to refuse.
 
