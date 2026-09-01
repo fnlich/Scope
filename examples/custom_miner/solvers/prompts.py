@@ -612,9 +612,19 @@ def build_repair_prompt(
 
     "Do not change both" is not lost by leaving it unsaid: it is enforced in
     ``verify.py``, where a reply that rewrites the program AND the cases is
-    graded against the bar as it stood before it arrived, and a revision that
-    drops cases is refused outright. The grader keeps the promise, so the
-    prompt stops asking for it.
+    graded against the bar as it stood before it arrived. The grader keeps the
+    promise, so the prompt stops asking for it.
+
+    The case array asked for is JUST THE FAILING CASES, not the whole suite,
+    and that is a change in what the miner does as much as in what it asks for.
+    The prompt reports one disagreement, so the natural reply is that one case
+    corrected -- and demanding the complete array back meant a twenty-case suite
+    was re-sent to fix one of them: slower, likelier to be truncated mid-array,
+    and refused outright whenever it came back one case short, which left the
+    wrong case breaking a correct program on every remaining round of the solve.
+    ``_merge_cases`` applies what comes back to the suite instead of replacing
+    it, and only the cases the program actually failed are in play, so a short
+    array cannot lower a bar the program has already cleared.
 
     ``stalled`` is how many times this exact report has already been sent in
     this solve, and it is the one thing here that is not about the failure.
@@ -651,8 +661,8 @@ def build_repair_prompt(
             f"I ran {target} against the test cases you sent and got:\n"
             f"{detail}\n\n"
             f"Send back ONE fenced block: {WHOLE_PROGRAM} — or, if the case "
-            f"was wrong rather than the program, a `json` array holding ALL of "
-            f"the cases, corrected."
+            f"was wrong rather than the program, a `json` array holding just "
+            f"the case(s) above, corrected. Send one or the other, not both."
         )
     else:
         detail = "\n".join(f"  - {line}" for line in failures)

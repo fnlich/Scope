@@ -40,6 +40,7 @@ from typing import Any, Optional, Protocol
 from rlvr.types import TestCase
 
 from .prompts import (
+    MAX_SELF_TESTS,
     build_code_prompt,
     build_repair_prompt,
     build_resume_prompt,
@@ -187,6 +188,9 @@ class Candidate:
     # into it because `_supersedes` has to tell this apart from every other way
     # code can be wrong -- see there.
     partial: bool = False
+    # The cases from `self_cases`' suite that this program did NOT pass. What
+    # a correction round is allowed to change: see `_merge_cases`.
+    failed_cases: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def verified(self) -> bool:
@@ -260,6 +264,100 @@ class Candidate:
             1 if self.code.strip() else 0,
             0 if self.defect else 1,
         )
+
+
+def _case_key(case: dict) -> tuple:
+    """What makes two cases the same case: the call, not the answer.
+
+    A correction changes what a case EXPECTS. Keying on the input is what lets
+    the corrected version be recognised as the same case rather than an
+    additional one -- and it is why `expected` is deliberately absent from the
+    key.
+    """
+    return (
+        repr(case.get("args", [])),
+        repr(sorted((case.get("kwargs") or {}).items())),
+    )
+
+
+def _merge_cases(
+    agreed: list[dict], revised: list[dict], failed: list[dict]
+) -> tuple[list[dict], str]:
+    """The agreed suite with a correction applied. Returns (cases, what changed).
+
+    A correction round happens because the program disagreed with a case, and
+    only one of the two can be wrong. The repair prompt says so and offers both
+    ways out: send the program back fixed, or -- if the CASE was the thing that
+    was wrong -- send that case back corrected.
+
+    What a correction may touch is exactly the cases the program FAILED. That
+    single rule is what makes accepting a short array safe:
+
+      * A case the program PASSES cannot be corrected, dropped or weakened. The
+        bar a program has already cleared is not up for negotiation, so the
+        obvious way to game this -- delete the case you cannot pass -- is not
+        reachable from here.
+      * A failing case may be corrected in place (same call, new expectation)
+        or swapped for a different one, when the call itself was the thing that
+        made no sense. Both are what "the case was wrong" means in practice.
+      * The suite keeps its SIZE. Every failing case removed must be replaced,
+        so a bar cannot be cleared by deleting what the program could not pass;
+        and it cannot GROW here either, because cases written beside a program
+        agree with its bugs and the program turn is already refused its own for
+        that reason.
+
+    Replacing the whole suite was the alternative, and refusing anything shorter
+    was what came before. Both were wrong in the same place. Demanding the full
+    array back meant a twenty-case suite was re-sent to correct one of them,
+    which is slower, likelier to be truncated mid-array, and -- when it came
+    back one case short for any reason at all -- refused outright, so the one
+    wrong case broke a correct program on every remaining round of the solve.
+    """
+    if not revised:
+        return list(agreed), ""
+    out = {_case_key(case) for case in failed}
+    keep = [case for case in agreed if _case_key(case) not in out]
+    seen = {_case_key(case) for case in keep}
+    merged = list(keep)
+    for case in revised:
+        key = _case_key(case)
+        if key in seen:
+            # It re-states a case the program PASSES. Not a correction this
+            # round is entitled to make, and not a hostile act either -- a
+            # model that re-sends its whole suite lands here on every passing
+            # case. Keep the version that was agreed.
+            continue
+        merged.append(case)
+        seen.add(key)
+    if merged == agreed:
+        return merged, ""
+    if len(merged) != len(agreed):
+        # The suite keeps its SIZE. Only the failing cases may change, and each
+        # one has to be replaced rather than simply removed -- "the program can
+        # drop the case it disagrees with and attach the corrected one in its
+        # place", with the second half enforced.
+        #
+        # Both directions of this were measured breaking a solve.
+        #
+        # SHORTER is a bar cleared by deletion. A repair that came back with
+        # only the cases it already passed dropped the one it did not, and a
+        # program failing 1 of 2 went out reported `self=1/1`, verified on
+        # local, on a bar it had rewritten in the same breath.
+        #
+        # LONGER is back-filling wearing a correction's clothes. Cases written
+        # beside a program agree with its bugs -- which is the entire argument
+        # for asking for them in a separate turn -- and a repair round that
+        # re-sends the program with its own cases attached would otherwise get
+        # them onto the bar by the side door the program turn is refused at.
+        # Measured: a buggy program adding two cases of its own to a one-case
+        # bar and finishing 2/3 instead of 0/1.
+        return list(agreed), (
+            f"REFUSED: {len(agreed) - len(keep)} case(s) failed and "
+            f"{len(merged) - len(keep)} came back; a failing case may be "
+            f"corrected, not dropped, and the suite may not grow here"
+        )
+    replaced = len(agreed) - len(keep)
+    return merged, f"{replaced} failing case(s) corrected"
 
 
 def _inherit_evidence(candidate: Candidate, prior: Candidate) -> None:
@@ -481,8 +579,16 @@ class _Grader:
         self, code: str, language: str, entrypoint: str,
         examples: list[dict[str, Any]], names: Optional[list[str]] = None,
         budget_s: Optional[float] = None,
-    ) -> tuple[int, int, list[str]]:
-        """Run ``code`` against the examples. Returns (passed, total, failures).
+    ) -> tuple[int, int, list[str], list[dict[str, Any]]]:
+        """Run ``code`` against the examples.
+
+        Returns ``(passed, total, failures, failed)`` -- the counts, one line of
+        concrete evidence per failure for the repair prompt, and the failing
+        cases themselves. The last is what lets a correction be merged into the
+        suite rather than replace it: the repair prompt shows the model the
+        cases that failed and offers to take them back corrected, and knowing
+        WHICH cases those were is the difference between correcting a bar and
+        letting a model rewrite it.
 
         ``budget_s`` bounds what the RUN may cost, and it is the difference
         between a check and a solve-ending one. Every case gets
@@ -517,7 +623,7 @@ class _Grader:
             for case in examples
         ]
         if not cases:
-            return 0, 0, []
+            return 0, 0, [], []
         executor = self.executor(language)
         started = time.monotonic()
         results: list[Any] = []
@@ -575,6 +681,7 @@ class _Grader:
                 f"passed, so this answer cannot read as verified"
             )
         failures: list[str] = []
+        failed: list[dict[str, Any]] = []
         passed = 0
         for index, (result, case) in enumerate(zip(results, running)):
             if result.passed:
@@ -584,7 +691,8 @@ class _Grader:
             if names and index < len(names) and names[index]:
                 label = f"case {index + 1} {names[index]!r}: "
             failures.append(label + _describe(result, case, language, entrypoint))
-        return passed, len(cases), failures
+            failed.append(examples[index])
+        return passed, len(cases), failures, failed
 
 
 # Text that changes between two runs of the SAME failure, and nothing else.
@@ -1249,6 +1357,10 @@ class VerifyingSolver:
             # What grading established about each program this pass has seen,
             # by its source. See `_inherit_evidence` for what it is for.
             judged: dict[str, Candidate] = {}
+            # The cases the LAST round failed -- the ones the repair prompt
+            # just quoted, and so the only ones the reply to it is entitled to
+            # change. See `_merge_cases`.
+            reported_failed: list[dict] = []
             async def _resume_elsewhere(why: str, avoid: Optional[str] = None):
                 """Carry the repair to a FRESH conversation, or None.
 
@@ -1421,19 +1533,47 @@ class VerifyingSolver:
                         f"program are back-filled from it"
                     )
                     revised = []
-                if revised and len(revised) < len(agreed):
-                    # A revision may CORRECT a case. It may not delete one --
-                    # and dropping the case you cannot pass is exactly how a
-                    # bar gets cleared without the program improving. The
-                    # repair prompt asks for the complete array back, so a
-                    # short one is either disobedience or the thing this
-                    # guards against; either way the old bar stands.
-                    print(
-                        f"[verify] the repair sent back {len(revised)} case(s) "
-                        f"where {len(agreed)} were agreed; keeping the fuller "
-                        f"set — a case may be corrected, not dropped"
+                if revised:
+                    # MERGED into the agreed suite, not swapped for it, and the
+                    # cases the last round FAILED are the only ones a correction
+                    # may touch. That rule is what makes a short array safe to
+                    # accept, and accepting one matters: the repair prompt asks
+                    # about one disagreement, so the natural reply is that one
+                    # case corrected. Demanding the whole array back re-sent
+                    # twenty cases to fix one of them -- slower, likelier to be
+                    # truncated mid-array, and refused outright whenever it came
+                    # back one short, which left the wrong case breaking a
+                    # correct program on every remaining round of the solve.
+                    #
+                    # What the old refusal was protecting is protected here by
+                    # construction rather than by suspicion: a case the program
+                    # PASSES cannot be corrected, dropped or weakened, so the
+                    # way to game this -- delete the case you cannot pass -- is
+                    # not reachable. See `_merge_cases`.
+                    merged, changed = _merge_cases(
+                        agreed, revised, reported_failed
                     )
-                    revised = []
+                    if changed.startswith("REFUSED"):
+                        print(f"[verify] {changed[len('REFUSED:'):].strip()}")
+                        revised = []
+                    else:
+                        if changed:
+                            print(
+                                f"[verify] the repair corrected the cases rather "
+                                f"than the program: {changed}. The program is "
+                                f"re-graded against the {len(merged)} that now "
+                                f"stand; if it still disagrees the loop keeps "
+                                f"going."
+                            )
+                        # Kept even when the merge changed nothing, because
+                        # `revised` is not only the new bar -- it is what tells
+                        # the branches below that this reply carried CASES. A
+                        # reply that sends the suite back untouched and no
+                        # program is still asking for the program in hand to be
+                        # re-graded, and zeroing it here made that reply read as
+                        # "nothing reached me as code" and spend a round trip
+                        # saying so.
+                        revised = merged
                 now_code = extract_code(reply, task.entrypoint, task.language).strip()
                 # Which reply the candidate is actually graded FROM. Normally
                 # this one; see the cases-only branch below for when it is not.
@@ -1650,6 +1790,9 @@ class VerifyingSolver:
                 # still holds the reply it gave, and the likeliest continuation
                 # of an identical prompt is an identical answer. So the report
                 # goes out again, with the repetition named in it.
+                # The cases this prompt is about. The reply may correct these
+                # and nothing else.
+                reported_failed = list(candidate.failed_cases)
                 stalled = reports_sent.get(report, 0)
                 reports_sent[report] = stalled + 1
                 if stalled:
@@ -1777,7 +1920,7 @@ class VerifyingSolver:
             return
         names = [case.get("name", "") for case in cases]
         try:
-            passed, total, failures = self._grader.check(
+            passed, total, failures, failed = self._grader.check(
                 candidate.code, task.language, task.entrypoint, cases, names,
                 budget_s=left,
             )
@@ -1799,6 +1942,10 @@ class VerifyingSolver:
         # ordinary outcome and saying so on every solve would bury the line
         # that matters.
         candidate.failures = failures
+        # WHICH cases failed, not just what the failures looked like. A repair
+        # round may take these back corrected, and the merge that does it has
+        # to know exactly which of the agreed cases are in play.
+        candidate.failed_cases = failed
 
     def _grade(
         self, reply: str, task, left: Optional[float] = None,
@@ -1931,7 +2078,7 @@ class VerifyingSolver:
         # the repair prompt ask for the right thing.
         if task.public_examples:
             try:
-                passed, total, failures = self._grader.check(
+                passed, total, failures, _ = self._grader.check(
                     code, task.language, task.entrypoint, task.public_examples,
                     budget_s=grading_budget,
                 )

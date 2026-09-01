@@ -336,7 +336,7 @@ def _verdict(
     if not tests:
         return UNKNOWN, "no tests came with this problem to check it against"
     try:
-        passed, total, failures = _Grader().check(
+        passed, total, failures, _ = _Grader().check(
             code, request.language, request.entrypoint,
             [t.model_dump(mode="json") for t in tests],
             names=[
