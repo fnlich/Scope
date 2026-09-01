@@ -1046,6 +1046,49 @@ def _parse_cases(
     return _case_items(raw, language)
 
 
+def salvage_case_array(text: str) -> Optional[str]:
+    """An UNFENCED test-case array inside `text`, re-fenced, or None.
+
+    The browser layer only ever hands back fenced code blocks -- deliberately,
+    and for a reason that has cost whole solves: claude.ai renders extended
+    thinking inside the element the assistant selector matches, so falling back
+    to the message text once submitted 13,200 characters of reasoning as a Rust
+    program. That rule has one blind spot, and it is exactly the reply a repair
+    round asks for. `extract_self_tests` can dig a corrected case array out of
+    prose, but it never gets the chance: a model that writes the array as
+    ordinary text renders no `pre code`, so the page read returns None and the
+    reply reaches `prompts.py` as the empty string. The fallback was
+    unreachable from the one path that needed it.
+
+    This is the narrow way through, and it stays narrow on purpose:
+
+      * Only when NOTHING was fenced. A reply that obeyed the contract is read
+        the way it always was.
+      * Only an array whose items pass the same structural gate everything else
+        here uses -- a dict carrying `expected`. Prose, a program, a stray list
+        of numbers and a quoted prompt all fail it.
+      * The result is CASES, never a program. `extract_code` skips a block that
+        parses as cases, so nothing salvaged here can be submitted as an answer;
+        the worst it can do is move the bar, which every other case array can
+        do too and which the caller's own guards already cover.
+
+    The gate is applied as `python` because a tab does not know the task's
+    language, and it is the permissive of the two. Nothing is conceded: the
+    Rust-specific filter still runs downstream in `_parse_cases`, where the
+    language is known.
+    """
+    if not text or "[" not in text:
+        return None
+    cleaned = _OPEN_THINK_RE.sub("", _THINK_RE.sub("", sanitize_code(text)))
+    if fenced_blocks(cleaned):
+        return None
+    for span in _array_spans(cleaned):
+        raw = _loads_cases(span)
+        if isinstance(raw, list) and _case_items(raw, "python"):
+            return f"```json\n{span.strip()}\n```"
+    return None
+
+
 def _case_items(raw: list, language: str) -> list[dict[str, Any]]:
     """The structural gate, and the only thing that decides what a case is.
 

@@ -1637,6 +1637,61 @@ def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():
     assert page.typed == ["solve it"]
 
 
+def test_corrected_cases_written_as_prose_are_not_thrown_away():
+    """The one reply "code blocks or nothing" could not read, and a repair round
+    asks for it by name.
+
+    The rule is right and stays: claude.ai renders extended thinking inside the
+    element the assistant selector matches, and falling back to the message text
+    once submitted 13,200 characters of reasoning as a Rust program. But the
+    repair prompt offers a second shape outright — "or, if the case was wrong
+    rather than the program, a `json` array" — and a model that writes that
+    array as ordinary text renders no `pre code`. The page read returned None,
+    the reply reached `prompts.py` as the empty string, and the loop answered a
+    correction it had asked for with "your reply did not reach me as code".
+
+    `extract_self_tests` could always dig an array out of prose. It was simply
+    never handed any.
+    """
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [_Node(
+        text="You are right — the case was wrong, not the program. Corrected:\n\n"
+             '[{"name": "zero", "args": [0], "expected": 0}, '
+             '{"name": "carry", "args": [12345], "expected": 15}]\n\n'
+             "The program itself is fine as sent."
+    )])
+    from solvers.prompts import extract_self_tests
+
+    reply = asyncio.run(_tab(page, _site()).send("fix it", 1.0))
+
+    assert extract_self_tests(reply, "g", "python") == [
+        {"args": [0], "kwargs": {}, "expected": 0, "name": "zero"},
+        {"args": [12345], "kwargs": {}, "expected": 15, "name": "carry"},
+    ], f"the corrected cases were lost: {reply!r}"
+    assert extract_code(reply, "g", "python") == "", (
+        f"prose came back as a program, which is what the None rule prevents: "
+        f"{reply!r}"
+    )
+
+
+def test_prose_without_an_array_is_still_read_as_nothing():
+    """The guard on the salvage above, and the reason it is safe.
+
+    Reasoning, a refusal and a clarifying question are all prose, and every one
+    of them must still read as "no answer". Only a bracketed array whose items
+    carry `expected` gets through — the same structural gate everything else
+    here uses.
+    """
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [_Node(
+        text="Let me think. The digits of 12345 are [1, 2, 3, 4, 5], so the sum "
+             "is 15. I will use a while loop and accumulate the remainder."
+    )])
+    assert asyncio.run(_tab(page, _site()).send("solve it", 1.0)) == "", (
+        "reasoning was returned as an answer"
+    )
+
+
 def test_a_partial_answer_survives_a_deadline_that_lands_mid_stream():
     """The commonest timeout there is: the model is still typing when the budget
     runs out. Returning "" there throws away a gradeable answer and hands the

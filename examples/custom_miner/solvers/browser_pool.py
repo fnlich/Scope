@@ -68,6 +68,7 @@ from typing import Any, NamedTuple, Optional, Sequence
 # measured ways that each cost a whole answer. Two readers of the same markdown
 # that disagree is a bug waiting for the reply that tells them apart.
 from .prompts import fenced_blocks as _fenced_blocks
+from .prompts import salvage_case_array as _salvage_case_array
 
 # The port `scripts/start_debug_browser.sh` uses unless told otherwise, and so
 # the port every backend assumes when `<PREFIX>_CDP` is not set.
@@ -1472,6 +1473,37 @@ class _Tab:
                     f"checking the answer against the network stream in "
                     f"{STREAM_PHASE_TIMEOUT_S:.0f}s. Submitting what the page gave."
                 )
+        if not best:
+            # The one reply this class's "code blocks or nothing" rule cannot
+            # read, and a repair round asks for it by name: cases corrected as
+            # ordinary text. No `pre code` renders, so the page read returns
+            # None, the copy control has no block to click and the stream holds
+            # no fence -- three sources agreeing on the empty string over a
+            # reply that answered the question. `prompts.py` has always been
+            # able to dig an array out of prose; it was simply never handed any.
+            #
+            # Narrow by construction, and the narrowness is in
+            # `salvage_case_array`: only when nothing was fenced, only an array
+            # whose items carry `expected`, and cases rather than a program --
+            # so the reasoning-as-a-program failure the None rule exists to
+            # prevent cannot come back through here.
+            salvaged = _salvage_case_array(last_whole or "")
+            where = "the page"
+            if not salvaged:
+                # Only if the page had none: a blind tab renders nothing at all,
+                # and the wire is the only place the reply exists. Fetched here
+                # rather than beside the page reading so a successful salvage
+                # does not pay for a stream read it does not need.
+                salvaged = _salvage_case_array(await self._streamed_markdown() or "")
+                where = "the network stream"
+            if salvaged:
+                print(
+                    f"[{self.site.name}] tab {self.label} answered with test cases "
+                    f"written as prose rather than a code block; recovered them "
+                    f"from {where}."
+                )
+                best = salvaged
+
         # A tab that showed no reply is NOT retired here, and that is the
         # point. Retiring it threw away the conversation the repair loop needs
         # -- and the tab was usually fine: the page rendered late, or not at
