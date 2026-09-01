@@ -1637,6 +1637,61 @@ def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():
     assert page.typed == ["solve it"]
 
 
+def test_corrected_cases_written_as_prose_are_not_thrown_away():
+    """The one reply "code blocks or nothing" could not read, and a repair round
+    asks for it by name.
+
+    The rule is right and stays: claude.ai renders extended thinking inside the
+    element the assistant selector matches, and falling back to the message text
+    once submitted 13,200 characters of reasoning as a Rust program. But the
+    repair prompt offers a second shape outright — "or, if the case was wrong
+    rather than the program, a `json` array" — and a model that writes that
+    array as ordinary text renders no `pre code`. The page read returned None,
+    the reply reached `prompts.py` as the empty string, and the loop answered a
+    correction it had asked for with "your reply did not reach me as code".
+
+    `extract_self_tests` could always dig an array out of prose. It was simply
+    never handed any.
+    """
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [_Node(
+        text="You are right — the case was wrong, not the program. Corrected:\n\n"
+             '[{"name": "zero", "args": [0], "expected": 0}, '
+             '{"name": "carry", "args": [12345], "expected": 15}]\n\n'
+             "The program itself is fine as sent."
+    )])
+    from solvers.prompts import extract_self_tests
+
+    reply = asyncio.run(_tab(page, _site()).send("fix it", 1.0))
+
+    assert extract_self_tests(reply, "g", "python") == [
+        {"args": [0], "kwargs": {}, "expected": 0, "name": "zero"},
+        {"args": [12345], "kwargs": {}, "expected": 15, "name": "carry"},
+    ], f"the corrected cases were lost: {reply!r}"
+    assert extract_code(reply, "g", "python") == "", (
+        f"prose came back as a program, which is what the None rule prevents: "
+        f"{reply!r}"
+    )
+
+
+def test_prose_without_an_array_is_still_read_as_nothing():
+    """The guard on the salvage above, and the reason it is safe.
+
+    Reasoning, a refusal and a clarifying question are all prose, and every one
+    of them must still read as "no answer". Only a bracketed array whose items
+    carry `expected` gets through — the same structural gate everything else
+    here uses.
+    """
+    page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    page.on_click = lambda _: page.dom.__setitem__("#assistant", [_Node(
+        text="Let me think. The digits of 12345 are [1, 2, 3, 4, 5], so the sum "
+             "is 15. I will use a while loop and accumulate the remainder."
+    )])
+    assert asyncio.run(_tab(page, _site()).send("solve it", 1.0)) == "", (
+        "reasoning was returned as an answer"
+    )
+
+
 def test_a_partial_answer_survives_a_deadline_that_lands_mid_stream():
     """The commonest timeout there is: the model is still typing when the budget
     runs out. Returning "" there throws away a gradeable answer and hands the
@@ -5394,7 +5449,7 @@ def test_the_examples_are_not_run_once_the_budget_is_already_gone(capsys):
     for with the answer it was checking."""
     solver = _solver([RIGHT])
     ran: list = []
-    solver._grader.check = lambda *a, **kw: ran.append(a) or (2, 2, [])
+    solver._grader.check = lambda *a, **kw: ran.append(a) or (2, 2, [], [])
 
     spent = solver._grade(RIGHT, DIGITS, -0.5)
     assert ran == [], "the grader ran on a budget that was already spent"
@@ -7458,7 +7513,7 @@ def test_grading_without_names_is_unchanged():
     inputs and outputs, and an authored title is noise there."""
     from solvers.verify import _Grader
 
-    passed, total, failures = _Grader().check(
+    passed, total, failures, _ = _Grader().check(
         "def g(n):\n    return 0", "python", "g",
         [{"args": [12345], "kwargs": {}, "expected": 15}],
     )
@@ -7572,9 +7627,13 @@ def test_a_repair_ends_on_the_rule_for_what_may_come_back():
 
     mine = build_repair_prompt(failure, "python", "g", from_self_tests=True)
     assert mine.rstrip().endswith(
-        "a `json` array holding ALL of the cases, corrected."
+        "a `json` array holding just the case(s) above, corrected. Send one or "
+        "the other, not both."
     ), mine
-    # ALL of the cases on one side, ALL of the program on the other. This
+    # The FAILING cases on one side, ALL of the program on the other, and the
+    # asymmetry is deliberate. A program sent in pieces cannot run; a case
+    # array sent in pieces is merged into the suite by `_merge_cases`, where
+    # only the failing cases are in play and the suite keeps its size. This
     # branch is the only one live traffic can reach -- every archived request
     # ships zero `public_examples` -- and it was the only one of the four that
     # said nothing about the program being complete.
@@ -9986,13 +10045,176 @@ def test_a_fragment_of_a_reply_still_being_written_is_not_a_version():
     assert _supersedes(fragment, Candidate(code="", raw=""), True)
 
 
+def test_a_correction_may_send_only_the_case_that_failed():
+    """What the repair prompt now asks for, and what the miner used to refuse.
+
+    The prompt reports ONE disagreement, so the natural reply is that one case
+    corrected. Demanding the complete array back meant a twenty-case suite was
+    re-sent to fix one of them -- slower, likelier to be truncated mid-array,
+    and refused outright whenever it came back one case short, which left the
+    wrong case breaking a correct program on every remaining round of the solve.
+
+    A short array is merged into the suite rather than swapped for it: the
+    cases the program passed stay exactly as they were, and only the ones it
+    failed are in play.
+    """
+    prompts: list[str] = []
+    # `carry` is wrong -- 12345 sums to 15, not 14 -- and the program is right.
+    cases_wrong = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+                   ' {"name": "single", "args": [7], "expected": 7},\n'
+                   ' {"name": "carry", "args": [12345], "expected": 14}]\n```')
+    program = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+               "        t += n % 10\n        n //= 10\n    return t\n```")
+    # ONE case comes back, not three.
+    just_the_one = '```json\n[{"name": "carry", "args": [12345], "expected": 15}]\n```'
+
+    class _Recording(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            return await super().send(text, timeout_s)
+
+    class _Recorded(_Backend):
+        async def open(self, avoid=None):
+            return _Recording(self._replies, self._provider)
+
+    task = SolveTask(problem_id="short", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=60.0)
+    solver = VerifyingSolver(_Recorded([cases_wrong, program, just_the_one]),
+                             reserve_s=0, max_budget_s=60, second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as chatter:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=60.0))
+    log = chatter.getvalue()
+
+    assert "while n > 0" in answer.code, answer.code
+    # All three cases still stand: two untouched, one corrected. Not one.
+    assert (answer.self_passed, answer.self_total) == (3, 3), (
+        f"the suite shrank to what the reply carried: "
+        f"{answer.self_passed}/{answer.self_total}\n{log}"
+    )
+    assert "1 failing case(s) corrected" in log, log
+    assert len(prompts) == 3, f"expected cases, program, one repair: {len(prompts)}"
+
+
+def test_the_case_escape_hatch_stops_being_offered(monkeypatch):
+    """A correction phase exists to make the PROGRAM more correct.
+
+    The offer to correct the case instead is there for a good reason -- turn 1
+    reasons its `expected` values out before any program exists, so a case can
+    simply be wrong, and a round that blames the code for that breaks a correct
+    program. Taken over and over with the program untouched it stops being that:
+    the correcting is happening entirely on the bar, and nothing is converging.
+
+    So the offer is made, and then it stops being made.
+    """
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "STALE_ROUND_S", 0.0)
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "carry", "args": [12345], "expected": 15}]\n```')
+    stuck = "```python\ndef g(n):\n    return 0\n```"
+    # A correction that is itself wrong, sent again and again while the program
+    # never moves.
+    nudge = '```json\n[{"name": "carry", "args": [12345], "expected": 14}]\n```'
+    sent: list[str] = []
+
+    class _Chat:
+        provider = "claude"
+        async def send(self, text, timeout_s, extend_to_s=None):
+            sent.append(text)
+            return (cases, stuck)[min(len(sent) - 1, 1)] if len(sent) < 3 else nudge
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    with contextlib.redirect_stdout(io.StringIO()) as chatter:
+        asyncio.run(
+            # Enough rounds to reach the withdrawal TWICE. Carrying the repair
+            # to a fresh conversation resets the count, and rightly -- a model
+            # that has not been asked anything yet has not refused to change
+            # its program -- so the first withdrawal is spent on the resume.
+            VerifyingSolver(_Fleet(), second_opinion=False, max_attempts=9)
+            .solve_task(_NO_EXAMPLES, timeout_s=300.0)
+        )
+    log = chatter.getvalue()
+
+    offers = [t for t in sent if "if the case was wrong" in t]
+    insists = [t for t in sent if "it is the program that has to" in t]
+    assert offers, "the case was never offered as the thing that might be wrong"
+    assert insists, (
+        "the escape hatch was offered on every round while the program never "
+        "changed:\n" + "\n---\n".join(t[-200:] for t in sent)
+    )
+    # And once it insists it keeps insisting: the last round asked for the
+    # program, not for another case.
+    assert "if the case was wrong" not in sent[-1], sent[-1][-300:]
+    # The withdrawal BINDS. A reply that sends cases anyway after the offer was
+    # taken away is that same round again, and accepting it would make the
+    # withdrawal a sentence rather than a rule.
+    assert "asked for the program" in log, (
+        "cases sent after the offer was withdrawn were still accepted:\n" + log
+    )
+
+
+def test_a_correction_cannot_shrink_or_grow_the_suite():
+    """The two ways a case array could be used to make a program's life easier,
+    and why the size rule closes both.
+
+    SHORTER is a bar cleared by deletion: reply with only the cases you already
+    pass and the one you cannot disappears. Measured before the rule: a program
+    failing 1 of 2 went out reported `self=1/1`, verified on local, on a bar it
+    had rewritten in the same breath.
+
+    LONGER is back-filling wearing a correction's clothes. Cases written beside
+    a program agree with its bugs — the entire argument for asking for them in a
+    separate turn — and the program turn is already refused its own for that
+    reason. Measured: a buggy program adding two cases of its own to a one-case
+    bar and finishing 2/3 instead of 0/1.
+    """
+    from solvers.verify import _merge_cases
+
+    agreed = [
+        {"args": [0], "kwargs": {}, "expected": 0, "name": "zero"},
+        {"args": [7], "kwargs": {}, "expected": 7, "name": "single"},
+        {"args": [12345], "kwargs": {}, "expected": 14, "name": "carry"},
+    ]
+    failing = [agreed[2]]
+
+    corrected = {"args": [12345], "kwargs": {}, "expected": 15, "name": "carry"}
+    merged, why = _merge_cases(agreed, [corrected], failing)
+    assert [c["expected"] for c in merged] == [0, 7, 15], merged
+    assert why == "1 failing case(s) corrected", why
+
+    # Dropped rather than corrected: the reply re-states only what it passes.
+    merged, why = _merge_cases(agreed, [agreed[0]], failing)
+    assert merged == agreed and why.startswith("REFUSED"), (merged, why)
+
+    # Grown: the reply corrects its case and slips in one of its own.
+    extra = {"args": [1], "kwargs": {}, "expected": 1, "name": "back-filled"}
+    merged, why = _merge_cases(agreed, [corrected, extra], failing)
+    assert merged == agreed and why.startswith("REFUSED"), (merged, why)
+
+    # And a case the program PASSES is never touched, however the reply words
+    # it -- this one tries to weaken `single` while correcting `carry`.
+    weakened = {"args": [7], "kwargs": {}, "expected": 0, "name": "single"}
+    merged, _ = _merge_cases(agreed, [corrected, weakened], failing)
+    assert [c["expected"] for c in merged] == [0, 7, 15], (
+        f"a passing case was weakened, or the correction beside it was lost: "
+        f"{merged}"
+    )
+
+
 def test_a_repair_may_send_the_corrected_cases_ALONE():
     """The reply the repair prompt asks for by name, and the one the miner had
     no answer to.
 
     "Send back ONE fenced block: the corrected program — or, if the case was
-    wrong rather than the program, a `json` array holding ALL of the cases" —
-    so a model whose PROGRAM was right sends the cases and nothing else. That
+    wrong rather than the program, a `json` array holding just the case(s)
+    above" — so a model whose PROGRAM was right sends the cases and nothing
+    else. That
     reply carries no code, and until this worked the miner answered it with
     "your previous reply did not reach me as code", demanded a program it
     already had, and submitted the right program reported 0/1 against a bogus
@@ -10129,6 +10351,128 @@ def test_a_round_that_changed_nothing_moves_to_a_different_model(capsys):
     assert "while n > 0" in answer.code, f"lost the answer the other model gave: {answer.code!r}"
 
 
+def test_a_crash_reads_the_same_on_every_round(monkeypatch):
+    """A crashing program must look like the same failure twice, and it did not.
+
+    The validator's own executor runs each case inside
+    `tempfile.TemporaryDirectory(prefix="rlvr_sbx_")`, and that random directory
+    is in every traceback line it hands back:
+
+        File "/tmp/rlvr_sbx_76pwvhk0/_sbx_runner.py", line 85, in main
+
+    The repeat detector is a comparison of those strings, so the same crash on
+    two rounds compared as two different failures and it could never fire on a
+    crashing program at all — the loop re-reported an identical crash until the
+    deadline. Worse, the repair prompt quoting the path changed with it, so the
+    "do not send this report twice" guard missed it too.
+
+    Run against the real executor rather than a fake one, because the point is a
+    property of the executor and a fake would simply be written not to have it.
+    """
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "STALE_ROUND_S", 0.0)  # fake sends cost no time
+    cases = '```json\n[{"name": "carries", "args": [12345], "expected": 15}]\n```'
+    crashing = "```python\ndef g(n):\n    return n / 0\n```"
+    sent: list[str] = []
+
+    class _Chat:
+        provider = "claude"
+        async def send(self, text, timeout_s, extend_to_s=None):
+            sent.append(text)
+            return cases if len(sent) == 1 else crashing
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        asyncio.run(
+            VerifyingSolver(_Fleet(), second_opinion=False, max_attempts=4)
+            .solve_task(_NO_EXAMPLES, timeout_s=300.0)
+        )
+    log = chatter.getvalue()
+
+    assert "rlvr_sbx_" not in log, (
+        "a per-run sandbox path reached the failure text:\n" + log
+    )
+    assert "the same program and the same failures" in log, (
+        "the same crash twice was not recognised as a repeat:\n" + log
+    )
+    repeated = [t for t in set(sent) if sent.count(t) > 1]
+    assert not repeated, (
+        f"a repair report went out byte-identical {sent.count(repeated[0])} "
+        f"times:\n{repeated[0][:300]}"
+    )
+
+
+def test_a_repeat_that_alternates_is_never_sent_word_for_word(monkeypatch):
+    """The spin this loop actually falls into, and the two things that end it.
+
+    The reported shape is not "the same round twice in a row". It ALTERNATES: a
+    repair round reports the failures of program P, the model answers with a
+    corrected case array the drop-guard refuses, that round grades as "nothing
+    reached me as code", and the round after is P and its failures again. No two
+    CONSECUTIVE signatures ever match, so a guard that remembers only the last
+    round never fires once — measured on a live solve, fifty-nine sends, one
+    repair prompt sent eight times byte-identical, the deadline gone and the
+    program never changed.
+
+    Two things close it. The signature is looked up across the whole pass, so
+    the alternation is seen for what it is; and a report that has already gone
+    out is never re-sent in the same words, because a conversation still holding
+    the reply it gave to those words is likeliest to give them again.
+    """
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "STALE_ROUND_S", 0.0)  # fake sends cost no time
+    short = '```json\n[{"name": "carries", "args": [12345], "expected": 15}]\n```'
+    sent: list[str] = []
+
+    def _reply(i):
+        if i == 0:
+            return _CASES_ONLY
+        # Program, refused correction, program, refused correction, ...
+        return _WRONG_PROGRAM if i % 2 else short
+
+    class _Chat:
+        provider = "claude"
+        async def send(self, text, timeout_s, extend_to_s=None):
+            sent.append(text)
+            return _reply(len(sent) - 1)
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        asyncio.run(
+            VerifyingSolver(_Fleet(), second_opinion=False, max_attempts=8)
+            .solve_task(_NO_EXAMPLES, timeout_s=300.0)
+        )
+    log = chatter.getvalue()
+
+    assert "the same program and the same failures" in log, (
+        "the alternation was never recognised as a repeat:\n" + log
+    )
+    repeated = [t for t in set(sent) if sent.count(t) > 1]
+    assert not repeated, (
+        f"{len(repeated)} prompt(s) went out byte-identical more than once; "
+        f"the first repeated {sent.count(repeated[0])} times:\n"
+        f"{repeated[0][:300]}"
+    )
+    assert any("solve it a different way" in t for t in sent), (
+        "a repeated report went out without naming the repetition:\n"
+        + "\n---\n".join(t[:200] for t in sent)
+    )
+
+
 def test_self_tests_never_reach_the_validator():
     """The output contract was ONE block for good reasons, and the JSON block
     relaxes it. `extract_code` picks the block that DEFINES the entrypoint, so
@@ -10177,7 +10521,7 @@ def test_a_disagreement_is_not_reported_as_the_program_being_wrong():
     # Which is not a lecture about deciding between them -- it is the OUTPUT
     # rule offering both, so the model answers by choosing rather than by
     # explaining its choice.
-    assert "`json` array holding ALL of the cases" in mine
+    assert "`json` array holding just the case(s) above" in mine
     # The validator's own examples are ground truth: only the program may change.
     assert "against the examples" in theirs
     assert "json" not in theirs
@@ -10237,8 +10581,21 @@ def test_the_case_parser_survives_whatever_a_model_writes():
     assert cases('```json\n[{"args": [], "kwargs": 3, "expected": 0}]\n```')[0]["kwargs"] == {}
 
     # Capped: each case is an executor run against the solve's own budget.
-    many = ", ".join('{"args": [1], "expected": 1}' for _ in range(40))
+    # Distinct calls, because identical ones are now collapsed before the cap
+    # ever applies -- see the de-duplication assertion below.
+    many = ", ".join('{"args": [%d], "expected": %d}' % (i, i) for i in range(40))
     assert len(cases(f"```json\n[{many}]\n```")) == MAX_SELF_TESTS
+
+    # One case per CALL. Two cases with the same arguments are the same case
+    # twice -- an executor run bought for nothing -- or a contradiction no
+    # program can satisfy. It also keeps the suite key-unique, which the
+    # correction merge depends on: there a case is identified by its call, so a
+    # duplicated call let one FAILING case take a passing one off the bar with
+    # it and left room for a model-authored case to replace both.
+    twice = ('```json\n[{"name": "a", "args": [[]], "expected": []},\n'
+             ' {"name": "b", "args": [[]], "expected": 0},\n'
+             ' {"name": "c", "args": [[1]], "expected": 1}]\n```')
+    assert [c["name"] for c in cases(twice)] == ["a", "c"], cases(twice)
 
 
 def test_rust_cases_that_cannot_run_are_discarded_rather_than_run():
@@ -10616,10 +10973,11 @@ def test_a_repair_may_correct_a_case_the_first_turn_got_wrong():
     # allowed at all -- without that sentence the model rewrites the program.
     assert "99" in prompts[2], prompts[2][:400]
     assert "if the case was wrong" in prompts[2].lower(), prompts[2][:800]
-    # It must ask for the WHOLE array back, since the reply replaces the bar
-    # outright -- a model resending only the cases it changed would silently
-    # delete the rest.
-    assert "ALL of the cases" in prompts[2]
+    # It asks for the FAILING case back, not the whole array. The reply is
+    # merged into the suite rather than replacing it -- only the cases the
+    # program failed are in play and the suite keeps its size -- so a model
+    # resending just what it changed cannot delete the rest.
+    assert "just the case(s) above" in prompts[2]
 
 
 def test_a_correction_survives_every_dialect_a_model_actually_writes():
@@ -10773,6 +11131,305 @@ def test_a_suite_read_off_the_rendered_page_survives_its_invisible_characters():
     ):
         cases = extract_self_tests(bad, "g", "python")
         assert len(cases) == 1, f"{name} discarded the whole suite"
+
+
+def test_a_finished_reply_with_no_code_block_does_not_poll_out_the_deadline():
+    """Where the 290 seconds went.
+
+    The read loop could only ever settle on a CODE BLOCK: `_read` returns None
+    when the message has no `pre code` in it, and `if busy or text_now is None:
+    continue` then ran to the deadline. So a FINISHED reply carrying no code —
+    corrected test cases written as prose, an array the page did not mark up as
+    code, an answer moved into an artifact — polled for every second that was
+    left, with `still_writing=False` the whole time.
+
+    Measured end to end on the real solver before the fix: a 290s solve spent
+    4.0s on the cases turn, 4.0s on the program turn, and handed the phase-3
+    round the remaining 281.3s, which it spent in full. The model had stopped
+    writing 280 seconds earlier. Worse, the copy control and the network rescue
+    — the two paths that recover exactly this shape — run AFTER this loop, so
+    they only got to look once there was nothing left to look with.
+
+    The message text settles it: when `whole` stops changing while the tab is
+    not busy, the reply is over whatever it contains."""
+    from solvers.browser_pool import _Tab
+    from solvers.claude_web import claude_site
+
+    class _Fake(_Tab):
+        def __init__(self, has_code):
+            self.site = claude_site(); self.label = "t#1"; self.alive = True
+            self.uses = 0; self.still_writing = False; self.empty_reason = None
+            self._warned_copy = self._warned_stream = True
+            self._warned_stream_diff = True
+            self._assistant = self._counted_with = None
+            self._has_code = has_code
+
+        async def _open_turn(self, text, ui_ms): return (0, None)
+
+        async def _poll(self, before):
+            # Not busy, rendered, unchanging. A code block only if has_code.
+            return (("```\ndef g(n): return n\n```" if self._has_code else None),
+                    False, "Here are all the cases, corrected: [...]", True)
+
+        async def _copied_blocks(self, reply): return None
+        async def _streamed_markdown(self): return None
+        async def _new_reply(self, before): return None
+        async def _dom_blocks(self, reply): return []
+        async def _explain_empty(self, before): return None
+        async def _whole(self, reply): return ""
+
+    def spent(has_code, slice_s, grace):
+        tab = _Fake(has_code)
+        started = time.monotonic()
+        with contextlib.redirect_stdout(io.StringIO()):
+            asyncio.run(tab.send("prompt", slice_s))
+        return time.monotonic() - started
+
+    # `BLIND_TAB_GRACE_S` is shortened so the test costs seconds rather than a
+    # minute; the shape under test is the same, and the number itself is
+    # asserted against the module constant below.
+    from solvers import browser_pool as _bp
+
+    grace = 3.0
+    with _monkey(_bp, "BLIND_TAB_GRACE_S", grace):
+        # The whole point: the cost must not scale with the slice it was given.
+        short, long = spent(False, 20.0, grace), spent(False, 120.0, grace)
+        assert long < grace + 12.0, (
+            f"a code-free reply spent {long:.1f}s of a 120s slice"
+        )
+        assert abs(long - short) < 4.0, (
+            f"cost tracked the slice, not the reply: {short:.1f}s vs {long:.1f}s"
+        )
+        # A reply WITH a code block is unchanged — it settles without waiting
+        # out the grace at all.
+        assert spent(True, 120.0, grace) < short
+
+    # The bound a wrong guess can cost is the grace, not the deadline.
+    assert _bp.BLIND_TAB_GRACE_S == 30.0
+    assert _bp.SETTLED_WITHOUT_CODE_POLLS >= 3
+
+
+@contextlib.contextmanager
+def _monkey(module, name, value):
+    """`monkeypatch` is a fixture and this test is called from a helper."""
+    old = getattr(module, name)
+    setattr(module, name, value)
+    try:
+        yield
+    finally:
+        setattr(module, name, old)
+
+
+def test_grading_cannot_spend_more_of_the_deadline_than_is_left():
+    """Where a 290-second solve actually went.
+
+    `_grade` gated on `left >= min(needed, GRADE_FLOOR_S)` — 15 seconds for a
+    twenty-case suite — and then started a run that had no bound at all. Every
+    case gets `VERIFY_TIMEOUT_S`, so twenty cases against a program that hangs
+    cost **100.2 seconds, measured**: a 6.7x under-estimate of a check the gate
+    had just called affordable. Two of those and the deadline is gone, which is
+    exactly what the operator's log showed — 290.0s/290s, `out of budget before
+    the model's 20 own case(s) could be run`, nothing graded, answer submitted
+    unverified.
+
+    A phase-3 reply that corrects the CASES makes it worse rather than better,
+    which is why the operator saw the two together: the program in hand is then
+    re-graded against the corrected bar, so a cases-only correction buys a
+    second full-price grading pass.
+
+    The gate's own comment already promised the remedy — "a partial run that
+    DOES fit is worth more than no evidence at all" — but it capped the demand
+    rather than the spend."""
+    import time as _time
+
+    from solvers.verify import VERIFY_TIMEOUT_S, _Grader
+
+    grader = _Grader()
+    cases = [{"args": [i], "kwargs": {}, "expected": i, "name": f"c{i}"}
+             for i in range(20)]
+    hangs = "def g(n):\n    import time\n    time.sleep(30)\n    return n\n"
+
+    started = _time.monotonic()
+    passed, total, *_ = grader.check(hangs, "python", "g", cases, budget_s=15.0)
+    spent = _time.monotonic() - started
+
+    assert spent < 25.0, f"a 15s budget bought {spent:.0f}s of grading"
+    assert total == 20, "an unrun case must still count against the bar"
+    assert passed == 0
+    # 15s // 5s per case = 3 cases. The rest are unrun, not passed.
+    assert spent >= VERIFY_TIMEOUT_S, "ran nothing at all, which reports nothing"
+
+
+def test_evidence_survives_a_round_that_could_not_be_graded(monkeypatch):
+    """`self=17/20` on one round and `self=0/0` on the answer that shipped —
+    the same program, twice, read once as checked and once as unchecked.
+
+    A round arriving with the budget gone is not graded at all: `_grade` refuses
+    to start a run there is no time for. When its source is one an earlier round
+    already ran, "never checked" is simply false, and it is the line the
+    operator reads to find out what the miner submitted.
+    """
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "STALE_ROUND_S", 0.0)
+    wrong = "```python\ndef g(n):\n    return 0\n```"
+    calls = {"n": 0}
+    real = verify._Grader.check
+
+    def spy(self, code, language, entrypoint, examples, names=None, budget_s=None):
+        # Grade the first round for real, then behave as a spent budget does:
+        # `_grade`'s gate stops calling this at all.
+        calls["n"] += 1
+        return real(self, code, language, entrypoint, examples, names, budget_s)
+
+    monkeypatch.setattr(verify._Grader, "check", spy)
+
+    class _Chat:
+        provider = "claude"
+        def __init__(self): self.n = -1
+        async def send(self, text, timeout_s, extend_to_s=None):
+            self.n += 1
+            return _CASES_ONLY if self.n == 0 else wrong
+        async def close(self): pass
+
+    class _Fleet:
+        async def open(self, avoid=None): return _Chat()
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(_Fleet(), second_opinion=False, max_attempts=3)
+    graded_once: dict = {}
+    real_grade = solver._grade
+
+    def once(*a, **kw):
+        candidate = real_grade(*a, **kw)
+        if graded_once:
+            # The second and later rounds land as an ungraded round does.
+            candidate.passed = candidate.total = 0
+            candidate.self_passed = candidate.self_total = 0
+            candidate.failures = []
+        graded_once["done"] = True
+        return candidate
+
+    monkeypatch.setattr(solver, "_grade", once)
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+    log = chatter.getvalue()
+
+    assert "self=0/0" not in log, (
+        "an answer already graded went out reported as never checked:\n" + log
+    )
+    assert answer.self_total == 3, (
+        f"the grading of this exact program was lost: "
+        f"{answer.self_passed}/{answer.self_total}"
+    )
+
+
+def test_a_cases_only_reply_cannot_launder_a_fragment(monkeypatch):
+    """`partial` was not merely lost across rounds, it was CLEARED.
+
+    A reply that corrects only the cases is graded against the program already
+    in hand, so the "previous" it is compared against is itself —
+    `dropped_definitions` finds nothing missing, because nothing can be missing
+    from a comparison with itself. A fragment flagged one round earlier came out
+    of that looking like a whole program, and `partial` is exactly the flag
+    `_supersedes` relies on to stop a fragment displacing one.
+    """
+    from solvers.verify import Candidate, _inherit_evidence, _supersedes
+
+    whole = Candidate(code="def helper():\n    return 1\ndef g(n):\n    return helper()",
+                      raw="", self_passed=3, self_total=3)
+    fragment = Candidate(code="def g(n):\n    return helper()", raw="", partial=True)
+    assert not _supersedes(fragment, whole, False), "a fragment displaced a program"
+
+    # The same fragment, re-graded against ITSELF by a cases-only round: nothing
+    # looks missing, so it arrives with `partial` false.
+    relaundered = Candidate(code=fragment.code, raw="", self_passed=1, self_total=1)
+    _inherit_evidence(relaundered, fragment)
+    assert relaundered.partial, "the fragment flag was cleared by a re-grade"
+    assert not _supersedes(relaundered, whole, False), (
+        "a fragment displaced a whole program after being re-graded against "
+        "itself"
+    )
+    # And its own grading is untouched — inheritance is not a ranking.
+    assert (relaundered.self_passed, relaundered.self_total) == (1, 1)
+
+
+def test_grading_leaves_room_for_the_round_the_evidence_is_for(monkeypatch):
+    """One grading pass could spend every second that was left.
+
+    A list of failures nobody has time to report is not worth the run that
+    produced it, so `_grade` holds a round trip back — and that reserve was
+    tried once before and reverted, because `check` sized its run by the worst
+    case and a shortened budget meant only the first case or two ran. Sizing by
+    iteration rather than by the worst case is what makes it safe: an ordinary
+    suite finishes well inside the shortened budget, so the reserve costs no
+    evidence at all and buys the correction round.
+    """
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "STALE_ROUND_S", 0.0)
+    seen: list[float] = []
+    real = verify._Grader.check
+
+    def spy(self, code, language, entrypoint, examples, names=None, budget_s=None):
+        if budget_s is not None:
+            seen.append(budget_s)
+        return real(self, code, language, entrypoint, examples, names, budget_s)
+
+    monkeypatch.setattr(verify._Grader, "check", spy)
+    solver, sent = _solver_seeing(
+        [_CASES_ONLY, _WRONG_PROGRAM, _RIGHT_PROGRAM], reserve_s=0, max_budget_s=60
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=60.0))
+
+    assert seen, "nothing was graded at all"
+    assert all(b <= 60.0 - verify.ROUND_TRIP_FLOOR_S for b in seen), (
+        f"a grading pass was handed the whole remainder: {seen}"
+    )
+    # And the reserve cost no evidence: three cases, all three run, the repair
+    # round sent and the corrected program submitted.
+    assert "while n > 0" in answer.code, f"lost the correction: {answer.code!r}"
+    assert answer.self_total == 3 and answer.self_passed == 3, (
+        f"the reserve truncated the run: {answer.self_passed}/{answer.self_total}"
+    )
+    assert len(sent) == 3, f"expected cases, program, repair; sent {len(sent)}"
+
+
+def test_a_partial_grading_run_can_never_read_as_verified():
+    """`total` stays the FULL case count when a run is truncated, so an unrun
+    case is unknown rather than passing. Passing what ran is not passing the
+    suite, and `verified`/`self_verified` both turn on `passed == total`.
+
+    Truncated by a case that HANGS, which is the only thing that truncates a run
+    any more. It used to be enough to hand twenty ordinary cases a short budget,
+    because the run was sized by the worst case — twenty times the per-case
+    timeout — and refused seventeen of them over a suite that costs three
+    quarters of a second in total. Sizing each chunk by what the cases have
+    actually cost ended that, and it should: cases refused are evidence thrown
+    away. So the honest version of this test makes them genuinely not fit.
+    """
+    from solvers.verify import Candidate, _Grader
+
+    grader = _Grader()
+    # Half of them answer instantly; the second half never return. The budget
+    # runs out partway through, so what ran passed and the rest are unknown.
+    slow = ("def g(n):\n"
+            "    import time\n"
+            "    if n >= 10:\n"
+            "        time.sleep(30)\n"
+            "    return 1\n")
+    cases = [{"args": [i], "kwargs": {}, "expected": 1, "name": f"c{i}"}
+             for i in range(20)]
+    passed, total, failures, _ = grader.check(slow, "python", "g", cases, budget_s=12.0)
+
+    assert total == 20 and passed < total, (passed, total)
+    assert passed >= 10, f"lost the cases that did run and pass: {passed}"
+    c = Candidate(code=slow, raw="", self_passed=passed, self_total=total,
+                  from_self_tests=True)
+    assert not c.self_verified, "a partial pass claimed the whole suite"
 
 
 def test_a_bracket_in_the_prose_does_not_steal_the_corrected_suite():
@@ -11141,7 +11798,7 @@ def test_a_repair_cannot_pass_a_bar_it_rewrote_in_the_same_breath():
     # And the shrunken bar is refused outright, on that round and every one
     # after it: dropping the case you cannot pass is how a bar gets cleared
     # without the program improving.
-    assert "a case may be corrected, not dropped" in log, log
+    assert "a failing case may be corrected, not dropped" in log, log
     # ...and the round after it was still asked to fix something.
     assert len(prompts) >= 4, [p[:40] for p in prompts]
     assert "returned 42" in prompts[3] or "returned 0" in prompts[3], prompts[3][:400]

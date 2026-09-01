@@ -585,6 +585,8 @@ def build_repair_prompt(
     entrypoint: str,
     defect: Optional[str] = None,
     from_self_tests: bool = False,
+    stalled: int = 0,
+    insist_on_program: bool = False,
 ) -> str:
     """Ask for a fix, quoting the concrete failures the local grader found.
 
@@ -611,9 +613,29 @@ def build_repair_prompt(
 
     "Do not change both" is not lost by leaving it unsaid: it is enforced in
     ``verify.py``, where a reply that rewrites the program AND the cases is
-    graded against the bar as it stood before it arrived, and a revision that
-    drops cases is refused outright. The grader keeps the promise, so the
-    prompt stops asking for it.
+    graded against the bar as it stood before it arrived. The grader keeps the
+    promise, so the prompt stops asking for it.
+
+    The case array asked for is JUST THE FAILING CASES, not the whole suite,
+    and that is a change in what the miner does as much as in what it asks for.
+    The prompt reports one disagreement, so the natural reply is that one case
+    corrected -- and demanding the complete array back meant a twenty-case suite
+    was re-sent to fix one of them: slower, likelier to be truncated mid-array,
+    and refused outright whenever it came back one case short, which left the
+    wrong case breaking a correct program on every remaining round of the solve.
+    ``_merge_cases`` applies what comes back to the suite instead of replacing
+    it, and only the cases the program actually failed are in play, so a short
+    array cannot lower a bar the program has already cleared.
+
+    ``stalled`` is how many times this exact report has already been sent in
+    this solve, and it is the one thing here that is not about the failure.
+    Without it the loop re-sends a byte-identical prompt into a conversation
+    that already holds the answer it produced last time, and the likeliest
+    continuation of "same context, same question" is the same reply: measured
+    on one live solve, eleven sends, one prompt repeated eight times verbatim,
+    the whole budget spent without the program changing once. Naming the
+    repetition is what makes the next round a different question -- still not
+    method, and still no advice about the problem itself.
     """
     if defect == NO_CODE:
         body = (
@@ -628,6 +650,31 @@ def build_repair_prompt(
             f"Send back ONE fenced code block, with nothing outside it: "
             f"{WHOLE_PROGRAM}."
         )
+    elif from_self_tests and insist_on_program:
+        # The case escape hatch, withdrawn. It exists because the model's own
+        # cases may be wrong -- turn 1 reasons its `expected` values out before
+        # any program exists -- and a repair round that blames the code for a
+        # wrong case breaks a correct program. But an escape hatch left open
+        # while nothing converges is not that: several rounds running in which
+        # the PROGRAM did not change is the one thing a correction phase cannot
+        # afford, whether those rounds spent themselves correcting the bar or
+        # re-sending the same code. So the offer is made, and then it stops
+        # being made.
+        #
+        # The sentence says the program has not changed, and nothing about what
+        # the replies contained, because only the first of those is known to be
+        # true here. Telling a model that re-sent identical code that it had
+        # "already corrected the cases" is a false premise, and a false premise
+        # is answered by arguing with it.
+        detail = "\n".join(f"  - {line}" for line in failures)
+        target = "the program" if language == "rust" else f"`{entrypoint}`"
+        body = (
+            f"I ran {target} against the test cases you sent and got:\n"
+            f"{detail}\n\n"
+            f"The program has not changed for several rounds now, so this time "
+            f"it is the program that has to. Send back ONE fenced block, with "
+            f"nothing outside it: {WHOLE_PROGRAM}."
+        )
     elif from_self_tests:
         # Deliberately not "your solution is WRONG". These cases came from the
         # model itself, so a disagreement proves only that two things it wrote
@@ -640,8 +687,8 @@ def build_repair_prompt(
             f"I ran {target} against the test cases you sent and got:\n"
             f"{detail}\n\n"
             f"Send back ONE fenced block: {WHOLE_PROGRAM} — or, if the case "
-            f"was wrong rather than the program, a `json` array holding ALL of "
-            f"the cases, corrected."
+            f"was wrong rather than the program, a `json` array holding just "
+            f"the case(s) above, corrected. Send one or the other, not both."
         )
     else:
         detail = "\n".join(f"  - {line}" for line in failures)
@@ -651,6 +698,14 @@ def build_repair_prompt(
             f"{detail}\n\n"
             f"Send back ONE fenced block, with nothing outside it: "
             f"{WHOLE_PROGRAM}."
+        )
+    if stalled:
+        how_often = "once" if stalled == 1 else f"{stalled} times"
+        body += (
+            f"\n\nYou have already been shown this exact report {how_often} in "
+            f"this conversation, and the reply came back with the same program "
+            f"each time. Do not send that program again — solve it a different "
+            f"way."
         )
     return body
 
@@ -769,7 +824,7 @@ def _thin(cases: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
 
 
 def _scrub_json(text: str) -> str:
-    """Strip line comments and trailing commas, leaving strings untouched.
+    r"""Strip line comments and trailing commas, leaving strings untouched.
 
     Both are things a model writes and JSON forbids, and both are cheap to undo
     -- but only with a scanner that knows where the strings are. `re.sub` on
@@ -1027,6 +1082,49 @@ def _parse_cases(
     return _case_items(raw, language)
 
 
+def salvage_case_array(text: str) -> Optional[str]:
+    """An UNFENCED test-case array inside `text`, re-fenced, or None.
+
+    The browser layer only ever hands back fenced code blocks -- deliberately,
+    and for a reason that has cost whole solves: claude.ai renders extended
+    thinking inside the element the assistant selector matches, so falling back
+    to the message text once submitted 13,200 characters of reasoning as a Rust
+    program. That rule has one blind spot, and it is exactly the reply a repair
+    round asks for. `extract_self_tests` can dig a corrected case array out of
+    prose, but it never gets the chance: a model that writes the array as
+    ordinary text renders no `pre code`, so the page read returns None and the
+    reply reaches `prompts.py` as the empty string. The fallback was
+    unreachable from the one path that needed it.
+
+    This is the narrow way through, and it stays narrow on purpose:
+
+      * Only when NOTHING was fenced. A reply that obeyed the contract is read
+        the way it always was.
+      * Only an array whose items pass the same structural gate everything else
+        here uses -- a dict carrying `expected`. Prose, a program, a stray list
+        of numbers and a quoted prompt all fail it.
+      * The result is CASES, never a program. `extract_code` skips a block that
+        parses as cases, so nothing salvaged here can be submitted as an answer;
+        the worst it can do is move the bar, which every other case array can
+        do too and which the caller's own guards already cover.
+
+    The gate is applied as `python` because a tab does not know the task's
+    language, and it is the permissive of the two. Nothing is conceded: the
+    Rust-specific filter still runs downstream in `_parse_cases`, where the
+    language is known.
+    """
+    if not text or "[" not in text:
+        return None
+    cleaned = _OPEN_THINK_RE.sub("", _THINK_RE.sub("", sanitize_code(text)))
+    if fenced_blocks(cleaned):
+        return None
+    for span in _array_spans(cleaned):
+        raw = _loads_cases(span)
+        if isinstance(raw, list) and _case_items(raw, "python"):
+            return f"```json\n{span.strip()}\n```"
+    return None
+
+
 def _case_items(raw: list, language: str) -> list[dict[str, Any]]:
     """The structural gate, and the only thing that decides what a case is.
 
@@ -1039,6 +1137,14 @@ def _case_items(raw: list, language: str) -> list[dict[str, Any]]:
     prompt echo or a stray list of numbers from being read as a suite.
     """
     cases: list[dict[str, Any]] = []
+    # One case per CALL. Two cases with the same arguments are either the same
+    # case twice -- an executor run bought for nothing -- or a contradiction no
+    # program can satisfy, and neither is worth carrying. It also keeps the
+    # suite key-unique, which the correction merge in `verify.py` depends on:
+    # there a case is identified by its call, so a duplicate call meant one
+    # failing case took a PASSING one off the bar with it and left room for a
+    # model-authored case to replace both. Measured on the real function.
+    seen: set[tuple] = set()
     for item in raw:
         if not isinstance(item, dict) or "expected" not in item:
             continue
@@ -1056,6 +1162,10 @@ def _case_items(raw: list, language: str) -> list[dict[str, Any]]:
                 continue
             if not isinstance(item.get("expected"), str):
                 continue
+        key = (repr(args), repr(sorted(kwargs.items(), key=repr)))
+        if key in seen:
+            continue
+        seen.add(key)
         name = item.get("name")
         cases.append({
             "args": args,

@@ -68,6 +68,7 @@ from typing import Any, NamedTuple, Optional, Sequence
 # measured ways that each cost a whole answer. Two readers of the same markdown
 # that disagree is a bug waiting for the reply that tells them apart.
 from .prompts import fenced_blocks as _fenced_blocks
+from .prompts import salvage_case_array as _salvage_case_array
 
 # The port `scripts/start_debug_browser.sh` uses unless told otherwise, and so
 # the port every backend assumes when `<PREFIX>_CDP` is not set.
@@ -187,6 +188,23 @@ def tail_budget(timeout_s: float) -> float:
 # resets nothing, because the check is "did it EVER appear", not "has it
 # finished".
 BLIND_TAB_GRACE_S = 30.0
+
+# How many consecutive unchanged polls settle a reply that has NO code block in
+# it. Two settle one that has (`mark == stable`); this asks for more because the
+# evidence is weaker -- prose can pause mid-generation where a streaming code
+# block rarely does, and reading a pause as an ending would cut a model off.
+#
+# It exists because the alternative was measured and is far worse: the read loop
+# could only ever settle on a code block, so a FINISHED reply with none --
+# corrected test cases written as prose, an array the page did not mark up as
+# code, an answer moved into an artifact -- polled until the deadline. End to
+# end on the real solver, a 290s solve: turns 1 and 2 took 4.0s each and turn 3
+# was handed the remaining 281.3s and spent every one of them, with
+# `still_writing=False` and `empty_reason='no-code'` the whole time. The model
+# had stopped writing 280 seconds earlier. The copy control and the network
+# rescue that would have recovered the answer both run AFTER this loop, so they
+# only got to look once the budget was already gone.
+SETTLED_WITHOUT_CODE_POLLS = 3
 
 # Installed before the copy button is clicked. It makes the page hand the code
 # to US instead of to the operating system.
@@ -1199,6 +1217,7 @@ class _Tab:
             )
             return time.monotonic() >= deadline
 
+        settled_empty = 0
         try:
             while True:
                 if out_of_time():
@@ -1258,9 +1277,65 @@ class _Tab:
                     )
                 if text_now is not None:
                     best = text_now  # keep it even mid-generation
-                if busy or text_now is None:
-                    stable = None  # still typing, or ours has not rendered yet
+                if busy:
+                    stable = None  # still typing
+                    settled_empty = 0
                     continue
+                if text_now is None:
+                    # Not busy, and nothing this tab recognises as code. That is
+                    # either a reply still rendering, or a FINISHED reply with no
+                    # code block in it -- and the loop used to be unable to tell,
+                    # so it assumed the first and polled to the deadline. On a
+                    # phase-3 round answering with corrected cases as prose, that
+                    # is the entire remaining budget spent on a model that
+                    # stopped writing seconds in.
+                    #
+                    # The message text settles it. When `whole` stops changing
+                    # while the tab is not busy, the reply is over whatever it
+                    # contains; `SETTLED_WITHOUT_CODE_POLLS` is how long it must
+                    # hold still, and it is longer than the code path asks for
+                    # because prose can pause where a code block does not.
+                    #
+                    # Breaking here does not throw the answer away -- it hands it
+                    # to the copy control and the network rescue below, which are
+                    # the paths that recover exactly this shape, and hands them a
+                    # tail measured in seconds rather than what is left of
+                    # nothing.
+                    # TWO things have to be true before stillness means an
+                    # ending, and both come from the tests that caught the
+                    # first attempt at this.
+                    #
+                    # The message must have TEXT in it. A chat UI paints an
+                    # EMPTY assistant bubble the moment you submit and fills it
+                    # in later, so "rendered and not growing" is the normal
+                    # look of a reply that has not started -- and breaking there
+                    # turns this from a fix for a burnt deadline into a zero on
+                    # every answer slower than a few polls.
+                    #
+                    # And the blind grace must have passed. It is the number
+                    # this class already uses for "long enough that something
+                    # should have appeared", and it bounds what a wrong guess
+                    # can cost: waiting 30 seconds for a slow code block,
+                    # instead of 290 for a reply that finished without one.
+                    still = (
+                        not grew
+                        and saw_reply
+                        and bool((whole or "").strip())
+                        and time.monotonic() - submitted_at >= BLIND_TAB_GRACE_S
+                    )
+                    settled_empty = settled_empty + 1 if still else 0
+                    if settled_empty >= SETTLED_WITHOUT_CODE_POLLS:
+                        print(
+                            f"[{self.site.name}] tab {self.label} finished without a "
+                            f"code block on the page after "
+                            f"{time.monotonic() - submitted_at:.0f}s; trying the copy "
+                            f"control and the wire rather than polling out the "
+                            f"deadline."
+                        )
+                        break
+                    stable = None
+                    continue
+                settled_empty = 0
                 mark = (text_now, whole)
                 if mark == stable:
                     # Finished: not busy, and nothing moved. Break rather than
@@ -1398,6 +1473,44 @@ class _Tab:
                     f"checking the answer against the network stream in "
                     f"{STREAM_PHASE_TIMEOUT_S:.0f}s. Submitting what the page gave."
                 )
+        if not best and not last_busy:
+            # `not last_busy`: only a reply the model has FINISHED. An array
+            # caught mid-stream is truncated by definition, and the one thing
+            # this recovers is a bar the program will be graded against -- half
+            # of one is worse than none. Where a site has no busy control at all
+            # this is always false and the salvage always runs, which is the
+            # same trade the read loop already makes there.
+            #
+            # The one reply this class's "code blocks or nothing" rule cannot
+            # read, and a repair round asks for it by name: cases corrected as
+            # ordinary text. No `pre code` renders, so the page read returns
+            # None, the copy control has no block to click and the stream holds
+            # no fence -- three sources agreeing on the empty string over a
+            # reply that answered the question. `prompts.py` has always been
+            # able to dig an array out of prose; it was simply never handed any.
+            #
+            # Narrow by construction, and the narrowness is in
+            # `salvage_case_array`: only when nothing was fenced, only an array
+            # whose items carry `expected`, and cases rather than a program --
+            # so the reasoning-as-a-program failure the None rule exists to
+            # prevent cannot come back through here.
+            salvaged = _salvage_case_array(last_whole or "")
+            where = "the page"
+            if not salvaged:
+                # Only if the page had none: a blind tab renders nothing at all,
+                # and the wire is the only place the reply exists. Fetched here
+                # rather than beside the page reading so a successful salvage
+                # does not pay for a stream read it does not need.
+                salvaged = _salvage_case_array(await self._streamed_markdown() or "")
+                where = "the network stream"
+            if salvaged:
+                print(
+                    f"[{self.site.name}] tab {self.label} answered with test cases "
+                    f"written as prose rather than a code block; recovered them "
+                    f"from {where}."
+                )
+                best = salvaged
+
         # A tab that showed no reply is NOT retired here, and that is the
         # point. Retiring it threw away the conversation the repair loop needs
         # -- and the tab was usually fine: the page rendered late, or not at
