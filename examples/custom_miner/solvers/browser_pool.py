@@ -357,6 +357,26 @@ _STREAM_INSTALL = f"({_STREAM_HOOK})()"
 # Not handled, and deliberately: an SSE payload split across several `data:`
 # lines. Neither site does it, and guessing at reassembly would corrupt more
 # than it recovered.
+def _fences_closed(text: str) -> bool:
+    """Every fence in `text` has a partner. Conservative, and only ever a HINT.
+
+    Used as the second half of "the wire is finished": stillness says the model
+    stopped sending, a closed fence says it stopped because it was done rather
+    than because the read caught it mid-word.
+
+    Deliberately approximate. A four-backtick block containing three backticks
+    is counted twice and reads as unbalanced, so this says "not finished" about
+    an answer that is -- and the only cost of that is waiting, which is what the
+    code did before. It is never allowed to be the reason something is taken
+    EARLY, only a reason to keep waiting.
+    """
+    fences = sum(
+        1 for line in text.splitlines()
+        if line.strip().startswith(("```", "~~~"))
+    )
+    return fences > 0 and fences % 2 == 0
+
+
 _STREAM_READ = r"""(since) => {
   var recs = (window.__honeStreams || []).filter(function (r) { return r.seq > since; });
   if (!recs.length) return null;
@@ -1269,11 +1289,35 @@ class _Tab:
                 return False
             if time.monotonic() - submitted_at < BLIND_TAB_GRACE_S:
                 return False
+            # Only when the PAGE has given nothing at all. A message with text
+            # in it is already covered by `settled_empty` above, which costs no
+            # page call -- and it is the shape this file documents at length: a
+            # model that thinks in prose for 77 seconds renders text the whole
+            # time. Reading the wire on every poll of one of those would buy
+            # nothing and pay a `page.evaluate` for it, and `_STREAM_READ`
+            # re-parses the whole buffer on each call, so the cost grows with
+            # the answer.
+            if (whole or "").strip():
+                return False
             wire = await self._streamed_markdown()
             # An answer, not a preamble. A stream holding "Let me think about
             # this" has settled too, and breaking on it would submit nothing.
+            #
+            # And a FINISHED answer, not a prefix of one. `fenced_blocks` keeps
+            # an unclosed final fence on purpose -- a reply cut off by a
+            # deadline still has its program in it -- so its presence says
+            # nothing about whether the model stopped writing. A closing fence
+            # does: the model wrote it, and it is the last thing it writes.
+            # Requiring it can only make this exit fire later, never wrongly,
+            # and a model that never closes its fence simply falls back to the
+            # behaviour that existed before any of this: read to the deadline.
+            #
+            # A salvaged case array has no fence to close, and does not need
+            # one -- `_salvage_case_array` only returns a span whose brackets
+            # balance and whose items parse, which is the same guarantee.
             usable = bool(wire) and bool(
-                _fenced_blocks(wire) or _salvage_case_array(wire)
+                (_fenced_blocks(wire) and _fences_closed(wire))
+                or _salvage_case_array(wire)
             )
             settled_wire = settled_wire + 1 if usable and wire == last_wire else 0
             last_wire = wire

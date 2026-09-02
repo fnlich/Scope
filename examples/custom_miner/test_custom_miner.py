@@ -5857,8 +5857,7 @@ def test_grading_is_not_started_when_it_cannot_finish():
     is no time for a repair round and `verified` never reaches the validator."""
     from types import SimpleNamespace
 
-    from solvers.prompts import MAX_SELF_TESTS
-    from solvers.verify import GRADE_FLOOR_S, VERIFY_TIMEOUT_S
+    from solvers.verify import ROUND_TRIP_FLOOR_S, VERIFY_TIMEOUT_S
 
     solver, _ = _solver_seeing([])
     ran = []
@@ -5878,10 +5877,25 @@ def test_grading_is_not_started_when_it_cannot_finish():
     solver._grade(reply, task, 300.0, cases)
     assert ran, "stopped grading when there was plenty of budget"
 
-    # A cap on the cap: a task with twenty cases must not refuse to grade
-    # anything under a hundred seconds, because a partial run that DOES fit is
-    # worth more than no evidence at all.
-    assert 0 < GRADE_FLOOR_S < VERIFY_TIMEOUT_S * MAX_SELF_TESTS
+    # The demand is ONE case, not the whole suite: a task with twenty cases must
+    # not refuse to grade anything under a hundred seconds, because a partial
+    # run that DOES fit is worth more than no evidence at all, and `check`
+    # bounds the rest itself.
+    ran.clear()
+    solver._grade(reply, task, VERIFY_TIMEOUT_S + 0.1, cases)
+    assert ran, "refused a six-case suite the budget could start"
+
+    # And grading must never be the thing that is too expensive when another
+    # model round trip is not. A band where the loop would spend twelve seconds
+    # on a prompt while refusing a check that measures under a second is not a
+    # trade anything would choose; it existed for two years because the two
+    # floors were never reasoned about together.
+    ran.clear()
+    solver._grade(reply, task, ROUND_TRIP_FLOOR_S + 0.1, cases)
+    assert ran, (
+        f"refused to grade with {ROUND_TRIP_FLOOR_S + 0.1:.1f}s left, which is "
+        f"more than the loop demands before sending a whole new prompt"
+    )
 
 
 def test_nothing_anywhere_still_submits_nothing(capsys):

@@ -98,9 +98,6 @@ DELIVERY_RESERVE_S = 15.0
 # failing fast lets the pass end while another tab might still be tried.
 OPEN_FLOOR_S = 5.0
 
-# The most `_grade` will insist on before it declines to run anything at all.
-GRADE_FLOOR_S = 15.0
-
 # The least a correction round can be worth starting with: one prompt out, one
 # reply back, and something read from the page at the end of it. Below this the
 # loop stops and the last version in hand goes out as it stands.
@@ -682,10 +679,9 @@ class _Grader:
         between a check and a solve-ending one. Every case gets
         `VERIFY_TIMEOUT_S` and nothing used to bound the set, so a suite of
         twenty cases against a program that hangs costs twenty times that:
-        measured, 100.2 seconds. `_grade`'s gate demanded only
-        `min(needed, GRADE_FLOOR_S)` = 15 seconds be left before starting it --
-        a 6.7x under-estimate, and the run then took the rest of the deadline
-        with it. Two of those and a 290-second solve grades nothing and submits
+        measured, 100.2 seconds. `_grade`'s gate demanded only 15 seconds be
+        left before starting it -- a 6.7x under-estimate, and the run then took
+        the rest of the deadline with it. Two of those and a 290-second solve grades nothing and submits
         unverified, which is the failure this argument exists to end.
 
         A partial run is the point, and it is what the gate's own comment
@@ -2209,13 +2205,26 @@ class VerifyingSolver:
         # can still be acted on") is as true at 0.2s as at 0, so it asks what
         # the run could actually cost.
         #
-        # `GRADE_FLOOR_S` caps the demand: a task with twenty cases would
-        # otherwise refuse to grade anything under a hundred seconds, and a
-        # partial run that DOES fit is worth more than no evidence at all.
-        needed = VERIFY_TIMEOUT_S * max(
-            1, len(cases or []) or len(getattr(task, "public_examples", None) or [])
-        )
-        out_of_budget = left is not None and left < min(needed, GRADE_FLOOR_S)
+        # The floor is ONE CASE, and it used to be `GRADE_FLOOR_S` = 15.
+        #
+        # Fifteen was picked to cap a demand computed from the suite size --
+        # twenty cases would otherwise refuse to grade below a hundred seconds
+        # -- and nothing reconciled it with `ROUND_TRIP_FLOOR_S` = 12, which is
+        # what the repair loop demands before it will send another prompt. The
+        # two constants left a band, 12 to 15 seconds, in which the loop would
+        # happily spend a whole model round trip but refused a local check that
+        # measures 0.78 seconds for twenty cases. A cases-only correction
+        # landing there was graded 0 of 0, `_inherit_evidence` restored the
+        # failures the merge had just corrected, and the round went out
+        # re-reporting a disagreement that no longer existed.
+        #
+        # Grading must never be the thing that is too expensive when another
+        # prompt is not, so the demand is now what a run actually costs at
+        # minimum: one case at the per-case timeout. `check` bounds the rest
+        # itself -- it chunks against the budget and stops on time -- which is
+        # what makes a size-derived demand unnecessary rather than merely
+        # capped.
+        out_of_budget = left is not None and left < VERIFY_TIMEOUT_S
         # What the RUN may spend, as opposed to what it must have to start.
         #
         # A round trip is held back, and the first attempt at that was reverted
@@ -2231,11 +2240,20 @@ class VerifyingSolver:
         # left, and a list of failures nobody has time to report is not worth
         # the run that produced it.
         #
-        # Only when a round trip is actually on the table. Below that floor the
-        # loop will not start another round whatever happens, so reserving for
-        # one would simply throw the seconds away.
+        # Only when a round trip is actually on the table, AND only when what
+        # is left after holding it back still buys a case. Below the round-trip
+        # floor the loop will not start another round whatever happens, so
+        # reserving for one would throw the seconds away; and between the two,
+        # subtracting the reserve leaves a sliver -- a run that grades one case
+        # of twenty, passes it, reports no failures, and ends the loop on
+        # ignorance rather than on evidence. That is the exact regression this
+        # reserve was reverted for once already, and the guard is what keeps it
+        # from coming back through the other side.
         grading_budget = left
-        if left is not None and left > ROUND_TRIP_FLOOR_S:
+        if (
+            left is not None
+            and left - ROUND_TRIP_FLOOR_S >= VERIFY_TIMEOUT_S
+        ):
             grading_budget = left - ROUND_TRIP_FLOOR_S
         # When the reserve starts running out from, so a SECOND grading pass
         # spends what the first one left rather than the same allowance over
