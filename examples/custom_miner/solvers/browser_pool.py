@@ -1218,6 +1218,67 @@ class _Tab:
             return time.monotonic() >= deadline
 
         settled_empty = 0
+        # The WIRE's own settling, kept apart from the page's because on a blind
+        # tab it is the only settling there is. See `_over_the_wire`.
+        settled_wire = 0
+        last_wire: Optional[str] = None
+
+        async def _over_the_wire() -> bool:
+            """Has the network stream stopped changing, with an answer in it?
+
+            The one way a BLIND tab can be known to have finished, and until
+            this existed there was none -- so every send into one cost its
+            whole slice. Measured against a fake page whose DOM never renders
+            and whose stream holds the finished answer from the first poll:
+            10.00s of a 10s slice and 30.00s of a 30s slice, 100% both times,
+            with the answer sitting on the wire the entire while. On a live
+            290-second solve that is the whole budget, and the log says so in
+            its own words -- "read NOTHING from the page and recovered 1 code
+            block(s) from the network stream instead", printed at the deadline
+            about an answer that had been complete for four minutes.
+
+            The class already KNEW this. The blind-tab notice says "the answer
+            may also arrive off the wire", and the comment above it records
+            eighteen tabs whose answers were recovered off the wire moments
+            later. What was missing was reading the wire before the deadline
+            rather than after it.
+
+            STILLNESS is the signal, not structure. `fenced_blocks` keeps an
+            unclosed final fence on purpose -- a reply cut off by a deadline
+            still has its program in it -- so "there is a fenced block" is true
+            of a half-written answer too and proves nothing about being
+            finished. Nor is there a done-marker to lean on: the stream
+            reconstruction is a heuristic over two undocumented private JSON
+            formats, and the one sentinel it sees (`[DONE]`) is an SSE
+            convention neither site is obliged to send.
+
+            So: unchanged across `SETTLED_WITHOUT_CODE_POLLS` reads, which at
+            the 2-second poll interval is about six seconds of a completely
+            static buffer. That is a STRICTER standard than the page path this
+            file has always trusted, which accepts an answer after two polls of
+            stillness.
+
+            Bounded twice over. Nothing is read from the wire until the blind
+            grace has passed, so a healthy read never pays for it; and
+            `_streamed_markdown` catches everything and caps itself at
+            `STREAM_TIMEOUT_MS`, so a page that cannot answer degrades to False
+            rather than to an exception.
+            """
+            nonlocal settled_wire, last_wire
+            if not self.site.stream:
+                return False
+            if time.monotonic() - submitted_at < BLIND_TAB_GRACE_S:
+                return False
+            wire = await self._streamed_markdown()
+            # An answer, not a preamble. A stream holding "Let me think about
+            # this" has settled too, and breaking on it would submit nothing.
+            usable = bool(wire) and bool(
+                _fenced_blocks(wire) or _salvage_case_array(wire)
+            )
+            settled_wire = settled_wire + 1 if usable and wire == last_wire else 0
+            last_wire = wire
+            return settled_wire >= SETTLED_WITHOUT_CODE_POLLS
+
         try:
             while True:
                 if out_of_time():
@@ -1279,7 +1340,7 @@ class _Tab:
                     best = text_now  # keep it even mid-generation
                 if busy:
                     stable = None  # still typing
-                    settled_empty = 0
+                    settled_empty = settled_wire = 0
                     continue
                 if text_now is None:
                     # Not busy, and nothing this tab recognises as code. That is
@@ -1333,9 +1394,20 @@ class _Tab:
                             f"deadline."
                         )
                         break
+                    # The page is not the only thing that can be finished, and
+                    # on a tab that renders nothing at all it is not the thing
+                    # that can be finished FIRST. See `_over_the_wire`.
+                    if await _over_the_wire():
+                        print(
+                            f"[{self.site.name}] tab {self.label} rendered nothing in "
+                            f"{time.monotonic() - submitted_at:.0f}s, but the answer "
+                            f"is complete on the wire and has stopped changing; "
+                            f"taking it now rather than polling out the deadline."
+                        )
+                        break
                     stable = None
                     continue
-                settled_empty = 0
+                settled_empty = settled_wire = 0
                 mark = (text_now, whole)
                 if mark == stable:
                     # Finished: not busy, and nothing moved. Break rather than

@@ -43,6 +43,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional, Sequence
 
@@ -503,7 +504,10 @@ async def run(
     results: list[tuple[Problem, str, str]] = []
     try:
         try:
+            warming = time.monotonic()
             await warm_up(solver, settings.miner_max_concurrent_requests)
+            print(f"[rehearse] browsers ready in {time.monotonic() - warming:.1f}s "
+                  f"at {datetime.now():%H:%M:%S}")
         except Exception as exc:  # noqa: BLE001 - no fleet is not a wrong answer
             # The fleet says what is wrong and how to fix it -- `_fill` names
             # every browser it wanted and the flag to start them with. A
@@ -531,12 +535,24 @@ async def run(
         probe = getattr(solver, "check_rust_support", None)
         if probe is not None:
             await probe()
+        run_started = time.monotonic()
         for index, problem in enumerate(problems, 1):
             if len(problems) > 1:
+                # The clock, on the banner. A run over five challenges takes
+                # long enough that the question afterwards is always "which one
+                # was going on at the time", and every other line in the run is
+                # relative to a start nobody wrote down.
                 print(f"\n{'=' * 72}\n[rehearse] {index} of {len(problems)}: "
-                      f"{problem.request.problem_id}\n{'=' * 72}")
+                      f"{problem.request.problem_id}  —  started "
+                      f"{datetime.now():%H:%M:%S}, "
+                      f"{time.monotonic() - run_started:.0f}s into the run"
+                      f"\n{'=' * 72}")
             verdict, why = await _rehearse_one(miner, problem, settings, args)
             results.append((problem, verdict, why))
+        if len(problems) > 1:
+            print(f"\n[rehearse] all {len(problems)} finished at "
+                  f"{datetime.now():%H:%M:%S}, "
+                  f"{time.monotonic() - run_started:.0f}s in total")
     finally:
         # The fleet is closed ONCE, after every problem. Opening browsers per
         # challenge would spend a minute of sign-in-warm page loads five times
@@ -574,9 +590,11 @@ async def _rehearse_one(miner, problem: Problem, settings, args) -> tuple[str, s
         print("-" * 72)
 
     timeout_s = min(request.deadline_s, settings.glm_request_timeout_s)
+    sent_at = datetime.now()
+    print(f"[rehearse] request sent {sent_at:%H:%M:%S}")
     status, payload, spent = await _answer(miner, request, timeout_s)
     print(f"[rehearse] the miner answered {status} in {spent:.1f}s "
-          f"(its budget was {timeout_s:g}s)")
+          f"at {datetime.now():%H:%M:%S} (its budget was {timeout_s:g}s)")
     if status != 200:
         print(f"[rehearse] FAILED: {payload}")
         return FAILED, f"the miner answered {status}"
@@ -612,10 +630,16 @@ async def _rehearse_one(miner, problem: Problem, settings, args) -> tuple[str, s
               f"({request.problem_id}.{'rs' if request.language == 'rust' else 'py'}, "
               f"and the exchange beside it)")
 
+    judging = time.monotonic()
     verdict, why = _verdict(
         payload, request, tests, problem.case_names, len(request.public_examples)
     )
-    print(f"[rehearse] {verdict}: {why}")
+    # Kept apart from the miner's own time, and said so. Grading is the
+    # VALIDATOR's work -- a Rust verdict starts a container and runs a build --
+    # and folding it into the solve would make a healthy miner look slow on a
+    # machine with a cold Docker daemon.
+    print(f"[rehearse] {verdict}: {why} (graded in {time.monotonic() - judging:.1f}s, "
+          f"which is the validator's time, not the miner's)")
     print(f"[rehearse] checked against {problem.tests_are}")
     return verdict, why
 

@@ -1637,6 +1637,98 @@ def test_a_reply_is_found_by_position_when_the_site_has_no_message_id():
     assert page.typed == ["solve it"]
 
 
+def _wire_page(stream, renders=True):
+    """A page whose network stream returns `stream` (a value or a callable).
+
+    `renders=False` is the BLIND tab: the DOM never shows the reply at all, and
+    the wire is the only place the answer exists.
+    """
+    class _Page(_FakePage):
+        async def evaluate(self, expression, arg=None):
+            if "since" in str(expression):
+                return stream() if callable(stream) else stream
+            return 0
+
+    page = _Page({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
+    if renders:
+        page.on_click = lambda _: page.dom.__setitem__(
+            "#assistant", [_Node(code=["def g(n):\n    return n"])])
+    return page
+
+
+def test_a_blind_tab_stops_when_the_wire_has_settled(monkeypatch):
+    """The whole budget, spent polling a DOM that was never going to render,
+    while the finished answer sat on the wire the entire time.
+
+    This is the failure the operator reported, and the class already half knew
+    about it: the blind-tab notice says "the answer may also arrive off the
+    wire", and the comment above it records eighteen tabs whose answers were
+    recovered off the wire moments later. What was missing was reading the wire
+    BEFORE the deadline rather than after it. Measured before this existed:
+    10.00s of a 10s slice and 30.00s of a 30s slice — 100% both times, with the
+    answer complete on the wire from the first poll.
+
+    On a live 290-second solve that is the whole budget, and the phase-3
+    correction then arrives with nothing left to grade it against.
+    """
+    from solvers import browser_pool
+
+    monkeypatch.setattr(browser_pool, "BLIND_TAB_GRACE_S", 1.0)
+    started = time.monotonic()
+    answer = "```python\ndef g(n):\n    return n\n```"
+    got = asyncio.run(
+        _tab(_wire_page(answer, renders=False), _site(stream=True)).send("solve it", 30.0)
+    )
+    spent = time.monotonic() - started
+
+    assert extract_code(got, "g") == "def g(n):\n    return n", f"lost it: {got!r}"
+    assert spent < 10.0, (
+        f"a blind tab spent {spent:.1f}s of a 30s slice on an answer that was "
+        f"complete on the wire before the first poll"
+    )
+
+
+def test_the_wire_is_only_taken_once_it_has_stopped_changing(monkeypatch):
+    """The guard on the fix above, and the reason stillness is the signal.
+
+    `fenced_blocks` keeps an unclosed final fence on purpose — a reply cut off
+    by a deadline still has its program in it — so "there is a fenced block" is
+    true of a half-written answer too and proves nothing about being finished.
+    Breaking on structure would submit whatever had arrived by the blind grace.
+
+    Two things must not end the read: a stream still growing, and a stream that
+    has settled with no answer in it (a preamble, or the model's reasoning).
+    """
+    from solvers import browser_pool
+
+    monkeypatch.setattr(browser_pool, "BLIND_TAB_GRACE_S", 1.0)
+
+    # Still arriving: every read is longer than the last.
+    lines = {"n": 0}
+
+    def growing():
+        lines["n"] += 1
+        return "```python\ndef g(n):\n" + "    x = 1\n" * lines["n"]
+
+    started = time.monotonic()
+    got = asyncio.run(
+        _tab(_wire_page(growing, renders=False), _site(stream=True)).send("solve it", 6.0)
+    )
+    assert time.monotonic() - started >= 5.0, "cut a stream off mid-answer"
+    assert got.count("x = 1") > 3, f"took a truncated prefix: {got!r}"
+
+    # Settled, but it is a preamble rather than an answer.
+    started = time.monotonic()
+    got = asyncio.run(
+        _tab(_wire_page("Let me think about this problem.", renders=False),
+             _site(stream=True)).send("solve it", 6.0)
+    )
+    assert time.monotonic() - started >= 5.0, (
+        "stopped on a stream holding no answer, which submits nothing"
+    )
+    assert not (got or "").strip(), f"returned prose as an answer: {got!r}"
+
+
 def test_corrected_cases_written_as_prose_are_not_thrown_away():
     """The one reply "code blocks or nothing" could not read, and a repair round
     asks for it by name.
@@ -10043,6 +10135,51 @@ def test_a_fragment_of_a_reply_still_being_written_is_not_a_version():
     assert not _supersedes(fragment, finished, True)
     # Unless there is nothing to displace: half an answer beats none.
     assert _supersedes(fragment, Candidate(code="", raw=""), True)
+
+
+def test_every_phase_says_when_it_ran_and_what_it_cost():
+    """One number at the end said a solve was fast or slow and nothing about
+    WHERE the time went — the single question an operator has when a
+    290-second budget comes back empty.
+
+    Numbered the way the prompts are, because that is the vocabulary: turn 1
+    asks for the cases, so the program is phase 2 and the first correction is
+    phase 3. A log that numbered them differently would be answering a question
+    nobody asked in words nobody used.
+
+    The model's time and the local check are reported apart. They fail for
+    different reasons and are fixed in different places — a slow model is an
+    account or a site problem, a slow check is a hanging test case or a cold
+    Docker daemon — and one number covering both hides whichever is smaller.
+    """
+    cases = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "carry", "args": [12345], "expected": 14}]\n```')
+    program = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+               "        t += n % 10\n        n //= 10\n    return t\n```")
+    one = '```json\n[{"name": "carry", "args": [12345], "expected": 15}]\n```'
+
+    solver, _ = _solver_seeing([cases, program, one])
+    chatter = io.StringIO()
+    with contextlib.redirect_stdout(chatter):
+        asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
+    lines = [ln for ln in chatter.getvalue().splitlines() if ln.startswith("[phase]")]
+
+    labels = [ln.split()[1:3] for ln in lines]
+    assert ["1", "cases"] in labels, lines
+    assert ["2", "program"] in labels, lines
+    assert ["3", "correction"] in labels, lines
+    assert any(ln.split()[1] == "open" for ln in lines), (
+        "leasing a tab was not timed; a fleet with no free tab has spent whole "
+        f"budgets waiting: {lines}"
+    )
+    # Wall clock, elapsed, and what is left of the budget, on every line.
+    for line in lines:
+        assert re.search(r"\d\d:\d\d:\d\d\.\d", line), f"no clock time: {line}"
+        assert re.search(r"took\s+\d+\.\d+s", line), f"no duration: {line}"
+        assert re.search(r"\d+s of \d+s left", line), f"no budget left: {line}"
+    # The model and the local check are separable on a graded phase.
+    graded = [ln for ln in lines if "program" in ln]
+    assert "model " in graded[0] and "checked " in graded[0], graded
 
 
 def test_a_correction_may_send_only_the_case_that_failed():

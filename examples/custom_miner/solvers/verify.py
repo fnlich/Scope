@@ -35,6 +35,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Optional, Protocol
 
 from rlvr.types import TestCase
@@ -276,6 +277,59 @@ class Candidate:
             self.self_passed,
             1 if self.code.strip() else 0,
             0 if self.defect else 1,
+        )
+
+
+class _Phases:
+    """Every phase of one pass, timed, on its own line as it finishes.
+
+    The solve already reported one number at the end -- `0.3s/290s` -- and that
+    is the only number it reported. It says a solve was fast or slow and
+    nothing whatever about WHERE the time went, which is the single question an
+    operator has when a 290-second budget comes back empty. Every defect fixed
+    in this file was found by reconstructing that breakdown by hand from
+    scattered lines, or by adding a stopwatch and running the solve again.
+
+    Phases are numbered the way the prompts are: 1 is the cases turn, 2 is the
+    program, 3 and up are corrections. Opening a tab is not a phase and is not
+    numbered, but it IS timed -- a fleet with no free tab has spent whole
+    budgets waiting, and that shows up here as a long `open` rather than as a
+    solve that mysteriously started late.
+
+    Each phase is measured from the end of the one before it, which is exact
+    because they run back to back, and it means the caller records nothing and
+    only says when a phase ended.
+    """
+
+    def __init__(self, budget: float, started: float, pass_no: int = 1) -> None:
+        self._budget = budget
+        self._solve_started = started
+        self._pass = pass_no
+        self._at = time.monotonic()
+        self._wall = datetime.now()
+
+    def mark(
+        self, label: str, *, model_s: Optional[float] = None,
+        checked_s: Optional[float] = None,
+    ) -> None:
+        now, wall = time.monotonic(), datetime.now()
+        spent = now - self._at
+        began, self._at, self._wall = self._wall, now, wall
+        left = self._budget - (now - self._solve_started)
+        parts = []
+        if model_s is not None:
+            parts.append(f"model {model_s:.1f}s")
+        if checked_s is not None:
+            parts.append(f"checked {checked_s:.1f}s")
+        detail = f"  ({', '.join(parts)})" if parts else ""
+        # The pass number only when there IS more than one, so the ordinary
+        # solve is not made to carry a column that always reads the same.
+        where = f"pass {self._pass} " if self._pass > 1 else ""
+        print(
+            f"[phase] {where}{label:<14} "
+            f"{began:%H:%M:%S}.{began.microsecond // 100000} "
+            f"took {spent:6.1f}s{detail}"
+            f"  — {max(0.0, left):.0f}s of {self._budget:.0f}s left"
         )
 
 
@@ -1118,7 +1172,8 @@ class VerifyingSolver:
                     break
             attempt_no += 1
             candidate, provider = await self._attempt(
-                task, remaining, avoid=asked[-1] if asked else None, plan=plan
+                task, remaining, avoid=asked[-1] if asked else None, plan=plan,
+                pass_no=attempt_no,
             )
             if provider:
                 asked.append(provider)
@@ -1298,6 +1353,7 @@ class VerifyingSolver:
         remaining: float,
         avoid: Optional[str],
         plan: Optional["_Plan"] = None,
+        pass_no: int = 1,
     ) -> tuple[Optional[Candidate], Optional[str]]:
         """One model, one conversation: initial answer plus repair rounds.
 
@@ -1333,8 +1389,10 @@ class VerifyingSolver:
             # deadline, and return empty having sent no prompt at all. Measured:
             # budget 40s, elapsed 50.1s, `open()` called at t=0 and t=25.1,
             # prompts sent 0.
+            phases = _Phases(budget, started, pass_no)
             conversation = await self._open_within(budget, started, avoid)
             provider = best_provider = getattr(conversation, "provider", None)
+            phases.mark(f"open {provider or 'tab'}")
             # Turn 1: the cases, before the program exists. Cases written
             # ALONGSIDE a program can be back-filled from what the program
             # happens to do, and then they agree with its bugs; cases written
@@ -1343,9 +1401,11 @@ class VerifyingSolver:
             cases: Optional[list] = None
             two_phase = plan is None or plan.two_phase
             if self._self_tests and two_phase:
+                asked_at = time.monotonic()
                 cases = await self._ask_for_cases(
                     conversation, task, budget - (time.monotonic() - started)
                 )
+                phases.mark("1 cases", model_s=time.monotonic() - asked_at)
                 if cases is None:
                     # The tab could not be read, or the model was still writing.
                     # Sending turn 2 into it would queue behind an answer that
@@ -1523,6 +1583,7 @@ class VerifyingSolver:
                 except Exception:  # noqa: BLE001 - it may already be broken
                     pass
                 fresh = await self._open_within(budget, started, avoid)
+                phases.mark(f"open {getattr(fresh, 'provider', None) or 'tab'}")
                 return (
                     fresh,
                     getattr(fresh, "provider", provider),
@@ -1733,6 +1794,7 @@ class VerifyingSolver:
                         # is re-graded, not assumed to pass.
                         agreed, revised = revised, None
                         graded = last_program_reply or reply
+                graded_at = time.monotonic()
                 candidate = await self._graded(
                     graded, task, budget - (time.monotonic() - started), agreed,
                     # The round ABOVE this one, still un-updated here -- see the
@@ -1742,6 +1804,17 @@ class VerifyingSolver:
                     # helpers that exist in the reply above it and nowhere in
                     # the file that would be submitted.
                     previous=last_code or "",
+                )
+                # Numbered as the prompts are: turn 1 asked for the cases, so
+                # the program is phase 2 and the first correction is phase 3.
+                # The operator's own vocabulary all through this file's history
+                # -- "3rd phase output should be full code" -- and a log that
+                # numbered them differently would be answering a question
+                # nobody asked in words nobody used.
+                phases.mark(
+                    "2 program" if attempt == 1 else f"{attempt + 1} correction",
+                    model_s=round_s,
+                    checked_s=time.monotonic() - graded_at,
                 )
                 # Before anything reads it: a round that could not be graded,
                 # or one graded against itself, must not report less about a
