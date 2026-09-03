@@ -1012,29 +1012,63 @@ class _Plan:
 
     two_phase: bool = True
 
-# Turn 1 has NO timeout of its own. There is one clock on a solve -- the
-# deadline the validator advertised -- and turn 1 reads against that, exactly
-# like every other read here.
+# The most of what is left that the CASES turn may spend.
 #
-# It carried a private cap twice, and both were wrong in the same direction.
-# The first passed `extend_to_s` equal to the slice, which makes `send`'s
-# extension a no-op by construction; the second kept a soft 60s slice and a hard
-# 100s cap. Both cut the model off MID-THINK, and cutting a model off mid-think
-# is the one thing that cannot help: the reply does not exist yet, so what the
-# cap saves is time that bought nothing and what it costs is the whole turn.
-# Measured on a live tab: `Thought for 1m 17s` before a single character
-# appeared, against a 60 second cap.
+# Turn 1 carried a private cap twice before and both were removed, for an
+# argument that was right about the caps and wrong about one thing. The
+# argument: `send` returns the moment the model finishes, so a slice is a
+# ceiling and never a wait -- a cases turn that takes 90 seconds hands the
+# program the other 190 whether a cap exists or not. The only case a cap
+# changes is the one where the model has NOT finished, "and there it converts
+# a slow answer into no answer, which is the one trade the payment policy says
+# never to make". Measured against those caps on a live tab: `Thought for
+# 1m 17s` before a single character appeared, against a 60 second cap.
 #
-# A cap LOOKS like it protects the program's read, and it does not. `send`
-# returns the moment the model finishes -- the slice is a ceiling, never a wait
-# -- so a cases turn that takes 90 seconds hands the program the other 190
-# whether or not a cap exists. The only case a cap changes is the one where the
-# model has NOT finished, and there it converts a slow answer into no answer,
-# which is the one trade the payment policy says never to make.
+# Every word of that holds. What it assumes is that being cut off ends the
+# SOLVE, and that was true only because of what happened next: `_ask_for_cases`
+# returned None for a conversation mid-answer, and `_attempt` abandoned the pass
+# rather than send turn 2 into a tab that had not answered turn 1. So the cap
+# did convert a slow answer into no answer -- not because it was a cap, but
+# because nothing picked the solve up afterwards.
 #
-# What protects the program now is the budget itself and `_Plan`: turn 1 cannot
-# outlive the deadline, and a turn 1 that fails the TASK's way does not get a
-# second chance in the same solve.
+# Turn 1's answer is not the answer. It is a local grading bar, and the code
+# has always known how to proceed without one ("the cases turn produced none
+# usable; asking for the program without them"). What was missing is that a
+# conversation still writing turn 1 cannot be reused -- and the answer to that
+# is a different conversation, which this file already opens for other reasons.
+# With that path in place a cap costs the CASES, never the answer, and the
+# trade the payment policy forbids is not the one being made.
+#
+# Measured over a live run of thirteen solves, which is why this exists at all:
+# the cases turn averaged 97.2s against the program turn's 66.7s and took 54%
+# of the mean solve -- 1264 seconds of 2338 -- to produce no code at all. Twice
+# it left less than the worst observed program turn behind it, and once it took
+# 197.9s of a 290s budget, after which the program turn was cut off mid-write
+# at 90.8s and a truncated Rust program went out. That is a zero, and it is the
+# only zero in the run.
+#
+# A half, rather than a tuned number of seconds: the turn that produces the
+# answer gets at least half the clock, at any deadline the protocol allows. On
+# that same run it would have bound on two solves of thirteen and changed
+# nothing about the other eleven, because a ceiling that is never reached costs
+# nothing.
+CASES_TURN_SHARE = 0.5
+
+# ...and the least the program must be left with for that ceiling to be applied
+# at all. Below this the ceiling becomes the disease it was meant to cure: half
+# of a small budget is not a program turn, so stopping turn 1 there leases a
+# second tab and asks a second account for a whole program with seconds on the
+# clock, arriving at the same empty answer having spent someone's quota to get
+# there. Measured at a 40-second deadline: a 25-second budget, a 12.5-second
+# ceiling, and 12.5 seconds in which to produce a program.
+#
+# 90 seconds, from the same live run: the program turn ran 31.5s to 141.7s with
+# a mean of 66.7s, so a program half below 90 is not comfortably above what a
+# program turn actually costs. The effect is that the ceiling binds only on the
+# deadlines this subnet advertises -- at 300s it caps the cases turn at 142.5s,
+# which is where both of the run's expensive cases turns (161.6s and 197.9s)
+# were -- and leaves every shorter deadline exactly as it was.
+PROGRAM_TURN_FLOOR_S = 90.0
 
 
 # Nothing here passes `extend_to_s` any more, and that is the end of a long
@@ -1466,10 +1500,68 @@ class VerifyingSolver:
             two_phase = plan is None or plan.two_phase
             if self._self_tests and two_phase:
                 asked_at = time.monotonic()
+                left_for_cases = budget - (time.monotonic() - started)
+                # Half, so the turn that produces the ANSWER keeps the other
+                # half. See `CASES_TURN_SHARE`. A ceiling, never a wait: a
+                # cases turn that finishes sooner hands the rest straight on,
+                # which on the run this was measured from is eleven solves of
+                # thirteen.
+                cases_slice = left_for_cases
+                if left_for_cases * (1.0 - CASES_TURN_SHARE) >= PROGRAM_TURN_FLOOR_S:
+                    cases_slice = max(1.0, left_for_cases * CASES_TURN_SHARE)
                 cases = await self._ask_for_cases(
-                    conversation, task, budget - (time.monotonic() - started)
+                    conversation, task, cases_slice
                 )
                 phases.mark("1 cases", model_s=time.monotonic() - asked_at)
+                if (
+                    cases is None
+                    and getattr(conversation, "still_writing", False)
+                    and cases_slice < left_for_cases - 1.0
+                    # ...and there is time to be worth a second tab. Without
+                    # this the ceiling recreated the failure `_burning_backend`
+                    # was written for: a 40s deadline gives a 20s budget and a
+                    # 10s ceiling, and recovering there leases a second tab and
+                    # asks a second account for a whole program with ten
+                    # seconds on the clock, arriving at the same empty answer
+                    # having spent someone's quota to get there.
+                    #
+                    # `EMPTY_HANDED_FLOOR_S` is the number this file already
+                    # uses for exactly this question -- is another ask worth it
+                    # while holding NOTHING -- and its argument applies here
+                    # unchanged: a failed extra ask costs nothing that was not
+                    # already lost, so the floor is the mechanical minimum.
+                    and budget - (time.monotonic() - started) >= EMPTY_HANDED_FLOOR_S
+                ):
+                    # OUR ceiling stopped it, not the deadline, and the model
+                    # is mid-answer rather than the tab being broken. The cases
+                    # are gone -- nothing is waited for and nothing partial is
+                    # kept, because half a bar is worse than none -- but the
+                    # SOLVE is not. What cannot happen is turn 2 going into
+                    # this conversation, which is still writing turn 1; so it
+                    # goes into a fresh one, and the program gets the half of
+                    # the budget this turn was not allowed to spend.
+                    #
+                    # This branch is the whole reason a ceiling is safe here.
+                    # Without it the ceiling would do exactly what the two
+                    # removed ones did: turn a slow cases turn into no answer.
+                    try:
+                        await conversation.close()
+                    except Exception:  # noqa: BLE001 - it may already be broken
+                        pass
+                    conversation = await self._open_within(budget, started, avoid)
+                    provider = best_provider = getattr(
+                        conversation, "provider", provider
+                    )
+                    phases.mark(f"open {provider or 'tab'}")
+                    cases = []
+                    print(
+                        f"[verify] the cases turn was still writing at its "
+                        f"{cases_slice:.0f}s share of the budget; dropping the "
+                        f"cases and asking a fresh conversation for the program "
+                        f"with {budget - (time.monotonic() - started):.0f}s left "
+                        f"— the program is the answer, the cases were only the "
+                        f"bar it would have been checked against"
+                    )
                 if cases is None:
                     # The tab could not be read, or the model was still writing.
                     # Sending turn 2 into it would queue behind an answer that

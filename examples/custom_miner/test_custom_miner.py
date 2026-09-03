@@ -8648,12 +8648,16 @@ def test_the_first_read_gets_the_deadline_the_validator_actually_advertised():
     )
     # Defaults on purpose: this is what an operator who has tuned nothing gets.
     asyncio.run(VerifyingSolver(_Fleet()).solve_task(task, timeout_s=300.0))
-    # slices[0] is the cases turn, and it reads against the SOLVE's clock like
-    # everything else -- no private cap. What it actually spends is decided by
-    # when the model finishes, not by an allocation.
-    assert slices[0] > 230.0, (
+    # slices[0] is the cases turn. It has a ceiling at `CASES_TURN_SHARE` of
+    # what is left -- see there for why that is not the cap this file removed
+    # twice -- but a ceiling is not a spend: what it actually costs is decided
+    # by when the model finishes, which is what the program read below shows.
+    from solvers.verify import CASES_TURN_SHARE
+
+    assert 230.0 * CASES_TURN_SHARE < slices[0] <= 300.0 * CASES_TURN_SHARE + 1.0, (
         f"the cases turn was given {slices[0]:.0f}s of a 300s deadline; it is "
-        f"supposed to read against the whole budget"
+        f"supposed to get its share of the budget and no more, and not so "
+        f"little that a thinking model is cut off"
     )
     slices = slices[1:]
     assert slices[0] > 230.0, (
@@ -10921,11 +10925,32 @@ def test_the_cases_turn_does_not_shrink_the_read_the_program_gets():
 
     So the guarantee is arithmetic, not allocation: turn 2 opens on what the
     clock says is left, and the elapsed cases turn is the only thing that took
-    any of it."""
+    any of it.
+
+    Turn 1 now has a CEILING at `CASES_TURN_SHARE` of what is left, and that is
+    not the cap this test was written to refuse. The two removed caps converted a
+    slow cases turn into no answer, because a conversation still writing turn 1
+    could not take turn 2 and `_attempt` abandoned the pass. A cases turn that
+    hits the ceiling now drops its cases and asks a FRESH conversation for the
+    program, so what the ceiling costs is the grading bar and never the answer —
+    which is the trade the payment policy does allow. Measured live before it
+    existed: the cases turn averaged 97.2s against the program's 66.7s, took 54%
+    of the mean solve, and once took 197.9s of 290s, after which the program was
+    cut off mid-write and a truncated Rust program went out for zero.
+
+    What this test still refuses is a ceiling that eats the PROGRAM's read.
+    """
+    from solvers.verify import CASES_TURN_SHARE
+
     _, slices, caps, _ = _two_turn(300.0, [_CASES_ONLY, _RIGHT_PROGRAM])
-    assert slices[0] > 230.0, (
-        f"the cases turn was allocated {slices[0]:.0f}s of a 300s deadline — it "
-        f"is supposed to read against the whole budget, not a share of it"
+    assert slices[0] <= 300.0 * CASES_TURN_SHARE + 1.0, (
+        f"the cases turn was allocated {slices[0]:.0f}s of a 300s deadline, more "
+        f"than its {CASES_TURN_SHARE:.0%} share — the turn that produces the "
+        f"answer is supposed to keep the rest"
+    )
+    assert slices[0] > 100.0, (
+        f"the cases turn got only {slices[0]:.0f}s; a model that thinks before "
+        f"it writes needs longer than that — 77s was measured on a live tab"
     )
     # A fast cases turn costs the program almost nothing: these fakes reply
     # instantly, so turn 2 still opens on essentially the whole budget.
@@ -10960,12 +10985,24 @@ def test_every_deadline_asks_for_the_cases_first():
         )
         assert "<must_pass" in prompts[1], "turn 2 must restate the cases"
         assert answer.code, f"no program came back at a {deadline:.0f}s deadline"
-        # And turn 1 is allocated the whole budget at every size — the ceiling
-        # never scales down, only what the model actually spends does.
-        assert slices[0] > slices[1], (
-            f"turn 1 got {slices[0]:.0f}s and turn 2 {slices[1]:.0f}s at a "
-            f"{deadline:.0f}s deadline; turn 1 is allocated everything left"
-        )
+        # And where the ceiling applies, the turn that produces the ANSWER is
+        # never given less than the turn that produces the bar it would be
+        # checked against. That ordering used to run the other way -- turn 1
+        # was allocated everything left -- and measured live it made the cases
+        # turn 54% of the mean solve.
+        #
+        # Where it does NOT apply -- a budget too small for half of it to be a
+        # program turn -- turn 1 still reads against everything, exactly as
+        # before, because there the ceiling would cost the answer rather than
+        # protect it. Both halves are the same rule seen from two sizes.
+        from solvers.verify import CASES_TURN_SHARE, PROGRAM_TURN_FLOOR_S
+
+        if slices[0] * (1.0 - CASES_TURN_SHARE) >= PROGRAM_TURN_FLOOR_S:
+            assert slices[1] >= slices[0], (
+                f"turn 1 got {slices[0]:.0f}s and turn 2 only {slices[1]:.0f}s "
+                f"at a {deadline:.0f}s deadline; the cases are an optimisation "
+                f"and the program is the answer"
+            )
 
 
 def _burning_backend(deadline, cases_burns_s):
@@ -12203,7 +12240,14 @@ def test_the_cases_turn_can_wait_out_a_model_that_is_still_thinking():
 
     Measured on a live tab: 77 seconds of thinking before a character appeared,
     against a 60 second cap. Turn 1 timed out, the conversation was unusable,
-    and the pass was handed on."""
+    and the pass was handed on.
+
+    Turn 1 now stops at `CASES_TURN_SHARE` of what is left, which is comfortably
+    past that measured think — and the second half of this test is the reason a
+    ceiling is safe at all now. Thinking PAST the ceiling no longer ends the
+    solve: the cases are dropped, a fresh conversation is opened, and the
+    program still goes out. What the ceiling costs is the grading bar; what the
+    two removed caps cost was the answer."""
     log, answer = _thinking_backend(77.0)
 
     turns = [t for t, _, _ in log]
@@ -12213,11 +12257,20 @@ def test_the_cases_turn_can_wait_out_a_model_that_is_still_thinking():
         f"the cases turn stops at {hard_s:.0f}s, under a measured think of 77s: "
         f"a thinking model is cut off and the turn is lost"
     )
-    # Not "a bigger cap" — no cap. Turn 1 reads against the solve's clock.
-    assert hard_s > 230.0, (
-        f"the cases turn is still capped at {hard_s:.0f}s of a 300s deadline"
-    )
     assert answer.code, "no program was submitted"
+
+    # And past the ceiling: the cases go, the answer does not. This is the case
+    # the two removed caps got wrong, and the only reason this one is allowed.
+    for think in (160.0, 200.0):
+        log, answer = _thinking_backend(think)
+        assert [t for t, _, _ in log][:2] == ["CASES", "CODE"], (
+            f"thinking for {think:.0f}s cost the program turn entirely"
+        )
+        assert answer.code, (
+            f"a model that thought for {think:.0f}s — past the cases turn's "
+            f"share — submitted nothing at all, which is the exact trade the "
+            f"payment policy forbids"
+        )
 
 
 def test_a_cases_turn_that_costs_a_pass_does_not_cost_every_pass():
