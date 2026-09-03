@@ -233,6 +233,25 @@ def fit_response(payload: SolutionPayload, limit: Optional[int] = None) -> Solut
 RESPONSE_GRACE_S = float(os.environ.get("MINER_RESPONSE_GRACE_S", "5"))
 
 
+def response_grace_s() -> float:
+    """The grace in force NOW, so a value written in `.env` is honoured.
+
+    The constant above is read when this module is imported, and both live
+    entry points import it BEFORE `load_miner_env` has promoted `.env` into
+    the environment -- so a `.env` value applied to the rehearsal (which
+    loads first) and not to the miner it was rehearsing. Read at request
+    time, the two agree. The constant stays as the default and as what the
+    tests set.
+    """
+    raw = os.environ.get("MINER_RESPONSE_GRACE_S", "").strip()
+    if not raw:
+        return RESPONSE_GRACE_S
+    try:
+        return float(raw)
+    except ValueError:
+        return RESPONSE_GRACE_S
+
+
 class CustomMiner(DemoMiner):
     """A DemoMiner whose answers come from your Solver instead of GLM."""
 
@@ -317,7 +336,7 @@ class CustomMiner(DemoMiner):
             return 400, {"error": "invalid task request"}
 
         timeout_s = min(
-            request.deadline_s + max(0.0, RESPONSE_GRACE_S),
+            request.deadline_s + max(0.0, response_grace_s()),
             self.settings.glm_request_timeout_s,
         )
 

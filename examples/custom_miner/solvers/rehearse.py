@@ -153,6 +153,27 @@ def _from_archive(path: str) -> list[Problem]:
     return [_from_file(str(f)) for f in files]
 
 
+def _warn_if_replaying_the_archive(path: str) -> None:
+    """Say so when `--from` points INTO the archive the miner writes.
+
+    Every replayed solve archives its answer and its exchange under the same
+    stem it was read from, so a replay of `solutions/` rewrites `solutions/`.
+    The file is read in full before the solve, so the run itself is fine;
+    what is lost is the record of what the miner did the first time.
+    """
+    from solution_archive import archive_dir
+
+    where = archive_dir()
+    if where is None:
+        return
+    source = Path(path).expanduser().resolve()
+    target = where.expanduser().resolve()
+    if source == target or source.parent == target:
+        print(f"[rehearse] NOTE: replaying from the archive itself ({target}); "
+              f"each replay overwrites the archived answer and exchange it "
+              f"reads. Copy the directory first to keep the originals.")
+
+
 def _from_file(path: str) -> Problem:
     """Replay a request the miner has already been sent.
 
@@ -255,7 +276,7 @@ def _stand_in_validator():
     return "rehearsal-validator"
 
 
-async def _answer(miner, request: TaskRequest, timeout_s: float):
+async def _answer(miner, request: TaskRequest):
     """Put the request through the miner's own HTTP handler.
 
     Signed, because that is how it arrives: this way the rehearsal also proves
@@ -480,6 +501,7 @@ async def run(
         problems = _from_challenges(which, args.examples, args.timeout)
     elif args.source_file:
         problems = _from_archive(args.source_file)
+        _warn_if_replaying_the_archive(args.source_file)
     elif args.lease:
         problems = [await _from_lease(args.insecure)]
     else:
@@ -506,7 +528,7 @@ async def run(
         try:
             warming = time.monotonic()
             await warm_up(solver, settings.miner_max_concurrent_requests)
-            print(f"[rehearse] browsers ready in {time.monotonic() - warming:.1f}s "
+            print(f"[rehearse] backend ready in {time.monotonic() - warming:.1f}s "
                   f"at {datetime.now():%H:%M:%S}")
         except Exception as exc:  # noqa: BLE001 - no fleet is not a wrong answer
             # The fleet says what is wrong and how to fix it -- `_fill` names
@@ -514,7 +536,7 @@ async def run(
             # traceback on top of that buries the one line worth reading, and
             # an operator who has not started Chrome yet is the likeliest
             # person ever to run this.
-            print(f"\n[rehearse] COULD NOT BE CHECKED: no browser to solve with.\n"
+            print(f"\n[rehearse] COULD NOT BE CHECKED: no backend to solve with.\n"
                   f"           {_one_line(exc, limit=400)}")
             return 2
         # Where `run_miner.py` puts it, and for its reason: neither Rust check
@@ -589,12 +611,20 @@ async def _rehearse_one(miner, problem: Problem, settings, args) -> tuple[str, s
         print(request.statement.strip())
         print("-" * 72)
 
-    timeout_s = min(request.deadline_s, settings.glm_request_timeout_s)
+    # The same cutoff `handle_request` applies, so the line below says what
+    # the miner was actually held to.
+    from custom_miner import response_grace_s
+
+    cutoff_s = min(
+        request.deadline_s + max(0.0, response_grace_s()),
+        settings.glm_request_timeout_s,
+    )
     sent_at = datetime.now()
     print(f"[rehearse] request sent {sent_at:%H:%M:%S}")
-    status, payload, spent = await _answer(miner, request, timeout_s)
+    status, payload, spent = await _answer(miner, request)
     print(f"[rehearse] the miner answered {status} in {spent:.1f}s "
-          f"at {datetime.now():%H:%M:%S} (its budget was {timeout_s:g}s)")
+          f"at {datetime.now():%H:%M:%S} (it would have cut itself off at "
+          f"{cutoff_s:g}s: the {request.deadline_s:g}s deadline plus its grace)")
     if status != 200:
         print(f"[rehearse] FAILED: {payload}")
         return FAILED, f"the miner answered {status}"

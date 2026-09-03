@@ -133,13 +133,14 @@ PAIR_HOLD_S = 300.0
 # is enough to notice one without spending turns on a seat that is not there.
 AUTH_HOLD_S = 1800.0
 
-# How many of the CLI's OWN retries a turn sits through before the model is
-# declared out. The CLI retries an overloaded or failing request itself, with
-# a growing delay between attempts, and each retry is reported on the stream
-# as a `system/api_retry` event carrying the HTTP status. The first retry is
-# ordinary weather. The second means three requests have failed in a row and
-# the next wait is already seconds long: a different model will answer sooner
-# than this one will.
+# The retry event, counted from one, at which the model is declared out. The
+# CLI retries an overloaded or failing request itself, with a growing delay
+# between attempts, and each retry is reported on the stream as a
+# `system/api_retry` event carrying the HTTP status. The first such event is
+# ordinary weather and its wait is paid. The second means three requests have
+# failed in a row and the next wait is already seconds long: a different model
+# will answer sooner than this one will. Counted HERE, per turn, rather than
+# read off the event's own `attempt` field, whose base is the CLI's business.
 API_RETRIES_TOLERATED = 2
 
 # A single announced retry wait this long is a wait this turn cannot afford
@@ -439,8 +440,10 @@ class CliConversation:
         self.still_writing = False
         self.empty_reason: Optional[str] = None
         self.hops = 0
-        # What the CLI's `result` said went wrong, this turn.
+        # What the CLI's `result` said went wrong, this turn, and how many
+        # retries it has reported this turn.
         self._turn_error: Optional[str] = None
+        self._retries = 0
 
     @property
     def model(self) -> str:
@@ -584,6 +587,7 @@ class CliConversation:
         """
         started = time.monotonic()
         self._turn_error = None
+        self._retries = 0
         errfile = None
         try:
             # stderr goes to a FILE, not a pipe. A pipe is read only after
@@ -670,6 +674,17 @@ class CliConversation:
         stderr = self._read_stderr(errfile) or self._turn_error or ""
         if proc.returncode:
             self._backend.last_error = stderr or f"exit {proc.returncode}"
+        if body and (self._turn_error or proc.returncode):
+            # Text arrived and THEN the turn failed -- the connection broke
+            # mid-answer and the CLI gave up. What arrived is a fragment of a
+            # reply, not the reply, and is reported the way a turn cut off by
+            # the clock is: kept, and marked unfinished, so the repair loop
+            # does not ask the model to fix what it never finished saying.
+            self.still_writing = True
+            print(f"[cli] {self.provider} failed after {len(body)} character(s) "
+                  f"had arrived ({self._backend.last_error or 'error'}); "
+                  f"keeping them as an unfinished reply")
+            return self._verdict(body, "partial")
         if body:
             return self._verdict(body, "ok")
         if not proc.returncode:
@@ -849,8 +864,9 @@ class CliConversation:
         """
         if chunks:
             del chunks[:]
+        self._retries += 1
         status = _number(event.get("error_status"))
-        attempt = int(_number(event.get("attempt")) or 0)
+        attempt = self._retries
         delay_ms = _number(event.get("retry_delay_ms")) or 0.0
         error = str(event.get("error") or "")
         self._backend.last_error = f"retry {attempt}: {error or status or 'error'}"
@@ -1345,10 +1361,11 @@ class CliBackend:
                       f"it that account's solves move to the next seat, or fail.")
         # A turn the subscription's window no longer covers, running on the
         # plan's paid extra usage. Allowed through only on request; otherwise
-        # it is the limit, and treated exactly as one.
+        # it is the limit, and treated exactly as one -- for the whole seat,
+        # whatever window the event named, because extra usage is the seat's:
+        # a hop to another model on it would start a metered request.
         if overage and not self.allow_overage:
-            if not limited:
-                limited, scope = True, "*"
+            limited, scope = True, "*"
             reason = ("the subscription window is spent and extra usage is "
                       "not enabled")
         else:
