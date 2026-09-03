@@ -41,7 +41,6 @@ from typing import Any, Optional, Protocol
 from rlvr.types import TestCase
 
 from .prompts import (
-    MAX_SELF_TESTS,
     build_code_prompt,
     build_repair_prompt,
     build_resume_prompt,
@@ -1512,6 +1511,13 @@ class VerifyingSolver:
                 cases = await self._ask_for_cases(
                     conversation, task, cases_slice
                 )
+                # Re-read after EVERY turn, here and below: a backend may move
+                # a conversation to another model or seat inside a turn (the
+                # CLI ladder does), and `provider` bound at open would then
+                # credit the answer to the pair that refused it -- and, passed
+                # back as `avoid`, ask "anyone but the refuser" when the ask
+                # was "anyone but the one that just answered".
+                provider = getattr(conversation, "provider", provider)
                 phases.mark("1 cases", model_s=time.monotonic() - asked_at)
                 if (
                     cases is None
@@ -1809,6 +1815,7 @@ class VerifyingSolver:
                 # extend into.
                 round_started = time.monotonic()
                 reply = await conversation.send(prompt, max(1.0, left))
+                provider = getattr(conversation, "provider", provider)
                 # How long the round trip actually took. Used only by the
                 # duplicate branch below, and only to tell a model from a tab.
                 round_s = time.monotonic() - round_started
@@ -1871,9 +1878,9 @@ class VerifyingSolver:
                     # anyway is that same round again, and accepting it would
                     # make the withdrawal a sentence rather than a rule.
                     print(
-                        f"[verify] the cases came back again after the prompt "
-                        f"stopped offering them; keeping the bar as it stands — "
-                        f"this round was asked for the program"
+                        "[verify] the cases came back again after the prompt "
+                        "stopped offering them; keeping the bar as it stands — "
+                        "this round was asked for the program"
                     )
                     revised = []
                 if revised:
@@ -2101,7 +2108,7 @@ class VerifyingSolver:
                         f"[verify] {provider or 'this model'} returned nothing and "
                         f"the conversation is {reason}; "
                         + (
-                            f"submitting the answer already in hand"
+                            "submitting the answer already in hand"
                             if best is not None and best.code.strip()
                             else "asking elsewhere"
                         )
