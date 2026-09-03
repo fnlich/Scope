@@ -41,7 +41,6 @@ from typing import Any, Optional, Protocol
 from rlvr.types import TestCase
 
 from .prompts import (
-    MAX_SELF_TESTS,
     build_code_prompt,
     build_repair_prompt,
     build_resume_prompt,
@@ -1879,9 +1878,9 @@ class VerifyingSolver:
                     # anyway is that same round again, and accepting it would
                     # make the withdrawal a sentence rather than a rule.
                     print(
-                        f"[verify] the cases came back again after the prompt "
-                        f"stopped offering them; keeping the bar as it stands — "
-                        f"this round was asked for the program"
+                        "[verify] the cases came back again after the prompt "
+                        "stopped offering them; keeping the bar as it stands — "
+                        "this round was asked for the program"
                     )
                     revised = []
                 if revised:
@@ -2109,7 +2108,7 @@ class VerifyingSolver:
                         f"[verify] {provider or 'this model'} returned nothing and "
                         f"the conversation is {reason}; "
                         + (
-                            f"submitting the answer already in hand"
+                            "submitting the answer already in hand"
                             if best is not None and best.code.strip()
                             else "asking elsewhere"
                         )
