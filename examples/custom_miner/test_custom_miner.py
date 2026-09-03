@@ -11573,6 +11573,49 @@ class _BatchExecutor:
         return [_R() for _ in tests]
 
 
+def test_the_solve_always_finishes_before_the_miner_answers_504():
+    """The arithmetic nobody re-checks after changing a constant, and every one
+    of these numbers has been changed this week.
+
+    A 504 is a total loss -- indistinguishable from a dead miner, and worth
+    exactly zero -- so the whole chain has to close: the solve's budget, plus
+    everything that can run PAST it, must land inside the cutoff
+    `handle_request` cancels at. Two things run past it, and both are bounded
+    rather than assumed:
+
+      * the post-slice tail of the last read (copy control, network stream,
+        post-mortem), scaled by `tail_budget` to the slice it followed;
+      * one grading overrun, which is now at most `MIN_CASE_TIMEOUT_S` because a
+        short clock shortens the per-case timeout instead of spending the full
+        one on the last case.
+
+    The loop will not START a round below `ROUND_TRIP_FLOOR_S`, so that is the
+    largest slice the last read can be given.
+    """
+    from solvers.browser_pool import tail_budget
+    from solvers.verify import (
+        DELIVERY_RESERVE_S, MIN_CASE_TIMEOUT_S, ROUND_TRIP_FLOOR_S,
+    )
+    from custom_miner import RESPONSE_GRACE_S
+
+    for deadline in (30.0, 60.0, 300.0, 600.0):
+        cutoff = deadline + RESPONSE_GRACE_S            # the wait_for in handle_request
+        budget = cutoff - DELIVERY_RESERVE_S            # what solve_task may spend
+        if budget <= 5.0:                               # solve_task's own fallback
+            budget = max(1.0, cutoff * 0.5)
+        worst = budget + tail_budget(ROUND_TRIP_FLOOR_S) + MIN_CASE_TIMEOUT_S
+        assert worst < cutoff, (
+            f"deadline={deadline:g}: the worst-case solve ends at {worst:.1f}s "
+            f"but the miner cancels itself at {cutoff:.1f}s — that is a 504, "
+            f"which pays exactly zero and looks identical to a dead miner"
+        )
+        # And inside the validator's own window, which is the one that pays.
+        assert worst < deadline + 10.0, (
+            f"deadline={deadline:g}: worst case {worst:.1f}s is past the "
+            f"validator's {deadline + 10:.0f}s cutoff"
+        )
+
+
 def test_a_short_budget_buys_time_per_case_not_fewer_cases():
     """The reported failure: eighteen Rust cases, eight seconds, five graded.
 
