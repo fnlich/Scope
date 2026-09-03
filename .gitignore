@@ -19,10 +19,20 @@ venv/
 /data/
 /build
 
-# A local rehearsal's output. `solvers.rehearse --solutions --log` writes the
-# answers and the run log here, and neither is repository content. The 43
-# archived submissions already committed under solutions/ stay tracked -- git
-# ignores untracked files, never tracked ones -- so the regression fixture they
-# form is unaffected.
+# A local rehearsal's output, and a live miner's. `solvers.rehearse` and
+# `run_miner.py` write answers and run logs here, and neither is repository
+# content. Anything already committed under these paths stays tracked -- git
+# ignores untracked files, never tracked ones -- so a regression fixture formed
+# from archived submissions is unaffected.
+#
+# BOTH paths, and the second is the one that matters. `SOLVER_SOLUTION_DIR`
+# defaults to the relative "solutions", resolved against the WORKING DIRECTORY,
+# and both entry points are run from examples/custom_miner -- so a live miner
+# archives beside itself, not at the repository root. Only the root path was
+# ignored, which is the one nothing writes to: every real solve left two
+# untracked files in the other, and an operator following the prompt to commit
+# them would have put their own submissions into the repository.
 /solutions/
 /logs/
+/examples/custom_miner/solutions/
+/examples/custom_miner/logs/
