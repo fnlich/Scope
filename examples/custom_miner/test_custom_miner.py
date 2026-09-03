@@ -9507,10 +9507,28 @@ def test_the_post_read_tail_never_outlives_the_read_it_rescues():
     outlived the whole request."""
     from solvers.browser_pool import (
         FULL_TAIL_S, COPY_PHASE_TIMEOUT_S, STREAM_PHASE_TIMEOUT_S,
-        POSTMORTEM_TIMEOUT_S, tail_budget,
+        SALVAGE_PHASE_TIMEOUT_S, POSTMORTEM_TIMEOUT_S, tail_budget,
     )
+    from solvers.verify import DELIVERY_RESERVE_S
 
-    assert FULL_TAIL_S == COPY_PHASE_TIMEOUT_S + STREAM_PHASE_TIMEOUT_S + POSTMORTEM_TIMEOUT_S
+    # EVERY phase, and the point of naming them is that a phase without a slice
+    # runs outside the promise. The prose salvage arrived that way and spent
+    # `STREAM_TIMEOUT_MS` beside the tail rather than inside it — measured, a
+    # constant +2.0s at every slice, which at a 5-second slice made the tail
+    # 180% of its own budget. It has a slice now, taken out of the stream phase
+    # rather than added to the total.
+    assert FULL_TAIL_S == (
+        COPY_PHASE_TIMEOUT_S + STREAM_PHASE_TIMEOUT_S
+        + SALVAGE_PHASE_TIMEOUT_S + POSTMORTEM_TIMEOUT_S
+    )
+    # And the total is what `DELIVERY_RESERVE_S` was sized to absorb. Growing it
+    # spends a reserve that also has to cover the last grade, the tab close and
+    # the archive-and-sign — and overrunning does not deliver the answer late,
+    # it answers 504 and throws away an answer already in hand.
+    assert FULL_TAIL_S < DELIVERY_RESERVE_S, (
+        f"the post-read tail ({FULL_TAIL_S}s) no longer fits inside the "
+        f"delivery reserve ({DELIVERY_RESERVE_S}s)"
+    )
     # Unchanged wherever there is room — which is every read in production.
     for generous in (22.0, 34.0, 238.0, 3600.0):
         assert tail_budget(generous) == FULL_TAIL_S

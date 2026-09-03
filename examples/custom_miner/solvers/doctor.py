@@ -250,6 +250,68 @@ async def run(name: str, cdp: str, probe: bool) -> int:
         await pw.stop()
 
 
+async def _report_copy_control(tab, site: Site) -> None:
+    """Say what the copy control actually is on this page, or why there is none.
+
+    The one role the doctor never looked at, and the miner's own warning sent
+    people here to check it: "the control may have been renamed. Run `python -m
+    solvers.doctor <site>`". That command never queried `site.copy` at all, so
+    the page could be fully renamed and the doctor still printed OK. The
+    warning named a remedy that could not observe the thing it named.
+
+    Reported, never fatal. A missing copy control is a documented degradation --
+    the DOM read carries on without it -- so this says what it found and leaves
+    `healthy` alone.
+
+    The two conditions are exactly the ones `_copied_blocks` tests: does any
+    `site.copy` selector match inside the reply, and does the button's own name
+    contain `site.copy_name` casefolded. Reporting anything else would be
+    describing a different check from the one that runs.
+    """
+    if not site.copy:
+        print(f"[doctor] copy control: not configured for {site.name}; the DOM "
+              f"read is the only source of a block's text here.")
+        return
+    try:
+        reply = await tab._new_reply((0, None))
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not raise
+        print(f"[doctor] copy control: could not re-find the reply ({exc}).")
+        return
+    if reply is None:
+        print("[doctor] copy control: no reply node to look inside, so nothing "
+              "can be said about it.")
+        return
+    for selector in site.copy:
+        try:
+            found = reply.locator(selector)
+            count = await found.count()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[doctor] copy control: {selector!r} could not be queried ({exc}).")
+            continue
+        if not count:
+            print(f"[doctor] copy control: {selector!r} matched nothing.")
+            continue
+        print(f"[doctor] copy control: {selector!r} matched {count} button(s).")
+        for i in range(count):
+            try:
+                button = found.nth(i)
+                name = await button.get_attribute("aria-label") or await button.inner_text()
+            except Exception:  # noqa: BLE001
+                name = None
+            ok = site.copy_name in (name or "").casefold()
+            print(f"           #{i} name={name!r} — "
+                  + (f"matches {site.copy_name!r}, this one gets pressed"
+                     if ok else
+                     f"does NOT contain {site.copy_name!r}, so nothing is "
+                     f"pressed and the DOM read is used instead. Set "
+                     f"{site.env_prefix}_COPY_NAME if the UI is in another "
+                     f"language, or {site.env_prefix}_COPY if it was renamed."))
+        return
+    print(f"[doctor] copy control: none of {list(site.copy)} matched inside the "
+          f"reply. Either this page has no copy button on a code block, or the "
+          f"selector drifted — set {site.env_prefix}_COPY.")
+
+
 async def _probe(page, site: Site, composer: str, busy) -> bool:
     """Send a real prompt through the real read path."""
     from .browser_pool import _Tab
@@ -271,6 +333,7 @@ async def _probe(page, site: Site, composer: str, busy) -> bool:
         _Solo(), page, None, "probe", replace(site, busy=busy), composer=composer
     )
     reply = await tab.send(PROBE, 120.0)
+    await _report_copy_control(tab, site)
     await _report_sources(tab, site)
     if not reply.strip():
         print("[doctor] !! the probe read nothing back. The assistant selector or the")

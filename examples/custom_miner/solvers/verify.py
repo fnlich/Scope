@@ -205,6 +205,14 @@ class Candidate:
     # the cases" indistinguishable from "the model never sent any", and the
     # warning in `solve_task` said the second when the truth was the first.
     self_cases: int = 0
+    # How many of `self_total` actually RAN. They differ when the budget cut a
+    # run short, and without this the two are indistinguishable in the one line
+    # an operator reads: `self=5/18` says five passed, and leaves them to assume
+    # the other thirteen failed when in fact nobody looked at them. Kept beside
+    # the counts rather than folded into them because `total` is deliberately
+    # the full suite -- an unrun case is unknown, which is neither a pass nor a
+    # failure, and that is exactly what keeps `self_verified` false.
+    self_observed: int = 0
     # This reply is part of a program rather than a program: it uses something
     # only the round above it defined. Kept beside `defect` rather than folded
     # into it because `_supersedes` has to tell this apart from every other way
@@ -487,6 +495,7 @@ def _inherit_evidence(candidate: Candidate, prior: Candidate) -> None:
         # doing it.
         candidate.passed, candidate.total = prior.passed, prior.total
         candidate.self_passed, candidate.self_total = prior.self_passed, prior.self_total
+        candidate.self_observed = prior.self_observed
         candidate.failures = list(prior.failures)
         # WITH the cases they came from. Splitting these was a silent hole: the
         # inherited `failures` built a repair prompt quoting concrete cases and
@@ -1336,7 +1345,16 @@ class VerifyingSolver:
             f"[verify] {task.language} entrypoint={task.entrypoint} "
             f"provider={won_with or 'none'} "
             f"examples={best.passed}/{best.total} "
-            + (f"self={best.self_passed}/{best.self_total} " if best.self_total else "")
+            + (
+                f"self={best.self_passed}/{best.self_total} "
+                + (
+                    f"({best.self_observed} ran, "
+                    f"{best.self_total - best.self_observed} never did) "
+                    if best.self_observed and best.self_observed < best.self_total
+                    else ""
+                )
+                if best.self_total else ""
+            )
             + f"verified={best.verified} "
             # `verified=False` is the only thing a live solve could ever print,
             # because no request ships public examples -- so on its own it said
@@ -2213,6 +2231,9 @@ class VerifyingSolver:
         if not total:
             return
         candidate.self_passed, candidate.self_total = passed, total
+        # Exact for THIS call: `check` counts every result as either a pass or
+        # a failure line, so the two together are what ran.
+        candidate.self_observed = passed + len(failures)
         candidate.from_self_tests = True
         # Only failures drive a repair. A clean run is left silent: it is the
         # ordinary outcome and saying so on every solve would bury the line

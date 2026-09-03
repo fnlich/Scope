@@ -128,10 +128,25 @@ COPY_TIMEOUT_MS = 1_500
 # 504 -- NOTHING -- when it is exceeded. Overrunning does not deliver the answer
 # late; it throws away an answer already in hand. 5 + 4 + 2 = 11 leaves the last
 # grade, the tab close, and the archive-and-sign on the way out the rest of it.
+# The split moves; the total does not.
 COPY_PHASE_TIMEOUT_S = 5.0
-STREAM_PHASE_TIMEOUT_S = 4.0
+STREAM_PHASE_TIMEOUT_S = 3.0
+# The prose salvage. It arrived without a slice of its own and simply ran after
+# the stream phase, so it spent `STREAM_TIMEOUT_MS` OUTSIDE everything the tail
+# promises: measured against a wedged page, a constant +2.0s at every slice,
+# which at a 5-second slice made the tail 180% of its own budget. Taken out of
+# the stream phase rather than added to the total, because the eleven seconds
+# below are what `DELIVERY_RESERVE_S` was sized against and growing them spends
+# a reserve somebody measured. The stream phase can afford it: its cost is one
+# `_streamed_markdown` (capped at `STREAM_TIMEOUT_MS`) plus a DOM refetch.
+SALVAGE_PHASE_TIMEOUT_S = 1.0
 POSTMORTEM_TIMEOUT_S = 2.0
-FULL_TAIL_S = COPY_PHASE_TIMEOUT_S + STREAM_PHASE_TIMEOUT_S + POSTMORTEM_TIMEOUT_S
+FULL_TAIL_S = (
+    COPY_PHASE_TIMEOUT_S
+    + STREAM_PHASE_TIMEOUT_S
+    + SALVAGE_PHASE_TIMEOUT_S
+    + POSTMORTEM_TIMEOUT_S
+)
 
 
 def tail_budget(timeout_s: float) -> float:
@@ -1042,17 +1057,32 @@ class _Tab:
     ) -> tuple[Optional[list[str]], Optional[list[str]]]:
         """What the copy control gives, and what the DOM shows, for comparison.
 
-        Returns ``(copied, rendered)``; ``rendered`` is only read when
-        ``copied`` is non-empty, so it is not fetched otherwise. Separated from
-        `send` for the same reason as `_open_turn`: it is three Playwright
-        calls that need ONE bound around them.
+        Returns ``(copied, rendered)``, and ``rendered`` carries THREE states
+        because the caller has three things to tell apart and used to have one:
+
+        * ``None``   -- there was no reply node at all. Nothing was asked of the
+          copy control, so nothing can be concluded about it.
+        * ``[]``     -- a reply, with no code block in it. There was no control
+          to click because there was nothing to copy.
+        * ``[...]``  -- a reply with code blocks on screen. If the copy control
+          gave nothing HERE, that is the selector drift this phase exists to
+          catch.
+
+        It used to be fetched only when ``copied`` was non-empty, which threw
+        away the one bit that separates those, and `send` then blamed the copy
+        control for all three. Measured against real Chromium: a blind tab and
+        a prose reply both printed "the control may have been renamed" about a
+        control that was working perfectly. The extra fetch costs 1.5-4.9ms
+        against a five-second allowance.
+
+        Separated from `send` for the same reason as `_open_turn`: it is three
+        Playwright calls that need ONE bound around them.
         """
         reply = await self._new_reply(before)
         if reply is None:
             return None, None
         copied = await self._copied_blocks(reply)
-        rendered = await self._dom_blocks(reply) if copied else None
-        return copied, rendered
+        return copied, await self._dom_blocks(reply)
 
     async def send(
         self, text: str, timeout_s: float, extend_to_s: Optional[float] = None
@@ -1441,7 +1471,22 @@ class _Tab:
                     # The page is not the only thing that can be finished, and
                     # on a tab that renders nothing at all it is not the thing
                     # that can be finished FIRST. See `_over_the_wire`.
-                    if await _over_the_wire():
+                    # Bounded by what is left of the READ, not merely by
+                    # `_streamed_markdown`'s own cap. Unbounded it could return
+                    # `STREAM_TIMEOUT_MS` past `deadline` on a page whose
+                    # `evaluate` wedges -- measured, a 3.0s slice returning at
+                    # 4.13s -- and the read loop's whole contract is that it
+                    # stops when it says it will.
+                    try:
+                        finished = await asyncio.wait_for(
+                            _over_the_wire(),
+                            timeout=max(0.05, min(remaining, STREAM_TIMEOUT_MS / 1000)),
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 - a reading, never fatal
+                        finished = False
+                    if finished:
                         print(
                             f"[{self.site.name}] tab {self.label} rendered nothing in "
                             f"{time.monotonic() - submitted_at:.0f}s, but the answer "
@@ -1567,13 +1612,39 @@ class _Tab:
                             f"reason, this line is where to look."
                         )
                 best = "\n".join(self._fence(b) for b in copied)
-            elif not self._warned_copy:
+            elif rendered and not self._warned_copy:
+                # `rendered` non-empty is the whole of the discriminator, and
+                # without it this line was a false accusation on the two shapes
+                # this file is built around. A blind tab has no reply node; a
+                # prose reply has no code block; neither asked anything of the
+                # copy control, and both printed "the control may have been
+                # renamed" about a control that was working. Measured against
+                # real Chromium, all four states:
+                #
+                #   blind, nothing rendered      copied=None  blocks=0  warned
+                #   prose reply, no code block   copied=None  blocks=0  warned
+                #   code block, control works    copied=[..]  blocks=1  silent
+                #   code block, control renamed  copied=None  blocks=1  warned
+                #
+                # Only the last is what the sentence says. And because
+                # `_warned_copy` latches for the life of the tab and is never
+                # reset, a blind first send used to spend the warning outright
+                # -- so a genuine rename on the same tab was then SILENT, which
+                # is the one case worth hearing about.
+                #
+                # Deliberately NOT gated on `best`: `best` comes from `_read`,
+                # which needs `pre code` to have matched, so it is empty in
+                # exactly the failure the copy control exists to rescue -- the
+                # DOM moved and the selectors stopped matching. Gating on it
+                # would silence the true positive.
                 self._warned_copy = True
                 print(
-                    f"[{self.site.name}] note: tab {self.label} could not use the "
-                    f"code block's copy control, falling back to reading the DOM. "
-                    f"Run `python -m solvers.doctor {self.site.name}` if answers "
-                    f"start arriving mangled — the control may have been renamed."
+                    f"[{self.site.name}] note: tab {self.label} shows "
+                    f"{len(rendered)} code block(s) but its copy control gave "
+                    f"nothing back, so the answer was read off the DOM instead. "
+                    f"That is what a renamed control looks like. Run `python -m "
+                    f"solvers.doctor {self.site.name} --probe` to see which "
+                    f"selectors matched."
                 )
         if self.site.stream:
             try:
@@ -1610,15 +1681,35 @@ class _Tab:
             # whose items carry `expected`, and cases rather than a program --
             # so the reasoning-as-a-program failure the None rule exists to
             # prevent cannot come back through here.
-            salvaged = _salvage_case_array(last_whole or "")
-            where = "the page"
-            if not salvaged:
+            async def _salvage():
+                """The two sources, page first. Returns (text, where) or (None, "")."""
+                found = _salvage_case_array(last_whole or "")
+                if found:
+                    return found, "the page"
                 # Only if the page had none: a blind tab renders nothing at all,
                 # and the wire is the only place the reply exists. Fetched here
                 # rather than beside the page reading so a successful salvage
                 # does not pay for a stream read it does not need.
-                salvaged = _salvage_case_array(await self._streamed_markdown() or "")
-                where = "the network stream"
+                return (
+                    _salvage_case_array(await self._streamed_markdown() or ""),
+                    "the network stream",
+                )
+
+            # Inside a slice of the tail, like every other phase out here. It
+            # used to run beside them with no clock of its own, and
+            # `_streamed_markdown`'s own cap is not the same promise: measured
+            # against a wedged page, a constant +2.0s past `tail_budget` at
+            # every slice. `DELIVERY_RESERVE_S` is what absorbs this tail, and
+            # a 504 does not deliver an answer late -- it throws away one
+            # already in hand.
+            try:
+                salvaged, where = await asyncio.wait_for(
+                    _salvage(), timeout=SALVAGE_PHASE_TIMEOUT_S * tail
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a rescue, never a failure
+                salvaged, where = None, ""
             if salvaged:
                 print(
                     f"[{self.site.name}] tab {self.label} answered with test cases "
