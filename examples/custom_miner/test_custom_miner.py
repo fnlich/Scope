@@ -13408,6 +13408,12 @@ def test_a_signed_out_account_found_mid_run_is_set_aside(tmp_path, monkeypatch):
     assert classify("Rate limit reached, resets at 5pm") == "limit"
     assert classify("No conversation found with session ID: 3f0e") is None
     assert classify("") is None
+    # A three-digit number is a status only beside a word that makes it one.
+    # Each of these once parked a model or a seat.
+    assert classify("    at Object.<anonymous> (/opt/cli.js:512:98765)") is None
+    assert classify("request took 503 ms and was aborted") is None
+    assert classify("127.0.0.1:401 refused the tunnel") is None
+    assert classify("HTTP 500") == "server" and classify("status 429") == "limit"
 
     log = _fake_cli(tmp_path, monkeypatch, backups=1)
     _cli_modes(log, {"default": "unauth", "*": "ok"})
@@ -13437,6 +13443,54 @@ def test_the_status_command_names_each_account(tmp_path, monkeypatch, capsys):
 
     _cli_modes(log, {"*": "ok"})
     assert claude_cli.main(["status"]) == 0
+
+
+def test_the_operators_opinion_model_answers_at_the_default_effort(
+    tmp_path, monkeypatch
+):
+    """With `SOLVER_CLI_MODELS=opus,sonnet` the ladder holds sonnet twice --
+    the emergency rung at high effort and the operator's opinion rung at the
+    default -- and a second opinion is the operator's rung, as documented."""
+    from solvers.claude_cli import CliBackend, Profile
+
+    _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOLVER_CLI_MODELS", "opus,sonnet")
+    backend = CliBackend()
+    assert backend.pick(avoid="cli:opus")[1] == Profile("sonnet", "low")
+    # An unexplained failure elsewhere does not turn an opinion request into
+    # a retry on the pair it named.
+    backend.note_failure(backend.accounts[0], "opus")
+    assert backend.pick(avoid="cli:opus")[1].model != "opus"
+
+
+def test_a_spent_seat_window_widens_a_limit_reported_on_one_model(
+    tmp_path, monkeypatch
+):
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch)
+    backend = CliBackend()
+    info = {"status": "rejected", "rateLimitType": "seven_day_opus",
+            "resetsAt": time.time() + 3600,
+            "unifiedWindows": {"five_hour": {"utilization": 1.0,
+                                             "resetsAt": time.time() + 600}}}
+    assert backend.note_rate_limit(info, "sonnet") is True
+    assert backend.limited_for("sonnet") > 0, "the whole seat is spent"
+
+
+def test_an_empty_model_name_is_refused_at_launch(tmp_path, monkeypatch):
+    """`:high` would have made `Profile("", "high")`, and an empty name
+    matches every model in the outage table -- one refusal parked them all."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:high,:low")
+    with pytest.raises(SystemExit):
+        CliBackend()
+    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:high")
+    monkeypatch.setenv("SOLVER_CLI_MODELS", "opus,son net")
+    with pytest.raises(SystemExit):
+        CliBackend()
 
 
 def test_the_cli_summary_names_the_ladder(tmp_path, monkeypatch):

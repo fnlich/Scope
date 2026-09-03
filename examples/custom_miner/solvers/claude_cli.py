@@ -170,7 +170,11 @@ _SERVER_MARKS = ("overloaded", "internal server error", "api_error",
                  # may not have access to it". Another model is the answer.
                  "issue with the selected model", "not_found_error",
                  "unrecognized_model", "may not exist")
-_STATUS_WORD = re.compile(r"\b(\d{3})\b")
+# A three-digit code counts only next to a word that makes it a status:
+# "API Error: 529", "HTTP 500", "status 429", "error code 503". Bare, it
+# matched the column of a stack frame (`cli.js:512:98765`), a duration
+# ("took 503 ms") and a port -- and each parked a model or a seat.
+_STATUS_WORD = re.compile(r"(?:status|error|http|code)\W{0,4}(\d{3})(?![\d:.])")
 
 
 class _Stalled(Exception):
@@ -212,6 +216,9 @@ def cli_models() -> tuple[str, ...]:
     """
     raw = _flag("SOLVER_CLI_MODELS", "opus")
     models = tuple(m.strip() for m in raw.split(",") if m.strip())
+    if any(not m or any(ch.isspace() for ch in m) for m in models):
+        raise SystemExit(f"SOLVER_CLI_MODELS={raw!r}: expected comma-separated "
+                         f"model aliases")
     return models or ("opus",)
 
 
@@ -262,13 +269,18 @@ def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profil
         if not entry:
             continue
         model, _, effort = entry.partition(":")
-        effort = effort.strip() or default_effort
+        model, effort = model.strip(), effort.strip() or default_effort
+        if not model or any(ch.isspace() for ch in model):
+            raise SystemExit(
+                f"SOLVER_CLI_EMERGENCY_PROFILES entry {entry!r}: expected "
+                f"model or model:effort"
+            )
         if effort not in EFFORTS:
             raise SystemExit(
                 f"SOLVER_CLI_EMERGENCY_PROFILES entry {entry!r}: effort must be "
                 f"one of {', '.join(EFFORTS)}"
             )
-        profiles.append(Profile(model.strip(), effort))
+        profiles.append(Profile(model, effort))
     return tuple(profiles)
 
 
@@ -427,6 +439,8 @@ class CliConversation:
         self.still_writing = False
         self.empty_reason: Optional[str] = None
         self.hops = 0
+        # What the CLI's `result` said went wrong, this turn.
+        self._turn_error: Optional[str] = None
 
     @property
     def model(self) -> str:
@@ -508,6 +522,12 @@ class CliConversation:
                 self.empty_reason = "unreadable"
                 return ""
             try:
+                # Checked again with the slot in hand: a conversation that
+                # queued for it may have been passed by another that marked
+                # this pair out meanwhile, and "told at once" should hold for
+                # it too.
+                if self._backend.outage_for(self.account, self.model)[0] > 0:
+                    continue
                 body, verdict = await self._send(
                     text, max(1.0, deadline - time.monotonic())
                 )
@@ -563,12 +583,14 @@ class CliConversation:
         `limited`, `stalled`, `degraded`, `auth`, `failed`.
         """
         started = time.monotonic()
-        # stderr goes to a FILE, not a pipe. A pipe is read only after stdout
-        # closes, so a child that fills it first blocks on the write while this
-        # side blocks on the read -- the classic two-pipe deadlock, and nothing
-        # about the CLI promises to keep stderr small.
-        errfile = tempfile.TemporaryFile()
+        self._turn_error = None
+        errfile = None
         try:
+            # stderr goes to a FILE, not a pipe. A pipe is read only after
+            # stdout closes, so a child that fills it first blocks on the write
+            # while this side blocks on the read -- the classic two-pipe
+            # deadlock, and nothing about the CLI promises to keep stderr small.
+            errfile = tempfile.TemporaryFile()
             proc = await asyncio.create_subprocess_exec(
                 *self._argv(),
                 stdin=asyncio.subprocess.PIPE,
@@ -578,7 +600,8 @@ class CliConversation:
                 cwd=self._backend.workdir,
             )
         except Exception as exc:  # noqa: BLE001 - a dead binary is not a crash
-            errfile.close()
+            if errfile is not None:
+                errfile.close()
             print(f"[cli] could not start {self._backend.binary!r}: "
                   f"{type(exc).__name__}: {exc}")
             self._backend.last_error = f"{type(exc).__name__}: {exc}"
@@ -644,7 +667,7 @@ class CliConversation:
             return self._verdict("", "failed")
 
         body = "".join(chunks).strip()
-        stderr = self._read_stderr(errfile)
+        stderr = self._read_stderr(errfile) or self._turn_error or ""
         if proc.returncode:
             self._backend.last_error = stderr or f"exit {proc.returncode}"
         if body:
@@ -811,8 +834,10 @@ class CliConversation:
             return
         if kind == "result":
             self._backend.note_result(event)
-            if event.get("is_error") and not chunks:
-                self._failed_result(event)
+            if event.get("is_error"):
+                self._turn_error = str(event.get("result") or event.get("subtype") or "")
+                if not chunks:
+                    self._failed_result(event)
 
     def _retry(self, event: dict, chunks: list[str]) -> None:
         """The CLI is retrying the request itself, and says why.
@@ -996,8 +1021,11 @@ class CliBackend:
                 continue
             # Loosely on the model: the CLI's windows say `opus`, the operator
             # may have written `claude-opus-5`, and they are the same thing.
-            if scope_model != "*" and scope_model not in model and model not in scope_model:
-                continue
+            if scope_model != "*":
+                if not scope_model or not model:
+                    continue
+                if scope_model not in model and model not in scope_model:
+                    continue
             if outage.until - now > worst[0]:
                 worst = (outage.until - now, outage.reason)
         return worst
@@ -1042,20 +1070,18 @@ class CliBackend:
                 if profile.model == model and (name is None or candidate.name == name):
                     avoided = (candidate, profile)
                     break
-            # Failed: the pair is out, or its last turn ended for no stated
-            # reason. Either way the ask is for someone who WORKS, and the
-            # best of those is the first healthy rung -- the same model on a
-            # fresh session, when that is all that was wrong.
-            failed = avoided is None or (
-                self.outage_for(avoided[0], avoided[1].model)[0] > 0
-                or (avoided[0].name, avoided[1].model) in self._failures
-            )
+            # Failed: the pair is out. The ask is then for someone who WORKS,
+            # and the best of those is the first healthy rung. (An unexplained
+            # failure that has not yet parked the pair is NOT read this way:
+            # `_failures` is shared by every conversation in flight, and one
+            # conversation's lost session must not turn another's request
+            # for a second opinion into a retry on the very pair it named.)
+            failed = avoided is None or self.outage_for(avoided[0], avoided[1].model)[0] > 0
             if not failed:
                 others = [(a, p) for a, p in healthy if p.model != model]
-                # The operator's own second-opinion models before the
-                # emergency ladder, when both are healthy.
-                opinion_models = {p.model for p in self.opinions}
-                others.sort(key=lambda ap: ap[1].model not in opinion_models)
+                # The operator's own second-opinion profiles -- at the default
+                # effort -- before the emergency ladder, when both are healthy.
+                others.sort(key=lambda ap: ap[1] not in self.opinions)
                 if others:
                     return others[0]
         if healthy:
@@ -1124,6 +1150,7 @@ class CliBackend:
 
     async def auth_status(self, account: Account) -> dict:
         binary = shutil.which(self.binary) or self.binary
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 binary, "auth", "status",
@@ -1133,6 +1160,13 @@ class CliBackend:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=60.0)
             status = json.loads(out.decode("utf-8", "replace"))
         except Exception:  # noqa: BLE001 - an older CLI may not print JSON
+            if proc is not None and proc.returncode is None:
+                # A hung check must not outlive the question.
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except Exception:  # noqa: BLE001
+                    pass
             return {}
         return status if isinstance(status, dict) else {}
 
@@ -1206,7 +1240,7 @@ class CliBackend:
         the same report arriving on the next turn lands a few seconds later
         and must not read as news."""
         current = self._out.get(key)
-        if current is not None and until <= current.until + 60.0:
+        if current is not None and current.until > time.time() and until <= current.until + 60.0:
             return
         self._out[key] = _Outage(until, reason)
         account, model = key
@@ -1259,8 +1293,11 @@ class CliBackend:
             # measured here is one that then blocks without another event.
             if (used >= 1.0 and not overage
                     and name not in ("seven_day_overage_included", "overage")):
-                if not limited:
-                    limited, scope = True, _MODEL_WINDOWS.get(name, "*")
+                window_scope = _MODEL_WINDOWS.get(name, "*")
+                # A spent window for the whole seat widens a limit that was
+                # reported against one model: the seat is out either way.
+                if not limited or window_scope == "*":
+                    limited, scope = True, window_scope
                 if reset is not None and (resets_at is None or reset < resets_at):
                     resets_at = reset
             # Said once per tenth of the budget from 80% up, per window and
