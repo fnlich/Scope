@@ -6718,7 +6718,7 @@ def test_no_browser_is_reported_as_unchecked_not_as_a_wrong_answer(capsys):
     code = asyncio.run(rehearse.run(_rehearsal_args(), solver_factory=lambda: solver))
     out = capsys.readouterr().out
     assert code == 2, f"a missing browser is not a wrong answer: {out}"
-    assert "COULD NOT BE CHECKED: no browser" in out, out
+    assert "COULD NOT BE CHECKED: no backend" in out, out
     assert "No usable tabs" in out, "the fleet's own advice was swallowed"
 
 
@@ -10131,6 +10131,22 @@ def test_a_correction_too_late_to_grade_still_beats_the_answer_it_corrects():
 
 
 
+def test_the_grace_written_in_dot_env_reaches_the_live_miner(monkeypatch):
+    """`RESPONSE_GRACE_S` is read when the module is imported, and both live
+    entry points import it before `.env` has been promoted into the
+    environment -- so a `.env` value used to apply to the rehearsal and not
+    to the miner it was rehearsing. The request-time read is what both use."""
+    import custom_miner
+
+    monkeypatch.delenv("MINER_RESPONSE_GRACE_S", raising=False)
+    monkeypatch.setattr(custom_miner, "RESPONSE_GRACE_S", 3.0)
+    assert custom_miner.response_grace_s() == 3.0
+    monkeypatch.setenv("MINER_RESPONSE_GRACE_S", "2")      # what load_miner_env does
+    assert custom_miner.response_grace_s() == 2.0
+    monkeypatch.setenv("MINER_RESPONSE_GRACE_S", "nonsense")
+    assert custom_miner.response_grace_s() == 3.0
+
+
 def test_the_latest_version_is_the_one_that_ships():
     """The whole rule. No score is compared.
 
@@ -10294,6 +10310,50 @@ def test_a_correction_may_send_only_the_case_that_failed():
     assert len(prompts) == 3, f"expected cases, program, one repair: {len(prompts)}"
 
 
+def test_correcting_one_of_two_failing_cases_leaves_the_other_standing():
+    """The prompt may report two disagreements; the natural reply corrects
+    one. Read as "the other was dropped", that reply was refused outright on
+    every round, and the one case the model HAD fixed never landed."""
+    from solvers.verify import _merge_cases
+
+    a = {"name": "a", "args": [1], "expected": 1}
+    b = {"name": "b", "args": [2], "expected": 99}
+    c = {"name": "c", "args": [3], "expected": 99}
+    b_fixed = {"name": "b", "args": [2], "expected": 2}
+    merged, what = _merge_cases([a, b, c], [b_fixed], failed=[b, c])
+    assert what == "1 failing case(s) corrected", what
+    assert merged == [a, b_fixed, c], merged
+    # Untouched is not deleted, and a passing case is still not negotiable.
+    merged, what = _merge_cases([a, b, c], [a], failed=[b, c])
+    assert merged == [a, b, c] and what.startswith("NOTHING"), (merged, what)
+    # The suite still may not grow, and a failing case still may not vanish.
+    extra = {"name": "d", "args": [4], "expected": 4}
+    merged, what = _merge_cases([a, b, c], [b_fixed, extra], failed=[b])
+    assert merged == [a, b, c] and what.startswith("REFUSED"), (merged, what)
+
+
+def test_a_round_that_ran_nothing_does_not_forget_the_reported_cases():
+    """Round 3 answers in prose; round 4 sends the JSON for the case round 3
+    was asked about. The reported set must survive the empty round, or the
+    correction merges against nothing and vanishes without a line of log."""
+    cases_wrong = ('```json\n[{"name": "zero", "args": [0], "expected": 0},\n'
+                   ' {"name": "carry", "args": [12345], "expected": 14}]\n```')
+    program = ("```python\ndef g(n):\n    t = 0\n    while n > 0:\n"
+               "        t += n % 10\n        n //= 10\n    return t\n```")
+    prose = "I think the expected value for carry should be 15, not 14."
+    corrected = '```json\n[{"name": "carry", "args": [12345], "expected": 15}]\n```'
+    task = SolveTask(problem_id="prose-then-json", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=60.0)
+    solver = VerifyingSolver(_Backend([cases_wrong, program, prose, corrected]),
+                             reserve_s=0, max_budget_s=60, second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as chatter:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=60.0))
+    log = chatter.getvalue()
+    assert "1 failing case(s) corrected" in log, log
+    assert (answer.self_passed, answer.self_total) == (2, 2), log
+
+
 def test_the_case_escape_hatch_stops_being_offered(monkeypatch):
     """A correction phase exists to make the PROGRAM more correct.
 
@@ -10388,7 +10448,9 @@ def test_a_correction_cannot_shrink_or_grow_the_suite():
 
     # Dropped rather than corrected: the reply re-states only what it passes.
     merged, why = _merge_cases(agreed, [agreed[0]], failing)
-    assert merged == agreed and why.startswith("REFUSED"), (merged, why)
+    # The failing case it left out is not dropped, it is left standing: the
+    # bar is unchanged and the reply corrected nothing.
+    assert merged == agreed and why.startswith("NOTHING"), (merged, why)
 
     # Grown: the reply corrects its case and slips in one of its own.
     extra = {"args": [1], "kwargs": {}, "expected": 1, "name": "back-filled"}
@@ -12606,10 +12668,21 @@ if mode == "server-error":
     emit({"type": "result", "is_error": True, "subtype": "error_during_execution",
           "result": "API Error: 500 Internal server error", "session_id": session})
     sys.exit(1)
-if mode == "overloaded":
+if mode == "error-after-text":
+    # The connection broke mid-answer: text arrived, then the CLI gave up.
+    for piece in ("```python\n", "def g(n):\n"):
+        emit({"type": "stream_event",
+              "event": {"type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": piece}}})
+    emit({"type": "result", "is_error": True, "subtype": "error_during_execution",
+          "result": "API Error: fetch failed", "session_id": session})
+    sys.exit(1)
+if mode in ("overloaded", "overloaded0"):
     # The CLI retrying an overloaded request itself, one event per retry,
-    # then waiting out a delay that only grows.
-    for attempt, delay in ((1, 1000), (2, 4000), (3, 16000)):
+    # then waiting out a delay that only grows. `overloaded0` numbers its
+    # attempts from zero, as nothing promises the real one will not.
+    first = 0 if mode == "overloaded0" else 1
+    for attempt, delay in ((first, 1000), (first + 1, 4000), (first + 2, 16000)):
         emit({"type": "system", "subtype": "api_retry", "attempt": attempt,
               "max_retries": 10, "retry_delay_ms": delay, "error_status": 529,
               "error": "API Error: 529 {\"type\":\"overloaded_error\"}"})
@@ -13428,6 +13501,65 @@ def test_a_signed_out_account_found_mid_run_is_set_aside(tmp_path, monkeypatch):
     assert conversation.provider == "cli:opus@claude-2"
     assert "primary/*" in backend.stats()["out"]
     assert "signed out" in backend.stats()["out"]["primary/*"]["why"]
+
+
+def test_text_that_arrived_before_the_turn_failed_is_an_unfinished_reply(
+    tmp_path, monkeypatch
+):
+    """The connection breaks mid-answer and the CLI gives up: what arrived is
+    a fragment, kept and marked unfinished, so the repair loop does not ask
+    the model to fix what it never finished saying."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch, mode="error-after-text")
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        return await conversation.send("solve it", 60.0), conversation
+
+    body, conversation = asyncio.run(go())
+    assert body.startswith("```python"), body
+    assert conversation.still_writing is True
+    assert conversation.empty_reason is None
+    assert conversation.hops == 0, "a fragment in hand is not a reason to hop"
+
+
+def test_the_cli_retry_events_are_counted_here_not_read_off_the_event(
+    tmp_path, monkeypatch
+):
+    """Whichever base the CLI numbers its attempts from, the second retry
+    event this turn is the signal: one wait paid, not two."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch)
+    _cli_modes(log, {"model:opus": "overloaded0", "*": "ok"})
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        started = time.monotonic()
+        body = await conversation.send("solve it", 60.0)
+        return body, conversation, time.monotonic() - started
+
+    body, conversation, spent = asyncio.run(go())
+    assert extract_code(body, "g"), body
+    assert conversation.provider == "cli:sonnet" and conversation.hops == 1
+    assert 0.9 < spent < 5.0, spent
+
+
+def test_extra_usage_is_the_seats_whatever_window_the_event_named(
+    tmp_path, monkeypatch
+):
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch)
+    backend = CliBackend()
+    info = {"status": "rejected", "rateLimitType": "seven_day_opus",
+            "isUsingOverage": True, "resetsAt": time.time() + 600}
+    assert backend.note_rate_limit(info, "opus") is True
+    # Not just opus: a hop to sonnet on this seat would start a metered request.
+    assert backend.limited_for("sonnet") > 0
 
 
 def test_the_status_command_names_each_account(tmp_path, monkeypatch, capsys):

@@ -1144,8 +1144,9 @@ cut the whole solve by 20 seconds. Neither was visible as anything except
 answers that arrived unfinished.
 
 What remains is not a deadline but the **cost of delivering**:
-`DELIVERY_RESERVE_S` covers `send`'s post-read phases (5 + 4 + 2 = 11s) plus
-grading, archiving, signing and transmission. The budget is the advertised
+`DELIVERY_RESERVE_S` covers `send`'s post-read phases (copy 5 + stream 3 +
+salvage 1 + postmortem 2 = 11s) plus grading, archiving, signing and
+transmission. The budget is the advertised
 deadline minus that, and nothing else.
 
 ### The model writes the tests, because nobody else does
@@ -1367,14 +1368,21 @@ and at the small end the arithmetic used to invert — three separate floors,
 each sensible on its own, combined into a guaranteed total loss:
 
 ```
-deadline  budget   asks?   read+tail   504 at   before
-     40    20.0     yes       28.5       40     ok
-     32    12.0     NO        --         32     empty answer, model never asked
-     20    10.0     NO        --         20     empty answer, model never asked
-     15     7.5     yes       18.5       15     504, NO ANSWER
-     10     5.0     yes       16.0       10     504, NO ANSWER
-      5     5.0     yes       16.0        5     504, NO ANSWER
+deadline  504 at   budget   asks?   read+tail   outcome
+     40      45     30.0     yes       41.0     ok
+     32      37     22.0     yes       33.0     ok
+     20      25     10.0     yes       15.0     ok
+     15      20     10.0     yes       15.0     ok
+     10      15      7.0     yes       10.5     ok
+      5      10      5.0     yes        7.5     ok
 ```
+
+(Measured by running the solver against each deadline. `504 at` is the
+miner's own cutoff, `deadline_s + MINER_RESPONSE_GRACE_S`; `read+tail` is the
+budget plus the post-read tail `tail_budget` allows at that size. Below a
+20-second budget the solver keeps the SHAPE of the reserve rather than its
+size -- half the request for the read, the other half for the tail and the
+wire -- which is why every row now lands before its cutoff.)
 
 Three separate causes:
 
@@ -1440,19 +1448,19 @@ deadline](#the-requests-deadline-is-the-only-deadline)*.
 
 ### How long the miner actually waits, and why it stops there
 
-**280 seconds — 4m40s.** Not five or six minutes, and that is not a setting.
-Everything above 300s belongs to the validator:
+**290 seconds — 4m50s.** Not five or six minutes, and that is not a setting.
+Everything above 305s belongs to the validator:
 
 ```
-310s  validator stops listening        (live.py:148 — deadline_s + 10)
-300s  miner answers 504 past here      (demo_miner.py:324 — wait_for)
- -11s send tail: copy 5 + stream 4 + postmortem 2, all AFTER the read
- -~9s grade, archive, sign, put on the wire
+310s  validator stops listening        (decentralized.py — deadline_s + 10)
+305s  miner answers 504 past here      (custom_miner.py handle_request — deadline_s + MINER_RESPONSE_GRACE_S)
+ -11s send tail: copy 5 + stream 3 + salvage 1 + postmortem 2, all AFTER the read
+ -~4s grade, archive, sign, put on the wire
 ----
-285s  the last moment a read can still end   ← DELIVERY_RESERVE_S = 15
+290s  the last moment a read can still end   ← DELIVERY_RESERVE_S = 15
 ```
 
-A model needing 300s misses by 20; one needing 360s misses by 80. The only
+A model needing 300s misses by 10; one needing 360s misses by 70. The only
 thing that would change this is a validator advertising a longer `deadline_s`,
 which is its config and not the miner's — so the miner's own caps are set not
 to bind if it ever does: both sit at 3600, the protocol's own maximum for
@@ -1597,7 +1605,10 @@ actually used.
 `save_solution` and `save_exchange` — in a single
 
 ```python
-asyncio.wait_for(solve_with_slot(), timeout=min(deadline_s, GLM_REQUEST_TIMEOUT_S))
+asyncio.wait_for(
+    solve_with_slot(),
+    timeout=min(deadline_s + MINER_RESPONSE_GRACE_S, GLM_REQUEST_TIMEOUT_S),
+)
 ```
 
 and a solve that overruns it is cancelled and answered **504 with nothing**. Not
@@ -1614,9 +1625,10 @@ and it is the real one:
 
 ```
 300s   deadline_s
-285s   budget            ← every phase plans against this, and it runs to the limit
-296s   read + tail
-300s   504 here
+305s   the miner's own cutoff (deadline_s + 5s of the validator's 10s grace)
+290s   budget            ← every phase plans against this, and it runs to the limit
+301s   read + tail
+305s   504 here
 ```
 
 A 300s deadline gives the reads **285s** where it used to give 280s. Checked

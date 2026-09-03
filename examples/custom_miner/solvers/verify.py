@@ -90,10 +90,11 @@ RESUME_FLOOR_S = 40.0
 #
 # `handle_request` wraps the WHOLE solve -- including `fit_response`,
 # `save_solution` and `save_exchange` -- in one `asyncio.wait_for(...,
-# timeout=min(deadline_s, GLM_REQUEST_TIMEOUT_S))`, and a solve that overruns it
-# is cancelled and answered 504 with nothing. So everything after the last read
-# has to fit in here: `send`'s post-read phases (copy, stream, post-mortem --
-# `FULL_TAIL_S`, 11s, itself scaled down on short deadlines by `tail_budget`),
+# timeout=min(deadline_s + RESPONSE_GRACE_S, GLM_REQUEST_TIMEOUT_S))`, and a
+# solve that overruns it is cancelled and answered 504 with nothing. So
+# everything after the last read has to fit in here: `send`'s post-read phases
+# (copy, stream, salvage, post-mortem -- `FULL_TAIL_S`, 11s, itself scaled
+# down on short deadlines by `tail_budget`),
 # then the archive writes and the response.
 #
 # There used to be a second reserve as well, `SOLVER_SAFETY_MARGIN_S` at 20s,
@@ -417,7 +418,20 @@ def _merge_cases(
             continue
         merged.append(case)
         seen.add(key)
-    if merged == agreed:
+    corrected = len(merged) - len(keep)
+    # A failing case the reply did NOT re-state stays as it was. The prompt
+    # may report two disagreements and the natural reply corrects one of
+    # them; read as "the other was dropped" that reply was refused outright,
+    # every round, and the one case the model had fixed never landed.
+    # Untouched is not deleted: the case is still on the bar, still failing,
+    # and still reported next round.
+    for case in failed:
+        if len(merged) >= len(agreed):
+            break
+        if _case_key(case) not in seen:
+            merged.append(case)
+            seen.add(_case_key(case))
+    if corrected == 0:
         # Nothing moved. Either the reply re-sent the suite unchanged -- the
         # ordinary shape, and nothing to say about it -- or every case it
         # carried matched one the program PASSES and was skipped above. The
@@ -425,7 +439,7 @@ def _merge_cases(
         # failing set this round was merged against is not the set the prompt
         # actually quoted, and that has been a real bug rather than a
         # hypothetical one.
-        return merged, "" if not failed else "NOTHING: the correction changed no case that failed"
+        return list(agreed), "" if not failed else "NOTHING: the correction changed no case that failed"
     if len(merged) != len(agreed):
         # The suite keeps its SIZE. Only the failing cases may change, and each
         # one has to be replaced rather than simply removed -- "the program can
@@ -448,11 +462,10 @@ def _merge_cases(
         # bar and finishing 2/3 instead of 0/1.
         return list(agreed), (
             f"REFUSED: {len(agreed) - len(keep)} case(s) failed and "
-            f"{len(merged) - len(keep)} came back; a failing case may be "
+            f"{corrected} came back; a failing case may be "
             f"corrected, not dropped, and the suite may not grow here"
         )
-    replaced = len(agreed) - len(keep)
-    return merged, f"{replaced} failing case(s) corrected"
+    return merged, f"{corrected} failing case(s) corrected"
 
 
 def _inherit_evidence(candidate: Candidate, prior: Candidate) -> None:
@@ -1164,10 +1177,11 @@ class VerifyingSolver:
     # -- the Solver interface custom_miner.py expects ---------------------- #
     async def solve_task(self, task, timeout_s: float) -> Answer:
         started = time.monotonic()
-        # `timeout_s` is already `min(deadline_s, glm_request_timeout_s)` -- the
-        # deadline the miner's own `handle_request` will 504 at. The margin is
-        # what keeps this side of it: `send` runs its copy, stream and
-        # post-mortem phases AFTER its slice expires (5 + 4 + 2 = 11s), and the
+        # `timeout_s` is already the cutoff the miner's own `handle_request`
+        # will 504 at: `deadline_s + RESPONSE_GRACE_S`, capped by
+        # `glm_request_timeout_s`. The margin is what keeps this side of it:
+        # `send` runs its copy, stream, salvage and post-mortem phases AFTER
+        # its slice expires (5 + 3 + 1 + 2 = 11s), and the
         # answer still has to be graded, archived, signed and put on the wire
         # before the validator stops listening at `deadline_s + 10`.
         #
@@ -1202,8 +1216,9 @@ class VerifyingSolver:
 
         advertised = float(getattr(task, "deadline_s", 0.0) or 0.0)
         if advertised - float(timeout_s) > 1.0 and not self._warned_short_deadline:
-            # `timeout_s` is `min(deadline_s, glm_request_timeout_s)`. When it
-            # comes back SHORTER than what the validator advertised, the miner
+            # `timeout_s` is the request's cutoff, capped by
+            # `glm_request_timeout_s`. When it comes back SHORTER than what
+            # the validator advertised, the miner
             # is giving up early on its own configuration -- and nothing else
             # says so. The reference miner's docs put GLM_REQUEST_TIMEOUT_S at
             # 280 against a 300s deadline, and a .env copied from there costs
@@ -1517,7 +1532,7 @@ class VerifyingSolver:
                 # credit the answer to the pair that refused it -- and, passed
                 # back as `avoid`, ask "anyone but the refuser" when the ask
                 # was "anyone but the one that just answered".
-                provider = getattr(conversation, "provider", provider)
+                provider = best_provider = getattr(conversation, "provider", provider)
                 phases.mark("1 cases", model_s=time.monotonic() - asked_at)
                 if (
                     cases is None
@@ -2183,8 +2198,13 @@ class VerifyingSolver:
                 # of an identical prompt is an identical answer. So the report
                 # goes out again, with the repetition named in it.
                 # The cases this prompt is about. The reply may correct these
-                # and nothing else.
-                reported_failed = list(candidate.failed_cases)
+                # and nothing else. Kept from the last GRADED round when this
+                # one ran nothing: an empty candidate has no failed cases, and
+                # forgetting the reported set here made the next correction --
+                # the JSON for exactly those cases -- merge against nothing
+                # and vanish without a line of log.
+                if candidate.total or candidate.self_total:
+                    reported_failed = list(candidate.failed_cases)
                 stalled = reports_sent.get(report, 0)
                 reports_sent[report] = stalled + 1
                 if stalled:
@@ -2512,7 +2532,9 @@ class VerifyingSolver:
             try:
                 passed, total, failures, _ = self._grader.check(
                     code, task.language, task.entrypoint, task.public_examples,
-                    budget_s=grading_budget,
+                    # What is left NOW: the compile above may have spent some
+                    # of it, and a Rust compile spends seconds.
+                    budget_s=_budget_left(),
                 )
             except Exception as exc:  # noqa: BLE001 - a broken grader loses no answer
                 print(f"[verify] local grading unavailable: {type(exc).__name__}: {exc}")
@@ -2529,11 +2551,10 @@ class VerifyingSolver:
         # should be and coding it wrong -- and that is objectively checkable
         # with the validator's own executor.
         if self._self_tests and code.strip():
-            # `left` is what the SOLVE has, and the run is bounded by it. The
-            # examples above may already have spent some of it; that is
-            # deliberately not re-measured, because the two suites share one
-            # deadline and a stale-but-generous number is the safer error here
-            # -- `run_tests` still stops at `VERIFY_TIMEOUT_S` per case.
+            # Bounded by what is left of the grading budget NOW, after the
+            # compile and the examples above have spent their share: the two
+            # suites share one deadline, and `run_tests` still stops at
+            # `VERIFY_TIMEOUT_S` per case inside it.
             self._run_self_tests(candidate, task, cases, left=_budget_left())
         return candidate
 
