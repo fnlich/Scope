@@ -1512,6 +1512,13 @@ class VerifyingSolver:
                 cases = await self._ask_for_cases(
                     conversation, task, cases_slice
                 )
+                # Re-read after EVERY turn, here and below: a backend may move
+                # a conversation to another model or seat inside a turn (the
+                # CLI ladder does), and `provider` bound at open would then
+                # credit the answer to the pair that refused it -- and, passed
+                # back as `avoid`, ask "anyone but the refuser" when the ask
+                # was "anyone but the one that just answered".
+                provider = getattr(conversation, "provider", provider)
                 phases.mark("1 cases", model_s=time.monotonic() - asked_at)
                 if (
                     cases is None
@@ -1809,6 +1816,7 @@ class VerifyingSolver:
                 # extend into.
                 round_started = time.monotonic()
                 reply = await conversation.send(prompt, max(1.0, left))
+                provider = getattr(conversation, "provider", provider)
                 # How long the round trip actually took. Used only by the
                 # duplicate branch below, and only to tell a model from a tab.
                 round_s = time.monotonic() - round_started

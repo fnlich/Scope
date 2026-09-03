@@ -13449,6 +13449,52 @@ def test_the_cli_summary_names_the_ladder(tmp_path, monkeypatch):
     )
 
 
+def test_the_solve_loop_follows_a_conversation_that_hops(capsys):
+    """A backend may move a conversation to another model inside a turn --
+    the CLI ladder does -- so `provider` must be read after every turn, not
+    once at open. Bound at open, the answer was credited to the pair that
+    REFUSED it, and that stale name went back as `avoid`, which asked
+    `pick()` for "anyone but the refuser" when the loop meant "anyone but the
+    one that just answered": the second opinion came from the same model."""
+    asked_to_avoid: list = []
+    replies = iter([CASES, WRONG, WRONG, RIGHT])
+
+    class _Hopping:
+        """Replies come from ONE script across conversations, so the fresh
+        conversation the loop opens gets the next reply, not the first."""
+        provider = "cli:opus"
+        still_writing = False
+        empty_reason = None
+
+        async def send(self, text, timeout_s):
+            reply = next(replies)
+            if reply is CASES:
+                self.provider = "cli:sonnet"   # opus refused; sonnet answered
+            return reply
+
+        async def close(self):
+            pass
+
+    class _Recording(_Backend):
+        async def open(self, avoid=None):
+            asked_to_avoid.append(avoid)
+            return _Hopping()
+
+    # WRONG twice: the same program with the same failures after being shown
+    # them is the duplicate branch, and it carries the repair elsewhere with
+    # `avoid=<the provider that repeated itself>`.
+    solver = VerifyingSolver(_Recording([]), reserve_s=0, max_budget_s=120)
+    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
+    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g")
+    assert asked_to_avoid[0] is None
+    assert "cli:sonnet" in asked_to_avoid[1:], asked_to_avoid
+    assert "cli:opus" not in asked_to_avoid, asked_to_avoid
+    out = capsys.readouterr().out
+    # The duplicate is blamed on the model that sent it, not the one refused.
+    assert "[verify] cli:sonnet sent back the same program" in out, out
+    assert "[verify] cli:opus sent back" not in out, out
+
+
 def test_selecting_the_cli_backend_needs_no_browser(monkeypatch):
     """`SOLVER_BACKEND=cli` and nothing else. The default stays `browser`,
     because a solver that silently changed where the answers came from would be
