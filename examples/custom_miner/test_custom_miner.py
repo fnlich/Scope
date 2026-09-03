@@ -12564,6 +12564,10 @@ if argv and argv[0] == "auth":
 
 prompt = sys.stdin.read()
 mode = os.environ.get("FAKE_CLI_MODE", "ok")
+if os.path.exists(os.environ["FAKE_CLI_LOG"] + ".mode"):
+    # A change of mode mid-test: the backend fixes the child's environment
+    # when it is built, so a file is the only way to reach a later turn.
+    mode = open(os.environ["FAKE_CLI_LOG"] + ".mode").read().strip()
 session = opt("--session-id") or opt("--resume") or "?"
 
 def emit(obj):
@@ -12576,11 +12580,36 @@ if mode == "exit1":
 if mode == "silent":
     emit({"type": "result", "is_error": False, "session_id": session})
     sys.exit(0)
-if mode == "ratelimit":
-    emit({"type": "rate_limit_event",
-          "rate_limit_info": {"status": "allowed_warning", "utilization": 0.93,
-                              "rateLimitType": "five_hour",
-                              "resetsAt": time.time() + 600}})
+if mode == "stall":
+    # The real CLI at the subscription's usage limit: no event, ever.
+    time.sleep(600)
+if mode in ("ratelimit", "limited", "opus-limit", "overage"):
+    # The event's shape as the CLI emits it: no utilisation at the top level,
+    # one entry per rolling window under `unifiedWindows`.
+    full = mode == "limited"
+    info = {"status": "rejected" if full else "allowed_warning",
+            "rateLimitType": "five_hour", "resetsAt": time.time() + 600,
+            "overageStatus": "rejected", "isUsingOverage": False,
+            "unifiedWindows": {
+                "five_hour": {"utilization": 1.0 if full else 0.93,
+                              "resetsAt": time.time() + 600},
+                "seven_day": {"utilization": 0.42,
+                              "resetsAt": time.time() + 86400}}}
+    if mode == "opus-limit":
+        # A weekly cap on ONE model: the seat's windows are fine.
+        info.update({"status": "rejected", "rateLimitType": "seven_day_opus",
+                     "resetsAt": time.time() + 3600})
+        info["unifiedWindows"]["five_hour"]["utilization"] = 0.5
+    if mode == "overage":
+        # The window is spent and the plan's paid extra usage is covering it.
+        info.update({"status": "allowed", "overageStatus": "allowed",
+                     "isUsingOverage": True})
+        info["unifiedWindows"]["five_hour"]["utilization"] = 1.0
+    emit({"type": "rate_limit_event", "rate_limit_info": info})
+    if full or (mode == "opus-limit" and opt("--model") == "opus"):
+        emit({"type": "result", "is_error": True, "subtype": "error_rate_limit",
+              "session_id": session})
+        sys.exit(1)
 
 # What the fake was asked, echoed so the test can assert on it.
 record = {"prompt": prompt, "argv": argv, "session": session,
@@ -12610,12 +12639,17 @@ def _fake_cli(tmp_path, monkeypatch, mode="ok"):
     binary.chmod(0o755)
     log = tmp_path / "calls.jsonl"
     monkeypatch.setenv("SOLVER_CLI_BIN", str(binary))
+    monkeypatch.setenv("SOLVER_CLI_WORKDIR", str(tmp_path / "work"))
     monkeypatch.setenv("FAKE_CLI_LOG", str(log))
     monkeypatch.setenv("FAKE_CLI_MODE", mode)
     return log
 
 
 def _cli_calls(log):
+    # A fake that fails or is refused exits before it records itself, so a
+    # log that was never written means no child got as far as running.
+    if not log.exists():
+        return []
     return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
 
 
@@ -12673,12 +12707,15 @@ def test_the_cli_backend_never_hands_a_child_the_api_key(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDECODE", "1")
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "the-parent-session")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/srv/miner/.claude")
 
     env = child_env()
     assert "ANTHROPIC_API_KEY" not in env, "the child would bill the API key"
     assert "CLAUDECODE" not in env and "CLAUDE_CODE_SESSION_ID" not in env
-    # Operator configuration is not this module's to edit.
+    # Operator configuration is not this module's to edit -- and the config
+    # dir is where the sign-in lives, so dropping it would sign the child out.
     assert env["ANTHROPIC_BASE_URL"] == "https://proxy.example"
+    assert env["CLAUDE_CONFIG_DIR"] == "/srv/miner/.claude"
     assert "PATH" in env
 
     asyncio.run(_one_cli_turn(CliBackend()))
@@ -12869,10 +12906,14 @@ def test_the_cli_child_is_given_no_tools_and_no_customisations(
     # A system prompt of our own: the default one is a coding AGENT's, all
     # tools and files and git, and none of it applies to "write one program".
     assert "--system-prompt" in argv
-    # An empty working directory, so there is nothing in scope to read.
-    # Recorded from INSIDE the child: `close()` removes the directory, and a
-    # test that looked afterwards would be asserting on its own cleanup.
-    assert _cli_calls(log)[0]["cwd_entries"] == [], _cli_calls(log)[0]["cwd_entries"]
+    # An empty working directory, so there is nothing in scope to read, and
+    # the SAME one for every child: the CLI keys its per-project state on the
+    # cwd, and a temp dir per conversation left a new `~/.claude/projects/`
+    # entry behind for every solve.
+    asyncio.run(_one_cli_turn(CliBackend()))
+    calls = _cli_calls(log)
+    assert calls[0]["cwd_entries"] == [], calls[0]["cwd_entries"]
+    assert calls[0]["cwd"] == calls[1]["cwd"] == str(tmp_path / "work"), calls
 
 
 def test_the_cli_backend_says_when_the_subscription_is_running_out(
@@ -12894,8 +12935,197 @@ def test_the_cli_backend_says_when_the_subscription_is_running_out(
     assert "93% of the five_hour subscription limit" in out, out
     assert "resets in about" in out, out
     # Once per tenth of the budget, not once per turn: two turns at the same
-    # utilisation say it once.
+    # utilisation say it once. And only the window that is running out: the
+    # seven-day one at 42% has nothing to say.
     assert out.count("subscription limit used") == 1, out
+    assert "seven_day" not in out, out
+    # A warning is not the limit. Both turns went through.
+    assert backend.limited_for() == 0
+    assert backend.stats()["turns"] == 2
+
+
+def test_at_the_subscription_limit_every_solve_is_turned_away_at_once(
+    tmp_path, monkeypatch, capsys
+):
+    """One solve discovers the limit; every solve after it, until the reset, is
+    told in a millisecond rather than each spending its slice finding out.
+
+    Backend-wide, because the limit is: a fresh conversation, a different
+    model, a second opinion — all the same seat, all equally spent."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch, mode="limited")
+    backend = CliBackend()
+
+    async def go():
+        first = await backend.open()
+        body = await first.send("solve it", 60.0)
+        reason = first.empty_reason
+        # The second opinion, on the other model, and a third solve entirely.
+        second = await backend.open(avoid=first.provider)
+        started = time.monotonic()
+        again = await second.send("solve it", 60.0)
+        spent = time.monotonic() - started
+        return body, reason, again, second.empty_reason, spent
+
+    body, reason, again, reason2, spent = asyncio.run(go())
+    assert body == "" and reason == "unreadable", (body, reason)
+    assert again == "" and reason2 == "unreadable", (again, reason2)
+    assert spent < 0.5, f"a known limit still cost {spent:.1f}s to rediscover"
+    assert len(_cli_calls(log)) <= 1, "the second solve started a child"
+    # Until the CLI's own reset time, which it reported as ten minutes out.
+    assert 500 < backend.limited_for() <= 600, backend.limited_for()
+    assert 500 < backend.limited_for("sonnet") <= 600
+    out = capsys.readouterr().out
+    assert "subscription limit has been reached" in out, out
+    assert "not asking again" in out, out
+
+
+def test_a_limit_on_one_model_leaves_the_other_answering(
+    tmp_path, monkeypatch, capsys
+):
+    """The CLI's schema names weekly windows for ONE model -- `seven_day_opus`,
+    `seven_day_sonnet` -- and a limit on Opus is not a limit on Sonnet. Read
+    as a limit on the seat it would turn away the model that still works."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch, mode="opus-limit")
+    monkeypatch.setenv("SOLVER_CLI_MODELS", "opus,sonnet")
+    backend = CliBackend()
+
+    async def go():
+        first = await backend.open()
+        body = await first.send("solve it", 60.0)
+        second = await backend.open(avoid=first.provider)
+        again = await second.send("solve it", 60.0)
+        # A THIRD solve asks for opus again and is turned away at the door.
+        third = await backend.open()
+        return body, first.empty_reason, again, third, await third.send("x", 60.0)
+
+    body, reason, again, third, nothing = asyncio.run(go())
+    assert body == "" and reason == "unreadable", (body, reason)
+    assert extract_code(again, "g") == "def g(n):\n    return n", again
+    assert third.provider == "cli:opus" and nothing == ""
+    # The CLI said an hour; the backend takes its word for half of that at
+    # most before one solve is let through to check (`LIMIT_RECHECK_S`).
+    assert 1700 < backend.limited_for("opus") <= 1800, backend.limited_for("opus")
+    assert backend.limited_for("sonnet") == 0
+    assert backend.limited_for("claude-opus-5") > 1700, "a full model id"
+    # opus once (refused), sonnet once (answered); the third never ran.
+    assert [c["model"] for c in _cli_calls(log)] == ["sonnet"], _cli_calls(log)
+    # The same report on sonnet's turn was the same limit, not news.
+    assert capsys.readouterr().out.count("has been reached") == 1
+
+
+def test_paid_extra_usage_is_off_unless_asked_for(tmp_path, monkeypatch, capsys):
+    """Extra usage is metered billing, and this backend's whole premise is a
+    seat that is already paid for. So it is treated as the limit unless the
+    operator says otherwise, exactly as the API key is."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch, mode="overage")
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        body = await conversation.send("solve it", 60.0)
+        return body, conversation.empty_reason
+
+    body, reason = asyncio.run(go())
+    assert body == "" and reason == "unreadable", (body, reason)
+    assert backend.limited_for("opus") > 0
+    out = capsys.readouterr().out
+    assert "extra usage is not enabled" in out, out
+
+    monkeypatch.setenv("SOLVER_CLI_ALLOW_OVERAGE", "1")
+    backend = CliBackend()
+    body, reason = asyncio.run(go())
+    assert extract_code(body, "g") == "def g(n):\n    return n", body
+    assert backend.limited_for("opus") == 0
+    assert "paid extra usage" in capsys.readouterr().out
+
+
+def test_a_cli_that_hangs_without_a_word_is_given_up_on_quickly(
+    tmp_path, monkeypatch, capsys
+):
+    """Measured at the usage limit: the CLI blocks silently, no event, no exit.
+
+    Left to the slice, that is a whole deadline burnt per solve with nothing to
+    show and no line of log to say why. A working turn emits its first event in
+    under a second, so a turn that has said nothing at all inside the first
+    window is not thinking, it is wedged."""
+    from solvers import claude_cli
+
+    _fake_cli(tmp_path, monkeypatch, mode="stall")
+    monkeypatch.setattr(claude_cli, "FIRST_EVENT_S", 1.0)
+    backend = claude_cli.CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        started = time.monotonic()
+        body = await conversation.send("solve it", 60.0)
+        return body, conversation.empty_reason, time.monotonic() - started
+
+    body, reason, spent = asyncio.run(go())
+    assert body == "" and reason == "unreadable", (body, reason)
+    assert spent < 5.0, f"a silent CLI held the slice for {spent:.1f}s"
+    assert backend.stats()["stalls"] == 1
+    assert "produced no event at all" in capsys.readouterr().out
+
+
+def test_a_failed_first_cli_turn_does_not_reuse_its_session_id(
+    tmp_path, monkeypatch
+):
+    """`--session-id` on an id that already exists is a hard error (measured:
+    "already in use", exit 1), and a first turn that failed may or may not have
+    created it. So a failed first turn takes a fresh id: the conversation was
+    empty either way, and a fresh one cannot collide."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch, mode="exit1")
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        failed = conversation._session
+        await conversation.send("turn one", 60.0)
+        (tmp_path / "calls.jsonl.mode").write_text("ok")
+        await conversation.send("turn two", 60.0)
+        await conversation.send("turn three", 60.0)
+        return failed
+
+    failed = asyncio.run(go())
+    # The failing fake exits before it records itself, so the log holds the
+    # two turns that worked: a fresh id created, then resumed.
+    calls = _cli_calls(log)
+    assert [c["resumed"] for c in calls] == [False, True], calls
+    assert calls[0]["session"] != failed, "reused the id of a failed first turn"
+    assert calls[0]["session"] == calls[1]["session"], "the session was lost"
+
+
+def test_waiting_for_a_cli_slot_counts_against_the_slice(tmp_path, monkeypatch):
+    """The slot is acquired INSIDE the slice. Acquired outside it, a solve queued
+    behind the others waited with no bound at all, and the wait was invisible
+    to every clock in `verify.py`."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch, mode="slow")
+    backend = CliBackend(concurrency=1)
+
+    async def go():
+        holder = await backend.open()
+        waiter = await backend.open()
+        holding = asyncio.ensure_future(holder.send("first", 60.0))
+        await asyncio.sleep(0.5)
+        started = time.monotonic()
+        body = await waiter.send("second", 2.0)
+        spent = time.monotonic() - started
+        await holding
+        return body, waiter.empty_reason, spent
+
+    body, reason, spent = asyncio.run(go())
+    assert body == "" and reason == "unreadable", (body, reason)
+    assert spent < 4.0, f"a 2s slice waited {spent:.1f}s for a slot"
 
 
 def test_selecting_the_cli_backend_needs_no_browser(monkeypatch):
