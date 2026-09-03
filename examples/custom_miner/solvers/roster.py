@@ -40,6 +40,23 @@ def site_for(provider: str) -> Site:
     raise SystemExit(f"unknown provider {provider!r}; expected one of {PROVIDERS}")
 
 
+def backend_kind(env: Optional[dict[str, str]] = None) -> str:
+    """Which backend answers: ``browser`` (default) or ``cli``.
+
+    The browser fleet stays the default because it is what every existing
+    deployment is configured for, and a solver that silently changed where the
+    answers came from would be the worst kind of upgrade. `SOLVER_BACKEND=cli`
+    opts in.
+    """
+    source = os.environ if env is None else env
+    kind = (source.get("SOLVER_BACKEND", "") or "browser").strip().lower()
+    if kind not in ("browser", "cli"):
+        raise SystemExit(
+            f"SOLVER_BACKEND={kind!r}; expected 'browser' or 'cli'"
+        )
+    return kind
+
+
 def roster(env: Optional[dict[str, str]] = None) -> list[Browser]:
     """Every browser named in the environment, in provider order.
 
@@ -48,6 +65,10 @@ def roster(env: Optional[dict[str, str]] = None) -> list[Browser]:
     ``scripts/start_debug_browser.sh`` starts by default.
     """
     source = os.environ if env is None else env
+    if backend_kind(source) == "cli":
+        # No browsers to attach, and saying so beats defaulting to one on the
+        # standard port and reporting that it could not be reached.
+        return []
     browsers: list[Browser] = []
     for provider in PROVIDERS:
         for endpoint in normalize_cdp(source.get(f"{provider.upper()}_CDP", "")):
@@ -86,11 +107,23 @@ def tabs_per_browser(env: Optional[dict[str, str]] = None) -> int:
 
 
 def build_solver(browsers: Optional[Sequence[Browser]] = None) -> VerifyingSolver:
-    """The fleet, wrapped in the self-verify-and-repair loop."""
-    fleet = BrowserFleet(
-        list(browsers) if browsers is not None else roster(),
-        tabs_per_browser=tabs_per_browser(),
-    )
+    """The backend, wrapped in the self-verify-and-repair loop.
+
+    Everything below the first two lines is the same whichever backend answers.
+    That is the point of `Backend` being a protocol: the repair loop, the
+    grading, the budget discipline and the archive have no idea whether a turn
+    came from a browser tab or a `claude` subprocess, and none of them had to
+    change to gain one.
+    """
+    if backend_kind() == "cli":
+        from .claude_cli import CliBackend
+
+        fleet: Any = CliBackend()
+    else:
+        fleet = BrowserFleet(
+            list(browsers) if browsers is not None else roster(),
+            tabs_per_browser=tabs_per_browser(),
+        )
     return VerifyingSolver(
         fleet,
         # 0 = keep correcting until the answer passes or the request's deadline
@@ -133,17 +166,31 @@ async def warm_up(solver, min_capacity: int = 1) -> None:
     if start is None:
         return
     await start()
-    tabs = fleet.stats().get("tabs", 0)
-    if tabs < min_capacity:
+    # Whatever this backend calls a slot. A browser fleet counts tabs; the CLI
+    # counts processes it will run at once. Reading only `tabs` reported the CLI
+    # backend as having no capacity at all and advised adding a browser to it.
+    stats = fleet.stats()
+    slots = stats.get("tabs", stats.get("concurrency", 0))
+    if slots < min_capacity:
+        unit = "tab(s)" if "tabs" in stats else "slot(s)"
+        remedy = (
+            "add a browser, raise MINER_TABS_PER_BROWSER, or lower the "
+            "concurrency"
+            if "tabs" in stats else
+            "raise SOLVER_CLI_CONCURRENCY, or lower the concurrency"
+        )
         print(
-            f"[fleet] NOTE: {tabs} tab(s) but MINER_MAX_CONCURRENT_REQUESTS="
-            f"{min_capacity}. Tasks beyond the tab count queue and burn their "
-            f"deadline — add a browser, raise MINER_TABS_PER_BROWSER, or lower "
-            f"the concurrency."
+            f"[fleet] NOTE: {slots} {unit} but MINER_MAX_CONCURRENT_REQUESTS="
+            f"{min_capacity}. Tasks beyond that queue and burn their "
+            f"deadline — {remedy}."
         )
 
 
 def describe(browsers: Sequence[Browser]) -> str:
+    if not browsers and backend_kind() == "cli":
+        from .claude_cli import cli_effort, cli_models
+
+        return f"claude CLI ({'/'.join(cli_models())}, effort {cli_effort()})"
     counts: dict[str, int] = {}
     for browser in browsers:
         counts[browser.site.name] = counts.get(browser.site.name, 0) + 1

@@ -1461,26 +1461,51 @@ def test_tabs_per_browser_comes_from_the_environment(monkeypatch):
     assert tabs_per_browser() == 4
 
 
-def test_no_backend_anywhere_reads_an_api_key():
-    """Every backend drives a browser. Nothing in the package reads a key, and
-    nothing imports a provider SDK — a regression would be invisible otherwise,
-    because a key-reading backend works fine right up until it bills someone."""
+def test_no_backend_anywhere_reads_an_api_key(monkeypatch):
+    """Every backend reaches a seat somebody already pays for. Nothing in the
+    package authenticates with a key, and nothing imports a provider SDK — a
+    regression would be invisible otherwise, because a key-reading backend
+    works fine right up until it bills someone.
+
+    This used to ban the substring `API_KEY` anywhere in the package, which was
+    the right intent and became the wrong instrument: `claude_cli` has to name
+    `ANTHROPIC_API_KEY` in order to REMOVE it from the environment its child
+    gets. A ban that cannot tell "reads a key" from "deletes a key" would have
+    forced the one module that actively prevents metered billing to stop saying
+    so. So the ban is on the act — the idioms that read a key's VALUE — and the
+    behaviour is then asserted directly, which is stronger than either.
+    """
     import inspect
     from pathlib import Path
 
     from solvers import claude_web
+    from solvers.claude_cli import child_env
     from solvers.roster import PROVIDERS, site_for
 
     assert set(PROVIDERS) == {"claude", "chatgpt"}
     assert "claude.ai" in site_for("claude").url
     assert "chatgpt.com" in site_for("chatgpt").url
 
-    banned = ("API_KEY", "import anthropic", "from anthropic", "google.genai")
+    # Reading a key's value, in every form that would work, and importing an
+    # SDK that would then use it.
+    banned = (
+        'environ["ANTHROPIC_API_KEY"]', "environ['ANTHROPIC_API_KEY']",
+        'environ.get("ANTHROPIC_API_KEY"', "environ.get('ANTHROPIC_API_KEY'",
+        'getenv("ANTHROPIC_API_KEY"', "getenv('ANTHROPIC_API_KEY'",
+        "import anthropic", "from anthropic", "google.genai",
+    )
     package = Path(inspect.getfile(claude_web)).parent
     for module in sorted(package.glob("*.py")):
         body = module.read_text()
         for needle in banned:
             assert needle not in body, f"{module.name} references {needle!r}"
+
+    # And the one backend that spawns something capable of using a key takes it
+    # away first. Asserted, not merely unmentioned: this is the difference
+    # between a subscription seat and an invoice.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-must-not-be-used")
+    monkeypatch.delenv("SOLVER_CLI_ALLOW_API_KEY", raising=False)
+    assert "ANTHROPIC_API_KEY" not in child_env()
 
 
 def test_the_doctor_probe_drives_a_real_tab():
@@ -12513,3 +12538,383 @@ def test_trimming_the_cases_keeps_the_boundaries():
         f"drop every boundary after it"
     )
     assert _thin(many[:5], MAX_SELF_TESTS) == many[:5], "no trim when it fits"
+
+
+# --------------------------------------------------------------------------- #
+# The CLI backend: the same subscription, reached without a browser.
+#
+# Driven against a FAKE `claude` binary rather than the real one. These tests
+# have to run hundreds of times; the real CLI would spend the operator's
+# subscription to prove things about argv and stdin that a stub proves exactly
+# as well. The one thing a stub cannot prove -- that the real CLI answers
+# correctly -- is proved by the rehearsal instead, which scored 2/2 on the
+# gradeable challenges.
+# --------------------------------------------------------------------------- #
+_FAKE_CLI = r'''#!/usr/bin/env python3
+"""A `claude` stand-in: emits the stream-json events the real one emits."""
+import json, os, sys, time
+
+argv = sys.argv[1:]
+def opt(name, default=None):
+    return argv[argv.index(name) + 1] if name in argv else default
+
+if argv and argv[0] == "auth":
+    print(json.dumps({"loggedIn": True, "authMethod": "oauth_token"}))
+    sys.exit(0)
+
+prompt = sys.stdin.read()
+mode = os.environ.get("FAKE_CLI_MODE", "ok")
+session = opt("--session-id") or opt("--resume") or "?"
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+if mode == "exit1":
+    sys.stderr.write("No conversation found with session ID: " + session + "\n")
+    sys.exit(1)
+if mode == "silent":
+    emit({"type": "result", "is_error": False, "session_id": session})
+    sys.exit(0)
+if mode == "ratelimit":
+    emit({"type": "rate_limit_event",
+          "rate_limit_info": {"status": "allowed_warning", "utilization": 0.93,
+                              "rateLimitType": "five_hour",
+                              "resetsAt": time.time() + 600}})
+
+# What the fake was asked, echoed so the test can assert on it.
+record = {"prompt": prompt, "argv": argv, "session": session,
+          "model": opt("--model"), "effort": opt("--effort"),
+          "resumed": "--resume" in argv,
+          "api_key": os.environ.get("ANTHROPIC_API_KEY"),
+          "claudecode": os.environ.get("CLAUDECODE"),
+          "cwd": os.getcwd(), "cwd_entries": sorted(os.listdir("."))}
+with open(os.environ["FAKE_CLI_LOG"], "a") as fh:
+    fh.write(json.dumps(record) + "\n")
+
+for piece in ("```python\n", "def g(n):\n", "    return n\n", "```"):
+    emit({"type": "stream_event",
+          "event": {"type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": piece}}})
+    if mode == "slow":
+        time.sleep(2.0)
+emit({"type": "result", "is_error": False, "session_id": session,
+      "total_cost_usd": 0.01})
+'''
+
+
+def _fake_cli(tmp_path, monkeypatch, mode="ok"):
+    """Install the stub as SOLVER_CLI_BIN and return its call log path."""
+    binary = tmp_path / "fake-claude"
+    binary.write_text(_FAKE_CLI, encoding="utf-8")
+    binary.chmod(0o755)
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setenv("SOLVER_CLI_BIN", str(binary))
+    monkeypatch.setenv("FAKE_CLI_LOG", str(log))
+    monkeypatch.setenv("FAKE_CLI_MODE", mode)
+    return log
+
+
+def _cli_calls(log):
+    return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+
+
+def test_the_cli_backend_carries_one_conversation_across_turns(tmp_path, monkeypatch):
+    """The repair loop's whole premise: the model sees its own previous attempt
+    beside the failure report. With a browser that is one tab; here it is one
+    session id — created on the first turn, reopened with `--resume` on every
+    one after."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch)
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        first = await conversation.send("turn one", 60.0)
+        second = await conversation.send("turn two", 60.0)
+        await conversation.close()
+        return first, second
+
+    first, second = asyncio.run(go())
+    assert extract_code(first, "g") == "def g(n):\n    return n", first
+    assert first == second
+
+    calls = _cli_calls(log)
+    assert len(calls) == 2, calls
+    # The prompt goes on STDIN, not in argv: measured, the CLI otherwise waits
+    # three seconds for input it is never given (5.2s against 2.4s for the
+    # identical turn), and an argv-borne 63KB statement is bounded by ARG_MAX.
+    assert calls[0]["prompt"] == "turn one" and calls[1]["prompt"] == "turn two"
+    assert not any(a in ("turn one", "turn two") for a in calls[0]["argv"])
+    # One session, created then resumed.
+    assert calls[0]["session"] == calls[1]["session"]
+    assert calls[0]["resumed"] is False and calls[1]["resumed"] is True
+
+
+def test_the_cli_backend_never_hands_a_child_the_api_key(tmp_path, monkeypatch):
+    """The whole reason this backend exists.
+
+    The CLI resolves credentials in a fixed order and an API key OUTRANKS the
+    subscription, so a stray `ANTHROPIC_API_KEY` would move every solve onto
+    metered billing without a word — while answering exactly as well, which is
+    what makes it invisible. The miner's own environment is left alone; only
+    the child's is scrubbed.
+
+    `CLAUDE_CODE_*` goes for a different reason, measured: launched from inside
+    a Claude Code session the child inherited the PARENT's session id, so
+    `--resume` would have appended every solve to the operator's own
+    conversation.
+    """
+    from solvers.claude_cli import CliBackend, child_env
+
+    log = _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-not-be-used")
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "the-parent-session")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example")
+
+    env = child_env()
+    assert "ANTHROPIC_API_KEY" not in env, "the child would bill the API key"
+    assert "CLAUDECODE" not in env and "CLAUDE_CODE_SESSION_ID" not in env
+    # Operator configuration is not this module's to edit.
+    assert env["ANTHROPIC_BASE_URL"] == "https://proxy.example"
+    assert "PATH" in env
+
+    asyncio.run(_one_cli_turn(CliBackend()))
+    seen = _cli_calls(log)[0]
+    assert seen["api_key"] is None and seen["claudecode"] is None
+
+    # ...and an operator who genuinely wants the key can have it back.
+    monkeypatch.setenv("SOLVER_CLI_ALLOW_API_KEY", "1")
+    assert child_env()["ANTHROPIC_API_KEY"] == "sk-ant-should-not-be-used"
+
+
+async def _one_cli_turn(backend, prompt="solve it", timeout_s=60.0):
+    conversation = await backend.open()
+    try:
+        return await conversation.send(prompt, timeout_s)
+    finally:
+        await conversation.close()
+
+
+def test_a_long_cli_answer_is_not_lost_to_a_line_limit(tmp_path, monkeypatch):
+    """The failure this had, found by asking what a 200KB answer does.
+
+    `readline()` is bounded by the stream reader's limit -- 64KB by default --
+    and the CLI's final `result` event embeds the whole answer a second time, so
+    one long program puts a single line over it. Measured before the fix: the
+    read did not merely lose the answer, it STALLED and then reported the turn
+    unfinished after the entire slice. Silent, slow and total, which is the
+    worst shape a failure can have.
+
+    Reading in chunks and splitting lines here removes the limit rather than
+    raising it, because a raised limit only moves the cliff.
+    """
+    from solvers.claude_cli import CliBackend
+
+    binary = tmp_path / "long-claude"
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "sys.stdin.read()\n"
+        "big = 'x' * 200000\n"
+        "d = {'type':'stream_event','event':{'type':'content_block_delta',"
+        "'delta':{'type':'text_delta','text':'```python\\n'+big+'\\n```'}}}\n"
+        "sys.stdout.write(json.dumps(d)+'\\n')\n"
+        "sys.stdout.write(json.dumps({'type':'result','is_error':False,"
+        "'result':'```python\\n'+big+'\\n```'})+'\\n')\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("SOLVER_CLI_BIN", str(binary))
+
+    async def go():
+        backend = CliBackend()
+        conversation = await backend.open()
+        try:
+            started = time.monotonic()
+            body = await conversation.send("solve it", 60.0)
+            return body, time.monotonic() - started, conversation.empty_reason
+        finally:
+            await conversation.close()
+
+    body, spent, reason = asyncio.run(go())
+    assert len(body) > 199_000, f"a long answer came back as {len(body)} chars"
+    assert spent < 20.0, (
+        f"took {spent:.0f}s of a 60s slice — the read stalled rather than "
+        f"failing, which spends the deadline and submits nothing"
+    )
+    assert reason is None
+
+
+def test_a_cli_turn_cut_off_keeps_what_arrived(tmp_path, monkeypatch):
+    """The same rule every other read here keeps: submit the part that arrived.
+
+    This is why the backend reads `stream-json` rather than `json`. The single
+    JSON result emits nothing until the turn ends, so a deadline landing
+    mid-answer would be a total loss; the event stream hands over the text
+    already written. `still_writing` is what then stops the repair loop asking a
+    model that never finished to fix what it did not say.
+    """
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch, mode="slow")
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        started = time.monotonic()
+        body = await conversation.send("solve it", 3.0)
+        spent = time.monotonic() - started
+        return body, spent, conversation.still_writing, conversation.empty_reason
+
+    body, spent, writing, reason = asyncio.run(go())
+    assert spent < 10.0, f"a 3s slice took {spent:.1f}s"
+    assert writing is True, "a turn killed mid-answer must read as unfinished"
+    assert body, "threw away the text that had already arrived"
+    assert body.startswith("```python"), body
+    assert reason is None, "text arrived, so nothing is missing to explain"
+
+
+def test_a_cli_session_that_fails_is_told_apart_from_one_that_says_nothing(
+    tmp_path, monkeypatch
+):
+    """Two empty turns that need opposite handling, and `_attempt` reads the
+    difference off `empty_reason`.
+
+    A non-zero exit is the SESSION failing — a lost conversation, a refused
+    resume, a broken install — and the loop answers that by carrying the repair
+    to a fresh one. A clean exit with no text is the model declining to say
+    anything, which is the conversation working and the turn being wasted.
+    """
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch, mode="exit1")
+    conversation_reason = _cli_reason(CliBackend())
+    assert conversation_reason == "unreadable", conversation_reason
+
+    _fake_cli(tmp_path, monkeypatch, mode="silent")
+    assert _cli_reason(CliBackend()) == "no-code"
+
+    # A binary that is not there at all must be a failed turn, never a crash:
+    # this runs inside a solve, and an exception here would surface as a dead
+    # backend for the whole pass.
+    monkeypatch.setenv("SOLVER_CLI_BIN", str(tmp_path / "does-not-exist"))
+    assert _cli_reason(CliBackend()) == "unreadable"
+
+
+def _cli_reason(backend):
+    async def go():
+        conversation = await backend.open()
+        body = await conversation.send("solve it", 30.0)
+        assert not body, body
+        return conversation.empty_reason
+    return asyncio.run(go())
+
+
+def test_the_cli_backend_asks_a_different_model_for_a_second_opinion(
+    tmp_path, monkeypatch
+):
+    """`avoid` is how a second pass reaches something other than what just
+    failed. A browser fleet answers it with another account; here the better
+    answer is another model, and it costs nothing to offer."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOLVER_CLI_MODELS", "opus,sonnet")
+    backend = CliBackend()
+
+    async def go():
+        first = await backend.open()
+        second = await backend.open(avoid=first.provider)
+        return first.provider, second.provider, first._session, second._session
+
+    a, b, sid_a, sid_b = asyncio.run(go())
+    assert a == "cli:opus" and b == "cli:sonnet", (a, b)
+    assert sid_a != sid_b, "two conversations shared one session id"
+
+
+def test_the_cli_child_is_given_no_tools_and_no_customisations(
+    tmp_path, monkeypatch
+):
+    """What the child is allowed to be, checked as argv because that is the only
+    place it is decided.
+
+    Three of these are load-bearing. `--tools ""` because the answer is text and
+    a tool call is a way for the turn to end without one. `--safe-mode` because
+    the operator's CLAUDE.md, skills and hooks are not part of this task and
+    could only steer it. And NOT `--bare`, whose own help says Anthropic auth is
+    then strictly an API key and OAuth is never read — precisely backwards for a
+    subscription.
+    """
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOLVER_CLI_EFFORT", "low")
+    asyncio.run(_one_cli_turn(CliBackend()))
+    argv = _cli_calls(log)[0]["argv"]
+
+    assert "--bare" not in argv, (
+        "--bare makes the CLI read an API key and never OAuth, which defeats "
+        "the entire purpose of this backend"
+    )
+    assert argv[argv.index("--tools") + 1] == ""
+    for flag in ("--safe-mode", "--strict-mcp-config", "--disable-slash-commands",
+                 "--include-partial-messages"):
+        assert flag in argv, f"{flag} missing from {argv}"
+    assert argv[argv.index("--output-format") + 1] == "stream-json"
+    assert argv[argv.index("--effort") + 1] == "low"
+    assert argv[argv.index("--permission-prompts") + 1] == "none"
+    # A system prompt of our own: the default one is a coding AGENT's, all
+    # tools and files and git, and none of it applies to "write one program".
+    assert "--system-prompt" in argv
+    # An empty working directory, so there is nothing in scope to read.
+    # Recorded from INSIDE the child: `close()` removes the directory, and a
+    # test that looked afterwards would be asserting on its own cleanup.
+    assert _cli_calls(log)[0]["cwd_entries"] == [], _cli_calls(log)[0]["cwd_entries"]
+
+
+def test_the_cli_backend_says_when_the_subscription_is_running_out(
+    tmp_path, monkeypatch, capsys
+):
+    """The one failure mode a subscription has that an API key does not.
+
+    Past the limit every solve fails identically, for a reason no other line of
+    the log would name. The CLI reports it on the event stream and this is the
+    only place it is ever seen."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch, mode="ratelimit")
+    backend = CliBackend()
+    asyncio.run(_one_cli_turn(backend))
+    asyncio.run(_one_cli_turn(backend))
+    out = capsys.readouterr().out
+
+    assert "93% of the five_hour subscription limit" in out, out
+    assert "resets in about" in out, out
+    # Once per tenth of the budget, not once per turn: two turns at the same
+    # utilisation say it once.
+    assert out.count("subscription limit used") == 1, out
+
+
+def test_selecting_the_cli_backend_needs_no_browser(monkeypatch):
+    """`SOLVER_BACKEND=cli` and nothing else. The default stays `browser`,
+    because a solver that silently changed where the answers came from would be
+    the worst kind of upgrade."""
+    from solvers import roster as roster_module
+
+    monkeypatch.setenv("SOLVER_BACKEND", "cli")
+    assert roster_module.backend_kind() == "cli"
+    # No browser is attached, and nothing defaults to one on the standard port
+    # only to report that it could not be reached.
+    assert roster_module.roster() == []
+    assert "claude CLI" in roster_module.describe([])
+    solver = roster_module.build_solver()
+    assert type(solver._backend).__name__ == "CliBackend"
+
+    monkeypatch.delenv("SOLVER_BACKEND", raising=False)
+    assert roster_module.backend_kind() == "browser"
+    monkeypatch.setenv("SOLVER_BACKEND", "nonsense")
+    with pytest.raises(SystemExit):
+        roster_module.backend_kind()
