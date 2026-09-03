@@ -5857,8 +5857,7 @@ def test_grading_is_not_started_when_it_cannot_finish():
     is no time for a repair round and `verified` never reaches the validator."""
     from types import SimpleNamespace
 
-    from solvers.prompts import MAX_SELF_TESTS
-    from solvers.verify import GRADE_FLOOR_S, VERIFY_TIMEOUT_S
+    from solvers.verify import ROUND_TRIP_FLOOR_S, VERIFY_TIMEOUT_S
 
     solver, _ = _solver_seeing([])
     ran = []
@@ -5878,10 +5877,25 @@ def test_grading_is_not_started_when_it_cannot_finish():
     solver._grade(reply, task, 300.0, cases)
     assert ran, "stopped grading when there was plenty of budget"
 
-    # A cap on the cap: a task with twenty cases must not refuse to grade
-    # anything under a hundred seconds, because a partial run that DOES fit is
-    # worth more than no evidence at all.
-    assert 0 < GRADE_FLOOR_S < VERIFY_TIMEOUT_S * MAX_SELF_TESTS
+    # The demand is ONE case, not the whole suite: a task with twenty cases must
+    # not refuse to grade anything under a hundred seconds, because a partial
+    # run that DOES fit is worth more than no evidence at all, and `check`
+    # bounds the rest itself.
+    ran.clear()
+    solver._grade(reply, task, VERIFY_TIMEOUT_S + 0.1, cases)
+    assert ran, "refused a six-case suite the budget could start"
+
+    # And grading must never be the thing that is too expensive when another
+    # model round trip is not. A band where the loop would spend twelve seconds
+    # on a prompt while refusing a check that measures under a second is not a
+    # trade anything would choose; it existed for two years because the two
+    # floors were never reasoned about together.
+    ran.clear()
+    solver._grade(reply, task, ROUND_TRIP_FLOOR_S + 0.1, cases)
+    assert ran, (
+        f"refused to grade with {ROUND_TRIP_FLOOR_S + 0.1:.1f}s left, which is "
+        f"more than the loop demands before sending a whole new prompt"
+    )
 
 
 def test_nothing_anywhere_still_submits_nothing(capsys):
@@ -8634,12 +8648,16 @@ def test_the_first_read_gets_the_deadline_the_validator_actually_advertised():
     )
     # Defaults on purpose: this is what an operator who has tuned nothing gets.
     asyncio.run(VerifyingSolver(_Fleet()).solve_task(task, timeout_s=300.0))
-    # slices[0] is the cases turn, and it reads against the SOLVE's clock like
-    # everything else -- no private cap. What it actually spends is decided by
-    # when the model finishes, not by an allocation.
-    assert slices[0] > 230.0, (
+    # slices[0] is the cases turn. It has a ceiling at `CASES_TURN_SHARE` of
+    # what is left -- see there for why that is not the cap this file removed
+    # twice -- but a ceiling is not a spend: what it actually costs is decided
+    # by when the model finishes, which is what the program read below shows.
+    from solvers.verify import CASES_TURN_SHARE
+
+    assert 230.0 * CASES_TURN_SHARE < slices[0] <= 300.0 * CASES_TURN_SHARE + 1.0, (
         f"the cases turn was given {slices[0]:.0f}s of a 300s deadline; it is "
-        f"supposed to read against the whole budget"
+        f"supposed to get its share of the budget and no more, and not so "
+        f"little that a thinking model is cut off"
     )
     slices = slices[1:]
     assert slices[0] > 230.0, (
@@ -9493,10 +9511,28 @@ def test_the_post_read_tail_never_outlives_the_read_it_rescues():
     outlived the whole request."""
     from solvers.browser_pool import (
         FULL_TAIL_S, COPY_PHASE_TIMEOUT_S, STREAM_PHASE_TIMEOUT_S,
-        POSTMORTEM_TIMEOUT_S, tail_budget,
+        SALVAGE_PHASE_TIMEOUT_S, POSTMORTEM_TIMEOUT_S, tail_budget,
     )
+    from solvers.verify import DELIVERY_RESERVE_S
 
-    assert FULL_TAIL_S == COPY_PHASE_TIMEOUT_S + STREAM_PHASE_TIMEOUT_S + POSTMORTEM_TIMEOUT_S
+    # EVERY phase, and the point of naming them is that a phase without a slice
+    # runs outside the promise. The prose salvage arrived that way and spent
+    # `STREAM_TIMEOUT_MS` beside the tail rather than inside it — measured, a
+    # constant +2.0s at every slice, which at a 5-second slice made the tail
+    # 180% of its own budget. It has a slice now, taken out of the stream phase
+    # rather than added to the total.
+    assert FULL_TAIL_S == (
+        COPY_PHASE_TIMEOUT_S + STREAM_PHASE_TIMEOUT_S
+        + SALVAGE_PHASE_TIMEOUT_S + POSTMORTEM_TIMEOUT_S
+    )
+    # And the total is what `DELIVERY_RESERVE_S` was sized to absorb. Growing it
+    # spends a reserve that also has to cover the last grade, the tab close and
+    # the archive-and-sign — and overrunning does not deliver the answer late,
+    # it answers 504 and throws away an answer already in hand.
+    assert FULL_TAIL_S < DELIVERY_RESERVE_S, (
+        f"the post-read tail ({FULL_TAIL_S}s) no longer fits inside the "
+        f"delivery reserve ({DELIVERY_RESERVE_S}s)"
+    )
     # Unchanged wherever there is room — which is every read in production.
     for generous in (22.0, 34.0, 238.0, 3600.0):
         assert tail_budget(generous) == FULL_TAIL_S
@@ -10889,11 +10925,32 @@ def test_the_cases_turn_does_not_shrink_the_read_the_program_gets():
 
     So the guarantee is arithmetic, not allocation: turn 2 opens on what the
     clock says is left, and the elapsed cases turn is the only thing that took
-    any of it."""
+    any of it.
+
+    Turn 1 now has a CEILING at `CASES_TURN_SHARE` of what is left, and that is
+    not the cap this test was written to refuse. The two removed caps converted a
+    slow cases turn into no answer, because a conversation still writing turn 1
+    could not take turn 2 and `_attempt` abandoned the pass. A cases turn that
+    hits the ceiling now drops its cases and asks a FRESH conversation for the
+    program, so what the ceiling costs is the grading bar and never the answer —
+    which is the trade the payment policy does allow. Measured live before it
+    existed: the cases turn averaged 97.2s against the program's 66.7s, took 54%
+    of the mean solve, and once took 197.9s of 290s, after which the program was
+    cut off mid-write and a truncated Rust program went out for zero.
+
+    What this test still refuses is a ceiling that eats the PROGRAM's read.
+    """
+    from solvers.verify import CASES_TURN_SHARE
+
     _, slices, caps, _ = _two_turn(300.0, [_CASES_ONLY, _RIGHT_PROGRAM])
-    assert slices[0] > 230.0, (
-        f"the cases turn was allocated {slices[0]:.0f}s of a 300s deadline — it "
-        f"is supposed to read against the whole budget, not a share of it"
+    assert slices[0] <= 300.0 * CASES_TURN_SHARE + 1.0, (
+        f"the cases turn was allocated {slices[0]:.0f}s of a 300s deadline, more "
+        f"than its {CASES_TURN_SHARE:.0%} share — the turn that produces the "
+        f"answer is supposed to keep the rest"
+    )
+    assert slices[0] > 100.0, (
+        f"the cases turn got only {slices[0]:.0f}s; a model that thinks before "
+        f"it writes needs longer than that — 77s was measured on a live tab"
     )
     # A fast cases turn costs the program almost nothing: these fakes reply
     # instantly, so turn 2 still opens on essentially the whole budget.
@@ -10928,12 +10985,24 @@ def test_every_deadline_asks_for_the_cases_first():
         )
         assert "<must_pass" in prompts[1], "turn 2 must restate the cases"
         assert answer.code, f"no program came back at a {deadline:.0f}s deadline"
-        # And turn 1 is allocated the whole budget at every size — the ceiling
-        # never scales down, only what the model actually spends does.
-        assert slices[0] > slices[1], (
-            f"turn 1 got {slices[0]:.0f}s and turn 2 {slices[1]:.0f}s at a "
-            f"{deadline:.0f}s deadline; turn 1 is allocated everything left"
-        )
+        # And where the ceiling applies, the turn that produces the ANSWER is
+        # never given less than the turn that produces the bar it would be
+        # checked against. That ordering used to run the other way -- turn 1
+        # was allocated everything left -- and measured live it made the cases
+        # turn 54% of the mean solve.
+        #
+        # Where it does NOT apply -- a budget too small for half of it to be a
+        # program turn -- turn 1 still reads against everything, exactly as
+        # before, because there the ceiling would cost the answer rather than
+        # protect it. Both halves are the same rule seen from two sizes.
+        from solvers.verify import CASES_TURN_SHARE, PROGRAM_TURN_FLOOR_S
+
+        if slices[0] * (1.0 - CASES_TURN_SHARE) >= PROGRAM_TURN_FLOOR_S:
+            assert slices[1] >= slices[0], (
+                f"turn 1 got {slices[0]:.0f}s and turn 2 only {slices[1]:.0f}s "
+                f"at a {deadline:.0f}s deadline; the cases are an optimisation "
+                f"and the program is the answer"
+            )
 
 
 def _burning_backend(deadline, cases_burns_s):
@@ -11535,6 +11604,159 @@ def test_grading_leaves_room_for_the_round_the_evidence_is_for(monkeypatch):
     assert len(sent) == 3, f"expected cases, program, repair; sent {len(sent)}"
 
 
+class _BatchExecutor:
+    """An executor whose cost is the CALL, not what is in it.
+
+    Both Docker executors are this shape: a container per `run_tests`, and for
+    Rust a full rustc build on top. The subprocess executor is not, which is
+    why sizing that ignores the call cost looked fine for so long.
+    """
+
+    def __init__(self, call_s=1.2, per_case_s=0.01):
+        self.call_s, self.per_case_s = call_s, per_case_s
+        self.calls, self.timeouts = 0, []
+
+    def run_tests(self, code, entrypoint, tests, timeout_s):
+        self.calls += 1
+        self.timeouts.append(timeout_s)
+        time.sleep(self.call_s + self.per_case_s * len(tests))
+
+        class _R:
+            passed, timed_out, error = True, False, None
+            value_ok, value, actual_repr = True, None, ""
+
+        return [_R() for _ in tests]
+
+
+def test_the_solve_always_finishes_before_the_miner_answers_504():
+    """The arithmetic nobody re-checks after changing a constant, and every one
+    of these numbers has been changed this week.
+
+    A 504 is a total loss -- indistinguishable from a dead miner, and worth
+    exactly zero -- so the whole chain has to close: the solve's budget, plus
+    everything that can run PAST it, must land inside the cutoff
+    `handle_request` cancels at. Two things run past it, and both are bounded
+    rather than assumed:
+
+      * the post-slice tail of the last read (copy control, network stream,
+        post-mortem), scaled by `tail_budget` to the slice it followed;
+      * one grading overrun, which is now at most `MIN_CASE_TIMEOUT_S` because a
+        short clock shortens the per-case timeout instead of spending the full
+        one on the last case.
+
+    The loop will not START a round below `ROUND_TRIP_FLOOR_S`, so that is the
+    largest slice the last read can be given.
+    """
+    from solvers.browser_pool import tail_budget
+    from solvers.verify import (
+        DELIVERY_RESERVE_S, MIN_CASE_TIMEOUT_S, ROUND_TRIP_FLOOR_S,
+    )
+    from custom_miner import RESPONSE_GRACE_S
+
+    for deadline in (30.0, 60.0, 300.0, 600.0):
+        cutoff = deadline + RESPONSE_GRACE_S            # the wait_for in handle_request
+        budget = cutoff - DELIVERY_RESERVE_S            # what solve_task may spend
+        if budget <= 5.0:                               # solve_task's own fallback
+            budget = max(1.0, cutoff * 0.5)
+        worst = budget + tail_budget(ROUND_TRIP_FLOOR_S) + MIN_CASE_TIMEOUT_S
+        assert worst < cutoff, (
+            f"deadline={deadline:g}: the worst-case solve ends at {worst:.1f}s "
+            f"but the miner cancels itself at {cutoff:.1f}s — that is a 504, "
+            f"which pays exactly zero and looks identical to a dead miner"
+        )
+        # And inside the validator's own window, which is the one that pays.
+        assert worst < deadline + 10.0, (
+            f"deadline={deadline:g}: worst case {worst:.1f}s is past the "
+            f"validator's {deadline + 10:.0f}s cutoff"
+        )
+
+
+def test_a_short_budget_buys_time_per_case_not_fewer_cases():
+    """The reported failure: eighteen Rust cases, eight seconds, five graded.
+
+    The sizing rule bought cases at the FULL per-case timeout and dropped the
+    rest — so eight seconds bought one case per call, and on an executor whose
+    cost is the CALL that meant one container per case. Measured on the shape
+    the log came from (1.2s per call, 18 cases):
+
+        budget    calls   graded   spent
+        none          1    18/18    1.38s
+        60s           2    18/18    2.58s
+        20s           7    18/18    8.58s
+        8s            6     6/18    7.26s   <- six containers for six cases,
+                                               where one call runs all
+                                               eighteen in 1.4s
+
+    A suite that is merely FAST should always run whole, because being fast is
+    exactly what makes a short clock enough for it.
+    """
+    from solvers.verify import MIN_CASE_TIMEOUT_S, VERIFY_TIMEOUT_S, _Grader
+
+    cases = [{"args": [i], "expected": i} for i in range(18)]
+
+    for budget in (None, 60.0, 20.0, 8.0):
+        grader, executor = _Grader(), _BatchExecutor()
+        grader.executor = lambda _lang, _e=executor: _e
+        passed, total, failures, _ = grader.check(
+            "x", "python", "g", cases, budget_s=budget
+        )
+        assert (passed, total) == (18, 18), (
+            f"budget={budget}: graded {passed}/{total}; a suite this fast fits "
+            f"any of these budgets"
+        )
+        assert not failures
+        assert executor.calls <= 4, (
+            f"budget={budget}: {executor.calls} executor calls for 18 cases — "
+            f"on a container-per-call backend that is {executor.calls} "
+            f"container starts"
+        )
+        # Never below the floor, and never above the real per-case timeout.
+        assert all(
+            MIN_CASE_TIMEOUT_S <= t <= VERIFY_TIMEOUT_S for t in executor.timeouts
+        ), executor.timeouts
+
+
+def test_shortening_the_clock_never_costs_the_hang_protection():
+    """What the bound exists for, and it must survive being spread thinner.
+
+    A suite that genuinely hangs must not overrun its budget — that was the
+    original defect, 100.2 seconds of grading bought with a 15-second gate. The
+    per-case clock is shortened, never removed, and never below
+    `MIN_CASE_TIMEOUT_S`, so a timeout still means the program did not finish in
+    a thousandfold margin rather than that the deadline was tight.
+    """
+    from solvers.verify import _Grader
+
+    grader = _Grader()
+    cases = [{"args": [i], "expected": i} for i in range(18)]
+    hangs = "def g(n):\n    while True:\n        pass\n"
+
+    started = time.monotonic()
+    passed, total, failures, _ = grader.check(
+        hangs, "python", "g", cases, budget_s=15.0
+    )
+    spent = time.monotonic() - started
+
+    assert spent < 20.0, f"a 15s budget bought {spent:.0f}s of grading"
+    assert (passed, total) == (0, 18)
+    assert len(failures) >= 10, (
+        f"only {len(failures)} of the hanging cases were identified; spreading "
+        f"the budget should report MORE of them for the same seconds, not fewer"
+    )
+    # And it says which clock it used, so a model is not told it failed to
+    # finish in five seconds when it was never given five seconds.
+    assert "that was all the time left" in failures[0], failures[0]
+
+    # Half hanging: the fast half must still pass, and the slow half be named.
+    half = ("def g(n):\n    import time\n    if n >= 9:\n"
+            "        time.sleep(30)\n    return n\n")
+    passed, total, failures, _ = grader.check(
+        half, "python", "g", cases, budget_s=15.0
+    )
+    assert passed == 9 and total == 18, (passed, total)
+    assert len(failures) == 9, len(failures)
+
+
 def test_a_partial_grading_run_can_never_read_as_verified():
     """`total` stays the FULL case count when a run is truncated, so an unrun
     case is unknown rather than passing. Passing what ran is not passing the
@@ -12018,7 +12240,14 @@ def test_the_cases_turn_can_wait_out_a_model_that_is_still_thinking():
 
     Measured on a live tab: 77 seconds of thinking before a character appeared,
     against a 60 second cap. Turn 1 timed out, the conversation was unusable,
-    and the pass was handed on."""
+    and the pass was handed on.
+
+    Turn 1 now stops at `CASES_TURN_SHARE` of what is left, which is comfortably
+    past that measured think — and the second half of this test is the reason a
+    ceiling is safe at all now. Thinking PAST the ceiling no longer ends the
+    solve: the cases are dropped, a fresh conversation is opened, and the
+    program still goes out. What the ceiling costs is the grading bar; what the
+    two removed caps cost was the answer."""
     log, answer = _thinking_backend(77.0)
 
     turns = [t for t, _, _ in log]
@@ -12028,11 +12257,20 @@ def test_the_cases_turn_can_wait_out_a_model_that_is_still_thinking():
         f"the cases turn stops at {hard_s:.0f}s, under a measured think of 77s: "
         f"a thinking model is cut off and the turn is lost"
     )
-    # Not "a bigger cap" — no cap. Turn 1 reads against the solve's clock.
-    assert hard_s > 230.0, (
-        f"the cases turn is still capped at {hard_s:.0f}s of a 300s deadline"
-    )
     assert answer.code, "no program was submitted"
+
+    # And past the ceiling: the cases go, the answer does not. This is the case
+    # the two removed caps got wrong, and the only reason this one is allowed.
+    for think in (160.0, 200.0):
+        log, answer = _thinking_backend(think)
+        assert [t for t, _, _ in log][:2] == ["CASES", "CODE"], (
+            f"thinking for {think:.0f}s cost the program turn entirely"
+        )
+        assert answer.code, (
+            f"a model that thought for {think:.0f}s — past the cases turn's "
+            f"share — submitted nothing at all, which is the exact trade the "
+            f"payment policy forbids"
+        )
 
 
 def test_a_cases_turn_that_costs_a_pass_does_not_cost_every_pass():

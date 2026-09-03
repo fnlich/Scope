@@ -58,6 +58,17 @@ from .rust_compile import compile_defect, rustc_path
 # a smoke test against tiny public examples, not the real grading run.
 VERIFY_TIMEOUT_S = float(os.environ.get("SOLVER_VERIFY_TIMEOUT_S", "5"))
 
+# The least a case may be given when the budget cannot afford the full timeout.
+#
+# `check` would rather shorten every case's clock than refuse cases outright --
+# see there for why -- but only down to a point where a timeout still MEANS
+# something. A correct answer to these problems runs in milliseconds, so one
+# second is already a thousandfold margin, and a program that cannot finish in
+# it is being reported honestly rather than harshly. Below this the number
+# stops being evidence and starts being an artefact of the deadline, so the run
+# gives up cases instead.
+MIN_CASE_TIMEOUT_S = 1.0
+
 # How long an executor that could not be built stays unavailable before the
 # next solve is allowed to try again.
 #
@@ -97,9 +108,6 @@ DELIVERY_RESERVE_S = 15.0
 # The least a lease wait may be cut to. Below this, waiting is pointless and
 # failing fast lets the pass end while another tab might still be tried.
 OPEN_FLOOR_S = 5.0
-
-# The most `_grade` will insist on before it declines to run anything at all.
-GRADE_FLOOR_S = 15.0
 
 # The least a correction round can be worth starting with: one prompt out, one
 # reply back, and something read from the page at the end of it. Below this the
@@ -197,6 +205,14 @@ class Candidate:
     # the cases" indistinguishable from "the model never sent any", and the
     # warning in `solve_task` said the second when the truth was the first.
     self_cases: int = 0
+    # How many of `self_total` actually RAN. They differ when the budget cut a
+    # run short, and without this the two are indistinguishable in the one line
+    # an operator reads: `self=5/18` says five passed, and leaves them to assume
+    # the other thirteen failed when in fact nobody looked at them. Kept beside
+    # the counts rather than folded into them because `total` is deliberately
+    # the full suite -- an unrun case is unknown, which is neither a pass nor a
+    # failure, and that is exactly what keeps `self_verified` false.
+    self_observed: int = 0
     # This reply is part of a program rather than a program: it uses something
     # only the round above it defined. Kept beside `defect` rather than folded
     # into it because `_supersedes` has to tell this apart from every other way
@@ -479,6 +495,7 @@ def _inherit_evidence(candidate: Candidate, prior: Candidate) -> None:
         # doing it.
         candidate.passed, candidate.total = prior.passed, prior.total
         candidate.self_passed, candidate.self_total = prior.self_passed, prior.self_total
+        candidate.self_observed = prior.self_observed
         candidate.failures = list(prior.failures)
         # WITH the cases they came from. Splitting these was a silent hole: the
         # inherited `failures` built a repair prompt quoting concrete cases and
@@ -682,10 +699,9 @@ class _Grader:
         between a check and a solve-ending one. Every case gets
         `VERIFY_TIMEOUT_S` and nothing used to bound the set, so a suite of
         twenty cases against a program that hangs costs twenty times that:
-        measured, 100.2 seconds. `_grade`'s gate demanded only
-        `min(needed, GRADE_FLOOR_S)` = 15 seconds be left before starting it --
-        a 6.7x under-estimate, and the run then took the rest of the deadline
-        with it. Two of those and a 290-second solve grades nothing and submits
+        measured, 100.2 seconds. `_grade`'s gate demanded only 15 seconds be
+        left before starting it -- a 6.7x under-estimate, and the run then took
+        the rest of the deadline with it. Two of those and a 290-second solve grades nothing and submits
         unverified, which is the failure this argument exists to end.
 
         A partial run is the point, and it is what the gate's own comment
@@ -714,6 +730,10 @@ class _Grader:
             return 0, 0, [], []
         executor = self.executor(language)
         started = time.monotonic()
+        # What each case was actually given. Reported in the failure text, so a
+        # timeout says the clock it was measured against rather than a constant
+        # the run may not have been able to afford.
+        per_case = VERIFY_TIMEOUT_S
         results: list[Any] = []
         ran = 0
         last_call_s = 0.0
@@ -735,41 +755,55 @@ class _Grader:
                 # costs milliseconds, it never fires.
                 if ran and (left <= 0 or left < last_call_s):
                     break
-                # How many the budget could pay for if every one of them burned
-                # the full per-case timeout. Nothing else can be known before a
-                # case runs, and nothing softer is safe: the executor has no
-                # batch-level timeout, so a chunk sized on what the cases have
-                # cost SO FAR runs to completion however long it turns out to
-                # take. Measured, sizing that way: a twenty-case suite whose
-                # second half hangs spent 50 seconds of a 12-second budget,
-                # because the ten fast cases said the next eighteen would be
-                # fast too.
+                # Buy TIME PER CASE, not cases at a fixed price.
                 #
-                # The pessimism that used to come with the worst case is gone
-                # all the same, and not by loosening the bound -- by looping.
-                # A run used to take `budget // timeout` cases and stop, so a
-                # suite of twenty ordinary cases costing 0.75s in total had
-                # seventeen of them refused whenever the budget was under a
-                # hundred seconds, and cases refused are evidence thrown away.
-                # Now each chunk costs almost nothing, the clock barely moves,
-                # and the next chunk is the same size again: all twenty run, in
-                # 0.75s, in seven executor calls.
+                # The rule here used to be `chunk = left // VERIFY_TIMEOUT_S`:
+                # every case costs the full timeout, so a short budget buys few
+                # cases and the rest are dropped. On a batch executor that is
+                # exactly backwards, because the cost is dominated by the CALL
+                # rather than by what is in it -- the Docker executor starts a
+                # container per `run_tests`, and the Rust one a container and a
+                # full rustc build. Dropping cases to make the arithmetic fit
+                # then pays that fixed cost once per surviving case.
                 #
-                # Chunked rather than case by case because the Docker executor
-                # puts a whole batch in ONE container, so a call per case is a
-                # container start per case. The subprocess executor does not
-                # care either way -- measured, 0.2ms per case.
+                # Measured against an executor with a 1.2s call cost and 18
+                # cases, which is the shape of the log this was written from:
+                #
+                #   budget    calls   graded   spent
+                #   none          1    18/18    1.38s
+                #   60s           2    18/18    2.58s
+                #   20s           7    18/18    8.58s
+                #   8s            6     6/18    7.26s   <- six containers for
+                #                                          six cases, and one
+                #                                          call would have run
+                #                                          all eighteen in 1.4s
+                #
+                # So the budget is spread across the cases instead: each gets
+                # `left / remaining`, and they go in ONE call. A suite that is
+                # merely fast then always runs whole, because being fast is
+                # precisely what makes a short clock enough for it.
+                #
+                # `MIN_CASE_TIMEOUT_S` is where this stops. Below a second a
+                # timeout says more about the deadline than about the program,
+                # so rather than shorten further the run does what it used to do
+                # and takes fewer cases -- still in one call. That also keeps
+                # the original protection intact: a suite that HANGS is bounded
+                # by `left` either way, and now reports more failures for the
+                # same seconds, because more of it ran.
                 #
                 # Always at least one case, so a check never reports nothing at
-                # all, which bounds the overrun at one per-case timeout: the
-                # last chunk can be started with a second left and still cost
-                # five. That is what the round trip held back in `_grade`
-                # absorbs, and it sits outside `DELIVERY_RESERVE_S` besides.
+                # all, which bounds the overrun at one per-case timeout -- now
+                # at most `MIN_CASE_TIMEOUT_S` when the clock is short, where it
+                # used to be the full five seconds.
                 if VERIFY_TIMEOUT_S > 0:
-                    chunk = max(1, min(chunk, int(left // VERIFY_TIMEOUT_S)))
+                    per_case = min(
+                        VERIFY_TIMEOUT_S,
+                        max(MIN_CASE_TIMEOUT_S, left / max(1, chunk)),
+                    )
+                    chunk = max(1, min(chunk, int(left // per_case)))
             call_started = time.monotonic()
             batch = executor.run_tests(
-                code, entrypoint, cases[ran:ran + chunk], VERIFY_TIMEOUT_S
+                code, entrypoint, cases[ran:ran + chunk], per_case
             )
             last_call_s = time.monotonic() - call_started
             results.extend(batch)
@@ -813,7 +847,9 @@ class _Grader:
             label = ""
             if names and index < len(names) and names[index]:
                 label = f"case {index + 1} {names[index]!r}: "
-            failures.append(label + _describe(result, case, language, entrypoint))
+            failures.append(
+                label + _describe(result, case, language, entrypoint, per_case)
+            )
             failed.append(examples[index])
         return passed, len(cases), failures, failed
 
@@ -846,14 +882,33 @@ def _stable(text: Optional[str]) -> Optional[str]:
     return _HEAP_ADDRESS_RE.sub(r"\g<1>0x...\g<2>", _SANDBOX_PATH_RE.sub("<sandbox>", text))
 
 
-def _describe(result, case: TestCase, language: str, entrypoint: str) -> str:
-    """One line of concrete evidence for the repair prompt."""
+def _describe(
+    result, case: TestCase, language: str, entrypoint: str,
+    timeout_s: Optional[float] = None,
+) -> str:
+    """One line of concrete evidence for the repair prompt.
+
+    ``timeout_s`` is the clock this case was actually given, which is not always
+    `VERIFY_TIMEOUT_S`: when the budget cannot afford the full timeout for every
+    case, `check` shortens it rather than dropping cases. Reporting the constant
+    there would tell the model its program failed to finish in five seconds when
+    it was never given five seconds -- and a model told that goes looking for a
+    performance problem it may not have.
+    """
+    limit = VERIFY_TIMEOUT_S if timeout_s is None else timeout_s
     if language == "rust":
         call = f"stdin={_clip(case.args[0] if case.args else '')!r}"
     else:
         call = f"{entrypoint}(*{case.args!r}, **{case.kwargs!r})"
     if result.timed_out:
-        return f"{call} timed out after {VERIFY_TIMEOUT_S:g}s (too slow or an infinite loop)"
+        short = (
+            "" if limit >= VERIFY_TIMEOUT_S
+            else f" — that was all the time left, not the usual {VERIFY_TIMEOUT_S:.3g}s"
+        )
+        return (
+            f"{call} timed out after {limit:.3g}s (too slow or an infinite "
+            f"loop){short}"
+        )
     if result.error:
         return f"{call} raised: {_clip(_stable(_bound(result.error)), 300)}"
     actual = result.value if result.value_ok else result.actual_repr
@@ -957,29 +1012,63 @@ class _Plan:
 
     two_phase: bool = True
 
-# Turn 1 has NO timeout of its own. There is one clock on a solve -- the
-# deadline the validator advertised -- and turn 1 reads against that, exactly
-# like every other read here.
+# The most of what is left that the CASES turn may spend.
 #
-# It carried a private cap twice, and both were wrong in the same direction.
-# The first passed `extend_to_s` equal to the slice, which makes `send`'s
-# extension a no-op by construction; the second kept a soft 60s slice and a hard
-# 100s cap. Both cut the model off MID-THINK, and cutting a model off mid-think
-# is the one thing that cannot help: the reply does not exist yet, so what the
-# cap saves is time that bought nothing and what it costs is the whole turn.
-# Measured on a live tab: `Thought for 1m 17s` before a single character
-# appeared, against a 60 second cap.
+# Turn 1 carried a private cap twice before and both were removed, for an
+# argument that was right about the caps and wrong about one thing. The
+# argument: `send` returns the moment the model finishes, so a slice is a
+# ceiling and never a wait -- a cases turn that takes 90 seconds hands the
+# program the other 190 whether a cap exists or not. The only case a cap
+# changes is the one where the model has NOT finished, "and there it converts
+# a slow answer into no answer, which is the one trade the payment policy says
+# never to make". Measured against those caps on a live tab: `Thought for
+# 1m 17s` before a single character appeared, against a 60 second cap.
 #
-# A cap LOOKS like it protects the program's read, and it does not. `send`
-# returns the moment the model finishes -- the slice is a ceiling, never a wait
-# -- so a cases turn that takes 90 seconds hands the program the other 190
-# whether or not a cap exists. The only case a cap changes is the one where the
-# model has NOT finished, and there it converts a slow answer into no answer,
-# which is the one trade the payment policy says never to make.
+# Every word of that holds. What it assumes is that being cut off ends the
+# SOLVE, and that was true only because of what happened next: `_ask_for_cases`
+# returned None for a conversation mid-answer, and `_attempt` abandoned the pass
+# rather than send turn 2 into a tab that had not answered turn 1. So the cap
+# did convert a slow answer into no answer -- not because it was a cap, but
+# because nothing picked the solve up afterwards.
 #
-# What protects the program now is the budget itself and `_Plan`: turn 1 cannot
-# outlive the deadline, and a turn 1 that fails the TASK's way does not get a
-# second chance in the same solve.
+# Turn 1's answer is not the answer. It is a local grading bar, and the code
+# has always known how to proceed without one ("the cases turn produced none
+# usable; asking for the program without them"). What was missing is that a
+# conversation still writing turn 1 cannot be reused -- and the answer to that
+# is a different conversation, which this file already opens for other reasons.
+# With that path in place a cap costs the CASES, never the answer, and the
+# trade the payment policy forbids is not the one being made.
+#
+# Measured over a live run of thirteen solves, which is why this exists at all:
+# the cases turn averaged 97.2s against the program turn's 66.7s and took 54%
+# of the mean solve -- 1264 seconds of 2338 -- to produce no code at all. Twice
+# it left less than the worst observed program turn behind it, and once it took
+# 197.9s of a 290s budget, after which the program turn was cut off mid-write
+# at 90.8s and a truncated Rust program went out. That is a zero, and it is the
+# only zero in the run.
+#
+# A half, rather than a tuned number of seconds: the turn that produces the
+# answer gets at least half the clock, at any deadline the protocol allows. On
+# that same run it would have bound on two solves of thirteen and changed
+# nothing about the other eleven, because a ceiling that is never reached costs
+# nothing.
+CASES_TURN_SHARE = 0.5
+
+# ...and the least the program must be left with for that ceiling to be applied
+# at all. Below this the ceiling becomes the disease it was meant to cure: half
+# of a small budget is not a program turn, so stopping turn 1 there leases a
+# second tab and asks a second account for a whole program with seconds on the
+# clock, arriving at the same empty answer having spent someone's quota to get
+# there. Measured at a 40-second deadline: a 25-second budget, a 12.5-second
+# ceiling, and 12.5 seconds in which to produce a program.
+#
+# 90 seconds, from the same live run: the program turn ran 31.5s to 141.7s with
+# a mean of 66.7s, so a program half below 90 is not comfortably above what a
+# program turn actually costs. The effect is that the ceiling binds only on the
+# deadlines this subnet advertises -- at 300s it caps the cases turn at 142.5s,
+# which is where both of the run's expensive cases turns (161.6s and 197.9s)
+# were -- and leaves every shorter deadline exactly as it was.
+PROGRAM_TURN_FLOOR_S = 90.0
 
 
 # Nothing here passes `extend_to_s` any more, and that is the end of a long
@@ -1290,7 +1379,16 @@ class VerifyingSolver:
             f"[verify] {task.language} entrypoint={task.entrypoint} "
             f"provider={won_with or 'none'} "
             f"examples={best.passed}/{best.total} "
-            + (f"self={best.self_passed}/{best.self_total} " if best.self_total else "")
+            + (
+                f"self={best.self_passed}/{best.self_total} "
+                + (
+                    f"({best.self_observed} ran, "
+                    f"{best.self_total - best.self_observed} never did) "
+                    if best.self_observed and best.self_observed < best.self_total
+                    else ""
+                )
+                if best.self_total else ""
+            )
             + f"verified={best.verified} "
             # `verified=False` is the only thing a live solve could ever print,
             # because no request ships public examples -- so on its own it said
@@ -1402,10 +1500,68 @@ class VerifyingSolver:
             two_phase = plan is None or plan.two_phase
             if self._self_tests and two_phase:
                 asked_at = time.monotonic()
+                left_for_cases = budget - (time.monotonic() - started)
+                # Half, so the turn that produces the ANSWER keeps the other
+                # half. See `CASES_TURN_SHARE`. A ceiling, never a wait: a
+                # cases turn that finishes sooner hands the rest straight on,
+                # which on the run this was measured from is eleven solves of
+                # thirteen.
+                cases_slice = left_for_cases
+                if left_for_cases * (1.0 - CASES_TURN_SHARE) >= PROGRAM_TURN_FLOOR_S:
+                    cases_slice = max(1.0, left_for_cases * CASES_TURN_SHARE)
                 cases = await self._ask_for_cases(
-                    conversation, task, budget - (time.monotonic() - started)
+                    conversation, task, cases_slice
                 )
                 phases.mark("1 cases", model_s=time.monotonic() - asked_at)
+                if (
+                    cases is None
+                    and getattr(conversation, "still_writing", False)
+                    and cases_slice < left_for_cases - 1.0
+                    # ...and there is time to be worth a second tab. Without
+                    # this the ceiling recreated the failure `_burning_backend`
+                    # was written for: a 40s deadline gives a 20s budget and a
+                    # 10s ceiling, and recovering there leases a second tab and
+                    # asks a second account for a whole program with ten
+                    # seconds on the clock, arriving at the same empty answer
+                    # having spent someone's quota to get there.
+                    #
+                    # `EMPTY_HANDED_FLOOR_S` is the number this file already
+                    # uses for exactly this question -- is another ask worth it
+                    # while holding NOTHING -- and its argument applies here
+                    # unchanged: a failed extra ask costs nothing that was not
+                    # already lost, so the floor is the mechanical minimum.
+                    and budget - (time.monotonic() - started) >= EMPTY_HANDED_FLOOR_S
+                ):
+                    # OUR ceiling stopped it, not the deadline, and the model
+                    # is mid-answer rather than the tab being broken. The cases
+                    # are gone -- nothing is waited for and nothing partial is
+                    # kept, because half a bar is worse than none -- but the
+                    # SOLVE is not. What cannot happen is turn 2 going into
+                    # this conversation, which is still writing turn 1; so it
+                    # goes into a fresh one, and the program gets the half of
+                    # the budget this turn was not allowed to spend.
+                    #
+                    # This branch is the whole reason a ceiling is safe here.
+                    # Without it the ceiling would do exactly what the two
+                    # removed ones did: turn a slow cases turn into no answer.
+                    try:
+                        await conversation.close()
+                    except Exception:  # noqa: BLE001 - it may already be broken
+                        pass
+                    conversation = await self._open_within(budget, started, avoid)
+                    provider = best_provider = getattr(
+                        conversation, "provider", provider
+                    )
+                    phases.mark(f"open {provider or 'tab'}")
+                    cases = []
+                    print(
+                        f"[verify] the cases turn was still writing at its "
+                        f"{cases_slice:.0f}s share of the budget; dropping the "
+                        f"cases and asking a fresh conversation for the program "
+                        f"with {budget - (time.monotonic() - started):.0f}s left "
+                        f"— the program is the answer, the cases were only the "
+                        f"bar it would have been checked against"
+                    )
                 if cases is None:
                     # The tab could not be read, or the model was still writing.
                     # Sending turn 2 into it would queue behind an answer that
@@ -2167,6 +2323,9 @@ class VerifyingSolver:
         if not total:
             return
         candidate.self_passed, candidate.self_total = passed, total
+        # Exact for THIS call: `check` counts every result as either a pass or
+        # a failure line, so the two together are what ran.
+        candidate.self_observed = passed + len(failures)
         candidate.from_self_tests = True
         # Only failures drive a repair. A clean run is left silent: it is the
         # ordinary outcome and saying so on every solve would bury the line
@@ -2209,13 +2368,26 @@ class VerifyingSolver:
         # can still be acted on") is as true at 0.2s as at 0, so it asks what
         # the run could actually cost.
         #
-        # `GRADE_FLOOR_S` caps the demand: a task with twenty cases would
-        # otherwise refuse to grade anything under a hundred seconds, and a
-        # partial run that DOES fit is worth more than no evidence at all.
-        needed = VERIFY_TIMEOUT_S * max(
-            1, len(cases or []) or len(getattr(task, "public_examples", None) or [])
-        )
-        out_of_budget = left is not None and left < min(needed, GRADE_FLOOR_S)
+        # The floor is ONE CASE, and it used to be `GRADE_FLOOR_S` = 15.
+        #
+        # Fifteen was picked to cap a demand computed from the suite size --
+        # twenty cases would otherwise refuse to grade below a hundred seconds
+        # -- and nothing reconciled it with `ROUND_TRIP_FLOOR_S` = 12, which is
+        # what the repair loop demands before it will send another prompt. The
+        # two constants left a band, 12 to 15 seconds, in which the loop would
+        # happily spend a whole model round trip but refused a local check that
+        # measures 0.78 seconds for twenty cases. A cases-only correction
+        # landing there was graded 0 of 0, `_inherit_evidence` restored the
+        # failures the merge had just corrected, and the round went out
+        # re-reporting a disagreement that no longer existed.
+        #
+        # Grading must never be the thing that is too expensive when another
+        # prompt is not, so the demand is now what a run actually costs at
+        # minimum: one case at the per-case timeout. `check` bounds the rest
+        # itself -- it chunks against the budget and stops on time -- which is
+        # what makes a size-derived demand unnecessary rather than merely
+        # capped.
+        out_of_budget = left is not None and left < VERIFY_TIMEOUT_S
         # What the RUN may spend, as opposed to what it must have to start.
         #
         # A round trip is held back, and the first attempt at that was reverted
@@ -2231,11 +2403,20 @@ class VerifyingSolver:
         # left, and a list of failures nobody has time to report is not worth
         # the run that produced it.
         #
-        # Only when a round trip is actually on the table. Below that floor the
-        # loop will not start another round whatever happens, so reserving for
-        # one would simply throw the seconds away.
+        # Only when a round trip is actually on the table, AND only when what
+        # is left after holding it back still buys a case. Below the round-trip
+        # floor the loop will not start another round whatever happens, so
+        # reserving for one would throw the seconds away; and between the two,
+        # subtracting the reserve leaves a sliver -- a run that grades one case
+        # of twenty, passes it, reports no failures, and ends the loop on
+        # ignorance rather than on evidence. That is the exact regression this
+        # reserve was reverted for once already, and the guard is what keeps it
+        # from coming back through the other side.
         grading_budget = left
-        if left is not None and left > ROUND_TRIP_FLOOR_S:
+        if (
+            left is not None
+            and left - ROUND_TRIP_FLOOR_S >= VERIFY_TIMEOUT_S
+        ):
             grading_budget = left - ROUND_TRIP_FLOOR_S
         # When the reserve starts running out from, so a SECOND grading pass
         # spends what the first one left rather than the same allowance over
