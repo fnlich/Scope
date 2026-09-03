@@ -11549,6 +11549,116 @@ def test_grading_leaves_room_for_the_round_the_evidence_is_for(monkeypatch):
     assert len(sent) == 3, f"expected cases, program, repair; sent {len(sent)}"
 
 
+class _BatchExecutor:
+    """An executor whose cost is the CALL, not what is in it.
+
+    Both Docker executors are this shape: a container per `run_tests`, and for
+    Rust a full rustc build on top. The subprocess executor is not, which is
+    why sizing that ignores the call cost looked fine for so long.
+    """
+
+    def __init__(self, call_s=1.2, per_case_s=0.01):
+        self.call_s, self.per_case_s = call_s, per_case_s
+        self.calls, self.timeouts = 0, []
+
+    def run_tests(self, code, entrypoint, tests, timeout_s):
+        self.calls += 1
+        self.timeouts.append(timeout_s)
+        time.sleep(self.call_s + self.per_case_s * len(tests))
+
+        class _R:
+            passed, timed_out, error = True, False, None
+            value_ok, value, actual_repr = True, None, ""
+
+        return [_R() for _ in tests]
+
+
+def test_a_short_budget_buys_time_per_case_not_fewer_cases():
+    """The reported failure: eighteen Rust cases, eight seconds, five graded.
+
+    The sizing rule bought cases at the FULL per-case timeout and dropped the
+    rest — so eight seconds bought one case per call, and on an executor whose
+    cost is the CALL that meant one container per case. Measured on the shape
+    the log came from (1.2s per call, 18 cases):
+
+        budget    calls   graded   spent
+        none          1    18/18    1.38s
+        60s           2    18/18    2.58s
+        20s           7    18/18    8.58s
+        8s            6     6/18    7.26s   <- six containers for six cases,
+                                               where one call runs all
+                                               eighteen in 1.4s
+
+    A suite that is merely FAST should always run whole, because being fast is
+    exactly what makes a short clock enough for it.
+    """
+    from solvers.verify import MIN_CASE_TIMEOUT_S, VERIFY_TIMEOUT_S, _Grader
+
+    cases = [{"args": [i], "expected": i} for i in range(18)]
+
+    for budget in (None, 60.0, 20.0, 8.0):
+        grader, executor = _Grader(), _BatchExecutor()
+        grader.executor = lambda _lang, _e=executor: _e
+        passed, total, failures, _ = grader.check(
+            "x", "python", "g", cases, budget_s=budget
+        )
+        assert (passed, total) == (18, 18), (
+            f"budget={budget}: graded {passed}/{total}; a suite this fast fits "
+            f"any of these budgets"
+        )
+        assert not failures
+        assert executor.calls <= 4, (
+            f"budget={budget}: {executor.calls} executor calls for 18 cases — "
+            f"on a container-per-call backend that is {executor.calls} "
+            f"container starts"
+        )
+        # Never below the floor, and never above the real per-case timeout.
+        assert all(
+            MIN_CASE_TIMEOUT_S <= t <= VERIFY_TIMEOUT_S for t in executor.timeouts
+        ), executor.timeouts
+
+
+def test_shortening_the_clock_never_costs_the_hang_protection():
+    """What the bound exists for, and it must survive being spread thinner.
+
+    A suite that genuinely hangs must not overrun its budget — that was the
+    original defect, 100.2 seconds of grading bought with a 15-second gate. The
+    per-case clock is shortened, never removed, and never below
+    `MIN_CASE_TIMEOUT_S`, so a timeout still means the program did not finish in
+    a thousandfold margin rather than that the deadline was tight.
+    """
+    from solvers.verify import _Grader
+
+    grader = _Grader()
+    cases = [{"args": [i], "expected": i} for i in range(18)]
+    hangs = "def g(n):\n    while True:\n        pass\n"
+
+    started = time.monotonic()
+    passed, total, failures, _ = grader.check(
+        hangs, "python", "g", cases, budget_s=15.0
+    )
+    spent = time.monotonic() - started
+
+    assert spent < 20.0, f"a 15s budget bought {spent:.0f}s of grading"
+    assert (passed, total) == (0, 18)
+    assert len(failures) >= 10, (
+        f"only {len(failures)} of the hanging cases were identified; spreading "
+        f"the budget should report MORE of them for the same seconds, not fewer"
+    )
+    # And it says which clock it used, so a model is not told it failed to
+    # finish in five seconds when it was never given five seconds.
+    assert "that was all the time left" in failures[0], failures[0]
+
+    # Half hanging: the fast half must still pass, and the slow half be named.
+    half = ("def g(n):\n    import time\n    if n >= 9:\n"
+            "        time.sleep(30)\n    return n\n")
+    passed, total, failures, _ = grader.check(
+        half, "python", "g", cases, budget_s=15.0
+    )
+    assert passed == 9 and total == 18, (passed, total)
+    assert len(failures) == 9, len(failures)
+
+
 def test_a_partial_grading_run_can_never_read_as_verified():
     """`total` stays the FULL case count when a run is truncated, so an unrun
     case is unknown rather than passing. Passing what ran is not passing the

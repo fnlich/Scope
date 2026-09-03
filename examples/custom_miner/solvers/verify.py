@@ -58,6 +58,17 @@ from .rust_compile import compile_defect, rustc_path
 # a smoke test against tiny public examples, not the real grading run.
 VERIFY_TIMEOUT_S = float(os.environ.get("SOLVER_VERIFY_TIMEOUT_S", "5"))
 
+# The least a case may be given when the budget cannot afford the full timeout.
+#
+# `check` would rather shorten every case's clock than refuse cases outright --
+# see there for why -- but only down to a point where a timeout still MEANS
+# something. A correct answer to these problems runs in milliseconds, so one
+# second is already a thousandfold margin, and a program that cannot finish in
+# it is being reported honestly rather than harshly. Below this the number
+# stops being evidence and starts being an artefact of the deadline, so the run
+# gives up cases instead.
+MIN_CASE_TIMEOUT_S = 1.0
+
 # How long an executor that could not be built stays unavailable before the
 # next solve is allowed to try again.
 #
@@ -710,6 +721,10 @@ class _Grader:
             return 0, 0, [], []
         executor = self.executor(language)
         started = time.monotonic()
+        # What each case was actually given. Reported in the failure text, so a
+        # timeout says the clock it was measured against rather than a constant
+        # the run may not have been able to afford.
+        per_case = VERIFY_TIMEOUT_S
         results: list[Any] = []
         ran = 0
         last_call_s = 0.0
@@ -731,41 +746,55 @@ class _Grader:
                 # costs milliseconds, it never fires.
                 if ran and (left <= 0 or left < last_call_s):
                     break
-                # How many the budget could pay for if every one of them burned
-                # the full per-case timeout. Nothing else can be known before a
-                # case runs, and nothing softer is safe: the executor has no
-                # batch-level timeout, so a chunk sized on what the cases have
-                # cost SO FAR runs to completion however long it turns out to
-                # take. Measured, sizing that way: a twenty-case suite whose
-                # second half hangs spent 50 seconds of a 12-second budget,
-                # because the ten fast cases said the next eighteen would be
-                # fast too.
+                # Buy TIME PER CASE, not cases at a fixed price.
                 #
-                # The pessimism that used to come with the worst case is gone
-                # all the same, and not by loosening the bound -- by looping.
-                # A run used to take `budget // timeout` cases and stop, so a
-                # suite of twenty ordinary cases costing 0.75s in total had
-                # seventeen of them refused whenever the budget was under a
-                # hundred seconds, and cases refused are evidence thrown away.
-                # Now each chunk costs almost nothing, the clock barely moves,
-                # and the next chunk is the same size again: all twenty run, in
-                # 0.75s, in seven executor calls.
+                # The rule here used to be `chunk = left // VERIFY_TIMEOUT_S`:
+                # every case costs the full timeout, so a short budget buys few
+                # cases and the rest are dropped. On a batch executor that is
+                # exactly backwards, because the cost is dominated by the CALL
+                # rather than by what is in it -- the Docker executor starts a
+                # container per `run_tests`, and the Rust one a container and a
+                # full rustc build. Dropping cases to make the arithmetic fit
+                # then pays that fixed cost once per surviving case.
                 #
-                # Chunked rather than case by case because the Docker executor
-                # puts a whole batch in ONE container, so a call per case is a
-                # container start per case. The subprocess executor does not
-                # care either way -- measured, 0.2ms per case.
+                # Measured against an executor with a 1.2s call cost and 18
+                # cases, which is the shape of the log this was written from:
+                #
+                #   budget    calls   graded   spent
+                #   none          1    18/18    1.38s
+                #   60s           2    18/18    2.58s
+                #   20s           7    18/18    8.58s
+                #   8s            6     6/18    7.26s   <- six containers for
+                #                                          six cases, and one
+                #                                          call would have run
+                #                                          all eighteen in 1.4s
+                #
+                # So the budget is spread across the cases instead: each gets
+                # `left / remaining`, and they go in ONE call. A suite that is
+                # merely fast then always runs whole, because being fast is
+                # precisely what makes a short clock enough for it.
+                #
+                # `MIN_CASE_TIMEOUT_S` is where this stops. Below a second a
+                # timeout says more about the deadline than about the program,
+                # so rather than shorten further the run does what it used to do
+                # and takes fewer cases -- still in one call. That also keeps
+                # the original protection intact: a suite that HANGS is bounded
+                # by `left` either way, and now reports more failures for the
+                # same seconds, because more of it ran.
                 #
                 # Always at least one case, so a check never reports nothing at
-                # all, which bounds the overrun at one per-case timeout: the
-                # last chunk can be started with a second left and still cost
-                # five. That is what the round trip held back in `_grade`
-                # absorbs, and it sits outside `DELIVERY_RESERVE_S` besides.
+                # all, which bounds the overrun at one per-case timeout -- now
+                # at most `MIN_CASE_TIMEOUT_S` when the clock is short, where it
+                # used to be the full five seconds.
                 if VERIFY_TIMEOUT_S > 0:
-                    chunk = max(1, min(chunk, int(left // VERIFY_TIMEOUT_S)))
+                    per_case = min(
+                        VERIFY_TIMEOUT_S,
+                        max(MIN_CASE_TIMEOUT_S, left / max(1, chunk)),
+                    )
+                    chunk = max(1, min(chunk, int(left // per_case)))
             call_started = time.monotonic()
             batch = executor.run_tests(
-                code, entrypoint, cases[ran:ran + chunk], VERIFY_TIMEOUT_S
+                code, entrypoint, cases[ran:ran + chunk], per_case
             )
             last_call_s = time.monotonic() - call_started
             results.extend(batch)
@@ -809,7 +838,9 @@ class _Grader:
             label = ""
             if names and index < len(names) and names[index]:
                 label = f"case {index + 1} {names[index]!r}: "
-            failures.append(label + _describe(result, case, language, entrypoint))
+            failures.append(
+                label + _describe(result, case, language, entrypoint, per_case)
+            )
             failed.append(examples[index])
         return passed, len(cases), failures, failed
 
@@ -842,14 +873,33 @@ def _stable(text: Optional[str]) -> Optional[str]:
     return _HEAP_ADDRESS_RE.sub(r"\g<1>0x...\g<2>", _SANDBOX_PATH_RE.sub("<sandbox>", text))
 
 
-def _describe(result, case: TestCase, language: str, entrypoint: str) -> str:
-    """One line of concrete evidence for the repair prompt."""
+def _describe(
+    result, case: TestCase, language: str, entrypoint: str,
+    timeout_s: Optional[float] = None,
+) -> str:
+    """One line of concrete evidence for the repair prompt.
+
+    ``timeout_s`` is the clock this case was actually given, which is not always
+    `VERIFY_TIMEOUT_S`: when the budget cannot afford the full timeout for every
+    case, `check` shortens it rather than dropping cases. Reporting the constant
+    there would tell the model its program failed to finish in five seconds when
+    it was never given five seconds -- and a model told that goes looking for a
+    performance problem it may not have.
+    """
+    limit = VERIFY_TIMEOUT_S if timeout_s is None else timeout_s
     if language == "rust":
         call = f"stdin={_clip(case.args[0] if case.args else '')!r}"
     else:
         call = f"{entrypoint}(*{case.args!r}, **{case.kwargs!r})"
     if result.timed_out:
-        return f"{call} timed out after {VERIFY_TIMEOUT_S:g}s (too slow or an infinite loop)"
+        short = (
+            "" if limit >= VERIFY_TIMEOUT_S
+            else f" — that was all the time left, not the usual {VERIFY_TIMEOUT_S:.3g}s"
+        )
+        return (
+            f"{call} timed out after {limit:.3g}s (too slow or an infinite "
+            f"loop){short}"
+        )
     if result.error:
         return f"{call} raised: {_clip(_stable(_bound(result.error)), 300)}"
     actual = result.value if result.value_ok else result.actual_repr
