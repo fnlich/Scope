@@ -13493,6 +13493,41 @@ def test_an_empty_model_name_is_refused_at_launch(tmp_path, monkeypatch):
         CliBackend()
 
 
+def test_a_drill_lets_the_operator_watch_the_ladder_move(
+    tmp_path, monkeypatch, capsys
+):
+    """A real usage limit cannot be ordered up, so `SOLVER_CLI_DRILL` pretends
+    one at launch: the first solve goes to the backup seat, on real traffic,
+    and the operator sees the lines a real limit would produce."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch, backups=1)
+    monkeypatch.setenv("SOLVER_CLI_DRILL", "limit:primary")
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        return await conversation.send("solve it", 60.0), conversation
+
+    body, conversation = asyncio.run(go())
+    assert extract_code(body, "g"), body
+    assert conversation.provider == "cli:opus@claude-2" and conversation.hops == 0
+    assert [c["account"] for c in _cli_calls(log)] == ["claude-2"]
+    out = capsys.readouterr().out
+    assert "DRILL: pretending account primary is at its usage limit" in out, out
+    assert "EMERGENCY MODE: cli:opus@claude-2" in out, out
+    # It expires like a real limit would, so it cannot become the config.
+    assert 0 < backend.limited_for("opus") <= 300
+
+    monkeypatch.setenv("SOLVER_CLI_DRILL", "refuse:opus")
+    backend = CliBackend()
+    assert backend.pick()[1].label == "sonnet/high"
+
+    monkeypatch.setenv("SOLVER_CLI_DRILL", "limit:nobody")
+    with pytest.raises(SystemExit):
+        CliBackend()
+
+
 def test_the_cli_summary_names_the_ladder(tmp_path, monkeypatch):
     from solvers import roster as roster_module
 

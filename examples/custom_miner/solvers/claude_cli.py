@@ -975,6 +975,40 @@ class CliBackend:
         self._mode: tuple[str, str] = (self.accounts[0].name, self.default.model)
         # Per (account, window), the utilisation last warned about.
         self._warned: dict[tuple[str, str], float] = {}
+        self._drill()
+
+    def _drill(self) -> None:
+        """`SOLVER_CLI_DRILL`: start with something pretended out, to watch the
+        ladder move on real traffic without waiting for a real outage.
+
+        `limit:<account>` pretends that account is at its usage limit;
+        `refuse:<model>` pretends the service is refusing that model. Comma-
+        separated, read once at launch, and every entry expires on its own
+        (five minutes for a limit, the recovery window for a model) so a drill
+        left in `.env` cannot quietly become the configuration. Said loudly at
+        launch for the same reason.
+        """
+        raw = _flag("SOLVER_CLI_DRILL", "")
+        if not raw:
+            return
+        by_name = {a.name: a for a in self.accounts}
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            kind, _, what = entry.partition(":")
+            kind, what = kind.strip().lower(), what.strip()
+            if kind == "limit" and what in by_name:
+                print(f"[cli] DRILL: pretending account {what} is at its usage limit")
+                self.note_limit(by_name[what], "*", time.time() + PAIR_HOLD_S, "drill")
+            elif kind == "refuse" and what:
+                print(f"[cli] DRILL: pretending the service refuses {what}")
+                self.note_degraded(what, "drill")
+            else:
+                raise SystemExit(
+                    f"SOLVER_CLI_DRILL entry {entry!r}: expected limit:<account> "
+                    f"(one of {', '.join(by_name)}) or refuse:<model>"
+                )
 
     # -- the ladder --------------------------------------------------------- #
 
@@ -1400,7 +1434,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             if status.get("loggedIn"):
                 method = status.get("authMethod")
                 seat = "subscription" if method == "oauth_token" else f"authMethod={method}"
-                print(f"  {account.name:<12} {where}: signed in ({seat})")
+                # Who, when the CLI says: two directories signed in as the
+                # SAME account share one limit, and this is where to see it.
+                who = " ".join(str(status[k]) for k in ("email", "subscriptionType")
+                               if status.get(k))
+                print(f"  {account.name:<12} {where}: signed in ({seat})"
+                      + (f" as {who}" if who else ""))
             else:
                 worst = 1
                 print(f"  {account.name:<12} {where}: NOT signed in -> "
