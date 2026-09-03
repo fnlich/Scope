@@ -163,7 +163,13 @@ _LIMIT_MARKS = ("rate limit", "rate_limit", "usage limit", "limit reached",
 _SERVER_MARKS = ("overloaded", "internal server error", "api_error",
                  "fetch failed", "econnreset", "econnrefused", "etimedout",
                  "socket hang up", "upstream", "timed out", "network error",
-                 "service unavailable", "bad gateway", "gateway time")
+                 "service unavailable", "bad gateway", "gateway time",
+                 # A model the service will not serve -- unknown, retired, or
+                 # not on this plan. Measured, a bad alias: exit 1 and "There's
+                 # an issue with the selected model ... It may not exist or you
+                 # may not have access to it". Another model is the answer.
+                 "issue with the selected model", "not_found_error",
+                 "unrecognized_model", "may not exist")
 _STATUS_WORD = re.compile(r"\b(\d{3})\b")
 
 
@@ -384,7 +390,7 @@ def classify(text: str) -> Optional[str]:
         return "auth"
     if any(mark in low for mark in _LIMIT_MARKS) or 429 in codes:
         return "limit"
-    if any(mark in low for mark in _SERVER_MARKS) or any(c >= 500 for c in codes):
+    if any(mark in low for mark in _SERVER_MARKS) or any(c >= 500 for c in codes) or 404 in codes:
         return "server"
     return None
 

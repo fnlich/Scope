@@ -13401,6 +13401,10 @@ def test_a_signed_out_account_found_mid_run_is_set_aside(tmp_path, monkeypatch):
     assert classify('API Error: 529 {"type":"overloaded_error"}') == "server"
     assert classify("API Error: 500 Internal server error") == "server"
     assert classify("fetch failed") == "server"
+    # A bad model alias, as the CLI words it: another model is the answer.
+    assert classify("There's an issue with the selected model (nonsense). It may "
+                    "not exist or you may not have access to it.") == "server"
+    assert classify("[claude-code:unrecognized_model] {}") == "server"
     assert classify("Rate limit reached, resets at 5pm") == "limit"
     assert classify("No conversation found with session ID: 3f0e") is None
     assert classify("") is None
