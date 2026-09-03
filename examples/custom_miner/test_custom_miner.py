@@ -12558,24 +12558,62 @@ argv = sys.argv[1:]
 def opt(name, default=None):
     return argv[argv.index(name) + 1] if name in argv else default
 
+# Which account: the CLI keeps one sign-in per CLAUDE_CONFIG_DIR.
+account = os.path.basename(os.environ.get("CLAUDE_CONFIG_DIR", "").rstrip("/")) or "default"
+model = opt("--model")
+
+# The mode, per account and model. FAKE_CLI_MODE is the default; a JSON file
+# beside the log overrides it mid-test -- the backend fixes the child's
+# environment when it is built, so a file is the only way to reach a later
+# turn -- keyed "<account>|<model>", "<account>", "model:<model>" or "*".
+mode = os.environ.get("FAKE_CLI_MODE", "ok")
+if os.path.exists(os.environ["FAKE_CLI_LOG"] + ".modes"):
+    table = json.load(open(os.environ["FAKE_CLI_LOG"] + ".modes"))
+    for key in (account + "|" + str(model), account, "model:" + str(model), "*"):
+        if key in table:
+            mode = table[key]
+            break
+
 if argv and argv[0] == "auth":
-    print(json.dumps({"loggedIn": True, "authMethod": "oauth_token"}))
+    print(json.dumps({"loggedIn": mode != "unauth", "authMethod": "oauth_token"}))
     sys.exit(0)
 
 prompt = sys.stdin.read()
-mode = os.environ.get("FAKE_CLI_MODE", "ok")
-if os.path.exists(os.environ["FAKE_CLI_LOG"] + ".mode"):
-    # A change of mode mid-test: the backend fixes the child's environment
-    # when it is built, so a file is the only way to reach a later turn.
-    mode = open(os.environ["FAKE_CLI_LOG"] + ".mode").read().strip()
 session = opt("--session-id") or opt("--resume") or "?"
 
 def emit(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
 
+# What the fake was asked, echoed so the test can assert on it. Written
+# FIRST, so a turn that then fails is still on the record.
+record = {"prompt": prompt, "argv": argv, "session": session,
+          "model": model, "effort": opt("--effort"), "account": account,
+          "resumed": "--resume" in argv,
+          "api_key": os.environ.get("ANTHROPIC_API_KEY"),
+          "claudecode": os.environ.get("CLAUDECODE"),
+          "cwd": os.getcwd(), "cwd_entries": sorted(os.listdir("."))}
+with open(os.environ["FAKE_CLI_LOG"], "a") as fh:
+    fh.write(json.dumps(record) + "\n")
+
 if mode == "exit1":
     sys.stderr.write("No conversation found with session ID: " + session + "\n")
+    sys.exit(1)
+if mode == "unauth":
+    sys.stderr.write("Not logged in \u00b7 Please run /login\n")
+    sys.exit(1)
+if mode == "server-error":
+    emit({"type": "result", "is_error": True, "subtype": "error_during_execution",
+          "result": "API Error: 500 Internal server error", "session_id": session})
+    sys.exit(1)
+if mode == "overloaded":
+    # The CLI retrying an overloaded request itself, one event per retry,
+    # then waiting out a delay that only grows.
+    for attempt, delay in ((1, 1000), (2, 4000), (3, 16000)):
+        emit({"type": "system", "subtype": "api_retry", "attempt": attempt,
+              "max_retries": 10, "retry_delay_ms": delay, "error_status": 529,
+              "error": "API Error: 529 {\"type\":\"overloaded_error\"}"})
+        time.sleep(delay / 1000.0)
     sys.exit(1)
 if mode == "silent":
     emit({"type": "result", "is_error": False, "session_id": session})
@@ -12611,16 +12649,6 @@ if mode in ("ratelimit", "limited", "opus-limit", "overage"):
               "session_id": session})
         sys.exit(1)
 
-# What the fake was asked, echoed so the test can assert on it.
-record = {"prompt": prompt, "argv": argv, "session": session,
-          "model": opt("--model"), "effort": opt("--effort"),
-          "resumed": "--resume" in argv,
-          "api_key": os.environ.get("ANTHROPIC_API_KEY"),
-          "claudecode": os.environ.get("CLAUDECODE"),
-          "cwd": os.getcwd(), "cwd_entries": sorted(os.listdir("."))}
-with open(os.environ["FAKE_CLI_LOG"], "a") as fh:
-    fh.write(json.dumps(record) + "\n")
-
 for piece in ("```python\n", "def g(n):\n", "    return n\n", "```"):
     emit({"type": "stream_event",
           "event": {"type": "content_block_delta",
@@ -12632,8 +12660,11 @@ emit({"type": "result", "is_error": False, "session_id": session,
 '''
 
 
-def _fake_cli(tmp_path, monkeypatch, mode="ok"):
-    """Install the stub as SOLVER_CLI_BIN and return its call log path."""
+def _fake_cli(tmp_path, monkeypatch, mode="ok", backups=0):
+    """Install the stub as SOLVER_CLI_BIN and return its call log path.
+
+    `backups` names that many backup accounts, each a directory under
+    `tmp_path` (`claude-2`, `claude-3`, ...), the way an operator would."""
     binary = tmp_path / "fake-claude"
     binary.write_text(_FAKE_CLI, encoding="utf-8")
     binary.chmod(0o755)
@@ -12642,7 +12673,21 @@ def _fake_cli(tmp_path, monkeypatch, mode="ok"):
     monkeypatch.setenv("SOLVER_CLI_WORKDIR", str(tmp_path / "work"))
     monkeypatch.setenv("FAKE_CLI_LOG", str(log))
     monkeypatch.setenv("FAKE_CLI_MODE", mode)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    if backups:
+        dirs = [tmp_path / f"claude-{n + 2}" for n in range(backups)]
+        monkeypatch.setenv("SOLVER_CLI_BACKUP_ACCOUNTS", ",".join(map(str, dirs)))
+    else:
+        monkeypatch.delenv("SOLVER_CLI_BACKUP_ACCOUNTS", raising=False)
+    monkeypatch.delenv("SOLVER_CLI_EMERGENCY_PROFILES", raising=False)
+    monkeypatch.delenv("SOLVER_CLI_MODELS", raising=False)
+    monkeypatch.delenv("SOLVER_CLI_RECOVERY_S", raising=False)
     return log
+
+
+def _cli_modes(log, table):
+    """Change what the fake does from here on, per account and model."""
+    (log.parent / (log.name + ".modes")).write_text(json.dumps(table))
 
 
 def _cli_calls(log):
@@ -12977,8 +13022,8 @@ def test_at_the_subscription_limit_every_solve_is_turned_away_at_once(
     assert 500 < backend.limited_for() <= 600, backend.limited_for()
     assert 500 < backend.limited_for("sonnet") <= 600
     out = capsys.readouterr().out
-    assert "subscription limit has been reached" in out, out
-    assert "not asking again" in out, out
+    assert "OUT for" in out and "account primary, every model -- limit" in out, out
+    assert "turned away" in out, out
 
 
 def test_a_limit_on_one_model_leaves_the_other_answering(
@@ -12996,25 +13041,28 @@ def test_a_limit_on_one_model_leaves_the_other_answering(
     async def go():
         first = await backend.open()
         body = await first.send("solve it", 60.0)
-        second = await backend.open(avoid=first.provider)
+        # A second solve: the ladder already knows, and goes straight there.
+        second = await backend.open()
         again = await second.send("solve it", 60.0)
-        # A THIRD solve asks for opus again and is turned away at the door.
-        third = await backend.open()
-        return body, first.empty_reason, again, third, await third.send("x", 60.0)
+        return body, first, again, second
 
-    body, reason, again, third, nothing = asyncio.run(go())
-    assert body == "" and reason == "unreadable", (body, reason)
+    body, first, again, second = asyncio.run(go())
+    # The turn itself moved on: opus refused, sonnet answered, same slice.
+    assert extract_code(body, "g") == "def g(n):\n    return n", body
+    assert first.provider == "cli:sonnet" and first.hops == 1
     assert extract_code(again, "g") == "def g(n):\n    return n", again
-    assert third.provider == "cli:opus" and nothing == ""
+    assert second.provider == "cli:sonnet" and second.hops == 0
     # The CLI said an hour; the backend takes its word for half of that at
     # most before one solve is let through to check (`LIMIT_RECHECK_S`).
     assert 1700 < backend.limited_for("opus") <= 1800, backend.limited_for("opus")
     assert backend.limited_for("sonnet") == 0
     assert backend.limited_for("claude-opus-5") > 1700, "a full model id"
-    # opus once (refused), sonnet once (answered); the third never ran.
-    assert [c["model"] for c in _cli_calls(log)] == ["sonnet"], _cli_calls(log)
+    calls = _cli_calls(log)
+    assert [c["model"] for c in calls] == ["opus", "sonnet", "sonnet"], calls
     # The same report on sonnet's turn was the same limit, not news.
-    assert capsys.readouterr().out.count("has been reached") == 1
+    out = capsys.readouterr().out
+    assert out.count("OUT for") == 1, out
+    assert "EMERGENCY MODE: cli:sonnet" in out, out
 
 
 def test_paid_extra_usage_is_off_unless_asked_for(tmp_path, monkeypatch, capsys):
@@ -13032,6 +13080,7 @@ def test_paid_extra_usage_is_off_unless_asked_for(tmp_path, monkeypatch, capsys)
         return body, conversation.empty_reason
 
     body, reason = asyncio.run(go())
+    # The fake reports overage on every model, so every rung refuses.
     assert body == "" and reason == "unreadable", (body, reason)
     assert backend.limited_for("opus") > 0
     out = capsys.readouterr().out
@@ -13068,9 +13117,14 @@ def test_a_cli_that_hangs_without_a_word_is_given_up_on_quickly(
 
     body, reason, spent = asyncio.run(go())
     assert body == "" and reason == "unreadable", (body, reason)
-    assert spent < 5.0, f"a silent CLI held the slice for {spent:.1f}s"
-    assert backend.stats()["stalls"] == 1
-    assert "produced no event at all" in capsys.readouterr().out
+    # Every rung of the ladder was tried -- a stall is one pair's until
+    # proven otherwise -- and each cost the first-event window, no more.
+    assert spent < 12.0, f"a silent CLI held the slice for {spent:.1f}s"
+    assert backend.stats()["stalls"] == 3
+    out = capsys.readouterr().out
+    assert "produced no event at all" in out
+    assert "hop: cli:opus -> cli:sonnet" in out, out
+    assert "hop: cli:sonnet -> cli:fable" in out, out
 
 
 def test_a_failed_first_cli_turn_does_not_reuse_its_session_id(
@@ -13089,18 +13143,17 @@ def test_a_failed_first_cli_turn_does_not_reuse_its_session_id(
         conversation = await backend.open()
         failed = conversation._session
         await conversation.send("turn one", 60.0)
-        (tmp_path / "calls.jsonl.mode").write_text("ok")
+        _cli_modes(log, {"*": "ok"})
         await conversation.send("turn two", 60.0)
         await conversation.send("turn three", 60.0)
         return failed
 
     failed = asyncio.run(go())
-    # The failing fake exits before it records itself, so the log holds the
-    # two turns that worked: a fresh id created, then resumed.
     calls = _cli_calls(log)
-    assert [c["resumed"] for c in calls] == [False, True], calls
-    assert calls[0]["session"] != failed, "reused the id of a failed first turn"
-    assert calls[0]["session"] == calls[1]["session"], "the session was lost"
+    assert [c["resumed"] for c in calls] == [False, False, True], calls
+    assert calls[0]["session"] == failed
+    assert calls[1]["session"] != failed, "reused the id of a failed first turn"
+    assert calls[1]["session"] == calls[2]["session"], "the session was lost"
 
 
 def test_waiting_for_a_cli_slot_counts_against_the_slice(tmp_path, monkeypatch):
@@ -13126,6 +13179,270 @@ def test_waiting_for_a_cli_slot_counts_against_the_slice(tmp_path, monkeypatch):
     body, reason, spent = asyncio.run(go())
     assert body == "" and reason == "unreadable", (body, reason)
     assert spent < 4.0, f"a 2s slice waited {spent:.1f}s for a slot"
+
+
+def test_a_usage_limit_moves_the_solve_to_the_backup_account(
+    tmp_path, monkeypatch, capsys
+):
+    """The first rung. A usage limit is the ACCOUNT's, so the answer is the
+    other account on the same model -- inside the same turn, since a session
+    that holds nothing yet loses nothing by moving."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch, backups=1)
+    _cli_modes(log, {"default": "limited", "*": "ok"})
+    backend = CliBackend()
+    assert [a.name for a in backend.accounts] == ["primary", "claude-2"]
+
+    async def go():
+        first = await backend.open()
+        body = await first.send("solve it", 60.0)
+        more = await first.send("fix it", 60.0)
+        # The next solve does not rediscover the limit.
+        second = await backend.open()
+        again = await second.send("solve it", 60.0)
+        return first, body, more, second, again
+
+    first, body, more, second, again = asyncio.run(go())
+    assert extract_code(body, "g") == "def g(n):\n    return n", body
+    assert first.provider == "cli:opus@claude-2" and first.hops == 1
+    assert extract_code(more, "g"), more
+    assert second.provider == "cli:opus@claude-2" and second.hops == 0
+    assert extract_code(again, "g"), again
+    calls = _cli_calls(log)
+    assert [(c["account"], c["model"], c["resumed"]) for c in calls] == [
+        ("default", "opus", False),   # refused
+        ("claude-2", "opus", False),  # the hop: fresh session on the other seat
+        ("claude-2", "opus", True),   # the repair turn resumes IT
+        ("claude-2", "opus", False),  # the next solve goes straight there
+    ], calls
+    assert calls[1]["session"] == calls[2]["session"]
+    assert calls[0]["session"] != calls[1]["session"], "a session cannot change seats"
+    out = capsys.readouterr().out
+    assert "hop: cli:opus@primary -> cli:opus@claude-2" in out, out
+    assert "EMERGENCY MODE: cli:opus@claude-2" in out and "limit" in out, out
+    assert "primary/*" in backend.stats()["out"], backend.stats()
+
+
+def test_a_limit_mid_conversation_hands_the_repair_to_a_fresh_one(
+    tmp_path, monkeypatch
+):
+    """A session lives in its account's config directory and cannot follow a
+    hop, so a limit that lands on a LATER turn ends the conversation as
+    unreadable -- and `VerifyingSolver`'s fresh-conversation path, asking
+    `open(avoid=<that provider>)`, lands on the other seat with the SAME model:
+    the failed pair is out, so any healthy pair is the answer, not a second
+    opinion."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch, backups=1)
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        first = await conversation.send("solve it", 60.0)
+        _cli_modes(log, {"default": "limited", "*": "ok"})
+        second = await conversation.send("fix it", 60.0)
+        carried = await backend.open(avoid=conversation.provider)
+        return first, second, conversation, carried
+
+    first, second, conversation, carried = asyncio.run(go())
+    assert extract_code(first, "g"), first
+    assert second == "" and conversation.empty_reason == "unreadable"
+    assert conversation.hops == 0, "a started session must not change seats"
+    assert conversation.provider == "cli:opus@primary"
+    assert carried.provider == "cli:opus@claude-2", carried.provider
+
+
+def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session(
+    tmp_path, monkeypatch, capsys
+):
+    """The second rung. The CLI retries an overloaded request itself and says
+    so on the stream, once per retry with the status; after the second the
+    next wait is already seconds long and a different model will answer
+    sooner. A model can change under a session, so the repair turn keeps its
+    history -- `--resume` on the same id, now with `--model sonnet --effort
+    high`."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch)
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        first = await conversation.send("solve it", 60.0)
+        _cli_modes(log, {"model:opus": "overloaded", "*": "ok"})
+        started = time.monotonic()
+        second = await conversation.send("fix it", 60.0)
+        spent = time.monotonic() - started
+        after = await backend.open()
+        return first, second, spent, conversation, after
+
+    first, second, spent, conversation, after = asyncio.run(go())
+    assert extract_code(first, "g") and extract_code(second, "g"), (first, second)
+    assert conversation.provider == "cli:sonnet" and conversation.hops == 1
+    assert conversation.effort == "high"
+    # The first retry was sat through (its 1s wait); the second was the
+    # signal, and the 4s and 16s waits behind it were never paid.
+    assert 0.9 < spent < 5.0, spent
+    calls = _cli_calls(log)
+    assert [(c["model"], c["effort"], c["resumed"]) for c in calls] == [
+        ("opus", "low", False), ("opus", "low", True), ("sonnet", "high", True),
+    ], calls
+    assert len({c["session"] for c in calls}) == 1, "the session was lost in the hop"
+    # Every account, ten minutes: the service's problem, not a seat's.
+    out_table = backend.stats()["out"]
+    assert "*/opus" in out_table and 500 < out_table["*/opus"]["seconds"] <= 600, out_table
+    assert "refused" in out_table["*/opus"]["why"] and "529" in out_table["*/opus"]["why"]
+    # The next fresh solve goes straight to the emergency profile.
+    assert after.provider == "cli:sonnet" and after.effort == "high"
+    out = capsys.readouterr().out
+    assert "hop: cli:opus -> cli:sonnet" in out, out
+    assert "EMERGENCY MODE: cli:sonnet (effort high)" in out, out
+
+
+def test_a_server_error_result_is_read_the_same_way(tmp_path, monkeypatch):
+    """The CLI giving up outright -- a `result` with `is_error` and a 5xx in
+    its text -- is the same refusal as a retry storm, and moves the same way."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch)
+    _cli_modes(log, {"model:opus": "server-error", "*": "ok"})
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        return await conversation.send("solve it", 60.0), conversation
+
+    body, conversation = asyncio.run(go())
+    assert extract_code(body, "g"), body
+    assert conversation.provider == "cli:sonnet"
+    assert "*/opus" in backend.stats()["out"]
+
+
+def test_the_default_model_is_tried_again_after_the_recovery_window(
+    tmp_path, monkeypatch, capsys
+):
+    """Recovery is not a background probe, it is the next real solve. When a
+    refused model's window expires the ladder puts it back on top, the next
+    solve asks it, and a failure re-parks it for another window."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOLVER_CLI_RECOVERY_S", "1")
+    _cli_modes(log, {"model:opus": "server-error", "*": "ok"})
+    backend = CliBackend()
+
+    async def go():
+        first = await backend.open()
+        await first.send("solve it", 60.0)
+        parked = await backend.open()           # still out: emergency profile
+        await asyncio.sleep(1.2)                # the window passes
+        _cli_modes(log, {"*": "ok"})            # and the service recovered
+        probe = await backend.open()            # ...so the next solve tries it
+        answer = await probe.send("solve it", 60.0)
+        _cli_modes(log, {"model:opus": "server-error", "*": "ok"})
+        await asyncio.sleep(1.2)
+        again = await backend.open()            # tried again, fails again
+        await again.send("solve it", 60.0)
+        parked_again = await backend.open()
+        return parked, probe, answer, again, parked_again
+
+    parked, probe, answer, again, parked_again = asyncio.run(go())
+    assert parked.provider == "cli:sonnet"
+    assert probe.provider == "cli:opus" and extract_code(answer, "g"), answer
+    # `again` was handed opus -- the window had passed -- and hopped inside
+    # its own turn; the solve after it is parked from the start.
+    assert again.provider == "cli:sonnet" and again.hops == 1
+    assert parked_again.provider == "cli:sonnet" and parked_again.hops == 0
+    out = capsys.readouterr().out
+    assert out.count("EMERGENCY MODE") == 2, out
+    assert out.count("back to normal") == 1, out
+    assert out.count("OUT for") == 2, out
+    assert not out.startswith("[cli] back to normal"), "nothing to come back from"
+
+
+def test_a_signed_out_backup_is_reported_at_launch_and_skipped(
+    tmp_path, monkeypatch, capsys
+):
+    """A backup that is not signed in is not fatal -- the primary answers --
+    but it is not a backup either, and the operator hears that at launch with
+    the command that fixes it, not at the limit."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch, backups=1)
+    _cli_modes(log, {"claude-2": "unauth", "*": "ok"})
+    backend = CliBackend()
+    asyncio.run(backend.start())
+    out = capsys.readouterr().out
+    assert "WARNING: backup account 'claude-2'" in out, out
+    assert f"python -m solvers.claude_cli login {tmp_path / 'claude-2'}" in out, out
+    assert "claude-2/*" in backend.stats()["out"]
+
+    # And at the limit, with the backup out too, the ladder still moves:
+    # the primary's next PROFILE rather than the seat that is not there.
+    _cli_modes(log, {"claude-2": "unauth", "default|opus": "limited", "*": "ok"})
+
+    async def go():
+        conversation = await backend.open()
+        return await conversation.send("solve it", 60.0), conversation
+
+    body, conversation = asyncio.run(go())
+    assert body == "" and conversation.empty_reason == "unreadable", body
+    assert [c["account"] for c in _cli_calls(log)] == ["default"], _cli_calls(log)
+
+
+def test_a_signed_out_account_found_mid_run_is_set_aside(tmp_path, monkeypatch):
+    """The CLI's own words -- "Not logged in" on stderr -- sort the failure:
+    an account's, not a model's, so the ladder moves seats and not models."""
+    from solvers.claude_cli import CliBackend, classify
+
+    assert classify("Not logged in · Please run /login") == "auth"
+    assert classify('API Error: 529 {"type":"overloaded_error"}') == "server"
+    assert classify("API Error: 500 Internal server error") == "server"
+    assert classify("fetch failed") == "server"
+    assert classify("Rate limit reached, resets at 5pm") == "limit"
+    assert classify("No conversation found with session ID: 3f0e") is None
+    assert classify("") is None
+
+    log = _fake_cli(tmp_path, monkeypatch, backups=1)
+    _cli_modes(log, {"default": "unauth", "*": "ok"})
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        return await conversation.send("solve it", 60.0), conversation
+
+    body, conversation = asyncio.run(go())
+    assert extract_code(body, "g"), body
+    assert conversation.provider == "cli:opus@claude-2"
+    assert "primary/*" in backend.stats()["out"]
+    assert "signed out" in backend.stats()["out"]["primary/*"]["why"]
+
+
+def test_the_status_command_names_each_account(tmp_path, monkeypatch, capsys):
+    from solvers import claude_cli
+
+    log = _fake_cli(tmp_path, monkeypatch, backups=1)
+    _cli_modes(log, {"claude-2": "unauth", "*": "ok"})
+    assert claude_cli.main(["status"]) == 1
+    out = capsys.readouterr().out
+    assert "primary" in out and "signed in (subscription)" in out, out
+    assert "claude-2" in out and "NOT signed in" in out, out
+    assert "ladder: opus/low, sonnet/high, fable/low" in out, out
+
+    _cli_modes(log, {"*": "ok"})
+    assert claude_cli.main(["status"]) == 0
+
+
+def test_the_cli_summary_names_the_ladder(tmp_path, monkeypatch):
+    from solvers import roster as roster_module
+
+    _fake_cli(tmp_path, monkeypatch, backups=1)
+    monkeypatch.setenv("SOLVER_BACKEND", "cli")
+    assert roster_module.describe([]) == (
+        "claude CLI (opus/low > sonnet/high > fable/low; 2 accounts)"
+    )
 
 
 def test_selecting_the_cli_backend_needs_no_browser(monkeypatch):

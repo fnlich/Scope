@@ -188,9 +188,14 @@ async def warm_up(solver, min_capacity: int = 1) -> None:
 
 def describe(browsers: Sequence[Browser]) -> str:
     if not browsers and backend_kind() == "cli":
-        from .claude_cli import cli_effort, cli_models
+        from .claude_cli import cli_backup_dirs, cli_effort, cli_emergency_profiles, cli_models
 
-        return f"claude CLI ({'/'.join(cli_models())}, effort {cli_effort()})"
+        effort = cli_effort()
+        ladder = [f"{cli_models()[0]}/{effort}"]
+        ladder += [p.label for p in cli_emergency_profiles(effort) if p.label not in ladder]
+        seats = 1 + len(cli_backup_dirs())
+        return (f"claude CLI ({' > '.join(ladder)}; "
+                f"{seats} account{'s' if seats != 1 else ''})")
     counts: dict[str, int] = {}
     for browser in browsers:
         counts[browser.site.name] = counts.get(browser.site.name, 0) + 1
