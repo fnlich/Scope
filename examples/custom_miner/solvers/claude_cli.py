@@ -984,6 +984,7 @@ class CliBackend:
         self._stalls = 0
         self._hops = 0
         self._cost = 0.0
+        self._tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
         self.last_error: Optional[str] = None
         # The outage table. Keyed (account name or "*", model or "*"): what is
         # known not to answer, until when, and why.
@@ -1262,6 +1263,16 @@ class CliBackend:
             self._cost += float(event.get("total_cost_usd") or 0.0)
         except (TypeError, ValueError):
             pass
+        # Tokens, as the CLI counts them: what a solve costs the seat, in the
+        # unit the seat's windows are measured in.
+        usage = event.get("usage") or {}
+        if isinstance(usage, dict):
+            for ours, theirs in (("input", "input_tokens"), ("output", "output_tokens"),
+                                 ("cache_read", "cache_read_input_tokens"),
+                                 ("cache_write", "cache_creation_input_tokens")):
+                value = _number(usage.get(theirs))
+                if value:
+                    self._tokens[ours] += int(value)
         if event.get("is_error"):
             self.last_error = str(event.get("result") or event.get("subtype") or "error")
 
@@ -1421,6 +1432,7 @@ class CliBackend:
             # billed this way -- it is here as a measure of how much work went
             # through the seat, not as an invoice.
             "list_price_usd": round(self._cost, 4),
+            "tokens": dict(self._tokens),
         }
 
     async def aclose(self) -> None:
