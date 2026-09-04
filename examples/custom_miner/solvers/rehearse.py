@@ -584,6 +584,10 @@ async def run(
 
     if len(results) > 1:
         _summarise(results, _solver_stats(solver))
+    else:
+        seat = _seat_line(_solver_stats(solver))
+        if seat:
+            print(f"[rehearse] {seat}")
     # 0 everything scored, 1 something answered and was wrong, 2 nothing could
     # be concluded -- so a rehearsal in a shell script can tell "my miner is
     # broken" from "this machine cannot grade Rust". A mixed run reports the
@@ -685,6 +689,26 @@ def _fit(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[: limit - 3] + "..."
 
 
+def _seat_line(solver_stats: Optional[dict]) -> Optional[str]:
+    """What the run cost the seat, when the backend counts it.
+
+    The CLI backend sums the tokens the CLI reports on every turn; a browser
+    tab reports nothing, and then there is no line. Printed after a single
+    solve and in the summary of a run, because the per-solve figure is what
+    an operator sizing a subscription needs and the run is where it becomes
+    a rate.
+    """
+    fleet = (solver_stats or {}).get("fleet") or {}
+    tokens = fleet.get("tokens") if isinstance(fleet, dict) else None
+    if not isinstance(tokens, dict) or not any(tokens.values()):
+        return None
+    return (f"seat: {fleet.get('turns', '?')} turn(s), "
+            f"{tokens.get('output', 0):,} output tokens, "
+            f"{tokens.get('cache_write', 0) + tokens.get('input', 0):,} written and "
+            f"{tokens.get('cache_read', 0):,} read from the cache; "
+            f"list price ${fleet.get('list_price_usd', 0):.2f}")
+
+
 def _summarise(
     results: list[tuple[Problem, str, str]],
     solver_stats: Optional[dict] = None,
@@ -747,6 +771,9 @@ def _summarise(
     empty = sum(1 for _, _, why in results if why == "nothing was submitted")
     print(f"  {total - empty}/{total} produced an answer"
           + (f"  ({empty} submitted nothing)" if empty else ""))
+    seat = _seat_line(solver_stats)
+    if seat:
+        print(f"  {seat}")
     broken = sum(1 for _, _, why in results if "does not compile" in why)
     rust = sum(1 for problem, _, _ in results
                if problem.request.language == "rust")

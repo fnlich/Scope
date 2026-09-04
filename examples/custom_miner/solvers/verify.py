@@ -40,6 +40,7 @@ from typing import Any, Optional, Protocol
 
 from rlvr.types import TestCase
 
+from . import crosscheck as _crosscheck
 from .prompts import (
     build_code_prompt,
     build_repair_prompt,
@@ -865,6 +866,83 @@ class _Grader:
             failed.append(examples[index])
         return passed, len(cases), failures, failed
 
+    def outputs(
+        self, code: str, language: str, entrypoint: str,
+        inputs: list[dict[str, Any]], budget_s: Optional[float] = None,
+    ) -> list["_Run"]:
+        """Run ``code`` on ``inputs`` and return what it produced, judged by
+        nobody: one `_Run` per input, in order, with the sandbox's own value.
+
+        The cross-check's primitive. `check` decides pass or fail against an
+        expectation; this has none, because the point is to compare two
+        programs' outputs with each other and put the difference to a reader.
+        Same executor, same per-case timeout, same budget discipline: the run
+        stops at what fits, and an input that did not run comes back as
+        `ok=False, error="unrun"` rather than as anything it did not do.
+        """
+        # The Rust runner compares stdout with `expected` unasked, and its
+        # token split reads a None as a crash; an empty string compares like
+        # any other and is ignored here just the same.
+        cases = [
+            TestCase(
+                args=list(case.get("args", []) or []),
+                kwargs=dict(case.get("kwargs", {}) or {}),
+                expected="" if language == "rust" else None,
+            )
+            for case in inputs
+        ]
+        if not cases:
+            return []
+        executor = self.executor(language)
+        started = time.monotonic()
+        results: list[Any] = []
+        ran = 0
+        last_call_s = 0.0
+        while ran < len(cases):
+            spent = time.monotonic() - started
+            left = None if budget_s is None else float(budget_s) - spent
+            chunk = len(cases) - ran
+            per_case = VERIFY_TIMEOUT_S
+            if left is not None:
+                if ran and (left <= 0 or left < last_call_s):
+                    break
+                if VERIFY_TIMEOUT_S > 0:
+                    per_case = min(
+                        VERIFY_TIMEOUT_S,
+                        max(MIN_CASE_TIMEOUT_S, left / max(1, chunk)),
+                    )
+                    chunk = max(1, min(chunk, int(left // per_case)))
+            call_started = time.monotonic()
+            batch = executor.run_tests(code, entrypoint, cases[ran:ran + chunk], per_case)
+            last_call_s = time.monotonic() - call_started
+            results.extend(batch)
+            ran += chunk
+            if len(batch) != chunk:
+                break
+        runs = [
+            _Run(
+                ok=bool(getattr(r, "value_ok", False)),
+                value=getattr(r, "value", None),
+                error=getattr(r, "error", None),
+                timed_out=bool(getattr(r, "timed_out", False)),
+                runtime_ms=float(getattr(r, "runtime_ms", 0.0) or 0.0),
+            )
+            for r in results
+        ]
+        runs += [_Run(ok=False, error="unrun")] * (len(cases) - len(runs))
+        return runs
+
+
+@dataclass
+class _Run:
+    """One input's outcome from `_Grader.outputs`."""
+
+    ok: bool
+    value: Any = None
+    error: Optional[str] = None
+    timed_out: bool = False
+    runtime_ms: float = 0.0
+
 
 # Text that changes between two runs of the SAME failure, and nothing else.
 #
@@ -1126,6 +1204,9 @@ class VerifyingSolver:
         self._second_opinion = bool(second_opinion)
         self._self_tests = bool(self_tests)
         self._grader = _Grader()
+        # The second reading. Off only by `SOLVER_CROSSCHECK=0`; see
+        # `crosscheck.py` for what it found on this miner's own answers.
+        self._crosscheck = _crosscheck.enabled()
         self._cache: dict[str, tuple[str, str]] = {}
         self._cache_size = max(0, int(cache_size))
         self._counts = {
@@ -1255,6 +1336,7 @@ class VerifyingSolver:
         # others" an unanswerable question.
         won_with: Optional[str] = None
         plan = _Plan()
+        checker = self._start_crosscheck(task, budget)
         # A ceiling, not a plan. Every ordinary path breaks out after one or
         # two: the loop only keeps going while it is holding NOTHING, which is
         # the one state where another ask cannot make things worse.
@@ -1276,7 +1358,7 @@ class VerifyingSolver:
             attempt_no += 1
             candidate, provider = await self._attempt(
                 task, remaining, avoid=asked[-1] if asked else None, plan=plan,
-                pass_no=attempt_no,
+                pass_no=attempt_no, checker=checker,
             )
             if provider:
                 asked.append(provider)
@@ -1355,6 +1437,8 @@ class VerifyingSolver:
                     )
                     + "; asking another model"
                 )
+        if checker is not None:
+            await checker.reading.close()
         if asked:
             # `won_with`, not `asked[-1]`. They usually coincide -- a verified
             # answer ends the loop, so the winner is normally the last one asked
@@ -1466,6 +1550,7 @@ class VerifyingSolver:
         avoid: Optional[str],
         plan: Optional["_Plan"] = None,
         pass_no: int = 1,
+        checker: Optional["_crosscheck.CrossCheck"] = None,
     ) -> tuple[Optional[Candidate], Optional[str]]:
         """One model, one conversation: initial answer plus repair rounds.
 
@@ -1658,6 +1743,11 @@ class VerifyingSolver:
             # with no answer. A crash that looks like a dead tab is the worst
             # kind, so the line does not depend on the guard above surviving.
             agreed = list(cases or [])
+            if checker is not None and checker.confirmed:
+                # Cases an earlier round or pass confirmed against the primary
+                # are on the bar from the start of this one.
+                have = {checker.key(c) for c in agreed}
+                agreed += [c for c in checker.confirmed if checker.key(c) not in have]
             # The program the LAST round produced, so a repair that corrects a
             # case can be told apart from one that rewrites both -- and the
             # reply that carried it, so a correction sent WITHOUT the program
@@ -1772,9 +1862,47 @@ class VerifyingSolver:
                     ),
                 )
 
+            async def second_reading_says(candidate: Candidate, attempt: int) -> list[str]:
+                """Cross-check a program its own cases pass; see `crosscheck.py`.
+
+                Returns what the second reading held against it -- confirmed
+                cases, a timed-out large input -- as failure lines, and leaves
+                them on the candidate for the repair round that follows.
+                Empty when the check is clean, unavailable, or out of time,
+                and the loop ends exactly where it used to.
+                """
+                nonlocal agreed
+                left_now = budget - (time.monotonic() - started)
+                if checker is None or left_now < (
+                    _crosscheck.XCHECK_FLOOR_S + _crosscheck.REPAIR_RESERVE_S
+                ):
+                    return []
+                checked_at = time.monotonic()
+                verdict = await checker.run(candidate.code, left_now)
+                phases.mark(
+                    f"{attempt + 1} cross-check",
+                    model_s=time.monotonic() - checked_at,
+                )
+                print(f"[verify] cross-check: {_crosscheck.describe(verdict)}")
+                if not verdict.failures:
+                    return []
+                # Wrong where two other readings agree. Into the ordinary
+                # repair round it goes, with cases it cannot correct: on the
+                # bar, locked, and named as such in the report.
+                candidate.failures = list(verdict.failures)
+                candidate.from_self_tests = True
+                candidate.failed_cases = []
+                candidate.self_total += len(verdict.new_cases)
+                have = {checker.key(c) for c in agreed}
+                agreed = agreed + [
+                    c for c in verdict.new_cases if checker.key(c) not in have
+                ]
+                return list(verdict.failures)
+
             attempt = 0
             while True:
                 attempt += 1
+                objections: list[str] = []
                 left = budget - (time.monotonic() - started)
                 if attempt > 1 and left < ROUND_TRIP_FLOOR_S:
                     # Not enough left to be worth another ROUND TRIP -- which is
@@ -1916,7 +2044,10 @@ class VerifyingSolver:
                     # way to game this -- delete the case you cannot pass -- is
                     # not reachable. See `_merge_cases`.
                     merged, changed = _merge_cases(
-                        agreed, revised, reported_failed
+                        agreed, revised,
+                        # A confirmed case is not the model's to correct.
+                        [c for c in reported_failed
+                         if checker is None or checker.key(c) not in checker.locked],
                     )
                     if changed.startswith("REFUSED"):
                         print(f"[verify] {changed[len('REFUSED:'):].strip()}")
@@ -2042,7 +2173,9 @@ class VerifyingSolver:
                 ):
                     best, best_provider = candidate, provider
                 if candidate.verified and not candidate.failures:
-                    break
+                    objections = await second_reading_says(candidate, attempt)
+                    if not objections:
+                        break
 
                 if getattr(conversation, "still_writing", False):
                     # The model had not finished when the read stopped, so
@@ -2171,17 +2304,33 @@ class VerifyingSolver:
                         )
                         break
                 if not candidate.defect and not candidate.failures:
-                    break  # nothing actionable to report (no examples shipped)
+                    # Nothing the model's OWN cases can say against it. That
+                    # is where the loop used to end, and where the second
+                    # reading begins: a program that agrees with its author's
+                    # reading of the statement has not yet been compared with
+                    # anyone else's.
+                    objections = await second_reading_says(candidate, attempt)
+                    if not objections:
+                        break
                 # Kept apart, not merged into one list of "problems": a defect
                 # means the code never ran, and the repair prompt has to say so
                 # rather than blame logic that was never executed.
-                insist = program_unchanged >= CASES_ONLY_ROUNDS
+                insist = program_unchanged >= CASES_ONLY_ROUNDS or bool(
+                    objections
+                    or (checker is not None and checker.locked and any(
+                        checker.key(c) in checker.locked for c in candidate.failed_cases))
+                )
                 program_only = insist and candidate.from_self_tests
-                if program_only:
+                if program_only and program_unchanged >= CASES_ONLY_ROUNDS:
                     print(
                         f"[verify] the program has not changed in "
                         f"{program_unchanged} round(s); asking for the program "
                         f"this time and not offering the cases"
+                    )
+                elif program_only:
+                    print(
+                        "[verify] the second reading's findings stand; asking "
+                        "for the program and not offering the cases"
                     )
                 report = build_repair_prompt(
                     candidate.failures,
@@ -2234,6 +2383,39 @@ class VerifyingSolver:
                 except Exception:  # noqa: BLE001 - cleanup must not mask a result
                     pass
         return best, best_provider
+
+    def _start_crosscheck(self, task, budget: float) -> Optional["_crosscheck.CrossCheck"]:
+        """The second reading, started beside the solve. None when off."""
+        if not self._crosscheck or budget < _crosscheck.XCHECK_FLOOR_S:
+            return None
+        backend = self._backend
+
+        def opener_for(profile: tuple[str, str]):
+            async def opener(timeout_s: float = 30.0):
+                # Bounded, as `_open_within` bounds the primary's: a fleet
+                # backend waits for a free tab on a clock of its own.
+                if hasattr(backend, "open_profile"):
+                    return await asyncio.wait_for(
+                        backend.open_profile(*profile), timeout=max(1.0, timeout_s)
+                    )
+                try:
+                    return await backend.open(avoid=None, timeout_s=max(1.0, timeout_s))
+                except TypeError:
+                    return await asyncio.wait_for(
+                        backend.open(avoid=None), timeout=max(1.0, timeout_s)
+                    )
+            return opener
+
+        try:
+            reading = _crosscheck.SecondReading(
+                opener_for(_crosscheck.reader_profile()), task, budget
+            ).start()
+        except Exception as exc:  # noqa: BLE001 - never costs the solve
+            print(f"[verify] no second reading: {type(exc).__name__}: {exc}")
+            return None
+        return _crosscheck.CrossCheck(
+            self._grader, task, reading, opener_for(_crosscheck.judge_profile())
+        )
 
     async def _open_within(self, budget: float, started: float, avoid: Optional[str]):
         """`backend.open`, bounded by the solve's own clock.
