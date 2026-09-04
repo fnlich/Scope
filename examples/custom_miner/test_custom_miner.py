@@ -12734,7 +12734,10 @@ for piece in ("```python\n", "def g(n):\n", "    return n\n", "```"):
     if mode == "slow":
         time.sleep(2.0)
 emit({"type": "result", "is_error": False, "session_id": session,
-      "total_cost_usd": 0.01})
+      "total_cost_usd": 0.01,
+      "usage": {"input_tokens": 3, "output_tokens": 40,
+                "cache_creation_input_tokens": 500, "cache_read_input_tokens": 120,
+                "output_tokens_details": {"thinking_tokens": 7}}})
 '''
 
 
@@ -13678,6 +13681,21 @@ def test_the_default_ladder_is_the_measured_one(tmp_path, monkeypatch):
     _fake_cli(tmp_path, monkeypatch)
     monkeypatch.delenv("SOLVER_CLI_EMERGENCY_PROFILES", raising=False)
     assert [p.label for p in CliBackend().profiles] == ["opus/low", "fable/low", "sonnet/low"]
+
+
+def test_the_cli_backend_counts_what_a_solve_costs_the_seat(tmp_path, monkeypatch):
+    """Tokens, from the CLI's own usage report on every result event, in the
+    four kinds it reports -- what the subscription's windows are spent in."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch)
+    backend = CliBackend()
+    asyncio.run(_one_cli_turn(backend))
+    asyncio.run(_one_cli_turn(backend))
+    stats = backend.stats()
+    assert stats["turns"] == 2
+    assert stats["tokens"] == {"input": 6, "output": 80, "cache_read": 240, "cache_write": 1000}
+    assert stats["list_price_usd"] == 0.02
 
 
 def test_the_cli_summary_names_the_ladder(tmp_path, monkeypatch):
