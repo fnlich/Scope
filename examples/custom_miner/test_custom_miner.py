@@ -142,6 +142,11 @@ def _never_archive_into_the_operators_corpus(tmp_path, monkeypatch):
     would have left the same hole open for the next test somebody writes.
     """
     monkeypatch.setenv("SOLVER_SOLUTION_DIR", str(tmp_path / "solutions"))
+    # The second reading opens conversations of its own, and the scripted
+    # backends here hand every conversation the same reply list. Off unless a
+    # test says otherwise; the cross-check tests build a backend that can
+    # tell its conversations apart.
+    monkeypatch.setenv("SOLVER_CROSSCHECK", "0")
 
 
 # --------------------------------------------------------------------------- #
@@ -12752,7 +12757,9 @@ def _fake_cli(tmp_path, monkeypatch, mode="ok", backups=0):
         monkeypatch.setenv("SOLVER_CLI_BACKUP_ACCOUNTS", ",".join(map(str, dirs)))
     else:
         monkeypatch.delenv("SOLVER_CLI_BACKUP_ACCOUNTS", raising=False)
-    monkeypatch.delenv("SOLVER_CLI_EMERGENCY_PROFILES", raising=False)
+    # The ladder these tests were written against. The shipped default is
+    # measured separately, in `test_the_default_ladder_is_the_measured_one`.
+    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:high,fable:low")
     monkeypatch.delenv("SOLVER_CLI_MODELS", raising=False)
     monkeypatch.delenv("SOLVER_CLI_RECOVERY_S", raising=False)
     return log
@@ -13660,6 +13667,19 @@ def test_a_drill_lets_the_operator_watch_the_ladder_move(
         CliBackend()
 
 
+def test_the_default_ladder_is_the_measured_one(tmp_path, monkeypatch):
+    """Measured on a real production problem, one program turn: fable 38s at
+    low effort, opus 86s, sonnet 161s; sonnet at high effort, and either
+    model at high, did not finish inside 200s. A rung that cannot answer
+    inside the deadline is not a rung, so the default order is by what
+    finishes."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.delenv("SOLVER_CLI_EMERGENCY_PROFILES", raising=False)
+    assert [p.label for p in CliBackend().profiles] == ["opus/low", "fable/low", "sonnet/low"]
+
+
 def test_the_cli_summary_names_the_ladder(tmp_path, monkeypatch):
     from solvers import roster as roster_module
 
@@ -13714,6 +13734,199 @@ def test_the_solve_loop_follows_a_conversation_that_hops(capsys):
     # The duplicate is blamed on the model that sent it, not the one refused.
     assert "[verify] cli:sonnet sent back the same program" in out, out
     assert "[verify] cli:opus sent back" not in out, out
+
+
+# --------------------------------------------------------------------------- #
+# The second reading: a program that passes its own cases and is wrong.
+# --------------------------------------------------------------------------- #
+# Passes both of ITS cases and is wrong on every single-digit input: it
+# returns 0 for n < 10. The cases it wrote never look there.
+BLIND = ("```python\ndef g(n):\n    if n < 10:\n        return 0\n    s = 0\n"
+         "    while n > 0:\n        s += n % 10\n        n //= 10\n    return s\n```")
+BLIND_CASES = ('```json\n[{"name": "all five digits", "args": [12345], "expected": 15},\n'
+               ' {"name": "zero", "args": [0], "expected": 0}]\n```')
+# The second reading: a right program and a generator that only ever asks
+# about single digits.
+SECOND = RIGHT
+GENERATOR = ("```python\nimport random\n\ndef generate(seed, scale):\n"
+             "    random.seed(seed)\n"
+             "    return {\"args\": [random.randint(1, 9)], \"kwargs\": {}}\n```")
+SLOW_GENERATOR = ("```python\nimport random\n\ndef generate(seed, scale):\n"
+                  "    random.seed(seed)\n"
+                  "    if scale >= 100:\n        return {\"args\": [10 ** 8], \"kwargs\": {}}\n"
+                  "    return {\"args\": [random.randint(10, 99)], \"kwargs\": {}}\n```")
+# Right on every digit sum, and quadratic in n: a maximum-size input times out.
+QUADRATIC = ("```python\ndef g(n):\n    s = 0\n    for i in range(n + 1):\n"
+             "        s += 0 * i\n    m = n\n    while m > 0:\n        s += m % 10\n"
+             "        m //= 10\n    return s\n```")
+
+
+class _Judge(_Chat):
+    """A judge that actually reasons: the digit sum of the call it is shown."""
+
+    def __init__(self):
+        super().__init__([], "judge")
+        self.asked = 0
+
+    async def send(self, text, timeout_s):
+        self.asked += 1
+        import re as _re
+        digits = [sum(int(d) for d in n) for n in _re.findall(r'"args": \[(\d+)\]', text)]
+        return f'```json\n{{"expected": {json.dumps(digits)}}}\n```'
+
+
+class _Readers(_Backend):
+    """Tells its conversations apart: the primary, the second reading, the judge."""
+
+    def __init__(self, primary, second, judge_factory=_Judge):
+        super().__init__(primary, "cli:opus")
+        self._second = second
+        self._judge_factory = judge_factory
+        self.opened = []
+        self.judges = []
+
+    async def open(self, avoid=None):
+        self.opened.append(("primary", avoid))
+        return _Chat(self._replies, self._provider)
+
+    async def open_profile(self, model, effort):
+        self.opened.append((model, effort))
+        if model == "fable":
+            return _Chat(self._second, "cli:fable")
+        judge = self._judge_factory()
+        self.judges.append(judge)
+        return judge
+
+
+def _crosschecked(monkeypatch, backend, **kw):
+    monkeypatch.setenv("SOLVER_CROSSCHECK", "1")
+    monkeypatch.setenv("SOLVER_CROSSCHECK_INPUTS", "12")
+    kw.setdefault("reserve_s", 0)
+    kw.setdefault("max_budget_s", 120)
+    kw.setdefault("second_opinion", False)
+    return VerifyingSolver(backend, **kw)
+
+
+def test_a_program_that_passes_its_own_cases_is_caught_by_the_second_reading(
+    monkeypatch, capsys
+):
+    """The shape measured on this miner's archived answers: every case the
+    model wrote passes, and the program is wrong. A second reading with its
+    own program and generator disagrees on generated inputs; a third reader
+    sides with it; the input lands on the bar as a confirmed case; the
+    ordinary repair round fixes the program; the cross-check then passes."""
+    backend = _Readers([BLIND_CASES, BLIND, RIGHT], [SECOND, GENERATOR])
+    solver = _crosschecked(monkeypatch, backend)
+    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
+    out = capsys.readouterr().out
+
+    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
+    assert ("fable", "low") in backend.opened and ("opus", "low") in backend.opened
+    assert len(backend.judges) >= 1 and backend.judges[0].asked == 1
+    assert "2 CONFIRMED against this program" in out, out
+    assert "second reading's findings stand; asking for the program" in out, out
+    # The confirmed cases joined the bar: the final tally counts them.
+    assert answer.self_total == 4, out
+    # And the repaired program went through the cross-check again, clean.
+    assert out.count("generated input(s)") == 2 and "-- clean" in out, out
+    assert "2 cross-check" in out and "3 cross-check" in out, out
+
+
+def test_a_confirmed_case_cannot_be_corrected_away(monkeypatch, capsys):
+    """The repair prompt offers to take a wrong CASE back corrected. A case two
+    other readings agreed on is not the model's to correct: a reply that
+    'corrects' it is refused and the program is asked for again."""
+    talk_back = '```json\n[{"name": "cross-check 1", "args": [7], "expected": 0}]\n```'
+    backend = _Readers([BLIND_CASES, BLIND, talk_back, RIGHT], [SECOND, GENERATOR])
+    solver = _crosschecked(monkeypatch, backend)
+    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
+    out = capsys.readouterr().out
+    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
+    assert "keeping the bar as it stands" in out, out
+    assert answer.self_total == 4 and answer.self_passed == 4, out
+
+
+def test_a_second_reading_that_is_itself_wrong_changes_nothing(monkeypatch, capsys):
+    """Two readings disagree and the judge sides with the PRIMARY. Nothing is
+    added to the bar, nothing is repaired, and the log says who was wrong."""
+    wrong_second = BLIND
+    backend = _Readers([CASES, RIGHT], [wrong_second, GENERATOR])
+    solver = _crosschecked(monkeypatch, backend)
+    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
+    out = capsys.readouterr().out
+    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g")
+    assert "CONFIRMED" not in out, out
+    assert "put to the judge" in out, out
+    assert answer.self_total == 1, "nothing joined the bar"
+
+
+def test_a_slow_program_is_timed_on_the_largest_input(monkeypatch, capsys):
+    """Hand-written cases are small. The generator's maximum-size input is the
+    one place the program is ever run at scale, and a timeout there -- when
+    the independent program finishes the same input -- is a failure the
+    repair round is told about in so many words."""
+    from solvers import verify as verify_module
+
+    monkeypatch.setattr(verify_module, "VERIFY_TIMEOUT_S", 1.0)
+    backend = _Readers([CASES, QUADRATIC, RIGHT], [SECOND, SLOW_GENERATOR])
+    solver = _crosschecked(monkeypatch, backend)
+    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
+    out = capsys.readouterr().out
+    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
+    assert "TIMED OUT (the independent program took" in out, out
+    assert "findings stand; asking for the program" in out, out
+
+
+def test_rust_outputs_can_be_taken_without_an_expectation(monkeypatch):
+    """The Rust runner compares stdout with `expected` whether or not anyone
+    asked, and its token split reads a None as a crash. Every Rust
+    cross-check died there, before a single input ran, until the grader
+    handed it an empty string instead."""
+    from rlvr.execution.rust_judge import outputs_match
+    from rlvr.types import ExecutionResult
+    from solvers.verify import _Grader
+
+    class _RustLike:
+        def run_tests(self, code, entrypoint, tests, timeout_s):
+            out = []
+            for i, test in enumerate(tests):
+                stdout = "42\n"
+                # What rust_docker_executor does with every result.
+                passed = outputs_match(stdout, test.expected)
+                out.append(ExecutionResult(test_index=i, passed=passed, value=stdout,
+                                           value_ok=True, runtime_ms=1.0))
+            return out
+
+    grader = _Grader()
+    monkeypatch.setattr(grader, "executor", lambda language: _RustLike())
+    runs = grader.outputs("fn main(){}", "rust", "main", [{"args": ["1\n"]}], budget_s=10)
+    assert len(runs) == 1 and runs[0].ok and runs[0].value == "42\n", runs
+
+
+def test_the_cross_check_is_off_when_told_and_never_blocks_the_answer(monkeypatch, capsys):
+    from solvers import crosscheck
+
+    monkeypatch.setenv("SOLVER_CROSSCHECK", "0")
+    backend = _Readers([CASES, RIGHT], [SECOND, GENERATOR])
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120, second_opinion=False)
+    asyncio.run(solver.solve_task(DIGITS, 120.0))
+    assert all(kind == "primary" for kind, _ in backend.opened), backend.opened
+
+    # On, but the second reading never produces a program: the solve ends
+    # exactly where it used to, with a line saying why.
+    backend = _Readers([CASES, RIGHT], ["I would rather not.", "no"])
+    solver = _crosschecked(monkeypatch, backend)
+    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
+    out = capsys.readouterr().out
+    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g")
+    assert "no second reading" in out, out
+
+    assert crosscheck.extract_generator("```python\nx = 1\n```") == ""
+    assert "def generate" in crosscheck.extract_generator(GENERATOR)
+    assert crosscheck.extract_expected('```json\n{"expected": [1, 2]}\n```', 2) == (True, [1, 2])
+    assert crosscheck.extract_expected('```json\n{"expected": 7}\n```', 1) == (True, [7])
+    assert crosscheck.extract_expected('```json\n{"expected": [1]}\n```', 2) == (False, [])
+    assert crosscheck.extract_expected("nothing", 1) == (False, [])
 
 
 def test_selecting_the_cli_backend_needs_no_browser(monkeypatch):

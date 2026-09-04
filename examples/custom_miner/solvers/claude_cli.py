@@ -256,14 +256,17 @@ class Profile:
 def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profile, ...]:
     """What answers when the default model will not, in order.
 
-    `SOLVER_CLI_EMERGENCY_PROFILES=sonnet:high,fable:low` -- each entry a model
-    alias the CLI accepts, optionally with an effort after a colon. Those two
-    are the defaults: a different model at a higher effort first, because
-    "the service is refusing Opus" is usually Opus's problem alone, and the
-    newest model at low effort second, for when it is not.
+    `SOLVER_CLI_EMERGENCY_PROFILES=fable:low,sonnet:low` -- each entry a model
+    alias the CLI accepts, optionally with an effort after a colon. Those are
+    the defaults, and the order is measured rather than ranked: on a real
+    production problem the program turn took fable 38s at low effort, opus
+    86s, sonnet 161s -- and sonnet at high effort, or either model at high,
+    did not finish inside 200s. A rung that cannot answer inside the deadline
+    is not a rung. Effort above low on the ladder is for problems that
+    justify it, set by the operator who measured it.
     """
     default_effort = default_effort or cli_effort()
-    raw = _flag("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:high,fable:low")
+    raw = _flag("SOLVER_CLI_EMERGENCY_PROFILES", "fable:low,sonnet:low")
     profiles: list[Profile] = []
     for entry in raw.split(","):
         entry = entry.strip()
@@ -1230,6 +1233,23 @@ class CliBackend:
         self._opened += 1
         self._live += 1
         return CliConversation(self, account, profile)
+
+    async def open_profile(self, model: str, effort: str) -> CliConversation:
+        """A fresh session on a NAMED model and effort, where the ladder allows.
+
+        For the second reading and the judge, which want a particular model
+        rather than the best available one. The first signed-in account on
+        which that model is not out gets it; if the model is out everywhere,
+        the ladder's own choice answers instead, and says so through
+        `provider`, so the caller can tell.
+        """
+        wanted = Profile(model, effort if effort in EFFORTS else self.effort)
+        for account in self.accounts:
+            if self.outage_for(account, wanted.model)[0] <= 0:
+                self._opened += 1
+                self._live += 1
+                return CliConversation(self, account, wanted)
+        return await self.open(avoid=f"cli:{model}")
 
     def release(self) -> None:
         self._live = max(0, self._live - 1)
