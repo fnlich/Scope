@@ -30,6 +30,7 @@ to use the container backend instead; Rust verification always requires it.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import threading
@@ -135,6 +136,12 @@ STALE_ROUND_S = 2.0
 # because the first correction is the ordinary case this whole path was built
 # for.
 CASES_ONLY_ROUNDS = 2
+# How many times per pass a CORRECTED case is put to the judge before the
+# rest are accepted as they arrive. One judge turn decides every case a reply
+# corrected, so this is a cap on turns, not on cases; a pass that keeps
+# correcting its bar after two verdicts has said what it has to say about
+# the cases, and the budget is better spent on the program.
+MAX_JUDGED_CORRECTIONS = 2
 
 
 class Conversation(Protocol):
@@ -348,6 +355,13 @@ class _Phases:
             f"took {spent:6.1f}s{detail}"
             f"  — {max(0.0, left):.0f}s of {self._budget:.0f}s left"
         )
+
+
+def _expectation(case: dict) -> str:
+    """What a case expects, as one comparable string. A correction is a case
+    that came back with the same call and a different one of these; a case
+    re-sent under a new name with the same answer is not a correction."""
+    return json.dumps(case.get("expected"), sort_keys=True, default=str)
 
 
 def _case_key(case: dict) -> tuple:
@@ -1211,7 +1225,7 @@ class VerifyingSolver:
         self._cache_size = max(0, int(cache_size))
         self._counts = {
             "solved": 0, "verified": 0, "verified_on_local": 0, "cache_hits": 0,
-            "empty": 0,
+            "empty": 0, "fallback": 0,
         }
         self._by_provider: dict[str, dict[str, int]] = {}
         # The no-examples explanation is worth saying, but only once a run.
@@ -1438,7 +1452,10 @@ class VerifyingSolver:
                     + "; asking another model"
                 )
         if checker is not None:
-            await checker.reading.close()
+            best, won_with = await self._fallback(
+                checker, best, won_with, budget - (time.monotonic() - started)
+            )
+            await checker.close()
         if asked:
             # `won_with`, not `asked[-1]`. They usually coincide -- a verified
             # answer ends the loop, so the winner is normally the last one asked
@@ -1748,6 +1765,11 @@ class VerifyingSolver:
                 # are on the bar from the start of this one.
                 have = {checker.key(c) for c in agreed}
                 agreed += [c for c in checker.confirmed if checker.key(c) not in have]
+            if checker is not None and agreed:
+                # The second reading's program, graded against this bar in the
+                # background, so that an answer of last resort is in hand the
+                # moment this pass runs out. See `_fallback`.
+                checker.pregrade(agreed, budget - (time.monotonic() - started))
             # The program the LAST round produced, so a repair that corrects a
             # case can be told apart from one that rewrites both -- and the
             # reply that carried it, so a correction sent WITHOUT the program
@@ -1862,6 +1884,126 @@ class VerifyingSolver:
                     ),
                 )
 
+            # Keys of cases whose correction a judge REFUSED this pass, so the
+            # same correction is not put to the judge twice; and how many
+            # judge turns corrections have cost. See `MAX_JUDGED_CORRECTIONS`.
+            stood: set[str] = set()
+            judged_corrections = 0
+            # Whether THIS round's correction was refused by the judge. Such a
+            # round re-grades the program in hand against the bar as it was,
+            # which looks exactly like the model repeating itself -- and it is
+            # the opposite: the case is now locked, and the next prompt is
+            # the first one to insist on the program. See `duplicate`.
+            correction_refused = False
+
+            async def judged_correction(
+                before: list[dict], merged: list[dict], failed: list[dict], changed: str
+            ) -> tuple[list[dict], str]:
+                """The bar after a correction, once a reader with no program in
+                hand has said which side of the disagreement was wrong.
+
+                Returns (the cases that now stand, what to say about it).
+
+                Every correction used to land on the model's own say-so, and
+                the author of a program is the one party with a reason to want
+                its cases changed. Measured on a production log of 76 solves:
+                eighteen corrections in fifteen of them, every one accepted
+                unread, and the answers from that log were graded right 83.5%
+                of the time against 98% for the miners beside it. The same
+                judge that settles a cross-check settles these: each corrected
+                case is put to it as the call alone, and its answer decides.
+
+                  * It agrees with the CORRECTION: the correction lands.
+                  * It agrees with the case AS WRITTEN: the correction is
+                    refused and the case is locked -- two readers now stand
+                    behind it, and the program has to change.
+                  * It agrees with NEITHER: the correction is refused and the
+                    case stands as written, unlocked. Three readings and three
+                    answers is a contested case, not a verdict, and the least
+                    that can be done with it is to leave the bar alone.
+                  * No verdict -- no judge, no time, or the turn cap reached:
+                    the correction lands as it always did. A judge that cannot
+                    be reached is not a reason to freeze the bar.
+
+                A correction the judge refused once is refused again without
+                asking: the case is locked when the judge sided with it, and
+                is in `stood` either way.
+                """
+                nonlocal judged_corrections, correction_refused
+                if checker is None:
+                    return merged, changed
+                originals = {checker.key(c): c for c in failed}
+                held = {checker.key(c): _expectation(c) for c in before}
+                disputes: list[tuple[dict, dict]] = []
+                for case in merged:
+                    key = checker.key(case)
+                    if held.get(key) == _expectation(case):
+                        continue
+                    disputes.append((originals.get(key, case), case))
+                if not disputes:
+                    return merged, changed
+                fresh = [(o, c) for o, c in disputes if checker.key(c) not in stood]
+                verdict_of: dict[str, tuple[str, Any]] = {}
+                unjudged = ""
+                if fresh:
+                    left = budget - (time.monotonic() - started)
+                    floor = _crosscheck.JUDGE_FLOOR_S + _crosscheck.REPAIR_RESERVE_S
+                    if judged_corrections >= MAX_JUDGED_CORRECTIONS:
+                        unjudged = (
+                            f"the judge has decided corrections {judged_corrections} "
+                            f"time(s) this pass already"
+                        )
+                    elif left < floor:
+                        unjudged = f"{left:.0f}s left is too little to judge and then repair"
+                    else:
+                        judged_corrections += 1
+                        for (_, case), verdict in zip(
+                            fresh, await checker.judge_corrections(fresh, left)
+                        ):
+                            verdict_of[checker.key(case)] = verdict
+                accepted: list[dict] = []
+                notes: list[str] = []
+                for original, case in disputes:
+                    key = checker.key(case)
+                    verdict, expected = verdict_of.get(
+                        key, ("repeat" if key in stood else "no verdict", None)
+                    )
+                    call = _crosscheck._render_call(task.language, task.entrypoint, case)
+                    if verdict in ("corrected", "no verdict"):
+                        accepted.append(case)
+                        if verdict == "corrected":
+                            notes.append(f"{call}: the judge agrees with the correction")
+                        continue
+                    stood.add(key)
+                    shown = json.dumps(expected, default=str)[:200]
+                    if verdict == "original":
+                        if original is not case:
+                            checker.confirm(original)
+                        notes.append(
+                            f"{call}: the judge says {shown}, as the case was "
+                            f"written; the case is locked and the program has to change"
+                        )
+                    elif verdict == "neither":
+                        notes.append(
+                            f"{call}: the judge says {shown}, which is neither side; "
+                            f"the case stands as written"
+                        )
+                    else:
+                        notes.append(f"{call}: refused before this pass; not asked again")
+                if unjudged:
+                    notes.append(f"{len(fresh)} unjudged ({unjudged}) and accepted as sent")
+                refused = len(disputes) - len(accepted)
+                if refused:
+                    correction_refused = True
+                    merged, _ = _merge_cases(before, accepted, failed)
+                    changed = (
+                        f"{len(disputes)} case(s) corrected and {refused} of them "
+                        f"refused -- " + "; ".join(notes)
+                    )
+                elif notes:
+                    changed = f"{changed} -- " + "; ".join(notes)
+                return merged, changed
+
             async def second_reading_says(candidate: Candidate, attempt: int) -> list[str]:
                 """Cross-check a program its own cases pass; see `crosscheck.py`.
 
@@ -1957,6 +2099,7 @@ class VerifyingSolver:
                 # answer stops being deliverable, so there is nothing past it to
                 # extend into.
                 round_started = time.monotonic()
+                correction_refused = False
                 reply = await conversation.send(prompt, max(1.0, left))
                 provider = getattr(conversation, "provider", provider)
                 # How long the round trip actually took. Used only by the
@@ -2043,12 +2186,12 @@ class VerifyingSolver:
                     # PASSES cannot be corrected, dropped or weakened, so the
                     # way to game this -- delete the case you cannot pass -- is
                     # not reachable. See `_merge_cases`.
-                    merged, changed = _merge_cases(
-                        agreed, revised,
-                        # A confirmed case is not the model's to correct.
-                        [c for c in reported_failed
-                         if checker is None or checker.key(c) not in checker.locked],
-                    )
+                    # A confirmed case is not the model's to correct.
+                    correctable = [
+                        c for c in reported_failed
+                        if checker is None or checker.key(c) not in checker.locked
+                    ]
+                    merged, changed = _merge_cases(agreed, revised, correctable)
                     if changed.startswith("REFUSED"):
                         print(f"[verify] {changed[len('REFUSED:'):].strip()}")
                         revised = []
@@ -2057,6 +2200,12 @@ class VerifyingSolver:
                         revised = merged
                     else:
                         if changed:
+                            # Judged BEFORE it is announced or graded against:
+                            # see `judged_correction` for what a correction
+                            # accepted on its author's word cost.
+                            merged, changed = await judged_correction(
+                                agreed, merged, correctable, changed
+                            )
                             print(
                                 f"[verify] the repair corrected the cases rather "
                                 f"than the program: {changed}. The program is "
@@ -2145,8 +2294,12 @@ class VerifyingSolver:
                     candidate.code.strip(), candidate.defect, tuple(candidate.failures)
                 )
                 repeats = seen_signatures.get(signature, 0)
-                seen_signatures[signature] = repeats + 1
-                duplicate = attempt > 1 and repeats > 0
+                # A round whose correction the judge refused is not the model
+                # repeating itself about the PROGRAM: the program was never
+                # asked for. It is neither counted nor held against it.
+                if not correction_refused:
+                    seen_signatures[signature] = repeats + 1
+                duplicate = attempt > 1 and repeats > 0 and not correction_refused
                 # Only when one ARRIVED. A cases-only reply leaves the program
                 # in hand standing, and forgetting it here would make the very
                 # next correction unattributable to any program at all.
@@ -2327,10 +2480,15 @@ class VerifyingSolver:
                         f"{program_unchanged} round(s); asking for the program "
                         f"this time and not offering the cases"
                     )
-                elif program_only:
+                elif program_only and objections:
                     print(
                         "[verify] the second reading's findings stand; asking "
                         "for the program and not offering the cases"
+                    )
+                elif program_only:
+                    print(
+                        "[verify] a confirmed case is failing; asking for the "
+                        "program and not offering the cases"
                     )
                 report = build_repair_prompt(
                     candidate.failures,
@@ -2383,6 +2541,59 @@ class VerifyingSolver:
                 except Exception:  # noqa: BLE001 - cleanup must not mask a result
                     pass
         return best, best_provider
+
+    async def _fallback(
+        self, checker: "_crosscheck.CrossCheck", best: Candidate,
+        won_with: Optional[str], left_s: float,
+    ) -> tuple[Candidate, Optional[str]]:
+        """The answer of last resort: the second reading's program, when the
+        primary ran out and that program passed every case the primary wrote.
+
+        Measured on a production log of 76 solves: the program turn ran past
+        200 seconds six times, and four of those solves ended with nothing,
+        a fragment, or a program still failing its own cases -- while the
+        second reading's program had been finished for two minutes and was
+        used only to argue with. Graded in the background against the
+        primary's own bar (see `CrossCheck.pregrade`), so it costs nothing
+        here: the verdict is either in hand or it is not.
+
+        It replaces the primary's answer only on evidence AGAINST that answer,
+        never on evidence for its own: an empty or partial program, a
+        structural defect, or cases the primary was seen to fail. A program
+        the primary finished and that passed everything it was run against
+        stands, however many cases went unrun -- unknown is not failed, and
+        the primary is the stronger model.
+        """
+        if best.verified:
+            return best, won_with
+        failed = best.self_observed - best.self_passed if best.from_self_tests else 0
+        why = (
+            "nothing" if not best.code.strip()
+            else "a fragment of a program" if best.partial
+            else f"a defective program ({best.defect[:120]})" if best.defect
+            else f"a program failing {failed} of the {best.self_observed} case(s) it was run against"
+            if failed > 0
+            else ""
+        )
+        if not why:
+            return best, won_with
+        # A grading still running is worth a short wait only now that the
+        # primary's answer is known to be no answer; half of what is left,
+        # and never long enough to matter to delivery.
+        found = await checker.fallback(min(max(0.0, left_s) * 0.5, 30.0))
+        if found is None:
+            return best, won_with
+        code, passed, total = found
+        self._counts["fallback"] += 1
+        print(
+            f"[verify] the primary ended with {why}; submitting the second "
+            f"reading's program instead -- it passed {passed}/{total} of the "
+            f"cases the primary wrote"
+        )
+        return Candidate(
+            code=code, raw=code, self_passed=passed, self_total=total,
+            from_self_tests=True, self_cases=total, self_observed=total,
+        ), "second reading"
 
     def _start_crosscheck(self, task, budget: float) -> Optional["_crosscheck.CrossCheck"]:
         """The second reading, started beside the solve. None when off."""

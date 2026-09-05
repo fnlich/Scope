@@ -953,10 +953,14 @@ class CliBackend:
                 profiles.append(profile)
         self.profiles = tuple(profiles)
         # One process per solve in flight, and no more. Measured, four at once:
-        # 3.1 seconds wall clock for four answers, no contention. The bound is
-        # here so a fleet of queued solves cannot become a fleet of processes.
+        # 3.1 seconds wall clock for four answers, no contention; and eight
+        # conversations across two miner processes on one login, all eight
+        # correct. The bound is here so a fleet of queued solves cannot become
+        # a fleet of processes -- and it has to fit a solve that now holds
+        # three conversations open at once (the primary, the second reading
+        # and a judge) with a second miner doing the same on the same login.
         self._limit = concurrency or max(
-            1, int(_flag("SOLVER_CLI_CONCURRENCY", "4") or "4")
+            1, int(_flag("SOLVER_CLI_CONCURRENCY", "8") or "8")
         )
         self.concurrency = self._limit
         self.slot = asyncio.Semaphore(self._limit)
