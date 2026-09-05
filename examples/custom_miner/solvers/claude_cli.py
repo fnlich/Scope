@@ -116,6 +116,14 @@ _MODEL_WINDOWS = {"seven_day_opus": "opus", "seven_day_sonnet": "sonnet"}
 # stale, and one turn every half hour is a cheap way to notice.
 LIMIT_RECHECK_S = 1800.0
 
+# The share of a seat's window past which FRESH solves go to another seat
+# while one is free, and the reading and judge turns go to the lightest seat
+# at all times. Measured: the limit landed at 91%+ in the middle of a repair
+# round, and the repair had to be carried to a fresh conversation on the
+# other seat with its context re-sent. A seat that is nearly spent is left
+# for the conversations already on it. SOLVER_CLI_SWITCH_AT.
+SWITCH_AT = 0.95
+
 # How long a MODEL is left alone after the service refused it -- an overload,
 # a 5xx, a connection that never completed. The operator's number, and the
 # recovery cadence: when it expires the default model is back at the top of
@@ -447,6 +455,19 @@ class CliConversation:
         # retries it has reported this turn.
         self._turn_error: Optional[str] = None
         self._retries = 0
+        # What the stream looked like this turn, for the line that reports
+        # a turn cut off: a 241-second program turn that ended with "nothing
+        # had arrived" was undiagnosable from the log -- no event count, no
+        # first-text time, no retry.
+        self._turn_started = 0.0
+        self._events = 0
+        self._text_chars = 0
+        self._first_text_s: Optional[float] = None
+
+    # A round trip on this backend starts a process and re-reads the session
+    # before the model says a word; `VerifyingSolver` will not start a
+    # correction round with less than this left.
+    round_trip_floor_s = 20.0
 
     @property
     def model(self) -> str:
@@ -591,6 +612,10 @@ class CliConversation:
         started = time.monotonic()
         self._turn_error = None
         self._retries = 0
+        self._turn_started = started
+        self._events = 0
+        self._text_chars = 0
+        self._first_text_s = None
         errfile = None
         try:
             # stderr goes to a FILE, not a pipe. A pipe is read only after
@@ -635,7 +660,8 @@ class CliConversation:
             print(f"[cli] {self.provider} did not finish inside "
                   f"{timeout_s:.0f}s; "
                   + (f"keeping the {len(body)} character(s) that arrived"
-                     if body else "nothing had arrived"))
+                     if body else "nothing had arrived")
+                  + f" ({self._stream_note()})")
             return self._verdict(body, "partial" if body else "unfinished")
         except _Stalled:
             await self._kill(proc)
@@ -713,6 +739,15 @@ class CliConversation:
             self._backend.note_limit(self.account, "*", None, stderr)
             return self._verdict("", "limited")
         return self._verdict("", "failed")
+
+    def _stream_note(self) -> str:
+        """What the stream looked like this turn, in one clause."""
+        spent = time.monotonic() - self._turn_started
+        first = (f"first text after {self._first_text_s:.0f}s"
+                 if self._first_text_s is not None else "no text at all")
+        return (f"{self._events} event(s), {first}, {self._text_chars} "
+                f"character(s) in {spent:.0f}s, {self._retries} "
+                f"retr{'y' if self._retries == 1 else 'ies'}")
 
     def _verdict(self, body: str, verdict: str) -> tuple[str, str]:
         """Bookkeeping every exit of `_send` shares.
@@ -835,12 +870,17 @@ class CliConversation:
             return
         if not isinstance(event, dict):
             return
+        self._events += 1
         kind = event.get("type")
         if kind == "stream_event":
             inner = event.get("event") or {}
             delta = inner.get("delta") or {}
             if delta.get("type") == "text_delta":
-                chunks.append(str(delta.get("text") or ""))
+                text = str(delta.get("text") or "")
+                chunks.append(text)
+                self._text_chars += len(text)
+                if self._first_text_s is None:
+                    self._first_text_s = time.monotonic() - self._turn_started
             return
         if kind == "rate_limit_event":
             info = event.get("rate_limit_info") or {}
@@ -874,6 +914,14 @@ class CliConversation:
         error = str(event.get("error") or "")
         self._backend.last_error = f"retry {attempt}: {error or status or 'error'}"
         code = int(status) if status is not None else None
+        # Every retry, as it arrives. Below the hop threshold these used to
+        # be silent, and a turn that spent its slice in the CLI's own retry
+        # loop read exactly like a model thinking.
+        limit = _number(event.get("max_retries"))
+        print(f"[cli] {self.provider} retry {attempt}"
+              + (f"/{int(limit)}" if limit else "")
+              + f": {error or (f'HTTP {code}' if code else 'connection error')}"
+              + f", next wait {delay_ms / 1000:.0f}s")
         if code in (401, 403) or classify(error) == "auth":
             raise _Unauthorised(error or f"HTTP {code}")
         if code == 429 or classify(error) == "limit":
@@ -997,6 +1045,13 @@ class CliBackend:
         self._failures: dict[tuple[str, str], int] = {}
         # The pair a fresh solve was last handed, so a change is said once.
         self._mode: tuple[str, str] = (self.accounts[0].name, self.default.model)
+        # How much of each seat's window is used, as the last turn on it
+        # reported: (share, when it resets). See `SWITCH_AT`.
+        self._usage: dict[str, tuple[float, Optional[float]]] = {}
+        try:
+            self.switch_at = float(_flag("SOLVER_CLI_SWITCH_AT", "") or SWITCH_AT)
+        except ValueError:
+            self.switch_at = SWITCH_AT
         # Per (account, window), the utilisation last warned about.
         self._warned: dict[tuple[str, str], float] = {}
         self._drill()
@@ -1096,6 +1151,22 @@ class CliBackend:
     def _healthy(self) -> list[tuple[Account, Profile]]:
         return [(a, p) for a, p in self.pairs() if self.outage_for(a, p.model)[0] <= 0]
 
+    def usage_of(self, account: Account) -> float:
+        """The share of `account`'s window used, as last reported; 0 once
+        that window has reset, or when nothing has been reported yet."""
+        used, resets_at = self._usage.get(account.name, (0.0, None))
+        if resets_at is not None and resets_at <= time.time():
+            return 0.0
+        return used
+
+    def _with_room_first(
+        self, pairs: list[tuple[Account, Profile]]
+    ) -> list[tuple[Account, Profile]]:
+        """The ladder's order, except that a seat at or past `switch_at`
+        comes after every seat under it. A stable sort: among seats with
+        room the ladder decides, as it always did."""
+        return sorted(pairs, key=lambda ap: self.usage_of(ap[0]) >= self.switch_at)
+
     def next_pair(
         self, account: Account, model: str, same_account: bool
     ) -> Optional[tuple[Account, Profile]]:
@@ -1120,7 +1191,7 @@ class CliBackend:
         them; or it answered WRONGLY and a second opinion is wanted, in which
         case only a different model is one.
         """
-        healthy = self._healthy()
+        healthy = self._with_room_first(self._healthy())
         if avoid:
             model, name = self._parse_provider(avoid)
             avoided = None
@@ -1160,6 +1231,14 @@ class CliBackend:
             print(f"[cli] back to normal: {label} answers again")
             return
         wait, why = self.outage_for(self.accounts[0], self.default.model)
+        if wait <= 0:
+            # Not out -- nearly spent. Fresh solves are steered away while
+            # the conversations already on it finish.
+            used, resets_at = self._usage.get(self.accounts[0].name, (0.0, None))
+            print(f"[cli] NEAR THE LIMIT: {label} takes fresh solves because "
+                  f"account {self.accounts[0].name} has used {used:.0%} of its "
+                  f"window{_resets_in(resets_at)}; back to it when that resets")
+            return
         print(f"[cli] EMERGENCY MODE: {label} is answering because "
               f"{self.provider_of(self.accounts[0], self.default)} is out "
               f"({why or 'no healthy pair'}; {_minutes(wait)} until it is tried again)")
@@ -1249,7 +1328,12 @@ class CliBackend:
         `provider`, so the caller can tell.
         """
         wanted = Profile(model, effort if effort in EFFORTS else self.effort)
-        for account in self.accounts:
+        # The LIGHTEST seat, not the first: these turns belong to no
+        # conversation and can go anywhere, and spreading them is what keeps
+        # the primary's window for the primary's own turns. Measured: with
+        # the second reading and the judge on the primary, a five-hour
+        # window that held 35 solves holds about 18.
+        for account in sorted(self.accounts, key=self.usage_of):
             if self.outage_for(account, wanted.model)[0] <= 0:
                 self._opened += 1
                 self._live += 1
@@ -1367,11 +1451,16 @@ class CliBackend:
         overage = bool(info.get("isUsingOverage"))
         limited = status not in _ALLOWED_STATUSES
         scope = _MODEL_WINDOWS.get(kind, "*") if limited else "*"
+        heaviest: Optional[tuple[float, Optional[float]]] = None
         for name, window in windows.items():
             used = _number(window.get("utilization"))
             if used is None:
                 continue
             reset = _number(window.get("resetsAt"))
+            if (_MODEL_WINDOWS.get(name, "*") == "*"
+                    and name not in ("seven_day_overage_included", "overage")
+                    and (heaviest is None or used > heaviest[0])):
+                heaviest = (float(used), reset)
             # A window fully used with nothing covering the overflow. The
             # status is the CLI's word on the turn and is believed first; this
             # is for the turn it reports `allowed` on a spent window, which
@@ -1394,6 +1483,8 @@ class CliBackend:
                 print(f"[cli] NOTE: {used:.0%} of the {name} subscription limit "
                       f"used on account {account.name}{_resets_in(reset)}. Past "
                       f"it that account's solves move to the next seat, or fail.")
+        if heaviest is not None:
+            self._usage[account.name] = heaviest
         # A turn the subscription's window no longer covers, running on the
         # plan's paid extra usage. Allowed through only on request; otherwise
         # it is the limit, and treated exactly as one -- for the whole seat,
@@ -1437,6 +1528,7 @@ class CliBackend:
             # through the seat, not as an invoice.
             "list_price_usd": round(self._cost, 4),
             "tokens": dict(self._tokens),
+            "usage": {a.name: round(self.usage_of(a), 3) for a in self.accounts},
         }
 
     async def aclose(self) -> None:

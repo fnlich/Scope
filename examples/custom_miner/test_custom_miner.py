@@ -14011,6 +14011,9 @@ def test_a_correction_the_judge_refuses_locks_the_case_and_the_program_changes(
     assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
     assert "1 of them refused" in out, out
     assert "cross-check failed" not in out, out
+    # The summary line says how the solve went, and which request it was.
+    assert "corrected=0/1 xcheck=clean" in out and "id=none" in out, out
+    assert "rounds=" in out and "  id=none" in out.split("[phase]")[1], out
     assert "the judge says 15, as the case was written; the case is locked" in out, out
     assert "a confirmed case is failing; asking for the program" in out, out
     # The bar stayed the bar: one case, the one turn 1 wrote, and it passes.
@@ -14032,6 +14035,7 @@ def test_a_correction_the_judge_agrees_with_lands(monkeypatch, capsys):
 
     assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
     assert "the judge agrees with the correction" in out, out
+    assert "corrected=1/1 xcheck=clean" in out, out
     assert "refused" not in out, out
     assert answer.self_total == 1 and answer.self_passed == 1, out
     assert len(backend.judges) == 1 and backend.judges[0].asked == 1, backend.judges
@@ -14098,3 +14102,98 @@ def test_the_primary_is_never_replaced_while_its_program_stands(monkeypatch, cap
     assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
     assert "submitting the second reading's program" not in out, out
     assert solver.stats()["solver"]["fallback"] == 0
+
+
+def test_the_cross_check_setting_is_said_once_at_launch_and_on_every_summary(
+    monkeypatch, capsys
+):
+    """A production log ran a whole day with no cross-check and not one line
+    said so. Now the launch line says it, and every summary line carries
+    the verdict -- `off` included."""
+    solver = _solver([CASES, RIGHT])
+    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    out = capsys.readouterr().out
+    assert out.startswith("[verify] cross-check: OFF (SOLVER_CROSSCHECK=0)"), out
+    assert answer.code and "xcheck=off " in out, out
+
+    monkeypatch.setenv("SOLVER_CROSSCHECK", "1")
+    monkeypatch.setenv("SOLVER_CROSSCHECK_PROFILE", "fable:low")
+    _solver([RIGHT])
+    out = capsys.readouterr().out
+    assert "[verify] cross-check: on (second reading fable:low, judge opus:low" in out, out
+
+
+def test_a_turn_cut_off_says_what_its_stream_looked_like(tmp_path, monkeypatch, capsys):
+    """'nothing had arrived' after 241 seconds was undiagnosable. The line now
+    carries the event count, the time to the first text, the characters and
+    the retries; and every retry the CLI reports is printed as it arrives."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch, mode="slow")
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        return await conversation.send("solve it", 1.0)
+
+    # The stub sends one chunk and then sleeps past the slice.
+    assert asyncio.run(go()).startswith("```python")
+    out = capsys.readouterr().out
+    assert "did not finish inside 1s; keeping the 9 character(s) that arrived (" in out, out
+    assert "1 event(s), first text after 0s, 10 character(s) in 1s, 0 retries)" in out, out
+
+    _cli_modes(log, {"*": "overloaded"})
+    asyncio.run(go())
+    out = capsys.readouterr().out
+    assert "[cli] cli:opus retry 1/" in out and "529" in out and "next wait 1s" in out, out
+
+
+def test_a_nearly_spent_seat_hands_fresh_solves_and_readings_to_the_other(
+    tmp_path, monkeypatch, capsys
+):
+    """The limit used to land mid-conversation at 91%+. Past `switch_at` a
+    seat takes no FRESH solve while another has room; the second reading and
+    the judge go to the lightest seat at all times; and a window that has
+    reset counts as empty again."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch, backups=1)
+    backend = CliBackend()
+    primary, backup = backend.accounts
+    soon = time.time() + 600
+
+    def report(account, used, resets_at=soon):
+        backend.note_rate_limit(
+            {"status": "allowed_warning", "rateLimitType": "five_hour",
+             "unifiedWindows": {"five_hour": {"utilization": used, "resetsAt": resets_at},
+                                "seven_day": {"utilization": 0.3, "resetsAt": resets_at}}},
+            "opus", account,
+        )
+
+    # Nothing reported: the ladder's order, primary first, everywhere.
+    assert backend.pick()[0] is primary
+    assert asyncio.run(backend.open_profile("fable", "low")).account is primary
+    # The primary is heavier than the backup: readings go to the backup,
+    # fresh solves stay on the primary while it has room.
+    report(primary, 0.5)
+    assert backend.pick()[0] is primary
+    assert asyncio.run(backend.open_profile("fable", "low")).account is backup
+    assert backend.stats()["usage"] == {"primary": 0.5, "claude-2": 0.0}
+    # Past the switch point: fresh solves go to the backup as well, and the
+    # log says why -- and that nothing is OUT.
+    report(primary, 0.96)
+    assert backend.pick()[0] is backup
+    assert backend.pick()[1].model == "opus", "same model, other seat"
+    assert asyncio.run(backend.open()).account is backup
+    out = capsys.readouterr().out
+    assert "NEAR THE LIMIT" in out and "96%" in out and "EMERGENCY" not in out, out
+    # Both seats past it: the ladder decides again.
+    report(backup, 0.97)
+    assert backend.pick()[0] is primary
+    # The primary's window has reset: it counts as empty.
+    report(primary, 0.96, resets_at=time.time() - 1)
+    assert backend.usage_of(primary) == 0.0
+    assert backend.pick()[0] is primary
+    assert asyncio.run(backend.open_profile("fable", "low")).account is primary
+    asyncio.run(backend.open())
+    assert "back to normal" in capsys.readouterr().out

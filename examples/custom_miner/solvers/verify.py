@@ -325,12 +325,18 @@ class _Phases:
     only says when a phase ended.
     """
 
-    def __init__(self, budget: float, started: float, pass_no: int = 1) -> None:
+    def __init__(
+        self, budget: float, started: float, pass_no: int = 1, ident: str = ""
+    ) -> None:
         self._budget = budget
         self._solve_started = started
         self._pass = pass_no
         self._at = time.monotonic()
         self._wall = datetime.now()
+        # The request this solve is for, at the end of every line. Solves
+        # interleave -- validators send every four minutes or so and a solve
+        # takes two -- and without it the phases of two solves read as one.
+        self._ident = f"  id={ident}" if ident else ""
 
     def mark(
         self, label: str, *, model_s: Optional[float] = None,
@@ -353,8 +359,13 @@ class _Phases:
             f"[phase] {where}{label:<14} "
             f"{began:%H:%M:%S}.{began.microsecond // 100000} "
             f"took {spent:6.1f}s{detail}"
-            f"  — {max(0.0, left):.0f}s of {self._budget:.0f}s left"
+            f"  — {max(0.0, left):.0f}s of {self._budget:.0f}s left{self._ident}"
         )
+
+
+def _ident(task) -> str:
+    """The request id as the log carries it: short, and empty when unknown."""
+    return str(getattr(task, "problem_id", "") or "")[:12]
 
 
 def _expectation(case: dict) -> str:
@@ -1116,6 +1127,16 @@ class _Plan:
 
     two_phase: bool = True
 
+    def __init__(self, xcheck: str = "not run") -> None:
+        # What the summary line reports beside the tally, so a hidden-suite
+        # outcome can be joined back to how the solve went: rounds asked,
+        # cases the model corrected and that stood, and the last word of
+        # the cross-check. Measured need: a log of 76 solves graded 83.5%
+        # right, and no way to tell a corrected-bar solve from a clean one.
+        self.rounds = 0
+        self.corrected = 0
+        self.xcheck = xcheck
+
 # The most of what is left that the CASES turn may spend.
 #
 # Turn 1 carried a private cap twice before and both were removed, for an
@@ -1221,6 +1242,21 @@ class VerifyingSolver:
         # The second reading. Off only by `SOLVER_CROSSCHECK=0`; see
         # `crosscheck.py` for what it found on this miner's own answers.
         self._crosscheck = _crosscheck.enabled()
+        # Said once, at launch. A production log ran a whole day with no
+        # cross-check and not one line said so; the operator read 76 solves
+        # as checked that were not.
+        if self._crosscheck:
+            reader, judge = _crosscheck.reader_profile(), _crosscheck.judge_profile()
+            print(
+                f"[verify] cross-check: on (second reading {reader[0]}:{reader[1]}, "
+                f"judge {judge[0]}:{judge[1]}, {_crosscheck.inputs_wanted()} inputs; "
+                f"SOLVER_CROSSCHECK=0 turns it off)"
+            )
+        else:
+            print(
+                "[verify] cross-check: OFF (SOLVER_CROSSCHECK=0): no second reading, "
+                "no judge, and a corrected case is accepted as sent"
+            )
         self._cache: dict[str, tuple[str, str]] = {}
         self._cache_size = max(0, int(cache_size))
         self._counts = {
@@ -1349,7 +1385,7 @@ class VerifyingSolver:
         # unattributable, which made "is one of these tabs doing worse than the
         # others" an unanswerable question.
         won_with: Optional[str] = None
-        plan = _Plan()
+        plan = _Plan(xcheck="off" if not self._crosscheck else "not run")
         checker = self._start_crosscheck(task, budget)
         # A ceiling, not a plan. Every ordinary path breaks out after one or
         # two: the loop only keeps going while it is holding NOTHING, which is
@@ -1516,7 +1552,10 @@ class VerifyingSolver:
                 if best.self_verified
                 else ""
             )
+            + f"rounds={plan.rounds} corrected={plan.corrected}/{best.self_total} "
+            + f"xcheck={plan.xcheck} "
             + f"{elapsed:.1f}s/{budget:.0f}s"
+            + (f" id={_ident(task)}" if _ident(task) else "")
         )
         return Answer(
             code=best.code, raw_response=best.raw,
@@ -1603,7 +1642,7 @@ class VerifyingSolver:
             # deadline, and return empty having sent no prompt at all. Measured:
             # budget 40s, elapsed 50.1s, `open()` called at t=0 and t=25.1,
             # prompts sent 0.
-            phases = _Phases(budget, started, pass_no)
+            phases = _Phases(budget, started, pass_no, ident=_ident(task))
             conversation = await self._open_within(budget, started, avoid)
             provider = best_provider = getattr(conversation, "provider", None)
             phases.mark(f"open {provider or 'tab'}")
@@ -1887,7 +1926,7 @@ class VerifyingSolver:
             # Keys of cases whose correction a judge REFUSED this pass, so the
             # same correction is not put to the judge twice; and how many
             # judge turns corrections have cost. See `MAX_JUDGED_CORRECTIONS`.
-            stood: set[str] = set()
+            stood: set[tuple] = set()
             judged_corrections = 0
             # Whether THIS round's correction was refused by the judge. Such a
             # round re-grades the program in hand against the bar as it was,
@@ -1898,11 +1937,12 @@ class VerifyingSolver:
 
             async def judged_correction(
                 before: list[dict], merged: list[dict], failed: list[dict], changed: str
-            ) -> tuple[list[dict], str]:
+            ) -> tuple[list[dict], str, int]:
                 """The bar after a correction, once a reader with no program in
                 hand has said which side of the disagreement was wrong.
 
-                Returns (the cases that now stand, what to say about it).
+                Returns (the cases that now stand, what to say about it, how
+                many corrected cases landed).
 
                 Every correction used to land on the model's own say-so, and
                 the author of a program is the one party with a reason to want
@@ -1930,20 +1970,20 @@ class VerifyingSolver:
                 is in `stood` either way.
                 """
                 nonlocal judged_corrections, correction_refused
-                if checker is None:
-                    return merged, changed
-                originals = {checker.key(c): c for c in failed}
-                held = {checker.key(c): _expectation(c) for c in before}
+                originals = {_case_key(c): c for c in failed}
+                held = {_case_key(c): _expectation(c) for c in before}
                 disputes: list[tuple[dict, dict]] = []
                 for case in merged:
-                    key = checker.key(case)
+                    key = _case_key(case)
                     if held.get(key) == _expectation(case):
                         continue
                     disputes.append((originals.get(key, case), case))
                 if not disputes:
-                    return merged, changed
-                fresh = [(o, c) for o, c in disputes if checker.key(c) not in stood]
-                verdict_of: dict[str, tuple[str, Any]] = {}
+                    return merged, changed, 0
+                if checker is None:
+                    return merged, changed, len(disputes)
+                fresh = [(o, c) for o, c in disputes if _case_key(c) not in stood]
+                verdict_of: dict[tuple, tuple[str, Any]] = {}
                 unjudged = ""
                 if fresh:
                     left = budget - (time.monotonic() - started)
@@ -1960,11 +2000,11 @@ class VerifyingSolver:
                         for (_, case), verdict in zip(
                             fresh, await checker.judge_corrections(fresh, left)
                         ):
-                            verdict_of[checker.key(case)] = verdict
+                            verdict_of[_case_key(case)] = verdict
                 accepted: list[dict] = []
                 notes: list[str] = []
                 for original, case in disputes:
-                    key = checker.key(case)
+                    key = _case_key(case)
                     verdict, expected = verdict_of.get(
                         key, ("repeat" if key in stood else "no verdict", None)
                     )
@@ -2002,7 +2042,7 @@ class VerifyingSolver:
                     )
                 elif notes:
                     changed = f"{changed} -- " + "; ".join(notes)
-                return merged, changed
+                return merged, changed, len(accepted)
 
             async def second_reading_says(candidate: Candidate, attempt: int) -> list[str]:
                 """Cross-check a program its own cases pass; see `crosscheck.py`.
@@ -2015,9 +2055,11 @@ class VerifyingSolver:
                 """
                 nonlocal agreed
                 left_now = budget - (time.monotonic() - started)
-                if checker is None or left_now < (
-                    _crosscheck.XCHECK_FLOOR_S + _crosscheck.REPAIR_RESERVE_S
-                ):
+                if checker is None:
+                    return []
+                if left_now < _crosscheck.XCHECK_FLOOR_S + _crosscheck.REPAIR_RESERVE_S:
+                    if plan is not None:
+                        plan.xcheck = f"skipped ({left_now:.0f}s left)"
                     return []
                 checked_at = time.monotonic()
                 verdict = await checker.run(candidate.code, left_now)
@@ -2026,6 +2068,12 @@ class VerifyingSolver:
                     model_s=time.monotonic() - checked_at,
                 )
                 print(f"[verify] cross-check: {_crosscheck.describe(verdict)}")
+                if plan is not None:
+                    plan.xcheck = (
+                        f"{len(verdict.failures)} finding(s)" if verdict.failures
+                        else "clean" if verdict.inputs
+                        else (verdict.note or "no verdict")[:60]
+                    )
                 if not verdict.failures:
                     return []
                 # Wrong where two other readings agree. Into the ordinary
@@ -2042,11 +2090,21 @@ class VerifyingSolver:
                 return list(verdict.failures)
 
             attempt = 0
+            # A backend may know its own round trip is longer than the floor
+            # here: the CLI starts a process and re-reads the session before
+            # the model says a word. Measured, a correction round started with
+            # 15s on the CLI backend produced nothing.
+            round_trip_floor = max(
+                ROUND_TRIP_FLOOR_S,
+                float(getattr(conversation, "round_trip_floor_s", 0.0) or 0.0),
+            )
             while True:
                 attempt += 1
+                if plan is not None:
+                    plan.rounds += 1
                 objections: list[str] = []
                 left = budget - (time.monotonic() - started)
-                if attempt > 1 and left < ROUND_TRIP_FLOOR_S:
+                if attempt > 1 and left < round_trip_floor:
                     # Not enough left to be worth another ROUND TRIP -- which is
                     # what this has always been about, and it never should have
                     # gated the first one. It did: below a 32-second deadline
@@ -2203,9 +2261,11 @@ class VerifyingSolver:
                             # Judged BEFORE it is announced or graded against:
                             # see `judged_correction` for what a correction
                             # accepted on its author's word cost.
-                            merged, changed = await judged_correction(
+                            merged, changed, landed = await judged_correction(
                                 agreed, merged, correctable, changed
                             )
+                            if plan is not None:
+                                plan.corrected += landed
                             print(
                                 f"[verify] the repair corrected the cases rather "
                                 f"than the program: {changed}. The program is "
