@@ -1778,6 +1778,79 @@ daemon nothing grades — so what is left is `rust_defect` looking for `fn main`
 in a fenced block. Installing `rustc` restores the compile gate on its own and
 needs no Docker; grading Rust needs the daemon.
 
+## The second reading: what a program's own cases cannot say
+
+Every answer above is graded against cases the same model wrote, and a model
+cannot confirm its own reading of a statement. Measured on this miner's
+archived answers: of 15 that could be re-graded independently, 2 passed every
+case their author wrote and were wrong. A production log of 76 solves came
+back 83.5% right on the hidden suite while 72 of the 76 reported *verified on
+local*. So a solve now buys a second opinion it can actually use.
+
+**The second reading.** Beside the primary conversation, a fresh one on
+`SOLVER_CROSSCHECK_PROFILE` (default `fable:low`) reads the statement cold and
+writes its own program and an input generator. Once the primary's program
+passes everything of its own, both programs run on 60 generated inputs and on
+one maximum-size input. Every disagreement goes to a **judge** — one turn on
+`SOLVER_JUDGE_PROFILE` (default `opus:low`) that is shown the statement and the
+inputs and nothing else — and an input the judge decides against the primary
+lands on the bar as a *confirmed* case: locked, reported as a failure, and not
+the primary's to correct. A large input the primary times out on while the
+second program finishes is reported the same way. `SOLVER_CROSSCHECK=0` turns
+all of it off, and the launch line says which:
+
+```text
+[verify] cross-check: on (second reading fable:low, judge opus:low, 60 inputs; SOLVER_CROSSCHECK=0 turns it off)
+```
+
+**A corrected case is judged before it lands.** The repair prompt offers two
+ways out of a failing case: fix the program, or send the case back corrected.
+In that log the model took the second in 18 of 24 open repair rounds, at a
+third of the thinking time, and every correction was accepted on its author's
+word. Now each corrected case goes to the same judge as the call alone. Agree
+with the correction and it lands; agree with the case as written and the
+correction is refused, the case is locked, and the next prompt asks for the
+program without offering the cases; agree with neither and the case stands as
+written. No judge, no time (under 65s left), or two judge turns already spent
+this pass: the correction lands as it always did — a judge that cannot be
+reached is not a reason to freeze the bar.
+
+```text
+[verify] the repair corrected the cases rather than the program: 1 case(s) corrected and 1 of them refused -- g(12345): the judge says 15, as the case was written; the case is locked and the program has to change. ...
+```
+
+**The answer of last resort.** Six program turns in that log ran past 200
+seconds; four solves ended with nothing, a fragment, or a program still
+failing its own cases — while the second reading's program had been finished
+for two minutes. That program is graded in the background against the
+primary's own cases, and submitted when the primary ends with nothing, a
+fragment, a structural defect, or cases it was seen to fail, and only when it
+passed every case the primary wrote. A primary that passed everything it was
+run against stands, however many cases went unrun: unknown is not failed, and
+the primary is the stronger model.
+
+**What the summary line now says**, so a hidden-suite outcome can be joined
+back to how the solve went:
+
+```text
+[verify] python entrypoint=longest_run provider=cli:opus examples=0/0 self=20/20 verified=False (verified on local: ...) rounds=3 corrected=1/20 xcheck=clean 29.3s/290s id=req-1
+```
+
+`rounds` is how many times the model was asked, `corrected` how many cases it
+corrected that stood over the size of the bar, `xcheck` the last word of the
+cross-check (`off`, `clean`, `N finding(s)`, `skipped (Ns left)`), and `id`
+the request, which every `[phase]` line of that solve also ends with. Solves
+interleave; without the id the phases of two solves read as one.
+
+**What it costs the seat.** About 1.9× the output tokens of a solve without
+it, and one to three more conversations per solve. On the CLI backend the
+second reading and the judge go to the **lightest** signed-in seat, and a
+seat past `SOLVER_CLI_SWITCH_AT` (default 95%) of its window takes no fresh
+solve while another has room — measured, the limit used to land at 91%+ in
+the middle of a repair round. `SOLVER_CLI_CONCURRENCY` defaults to 8 for the
+same reason: a solve holds up to three conversations, and two miners on one
+login hold twice that.
+
 ## Running under pm2
 
 pm2 supervises **only the miner**. The browsers are yours: you start them, you

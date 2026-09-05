@@ -445,12 +445,136 @@ class CrossCheck:
         self.confirmed: list[dict] = []
         self.locked: set[str] = set()
         self.rounds = 0
+        # The second reading's program graded against the primary's own
+        # cases, in the background, so that a fallback verdict is in hand the
+        # moment the primary runs out. See `pregrade` and `fallback`.
+        self._pregrade: Optional[asyncio.Task] = None
+        self.second_passed = 0
+        self.second_total = 0
 
     @staticmethod
     def key(case: dict) -> str:
         return json.dumps(
             [case.get("args", []), case.get("kwargs") or {}], sort_keys=True, default=str
         )
+
+    def confirm(self, case: dict) -> None:
+        """Lock a case the primary must satisfy: on the bar for every later
+        round and pass, and never the primary's to correct."""
+        key = self.key(case)
+        if key not in self.locked:
+            self.locked.add(key)
+            confirmed = dict(case)
+            # `run` reports a confirmed case by name, and a case the model
+            # wrote need not have one.
+            confirmed.setdefault("name", f"confirmed {len(self.confirmed) + 1}")
+            self.confirmed.append(confirmed)
+
+    # -- the second reading as the answer of last resort ------------------- #
+
+    def pregrade(self, cases: list[dict], left_s: float) -> None:
+        """Grade the second reading's program against the primary's own cases,
+        in the background, once per solve.
+
+        Measured on a production log: the primary's program turn ran past
+        200 seconds in six of seventy-six solves, and four of those ended
+        with nothing, a fragment, or a program failing its own cases -- while
+        a second program had been sitting finished for two minutes. The
+        verdict on that program is computed while there is still time, so
+        that using it costs nothing at the deadline.
+        """
+        if self._pregrade is not None or not cases:
+            return
+        self._pregrade = asyncio.ensure_future(self._pregrade_run(list(cases), left_s))
+
+    async def _pregrade_run(self, cases: list[dict], left_s: float) -> None:
+        started = time.monotonic()
+        try:
+            if not await self._reading.wait(max(1.0, left_s * 0.9)):
+                return
+            left = left_s - (time.monotonic() - started)
+            if left < 3.0:
+                return
+            runs = await self._outputs(self._reading.code, cases, left)
+            language = self._task.language
+            passed = sum(
+                1 for case, run in zip(cases, runs)
+                if same(language, Outcome(True, case.get("expected")), run)
+            )
+            self.second_passed, self.second_total = passed, len(cases)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a lost pregrade loses no answer
+            return
+
+    async def fallback(self, wait_s: float = 0.0) -> Optional[tuple[str, int, int]]:
+        """The second reading's program, when it passed every one of the
+        primary's own cases: (code, passed, total). None otherwise.
+
+        Waits up to `wait_s` for a grading still running. Ordinarily it
+        finished minutes ago -- the primary's program turn is the long part
+        of a solve -- and the wait is for the other shape, a primary that
+        died early, where a few seconds buys the only answer there is."""
+        if self._pregrade is None:
+            return None
+        if not self._pregrade.done() and wait_s > 0:
+            try:
+                await asyncio.wait_for(asyncio.shield(self._pregrade), wait_s)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                pass
+        if not self._pregrade.done():
+            return None
+        if self.second_total and self.second_passed == self.second_total:
+            code = self._reading.code
+            if code.strip():
+                return code, self.second_passed, self.second_total
+        return None
+
+    async def close(self) -> None:
+        if self._pregrade is not None and not self._pregrade.done():
+            self._pregrade.cancel()
+            try:
+                await self._pregrade
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        await self._reading.close()
+
+    # -- a correction, judged before it is accepted --------------------------- #
+
+    async def judge_corrections(
+        self, disputes: list[tuple[dict, dict]], left_s: float
+    ) -> list[tuple[str, Any]]:
+        """Each dispute is (the case as it stood, the case as the primary
+        wants it), same call, different expectation. One judge turn decides
+        them all: per dispute, `original`, `corrected`, `neither` or `no
+        verdict`, with the judge's own expected value.
+
+        Measured on a production log: eighteen times in seventy-six solves
+        the primary answered a failing case by rewriting the case, and every
+        one of those rewrites was accepted on its own say-so. The author of
+        a program is the one party with a reason to want its cases changed;
+        a reader with no program decides instead.
+        """
+        cases = [original for original, _ in disputes]
+        values = await self._ask_judge(cases, left_s)
+        if values is None:
+            return [("no verdict", None)] * len(disputes)
+        language = self._task.language
+        verdicts: list[tuple[str, Any]] = []
+        for (original, corrected), expected in zip(disputes, values):
+            if language == "rust" and not isinstance(expected, str):
+                verdicts.append(("no verdict", None))
+                continue
+            judge = Outcome(True, expected)
+            with_original = same(language, judge, Outcome(True, original.get("expected")))
+            with_corrected = same(language, judge, Outcome(True, corrected.get("expected")))
+            verdicts.append((
+                "corrected" if with_corrected and not with_original
+                else "original" if with_original and not with_corrected
+                else "neither" if not with_original else "corrected",
+                expected,
+            ))
+        return verdicts
 
     async def run(self, code: str, left_s: float) -> CheckResult:
         """Cross-check `code` inside `left_s`. Never raises."""
@@ -592,25 +716,22 @@ class CrossCheck:
         return [Outcome(ok=r.ok, value=r.value, error=r.error, timed_out=r.timed_out,
                         runtime_ms=r.runtime_ms) for r in raw]
 
-    async def _adjudicate(
-        self, disputed: list[tuple[dict, Outcome, Outcome]], left_s: float
-    ) -> list[tuple[str, Any]]:
-        """Put the disputed inputs to the judge in one turn: one (verdict,
-        expected) per input, in order. A turn that cannot finish inside
-        `JUDGE_TURN_MAX_S` is cut and counted as no verdict."""
+    async def _ask_judge(self, cases: list[dict], left_s: float) -> Optional[list[Any]]:
+        """One judge turn over `cases`: the expected value for each, in order,
+        or None when no usable verdict came back. A turn that cannot finish
+        inside `JUDGE_TURN_MAX_S` is cut and counted as no verdict."""
         task = self._task
         conversation = None
         started = time.monotonic()
         try:
             conversation = await self._judge(min(left_s * 0.5, 30.0))
             reply = await conversation.send(
-                build_judge_prompt(task.language, task.statement, task.entrypoint,
-                                   [case for case, _, _ in disputed]),
+                build_judge_prompt(task.language, task.statement, task.entrypoint, cases),
                 max(1.0, min(left_s, JUDGE_TURN_MAX_S)),
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[verify] cross-check: no judge ({type(exc).__name__}: {exc})")
-            return [(f"no judge ({type(exc).__name__})", None)] * len(disputed)
+            return None
         finally:
             if conversation is not None:
                 try:
@@ -618,10 +739,22 @@ class CrossCheck:
                 except Exception:  # noqa: BLE001
                     pass
         spent = time.monotonic() - started
-        found, values = extract_expected(reply, len(disputed))
+        found, values = extract_expected(reply, len(cases))
         if not found:
             print(f"[verify] cross-check: the judge gave no usable verdict in {spent:.0f}s"
                   + (" (cut off)" if getattr(conversation, "still_writing", False) else ""))
+            return None
+        print(f"[verify] cross-check: the judge decided {len(cases)} input(s) in {spent:.0f}s")
+        return values
+
+    async def _adjudicate(
+        self, disputed: list[tuple[dict, Outcome, Outcome]], left_s: float
+    ) -> list[tuple[str, Any]]:
+        """Put the disputed inputs to the judge in one turn: one (verdict,
+        expected) per input, in order."""
+        task = self._task
+        values = await self._ask_judge([case for case, _, _ in disputed], left_s)
+        if values is None:
             return [("no verdict", None)] * len(disputed)
         verdicts: list[tuple[str, Any]] = []
         for (case, a, b), expected in zip(disputed, values):
@@ -637,8 +770,7 @@ class CrossCheck:
                        else "second wrong" if with_a and not with_b
                        else "undecided" if not with_a else "tie")
             verdicts.append((verdict, expected))
-        print(f"[verify] cross-check: the judge decided {len(disputed)} input(s) in "
-              f"{spent:.0f}s: " + ", ".join(v for v, _ in verdicts))
+        print("[verify] cross-check: " + ", ".join(v for v, _ in verdicts))
         return verdicts
 
     async def _stress(self, code: str, result: CheckResult, left) -> None:

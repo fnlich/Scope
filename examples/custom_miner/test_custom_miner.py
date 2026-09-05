@@ -13967,3 +13967,233 @@ def test_selecting_the_cli_backend_needs_no_browser(monkeypatch):
     monkeypatch.setenv("SOLVER_BACKEND", "nonsense")
     with pytest.raises(SystemExit):
         roster_module.backend_kind()
+
+
+# --------------------------------------------------------------------------- #
+# A correction is judged before it lands; the second reading is the answer of
+# last resort.
+# --------------------------------------------------------------------------- #
+# The same problem with no public examples -- the shape of all 97 archived
+# requests, and the one where a fallback can ever matter, because a program
+# that reproduces the validator's examples is never replaced.
+NO_EXAMPLES = SolveTask(
+    problem_id="none", language="python", statement=DIGITS.statement,
+    entrypoint="g", public_examples=[], deadline_s=120.0,
+)
+# A wrong case: 12345 does not sum to 14. `RIGHT` fails it; `WRONG` passes it.
+WRONG_CASE = '```json\n[{"name": "all five digits", "args": [12345], "expected": 14}]\n```'
+# The two corrections a program can send back for that call: one that agrees
+# with the digits, one that agrees with `WRONG`.
+CORRECT_TO_15 = '```json\n[{"name": "all five digits", "args": [12345], "expected": 15}]\n```'
+CORRECT_TO_14 = WRONG_CASE
+# A second program that is right and can be told from `RIGHT` by its text.
+SECOND_BY_STRING = "```python\ndef g(n):\n    return sum(int(d) for d in str(n))\n```"
+
+
+def test_a_correction_the_judge_refuses_locks_the_case_and_the_program_changes(
+    monkeypatch, capsys
+):
+    """The program is wrong, the case is right, and the repair 'corrects' the
+    case to what the program prints. Measured on a production log: eighteen
+    such corrections in seventy-six solves, every one accepted on its
+    author's word. Now a reader with no program is asked first: it sides with
+    the case as written, the correction is refused, the case is locked, the
+    next prompt asks for the program and not the cases, and the program is
+    what changes."""
+    # The case carries no name: a locked case is reported by name later, and
+    # a model's own case need not have one.
+    unnamed = '```json\n[{"args": [12345], "expected": 15}]\n```'
+    backend = _Readers([unnamed, WRONG, CORRECT_TO_14, RIGHT], [SECOND, GENERATOR])
+    solver = _crosschecked(monkeypatch, backend)
+    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    out = capsys.readouterr().out
+
+    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
+    assert "1 of them refused" in out, out
+    assert "cross-check failed" not in out, out
+    # The summary line says how the solve went, and which request it was.
+    assert "corrected=0/1 xcheck=clean" in out and "id=none" in out, out
+    assert "rounds=" in out and "  id=none" in out.split("[phase]")[1], out
+    assert "the judge says 15, as the case was written; the case is locked" in out, out
+    assert "a confirmed case is failing; asking for the program" in out, out
+    # The bar stayed the bar: one case, the one turn 1 wrote, and it passes.
+    assert answer.self_total == 1 and answer.self_passed == 1, out
+    # One judge turn for the correction; the cross-check found nothing to judge.
+    assert len(backend.judges) == 1 and backend.judges[0].asked == 1, backend.judges
+    assert "the judge decided 1 input(s)" in out, out
+
+
+def test_a_correction_the_judge_agrees_with_lands(monkeypatch, capsys):
+    """The other way round: the CASE was wrong, the program was right, and the
+    correction says so. The judge agrees with the correction, it lands, and
+    the program in hand is re-graded against it -- no repair round, no
+    program re-sent."""
+    backend = _Readers([WRONG_CASE, RIGHT, CORRECT_TO_15], [SECOND, GENERATOR])
+    solver = _crosschecked(monkeypatch, backend)
+    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    out = capsys.readouterr().out
+
+    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
+    assert "the judge agrees with the correction" in out, out
+    assert "corrected=1/1 xcheck=clean" in out, out
+    assert "refused" not in out, out
+    assert answer.self_total == 1 and answer.self_passed == 1, out
+    assert len(backend.judges) == 1 and backend.judges[0].asked == 1, backend.judges
+
+
+def test_the_second_reading_answers_when_the_primary_returns_nothing(
+    monkeypatch, capsys
+):
+    """The shape that cost four of seventy-six production solves: the cases
+    turn worked, the program turn ran out, and the answer was nothing -- while
+    the second reading's program had been finished for minutes. Its program is
+    graded against the primary's own cases in the background, and submitted
+    when the primary ends with nothing."""
+
+    class _Dies(_Chat):
+        async def send(self, text, timeout_s):
+            self._n += 1
+            if self._n == 0:
+                return CASES
+            await asyncio.sleep(0.3)
+            raise RuntimeError("the tab went away")
+
+    class _Primary(_Readers):
+        async def open(self, avoid=None):
+            self.opened.append(("primary", avoid))
+            return _Dies(self._replies, self._provider)
+
+    backend = _Primary([CASES], [SECOND_BY_STRING, GENERATOR])
+    solver = _crosschecked(monkeypatch, backend)
+    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    out = capsys.readouterr().out
+
+    assert extract_code(answer.code, "g") == extract_code(SECOND_BY_STRING, "g"), out
+    assert "the primary ended with nothing; submitting the second reading's program" in out, out
+    assert "passed 1/1 of the cases the primary wrote" in out, out
+    assert answer.self_total == 1 and answer.self_passed == 1, out
+    assert solver.stats()["solver"]["fallback"] == 1
+
+
+def test_the_second_reading_answers_when_the_primary_never_fixes_its_program(
+    monkeypatch, capsys
+):
+    """The primary's program fails the case the primary itself wrote, and every
+    repair round sends the same program back. The second reading's program
+    passes that case, and it is the answer."""
+    backend = _Readers([CASES, WRONG, WRONG], [SECOND_BY_STRING, GENERATOR])
+    solver = _crosschecked(monkeypatch, backend)
+    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    out = capsys.readouterr().out
+
+    assert extract_code(answer.code, "g") == extract_code(SECOND_BY_STRING, "g"), out
+    assert "the primary ended with a program failing 1 of the 1 case(s)" in out, out
+
+
+def test_the_primary_is_never_replaced_while_its_program_stands(monkeypatch, capsys):
+    """A primary that passed everything it was run against keeps the answer,
+    however good the second reading's program is: the fallback is taken on
+    evidence against the primary, never on evidence for the second."""
+    backend = _Readers([CASES, RIGHT], [SECOND_BY_STRING, GENERATOR])
+    solver = _crosschecked(monkeypatch, backend)
+    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    out = capsys.readouterr().out
+
+    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
+    assert "submitting the second reading's program" not in out, out
+    assert solver.stats()["solver"]["fallback"] == 0
+
+
+def test_the_cross_check_setting_is_said_once_at_launch_and_on_every_summary(
+    monkeypatch, capsys
+):
+    """A production log ran a whole day with no cross-check and not one line
+    said so. Now the launch line says it, and every summary line carries
+    the verdict -- `off` included."""
+    solver = _solver([CASES, RIGHT])
+    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    out = capsys.readouterr().out
+    assert out.startswith("[verify] cross-check: OFF (SOLVER_CROSSCHECK=0)"), out
+    assert answer.code and "xcheck=off " in out, out
+
+    monkeypatch.setenv("SOLVER_CROSSCHECK", "1")
+    monkeypatch.setenv("SOLVER_CROSSCHECK_PROFILE", "fable:low")
+    _solver([RIGHT])
+    out = capsys.readouterr().out
+    assert "[verify] cross-check: on (second reading fable:low, judge opus:low" in out, out
+
+
+def test_a_turn_cut_off_says_what_its_stream_looked_like(tmp_path, monkeypatch, capsys):
+    """'nothing had arrived' after 241 seconds was undiagnosable. The line now
+    carries the event count, the time to the first text, the characters and
+    the retries; and every retry the CLI reports is printed as it arrives."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch, mode="slow")
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        return await conversation.send("solve it", 1.0)
+
+    # The stub sends one chunk and then sleeps past the slice.
+    assert asyncio.run(go()).startswith("```python")
+    out = capsys.readouterr().out
+    assert "did not finish inside 1s; keeping the 9 character(s) that arrived (" in out, out
+    assert "1 event(s), first text after 0s, 10 character(s) in 1s, 0 retries)" in out, out
+
+    _cli_modes(log, {"*": "overloaded"})
+    asyncio.run(go())
+    out = capsys.readouterr().out
+    assert "[cli] cli:opus retry 1/" in out and "529" in out and "next wait 1s" in out, out
+
+
+def test_a_nearly_spent_seat_hands_fresh_solves_and_readings_to_the_other(
+    tmp_path, monkeypatch, capsys
+):
+    """The limit used to land mid-conversation at 91%+. Past `switch_at` a
+    seat takes no FRESH solve while another has room; the second reading and
+    the judge go to the lightest seat at all times; and a window that has
+    reset counts as empty again."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch, backups=1)
+    backend = CliBackend()
+    primary, backup = backend.accounts
+    soon = time.time() + 600
+
+    def report(account, used, resets_at=soon):
+        backend.note_rate_limit(
+            {"status": "allowed_warning", "rateLimitType": "five_hour",
+             "unifiedWindows": {"five_hour": {"utilization": used, "resetsAt": resets_at},
+                                "seven_day": {"utilization": 0.3, "resetsAt": resets_at}}},
+            "opus", account,
+        )
+
+    # Nothing reported: the ladder's order, primary first, everywhere.
+    assert backend.pick()[0] is primary
+    assert asyncio.run(backend.open_profile("fable", "low")).account is primary
+    # The primary is heavier than the backup: readings go to the backup,
+    # fresh solves stay on the primary while it has room.
+    report(primary, 0.5)
+    assert backend.pick()[0] is primary
+    assert asyncio.run(backend.open_profile("fable", "low")).account is backup
+    assert backend.stats()["usage"] == {"primary": 0.5, "claude-2": 0.0}
+    # Past the switch point: fresh solves go to the backup as well, and the
+    # log says why -- and that nothing is OUT.
+    report(primary, 0.96)
+    assert backend.pick()[0] is backup
+    assert backend.pick()[1].model == "opus", "same model, other seat"
+    assert asyncio.run(backend.open()).account is backup
+    out = capsys.readouterr().out
+    assert "NEAR THE LIMIT" in out and "96%" in out and "EMERGENCY" not in out, out
+    # Both seats past it: the ladder decides again.
+    report(backup, 0.97)
+    assert backend.pick()[0] is primary
+    # The primary's window has reset: it counts as empty.
+    report(primary, 0.96, resets_at=time.time() - 1)
+    assert backend.usage_of(primary) == 0.0
+    assert backend.pick()[0] is primary
+    assert asyncio.run(backend.open_profile("fable", "low")).account is primary
+    asyncio.run(backend.open())
+    assert "back to normal" in capsys.readouterr().out
