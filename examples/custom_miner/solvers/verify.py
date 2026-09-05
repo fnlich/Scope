@@ -142,6 +142,20 @@ CASES_ONLY_ROUNDS = 2
 # correcting its bar after two verdicts has said what it has to say about
 # the cases, and the budget is better spent on the program.
 MAX_JUDGED_CORRECTIONS = 2
+# The most of the bar ONE repair reply may rewrite, as a fraction. A reply
+# that corrects more than this is re-specifying the problem rather than fixing
+# a case, and is refused whole.
+#
+# Measured on a production day: the share of the bar rewritten by each of the
+# thirteen correction replies was 5, 7, 7, 8, 8, 10, 10, 10, 10, 11, 15, 29
+# and 68 percent. A third fires on the 68 and on nothing else. That reply came
+# from a program the cross-check had already confirmed wrong on two inputs: it
+# rewrote fifteen of its twenty-two cases with nine seconds left, no judge had
+# time to look, and the solve shipped reporting it had passed all twenty-two.
+BULK_CORRECTION_SHARE = 3
+# How many bulk rewrites a pass tolerates before the case offer is withdrawn
+# for good. Refusing without this is a spin: the reply comes back the same.
+MAX_BULK_REFUSALS = 2
 
 
 class Conversation(Protocol):
@@ -1135,6 +1149,10 @@ class _Plan:
         # right, and no way to tell a corrected-bar solve from a clean one.
         self.rounds = 0
         self.corrected = 0
+        # Corrected cases that landed with NO judge verdict behind them. The
+        # summary line stops claiming the answer passed its own cases when
+        # this is non-zero: the bar it passed is one the failing model moved.
+        self.unjudged = 0
         self.xcheck = xcheck
 
 # The most of what is left that the CASES turn may spend.
@@ -1549,10 +1567,18 @@ class VerifyingSolver:
             + (
                 f"(verified on local: passed all {best.self_total} of its "
                 f"own cases; no public examples exist to confirm it) "
+                if best.self_verified and not plan.unjudged
+                # The bar it passed is one the failing model moved, with
+                # nobody to check the move. That is not a local verification
+                # and the line that an operator reads must not call it one.
+                else f"(NOT verified on local: {plan.unjudged} of the "
+                f"{best.self_total} case(s) it passed were rewritten by the "
+                f"model itself with no judge) "
                 if best.self_verified
                 else ""
             )
-            + f"rounds={plan.rounds} corrected={plan.corrected}/{best.self_total} "
+            + f"rounds={plan.rounds} corrected={plan.corrected}/{best.self_total}"
+            + (f"({plan.unjudged} unjudged)" if plan.unjudged else "") + " "
             + f"xcheck={plan.xcheck} "
             + f"{elapsed:.1f}s/{budget:.0f}s"
             + (f" id={_ident(task)}" if _ident(task) else "")
@@ -1928,6 +1954,9 @@ class VerifyingSolver:
             # judge turns corrections have cost. See `MAX_JUDGED_CORRECTIONS`.
             stood: set[tuple] = set()
             judged_corrections = 0
+            # Replies refused whole for rewriting too much of the bar at once.
+            # See `BULK_CORRECTION_SHARE` and `MAX_BULK_REFUSALS`.
+            bulk_refusals = 0
             # Whether THIS round's correction was refused by the judge. Such a
             # round re-grades the program in hand against the bar as it was,
             # which looks exactly like the model repeating itself -- and it is
@@ -1969,7 +1998,7 @@ class VerifyingSolver:
                 asking: the case is locked when the judge sided with it, and
                 is in `stood` either way.
                 """
-                nonlocal judged_corrections, correction_refused
+                nonlocal judged_corrections, correction_refused, bulk_refusals
                 originals = {_case_key(c): c for c in failed}
                 held = {_case_key(c): _expectation(c) for c in before}
                 disputes: list[tuple[dict, dict]] = []
@@ -1980,7 +2009,30 @@ class VerifyingSolver:
                     disputes.append((originals.get(key, case), case))
                 if not disputes:
                     return merged, changed, 0
+                # A reply that rewrites a THIRD of the bar is not correcting a
+                # case. Refused whole, before the judge is even consulted --
+                # the judge is capped at a couple of cases a turn and could not
+                # speak to fifteen of them anyway. The cases are NOT added to
+                # `stood`: the model is free to correct two or three of them
+                # next round, where a judge can actually look.
+                allowed = max(2, len(before) // BULK_CORRECTION_SHARE)
+                if len(disputes) > allowed:
+                    bulk_refusals += 1
+                    correction_refused = True
+                    return list(before), (
+                        f"{len(disputes)} of the {len(before)} case(s) on the bar "
+                        f"came back rewritten in one reply, which is a "
+                        f"re-specification rather than a correction; the bar "
+                        f"stands and the program is re-graded against it"
+                        + ("" if bulk_refusals < MAX_BULK_REFUSALS
+                           else " -- and the cases are not offered again this pass")
+                    ), 0
                 if checker is None:
+                    # No cross-check running means no judge exists, so every
+                    # correction lands unread. That is the old behaviour and
+                    # it stays -- but the summary line has to say so.
+                    if plan is not None:
+                        plan.unjudged += len(disputes)
                     return merged, changed, len(disputes)
                 fresh = [(o, c) for o, c in disputes if _case_key(c) not in stood]
                 verdict_of: dict[tuple, tuple[str, Any]] = {}
@@ -2032,6 +2084,8 @@ class VerifyingSolver:
                         notes.append(f"{call}: refused before this pass; not asked again")
                 if unjudged:
                     notes.append(f"{len(fresh)} unjudged ({unjudged}) and accepted as sent")
+                    if plan is not None:
+                        plan.unjudged += len(fresh)
                 refused = len(disputes) - len(accepted)
                 if refused:
                     correction_refused = True
@@ -2071,6 +2125,10 @@ class VerifyingSolver:
                 if plan is not None:
                     plan.xcheck = (
                         f"{len(verdict.failures)} finding(s)" if verdict.failures
+                        else f"unresolved({verdict.unresolved} open)"
+                        if verdict.unresolved
+                        else f"unresolved({verdict.undecided} undecided)"
+                        if verdict.undecided
                         else "clean" if verdict.inputs
                         else (verdict.note or "no verdict")[:60]
                     )
@@ -2267,11 +2325,18 @@ class VerifyingSolver:
                             if plan is not None:
                                 plan.corrected += landed
                             print(
-                                f"[verify] the repair corrected the cases rather "
-                                f"than the program: {changed}. The program is "
-                                f"re-graded against the {len(merged)} that now "
-                                f"stand; if it still disagrees the loop keeps "
-                                f"going."
+                                "[verify] "
+                                + (
+                                    "the repair corrected the cases rather than "
+                                    "the program: " if landed
+                                    # Nothing landed, so the lead-in must not
+                                    # say the bar moved. It did not.
+                                    else "the repair sent cases and none of "
+                                    "them stand: "
+                                )
+                                + f"{changed}. The program is re-graded against "
+                                f"the {len(merged)} that now stand; if it still "
+                                f"disagrees the loop keeps going."
                             )
                         # Kept even when the merge changed nothing, because
                         # `revised` is not only the new bar -- it is what tells
@@ -2528,10 +2593,18 @@ class VerifyingSolver:
                 # Kept apart, not merged into one list of "problems": a defect
                 # means the code never ran, and the repair prompt has to say so
                 # rather than blame logic that was never executed.
-                insist = program_unchanged >= CASES_ONLY_ROUNDS or bool(
-                    objections
-                    or (checker is not None and checker.locked and any(
-                        checker.key(c) in checker.locked for c in candidate.failed_cases))
+                insist = (
+                    program_unchanged >= CASES_ONLY_ROUNDS
+                    # A pass that has twice answered a repair by rewriting a
+                    # third of its bar has said what it has to say about the
+                    # cases. The offer does not come back.
+                    or bulk_refusals >= MAX_BULK_REFUSALS
+                    or bool(
+                        objections
+                        or (checker is not None and checker.locked and any(
+                            checker.key(c) in checker.locked
+                            for c in candidate.failed_cases))
+                    )
                 )
                 program_only = insist and candidate.from_self_tests
                 if program_only and program_unchanged >= CASES_ONLY_ROUNDS:
@@ -2641,6 +2714,22 @@ class VerifyingSolver:
         # primary's answer is known to be no answer; half of what is left,
         # and never long enough to matter to delivery.
         found = await checker.fallback(min(max(0.0, left_s) * 0.5, 30.0))
+        if found is None and not best.code.strip():
+            # The one case that needs no verdict: there is NOTHING to ship.
+            # An empty answer scores zero with certainty, so any program that
+            # exists dominates it -- graded, half-graded or not graded at all.
+            # Measured: two solves a day submit nothing while a finished
+            # program from the second reading sits unused, because the
+            # background grading had not returned in time to bless it.
+            ungraded = checker.ungraded()
+            if ungraded:
+                self._counts["fallback"] += 1
+                print(
+                    "[verify] the primary ended with nothing and there is no "
+                    "graded fallback; submitting the second reading's program "
+                    "ungraded rather than submitting nothing"
+                )
+                return Candidate(code=ungraded, raw=ungraded), "second reading"
         if found is None:
             return best, won_with
         code, passed, total = found

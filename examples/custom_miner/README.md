@@ -1842,6 +1842,68 @@ cross-check (`off`, `clean`, `N finding(s)`, `skipped (Ns left)`), and `id`
 the request, which every `[phase]` line of that solve also ends with. Solves
 interleave; without the id the phases of two solves read as one.
 
+**"clean" means the two readings agreed, and nothing weaker.** It used to mean
+"no case was confirmed", which is a different claim. On a production day the
+difference was eight solves, one of which had found sixty disagreements in
+sixty generated inputs, had its judge turn cut off, and still printed `clean`.
+The line now has three states, and `xcheck=` on the summary carries the same
+word:
+
+```text
+[verify] cross-check: 60 generated input(s), 60 disagreement(s); the second program failed on 58 of them -- UNRESOLVED (58 open, no verdict)
+```
+
+Only two disagreements a round go to the judge, so a round can find far more
+than it settles. That is a deliberate bound on judge turns, not a pass, and
+the log says which. The count of inputs the *second* program crashed on is
+printed beside it: a second reading that never runs disagrees with everything,
+and without that number it is indistinguishable from a real dispute.
+
+**One repair reply may not rewrite the bar.** The repair prompt offers to take
+a wrong case back corrected, and a failing program has every incentive to take
+it. Measured: a program the cross-check had already confirmed wrong on two
+inputs answered its repair by rewriting fifteen of its twenty-two cases with
+nine seconds left, no judge had time to look, and the solve shipped reporting
+it had passed all twenty-two. A reply that corrects more than a third of the
+bar is now refused whole, and after two such replies the cases are not offered
+again for the rest of the pass. Across a day of real corrections the share
+rewritten per reply was 5 to 15 percent, once 29, and once 68: the threshold
+fires on the 68 and on nothing else.
+
+When a correction does land with no judge behind it, the summary says so
+rather than claiming a local verification:
+
+```text
+[verify] ... (NOT verified on local: 2 of the 3 case(s) it passed were rewritten by the model itself with no judge) rounds=2 corrected=2/3(2 unjudged)
+```
+
+**A turn that streams a heartbeat and no answer is cut.** Six turns in one
+production day emitted between 34 and 388 events with zero characters of text,
+one event every 750ms, across two models and two accounts. That regularity is
+a keepalive, not a model thinking, and two of those solves submitted nothing at
+all. The old guard fired only when *no* event had arrived, which never happens
+here. A turn is now cut once it has been quiet for `SOLVER_CLI_FIRST_TEXT_S`
+(120s) with sixty events gone by and enough slice left to ask someone else,
+and the next rung answers. Measured on live turns, the first character arrives
+after one to two seconds on an easy problem and after thirty-seven at worst on
+a hard one, so the threshold has better than threefold margin. Every answered
+turn now reports its own shape, which is where that margin is measured:
+
+```text
+[cli] cli:opus ok: 93 event(s), first text after 37s, 4527 character(s) in 58s, 0 retries
+```
+
+Two event shapes carry the whole reply and neither used to be read: a `result`
+event's own text and a complete `assistant` message. A turn whose deltas never
+arrived still has its answer in one of them, and it is used when nothing
+streamed.
+
+**An empty answer is worth zero, so any program beats it.** The graded fallback
+asks that the second reading's program pass every one of the primary's cases.
+When the primary has *nothing* that bar is beside the point, and the second
+reading's program is submitted whatever it scores. The refusal is logged either
+way, so an operator can see which of the three conditions declined.
+
 **What it costs the seat.** About 1.9× the output tokens of a solve without
 it, and one to three more conversations per solve. On the CLI backend the
 second reading and the judge go to the **lightest** signed-in seat, and a

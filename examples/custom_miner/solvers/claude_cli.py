@@ -124,6 +124,24 @@ LIMIT_RECHECK_S = 1800.0
 # for the conversations already on it. SOLVER_CLI_SWITCH_AT.
 SWITCH_AT = 0.95
 
+# A turn that has emitted this many events without one character of the
+# answer, for this long, is not writing. Both gates matter: the time alone
+# would cut a model that thinks before it writes, and the event count alone
+# would cut a quiet-but-healthy stream. Together they name the heartbeat.
+#
+# The threshold is deliberately well past any first token seen in practice,
+# because the cost of cutting a working turn is a wasted round trip while the
+# cost of not cutting a wedged one is the entire solve. SOLVER_CLI_FIRST_TEXT_S.
+FIRST_TEXT_S = 120.0
+SILENT_EVENTS = 60
+# ...and only when enough of the slice is left for the next rung to do
+# something with it. Cutting a wedged turn at the buzzer buys nothing and
+# gives up the last of the chance that it was about to speak.
+SILENT_FLOOR_S = 20.0
+# One silent hop per conversation. Two rungs that both go quiet would
+# otherwise spend the budget discovering it, at `FIRST_TEXT_S` each.
+MAX_SILENT_HOPS = 1
+
 # How long a MODEL is left alone after the service refused it -- an overload,
 # a 5xx, a connection that never completed. The operator's number, and the
 # recovery cadence: when it expires the default model is back at the top of
@@ -188,6 +206,23 @@ _STATUS_WORD = re.compile(r"(?:status|error|http|code)\W{0,4}(\d{3})(?![\d:.])")
 
 class _Stalled(Exception):
     """No event arrived inside `FIRST_EVENT_S`."""
+
+
+class _Silent(Exception):
+    """Events are arriving and none of them carries a character of the answer.
+
+    A different failure from `_Stalled`, and the one that actually costs
+    whole solves. Measured over a production day, six turns ended this way:
+    (24s, 34 events), (60s, 83), (147s, 198), (220s, 297), (229s, 308) and
+    (290s, 388) -- one event every 750.5ms, R-squared 0.99996, across two
+    models and two accounts, with zero characters of text in any of them.
+    That regularity is a keepalive heartbeat, not a model thinking. Two of
+    those solves submitted nothing at all.
+
+    `_Stalled` cannot see it: it fires only when NO event has arrived, and
+    here they arrive all day. The slice was the only other bound, and the
+    program turn's slice is everything the solve has left.
+    """
 
 
 class _Limited(Exception):
@@ -463,6 +498,19 @@ class CliConversation:
         self._events = 0
         self._text_chars = 0
         self._first_text_s: Optional[float] = None
+        # The whole reply, when it arrived in one piece rather than as deltas.
+        # See `_consume`: two event shapes carry it and neither used to be read.
+        self._final_text = ""
+        # The slice this turn was given, so the watchdog can tell a cut that
+        # leaves room to re-ask from one that does not.
+        self._slice_s = 0.0
+        self._silent_hops = 0
+        try:
+            self._first_text_after = float(
+                _flag("SOLVER_CLI_FIRST_TEXT_S", "") or FIRST_TEXT_S
+            )
+        except ValueError:
+            self._first_text_after = FIRST_TEXT_S
 
     # A round trip on this backend starts a process and re-reads the session
     # before the model says a word; `VerifyingSolver` will not start a
@@ -560,7 +608,15 @@ class CliConversation:
                 )
             finally:
                 self._backend.slot.release()
-            if verdict not in ("limited", "stalled", "degraded", "auth"):
+            if verdict == "silent":
+                # Worth exactly one hop. A second rung that also goes quiet
+                # would cost another `FIRST_TEXT_S` to find out, and the
+                # caller's own recovery -- a fresh conversation elsewhere --
+                # is the better use of what is left.
+                self._silent_hops += 1
+                if self._silent_hops > MAX_SILENT_HOPS:
+                    return body
+            elif verdict not in ("limited", "stalled", "degraded", "auth"):
                 # An answer, a partial one, a model that chose to say nothing
                 # -- or a failure with no stated cause. That last one is NOT
                 # hopped on: nothing says another rung would do better, and
@@ -613,9 +669,11 @@ class CliConversation:
         self._turn_error = None
         self._retries = 0
         self._turn_started = started
+        self._slice_s = max(1.0, float(timeout_s))
         self._events = 0
         self._text_chars = 0
         self._first_text_s = None
+        self._final_text = ""
         errfile = None
         try:
             # stderr goes to a FILE, not a pipe. A pipe is read only after
@@ -663,6 +721,18 @@ class CliConversation:
                      if body else "nothing had arrived")
                   + f" ({self._stream_note()})")
             return self._verdict(body, "partial" if body else "unfinished")
+        except _Silent:
+            await self._kill(proc)
+            errfile.close()
+            # Deliberately NOT `note_stall`. A pair hold would sideline the
+            # best model on the ladder for every solve in the next five
+            # minutes, and the silent turns measured on a production day were
+            # spread over hours -- the hold would have expired before each
+            # recurrence and bought nothing. The turn is lost; the seat is fine.
+            print(f"[cli] {self.provider} has sent no answer text at all "
+                  f"({self._stream_note()}); cutting it rather than spending "
+                  f"the rest of the slice on a stream that is not writing")
+            return self._verdict("", "silent")
         except _Stalled:
             await self._kill(proc)
             errfile.close()
@@ -699,7 +769,7 @@ class CliConversation:
             self._backend.last_error = f"{type(exc).__name__}: {exc}"
             return self._verdict("", "failed")
 
-        body = "".join(chunks).strip()
+        body = "".join(chunks).strip() or self._final_text.strip()
         stderr = self._read_stderr(errfile) or self._turn_error or ""
         if proc.returncode:
             self._backend.last_error = stderr or f"exit {proc.returncode}"
@@ -771,6 +841,12 @@ class CliConversation:
         if verdict in ("ok", "partial"):
             self.empty_reason = None
             self._backend.note_success(self.account, self.model)
+            # On EVERY answered turn, not only the ones that go wrong. The
+            # time to the first character is the one number that says how
+            # long a healthy turn stays quiet, and it is what any watchdog
+            # threshold has to be sized against; before this line the logs
+            # held it for failures only, which is the wrong tail.
+            print(f"[cli] {self.provider} {verdict}: {self._stream_note()}")
         elif verdict == "unfinished":
             self.empty_reason = "unfinished"
         elif verdict == "no-code":
@@ -847,6 +923,7 @@ class CliConversation:
                         break
                     line, buffered = buffered[:newline], buffered[newline + 1:]
                     self._consume(line, chunks)
+                self._check_silent()
             if buffered.strip():
                 # A last event with no trailing newline, which is what a killed
                 # child leaves behind.
@@ -858,6 +935,26 @@ class CliConversation:
             await proc.wait()
         finally:
             writer.cancel()
+
+    def _check_silent(self) -> None:
+        """Raise `_Silent` on a turn that is streaming a heartbeat and no answer.
+
+        Four conditions, and every one of them is load-bearing:
+        nothing of the answer has arrived, enough events have gone by to know
+        the stream is alive rather than merely slow, enough time has passed to
+        be well clear of a model that thinks first, and enough of the slice is
+        left that hopping can still produce something.
+        """
+        if self._text_chars or self._final_text:
+            return
+        if self._events < SILENT_EVENTS:
+            return
+        spent = time.monotonic() - self._turn_started
+        if spent < self._first_text_after:
+            return
+        if self._slice_s - spent < SILENT_FLOOR_S:
+            return
+        raise _Silent()
 
     def _consume(self, line: bytes, chunks: list[str]) -> None:
         """One event. A stream this cannot parse is not an error and is skipped;
@@ -890,8 +987,27 @@ class CliConversation:
         if kind == "system" and event.get("subtype") == "api_retry":
             self._retry(event, chunks)
             return
+        if kind == "assistant":
+            # A complete assistant message. With `--include-partial-messages`
+            # the same text also arrives as deltas, so this is normally a
+            # duplicate and is kept ONLY as a fallback for the turn where the
+            # deltas did not come -- see `_final_text` at the end of `_send`.
+            message = event.get("message")
+            if isinstance(message, dict):
+                for block in message.get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        self._final_text += str(block.get("text") or "")
+            return
         if kind == "result":
             self._backend.note_result(event)
+            if not event.get("is_error"):
+                # The CLI's own copy of the finished answer. Read only when
+                # nothing streamed: a turn whose deltas never arrived still
+                # has its reply right here, and submitting nothing while
+                # holding it is the worst trade this backend can make.
+                text = event.get("result")
+                if isinstance(text, str) and text.strip():
+                    self._final_text = text
             if event.get("is_error"):
                 self._turn_error = str(event.get("result") or event.get("subtype") or "")
                 if not chunks:
