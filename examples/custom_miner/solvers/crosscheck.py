@@ -407,12 +407,37 @@ class CheckResult:
     inputs: int = 0
     disagreements: int = 0
     judged: int = 0
+    # Disputed inputs the judge answered without settling: its own value
+    # matched NEITHER program. Evidence that something is wrong, not a verdict
+    # about which side -- and the reason a round can find disagreement, reach
+    # the judge, and still establish nothing.
+    undecided: int = 0
+    # The judge was asked and nothing usable came back -- unreachable, or cut
+    # off mid-answer. Measured: one judge turn spent its whole 60s and the
+    # round it belonged to reported 60 of 60 inputs disagreeing.
+    no_verdict: bool = False
+    # Generated inputs the SECOND program crashed or timed out on. `same()`
+    # counts a crash on one side as a disagreement, so a second reading that
+    # never runs disagrees with everything -- and without this number that is
+    # indistinguishable from two working programs that really differ.
+    second_broken: int = 0
     stress: str = ""
     note: str = ""
 
     @property
     def clean(self) -> bool:
-        return not self.failures and self.inputs > 0
+        """Nothing stands against this program AND nothing was left open.
+
+        A disagreement nobody adjudicated is not a pass. The old rule was
+        `not failures`, which called a round clean when it had found sixty
+        disagreements in sixty inputs and resolved none of them.
+        """
+        return not self.failures and self.inputs > 0 and not self.unresolved
+
+    @property
+    def unresolved(self) -> int:
+        """Disagreements this round found and did not settle."""
+        return max(0, self.disagreements - self.judged)
 
 
 class CrossCheck:
@@ -523,12 +548,22 @@ class CrossCheck:
             except (asyncio.TimeoutError, Exception):  # noqa: BLE001
                 pass
         if not self._pregrade.done():
+            print("[verify] no fallback: the second reading's program was still "
+                  "being graded against the primary's cases")
             return None
         if self.second_total and self.second_passed == self.second_total:
             code = self._reading.code
             if code.strip():
                 return code, self.second_passed, self.second_total
+        print(f"[verify] no fallback: the second reading's program passed "
+              f"{self.second_passed}/{self.second_total} of the primary's cases")
         return None
+
+    def ungraded(self) -> str:
+        """The second reading's program, whatever it scores. For the one case
+        that needs no argument: the primary has NOTHING, so any program that
+        exists beats the empty answer a solve would otherwise submit."""
+        return self._reading.code if self._reading.code.strip() else ""
 
     async def close(self) -> None:
         if self._pregrade is not None and not self._pregrade.done():
@@ -606,6 +641,17 @@ class CrossCheck:
                 if not same(language, a, b)
             ]
             result.disagreements = len(gaps)
+            # How much of that disagreement is the second reading falling over
+            # rather than reading the statement differently. See `second_broken`.
+            result.second_broken = sum(
+                1 for outcome in self._second if not outcome.ok or outcome.timed_out
+            )
+            # Disagreements settled in an EARLIER round still count as settled:
+            # `_verdicts` is per-solve, and a round that re-runs the same inputs
+            # against a repaired program must not report them as open again.
+            result.judged = sum(
+                1 for case, _, _ in gaps if self.key(case) in self._verdicts
+            )
             # Judge the gaps not judged before, a few per round, in ONE turn,
             # while it fits.
             disputed = [
@@ -615,14 +661,25 @@ class CrossCheck:
                 await self._adjudicate(disputed, left())
                 if disputed and left() >= JUDGE_FLOOR_S else []
             )
+            if disputed and not verdicts:
+                # Asked and nothing came back at all -- or never asked because
+                # the clock said no. Either way this round settled nothing it
+                # found, and the line must not read as a pass.
+                result.no_verdict = True
             for (case, a, b), (verdict, expected) in zip(disputed, verdicts):
                 key = self.key(case)
-                result.judged += 1
                 if verdict not in ("primary wrong", "second wrong", "tie", "undecided"):
                     # A judge that could not be reached, or said nothing
                     # usable, is asked again next round; a verdict is not.
+                    result.no_verdict = True
                     continue
                 self._verdicts[key] = verdict
+                result.judged += 1
+                if verdict == "undecided":
+                    # The judge computed a value that matches neither program.
+                    # Deliberately NOT turned into a repair objection: see the
+                    # note in `describe`. It is reported and counted.
+                    result.undecided += 1
                 if verdict == "primary wrong":
                     confirmed = dict(case)
                     confirmed["name"] = f"cross-check {len(self.confirmed) + 1}"
@@ -800,7 +857,20 @@ class CrossCheck:
                 f"do not ask for the case, there is no case to correct"
             )
         elif first.ok:
-            result.stress = f"{scale}{size} bytes in {first.runtime_ms / 1000:.1f}s"
+            # Both programs' output on the one big input is already in hand.
+            # Comparing it costs nothing and is the only look either program
+            # gets at scale -- the other sixty inputs are all scale 1 to 3.
+            # Reported, never raised as a failure: a judge cannot check a
+            # 200KB input, so there is no way to tell which side is wrong.
+            agreement = ""
+            if self._stress_second.ok and not self._stress_second.timed_out:
+                agreement = (
+                    "" if same(self._task.language, first, self._stress_second)
+                    else ", and the two programs DISAGREE on it"
+                )
+            result.stress = (
+                f"{scale}{size} bytes in {first.runtime_ms / 1000:.1f}s{agreement}"
+            )
         elif first.timed_out:
             result.stress = f"{size} bytes: timed out, and so did the independent program; not held against it"
         else:
@@ -823,6 +893,25 @@ def describe(result: CheckResult) -> str:
             result.stress if result.stress.startswith("no large input")
             else f"largest input {result.stress}"
         )
+    if result.second_broken:
+        parts.append(
+            f"the second program failed on {result.second_broken} of them"
+        )
     if result.note:
         parts.append(result.note)
-    return "; ".join(parts) + ("" if result.failures else " -- clean")
+    if result.failures:
+        return "; ".join(parts)
+    # Three states, not two. "clean" used to mean "no failure was raised",
+    # which is a different claim from "the two readings agreed" -- and on a
+    # production day the difference was eight solves, one of them with sixty
+    # disagreements in sixty inputs.
+    if result.unresolved:
+        why = (
+            "no verdict" if result.no_verdict
+            else f"{result.undecided} undecided" if result.undecided
+            else "not adjudicated"
+        )
+        return "; ".join(parts) + f" -- UNRESOLVED ({result.unresolved} open, {why})"
+    if result.undecided:
+        return "; ".join(parts) + f" -- unresolved ({result.undecided} undecided)"
+    return "; ".join(parts) + " -- clean"

@@ -12696,6 +12696,26 @@ if mode in ("overloaded", "overloaded0"):
 if mode == "silent":
     emit({"type": "result", "is_error": False, "session_id": session})
     sys.exit(0)
+if mode == "heartbeat":
+    # The shape measured in production: events arriving forever, none of them
+    # carrying a character of the answer. A keepalive, not a model writing.
+    while True:
+        emit({"type": "stream_event", "event": {"type": "ping"}})
+        time.sleep(0.005)
+if mode == "result-only":
+    # No deltas at all: the whole reply arrives in the `result` event. The
+    # backend used to open this event only to read `is_error`.
+    emit({"type": "result", "is_error": False, "session_id": session,
+          "result": "```python\ndef g(n):\n    return n\n```",
+          "usage": {"input_tokens": 3, "output_tokens": 40}})
+    sys.exit(0)
+if mode == "assistant-only":
+    # The complete message, with no partial-message deltas behind it.
+    emit({"type": "assistant", "session_id": session, "message": {"content": [
+        {"type": "thinking", "thinking": "..."},
+        {"type": "text", "text": "```python\ndef g(n):\n    return n\n```"}]}})
+    emit({"type": "result", "is_error": False, "session_id": session})
+    sys.exit(0)
 if mode == "stall":
     # The real CLI at the subscription's usage limit: no event, ever.
     time.sleep(600)
@@ -14197,3 +14217,228 @@ def test_a_nearly_spent_seat_hands_fresh_solves_and_readings_to_the_other(
     assert asyncio.run(backend.open_profile("fable", "low")).account is primary
     asyncio.run(backend.open())
     assert "back to normal" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# A turn that streams a heartbeat and no answer.
+# --------------------------------------------------------------------------- #
+def test_a_turn_that_streams_no_answer_text_is_cut_and_asked_elsewhere(
+    tmp_path, monkeypatch, capsys
+):
+    """Measured over a production day: six turns emitted 34 to 388 events, one
+    every 750ms, with zero characters of text, and two of those solves
+    submitted nothing at all. `_Stalled` cannot see it -- events are arriving.
+    The turn is cut once the stream has proved itself alive but silent, and
+    the next rung answers."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOLVER_CLI_FIRST_TEXT_S", "1")
+    _cli_modes(log, {"model:opus": "heartbeat", "*": "ok"})
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        started = time.monotonic()
+        body = await conversation.send("solve it", 40.0)
+        return body, conversation, time.monotonic() - started
+
+    body, conversation, spent = asyncio.run(go())
+    out = capsys.readouterr().out
+    assert extract_code(body, "g"), out
+    # Cut early, not at the 40s slice, and carried to the next rung.
+    assert spent < 15.0, (spent, out)
+    # The next rung down the ladder, whichever it is -- not the one that
+    # went quiet.
+    assert conversation.provider != "cli:opus" and conversation.hops == 1, out
+    assert "has sent no answer text at all" in out, out
+    assert "no text at all" in out, out
+    # The seat is NOT parked: the turn was lost, the account is fine.
+    assert backend.stats()["out"] == {}, backend.stats()["out"]
+
+
+def test_a_silent_turn_is_worth_one_hop_and_no_more(tmp_path, monkeypatch, capsys):
+    """Every rung going quiet must not cost a `FIRST_TEXT_S` each. One hop,
+    then the answer goes back empty for the caller's own recovery to handle."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOLVER_CLI_FIRST_TEXT_S", "1")
+    _cli_modes(log, {"*": "heartbeat"})
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        started = time.monotonic()
+        return await conversation.send("solve it", 60.0), time.monotonic() - started
+
+    body, spent = asyncio.run(go())
+    out = capsys.readouterr().out
+    assert body == "", out
+    # Two silent turns, not five: one hop, then it gives up on the ladder.
+    assert out.count("has sent no answer text at all") == 2, out
+    assert spent < 20.0, (spent, out)
+
+
+def test_a_reply_that_never_streamed_is_still_read_from_the_result_event(
+    tmp_path, monkeypatch
+):
+    """Two event shapes carry the whole reply, and the backend used to read
+    neither: a `result` event's own text, and a complete `assistant` message.
+    A turn whose deltas never came still has its answer right there."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch)
+    for shape in ("result-only", "assistant-only"):
+        _cli_modes(log, {"*": shape})
+        backend = CliBackend()
+
+        async def go():
+            conversation = await backend.open()
+            return await conversation.send("solve it", 30.0)
+
+        assert extract_code(asyncio.run(go()), "g") == "def g(n):\n    return n", shape
+
+
+# --------------------------------------------------------------------------- #
+# The cross-check says what it actually established.
+# --------------------------------------------------------------------------- #
+def test_a_check_that_settles_nothing_it_found_does_not_report_clean(
+    monkeypatch, capsys
+):
+    """`clean` used to mean "no failure was raised", which is a different
+    claim from "the two readings agreed". On a production day the difference
+    was eight solves, one of them with sixty disagreements in sixty inputs and
+    a judge that had been cut off."""
+    class _Mute(_Chat):
+        def __init__(self):
+            super().__init__([], "judge")
+        async def send(self, text, timeout_s):
+            return "I would rather not say."
+
+    # BLIND is wrong on every single digit; the generator only asks about
+    # single digits; the judge answers nothing usable.
+    backend = _Readers([BLIND_CASES, BLIND], [SECOND, GENERATOR], judge_factory=_Mute)
+    solver = _crosschecked(monkeypatch, backend)
+    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
+    out = capsys.readouterr().out
+
+    assert "UNRESOLVED" in out, out
+    assert "no verdict" in out, out
+    assert " -- clean" not in out, out
+    # The label on the summary line agrees with the detail line.
+    assert "xcheck=unresolved(" in out, out
+    # And nothing was invented: no case was confirmed, so the program stands.
+    assert extract_code(answer.code, "g") == extract_code(BLIND, "g"), out
+
+
+def test_the_check_counts_a_second_program_that_simply_does_not_run(
+    monkeypatch, capsys
+):
+    """A second reading that crashes on every input disagrees with everything.
+    Without that number a broken reading is indistinguishable from a real
+    dispute, and the operator sizes the cross-check from a fiction."""
+    broken = "```python\ndef g(n):\n    raise RuntimeError('nope')\n```"
+    backend = _Readers([CASES, RIGHT], [broken, GENERATOR])
+    solver = _crosschecked(monkeypatch, backend)
+    asyncio.run(solver.solve_task(DIGITS, 120.0))
+    out = capsys.readouterr().out
+    assert "the second program failed on" in out, out
+
+
+# --------------------------------------------------------------------------- #
+# One reply may not rewrite the bar.
+# --------------------------------------------------------------------------- #
+SIX_CASES = ('```json\n[{"name": "five digits", "args": [12345], "expected": 15},\n'
+             ' {"name": "seven", "args": [7], "expected": 7},\n'
+             ' {"name": "three", "args": [3], "expected": 3},\n'
+             ' {"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "ninety nine", "args": [99], "expected": 18},\n'
+             ' {"name": "hundred", "args": [100], "expected": 1}]\n```')
+# The same six calls with every expectation bent to what WRONG happens to do.
+BENT = ('```json\n[{"name": "five digits", "args": [12345], "expected": 14},\n'
+        ' {"name": "seven", "args": [7], "expected": 0},\n'
+        ' {"name": "three", "args": [3], "expected": 0},\n'
+        ' {"name": "ninety nine", "args": [99], "expected": 9},\n'
+        ' {"name": "hundred", "args": [100], "expected": 0}]\n```')
+
+
+def test_one_reply_may_not_rewrite_a_third_of_the_bar(monkeypatch, capsys):
+    """Measured: a program the cross-check had already confirmed wrong answered
+    its repair by rewriting fifteen of its twenty-two cases with nine seconds
+    left, no judge had time to look, and the solve shipped reporting it had
+    passed all twenty-two. A reply that corrects a third of the bar is a
+    re-specification, not a correction, and is refused whole."""
+    backend = _Backend([SIX_CASES, WRONG, BENT, RIGHT])
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             second_opinion=False)
+    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    out = capsys.readouterr().out
+
+    assert "came back rewritten in one reply" in out, out
+    assert "re-specification rather than a correction" in out, out
+    # The bar is untouched and the program is what changed.
+    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
+    assert answer.self_total == 6 and answer.self_passed == 6, out
+    assert "corrected=0/6" in out, out
+
+
+def test_a_correction_within_the_cap_still_lands(monkeypatch, capsys):
+    """The cap must not swallow the ordinary case: a repair prompt reports one
+    disagreement and the natural reply corrects that one case."""
+    one = '```json\n[{"name": "five digits", "args": [12345], "expected": 14}]\n```'
+    backend = _Backend([SIX_CASES, WRONG, one, RIGHT])
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             second_opinion=False)
+    asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    out = capsys.readouterr().out
+    assert "came back rewritten in one reply" not in out, out
+
+
+def test_an_unjudged_correction_stops_the_answer_claiming_it_verified(
+    monkeypatch, capsys
+):
+    """A bar the failing model moved with nobody to check the move is not a
+    local verification, and the one line an operator reads must not call it
+    one. Measured: three solves a day shipped `verified on local` this way."""
+    # A three-case bar WRONG fails twice, and a reply that bends both -- which
+    # is inside the cap, so it lands. The program then "passes" 3 of 3.
+    three = ('```json\n[{"name": "five digits", "args": [12345], "expected": 15},\n'
+             ' {"name": "zero", "args": [0], "expected": 0},\n'
+             ' {"name": "nineteen", "args": [19], "expected": 10}]\n```')
+    bent = ('```json\n[{"name": "five digits", "args": [12345], "expected": 14},\n'
+            ' {"name": "nineteen", "args": [19], "expected": 9}]\n```')
+    # No cross-check, so no judge exists at all: every correction is unjudged.
+    backend = _Backend([three, WRONG, bent])
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             second_opinion=False)
+    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    out = capsys.readouterr().out
+    assert answer.code, out
+    assert answer.self_passed == 3 and answer.self_total == 3, out
+    # It passed every case on the bar -- and the bar is one it moved itself.
+    assert "NOT verified on local" in out, out
+    assert "2 of the 3 case(s) it passed were rewritten by the model" in out, out
+    assert "corrected=2/3(2 unjudged)" in out, out
+
+
+# --------------------------------------------------------------------------- #
+# An empty answer is worth zero, so any program beats it.
+# --------------------------------------------------------------------------- #
+def test_an_empty_primary_takes_the_second_reading_ungraded(monkeypatch, capsys):
+    """The graded fallback needs the second program to pass every one of the
+    primary's cases. When the primary has NOTHING that bar is beside the
+    point: an empty answer scores zero with certainty, so any program that
+    exists dominates it. Measured: two solves a day submitted nothing."""
+    # The second reading FAILS the primary's bar, so the graded fallback
+    # refuses it -- and the primary returns no code at all.
+    useless = "```python\ndef g(n):\n    return 0\n```"
+    backend = _Readers([CASES, "I have no answer for you."], [useless, GENERATOR])
+    solver = _crosschecked(monkeypatch, backend)
+    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    out = capsys.readouterr().out
+
+    assert extract_code(answer.code, "g") == "def g(n):\n    return 0", out
+    assert "no fallback: the second reading's program passed 0/1" in out, out
+    assert "submitting the second reading's program ungraded" in out, out
+    assert "provider=second reading" in out, out
