@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pipeline import compare  # noqa: E402
 from pipeline.clock import (  # noqa: E402
-    Action, Clock, State, decide,
+    Action, Clock, Latency, State, decide,
 )
 from pipeline.ladder import (  # noqa: E402
     Candidate, Fail, Kit, Ladder, static_defect,
@@ -130,24 +130,54 @@ def test_a_green_verdict_buys_deep_verification_once_and_then_reports():
 
 
 def test_a_fix_is_launched_only_while_one_could_still_land():
+    """`fix` is the `correction` phase: p95 59s over 38 observations."""
     assert decide(_at(100), State.VERIFIED_FAIL) is Action.LAUNCH_FIX
-    # Past the Opus gate but inside the smaller model's.
-    assert decide(_at(232), State.VERIFIED_FAIL) is Action.LAUNCH_FIX_SMALL
-    assert decide(_at(250), State.VERIFIED_FAIL) is Action.REPORT
-    # And never more than the cap allows.
+    assert decide(_at(210), State.VERIFIED_FAIL) is Action.REPORT
     assert decide(_at(100), State.VERIFIED_FAIL, fix_rounds=2) is Action.REPORT
 
 
-def test_the_kit_is_launched_only_when_a_fix_could_still_follow_it():
-    """Evidence with no time to act on it buys nothing. The design's own
-    `decide` has no branch for this at all and never launches the kit."""
-    assert decide(_at(20), State.HAVE_SOLUTION) is Action.LAUNCH_KIT
-    assert decide(_at(200), State.HAVE_SOLUTION) is Action.REPORT
+def test_the_kit_never_fits_and_the_clock_says_so_rather_than_pretending():
+    """The measured verdict on a four-call sequential pipeline.
+
+    A test kit is two programs of output. The only bucket in the logs with two
+    programs' worth in it is `huge`, p95 133s per successful call, 293s once
+    the measured retry ratio is applied. A fix behind it costs 59s and a
+    verification round 16s. There is no point in a 280-second budget where
+    that fits, so the kit is never launched -- not because a rule forbids it,
+    but because the arithmetic on measured numbers never allows it.
+    """
+    for at in (0, 30, 60, 120, 200):
+        assert decide(_at(at), State.HAVE_SOLUTION) is Action.REPORT, at
 
 
-def test_a_timed_out_solution_falls_back_to_a_smaller_model_while_one_fits():
-    assert decide(_at(160), State.NO_SOLUTION, solution_attempts=2) is Action.LAUNCH_SOLUTION_SMALL
-    assert decide(_at(250), State.NO_SOLUTION, solution_attempts=2) is Action.REPORT
+def test_a_stage_with_no_measurement_cannot_be_gated_on():
+    """The rule that makes the previous test trustworthy. An invented constant
+    is indistinguishable from a measured one once it is a float, so a stage
+    with no log line behind it raises instead of deciding anything."""
+    clock = Clock()
+    for stage in ("solution", "fix", "register", "kit"):
+        assert clock.cost(stage) > 0
+    for absent in ("solution_small", "fix_small", "audit"):
+        with pytest.raises(KeyError, match="no measured latency"):
+            clock.cost(absent)
+
+
+def test_every_latency_carries_its_observation_count_and_source():
+    for name, row in Clock().latency.items():
+        assert row.n > 0, name
+        assert row.source, name
+        assert row.kind in ("measured", "derived"), name
+    with pytest.raises(ValueError, match="no observations"):
+        Latency(10.0, 0, "invented")
+    with pytest.raises(ValueError, match="no observations"):
+        Latency(10.0, 5, "")
+
+
+def test_the_solution_call_is_the_program_phase_under_another_name():
+    """220s at p95 over 101 phases -- against the 105s the design assumed."""
+    solution = Clock().latency["solution"]
+    assert solution.kind == "measured" and solution.n >= 100
+    assert solution.seconds > 200, "the design's 105s assumption is not what the logs say"
 
 
 # --------------------------------------------------------------------------- #

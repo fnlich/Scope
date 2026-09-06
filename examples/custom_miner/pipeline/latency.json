@@ -1,0 +1,106 @@
+{
+  "first_text": {
+    "max": 119,
+    "n": 237,
+    "p50": 26,
+    "p90": 63.0,
+    "p95": 77.0,
+    "source": "[cli] first text after Ns, all turns"
+  },
+  "logs": [
+    "/tmp/claude-0/-home-user-Scope/696e92a5-91cd-56cb-8e39-fad928a8c630/scratchpad/prodlog2/miner.log",
+    "/tmp/claude-0/-home-user-Scope/696e92a5-91cd-56cb-8e39-fad928a8c630/scratchpad/prodlog3/miner.log"
+  ],
+  "output_chars_all_turns": {
+    "max": 12386.0,
+    "n": 237,
+    "p50": 3535.0,
+    "p90": 7638.0,
+    "p95": 8290.0,
+    "source": "[cli] output chars"
+  },
+  "phase": {
+    "cases": {
+      "max": 145.0,
+      "n": 101,
+      "p50": 56.9,
+      "p90": 99.8,
+      "p95": 119.5,
+      "source": "[phase] cases, model seconds"
+    },
+    "correction": {
+      "max": 121.3,
+      "n": 38,
+      "p50": 8.8,
+      "p90": 36.9,
+      "p95": 58.6,
+      "source": "[phase] correction, model seconds"
+    },
+    "cross-check": {
+      "max": 76.0,
+      "n": 85,
+      "p50": 16.4,
+      "p90": 47.5,
+      "p95": 61.2,
+      "source": "[phase] cross-check, model seconds"
+    },
+    "program": {
+      "max": 250.9,
+      "n": 101,
+      "p50": 62.0,
+      "p90": 171.4,
+      "p95": 220.2,
+      "source": "[phase] program, model seconds"
+    }
+  },
+  "turn_by_output_size": {
+    "huge": {
+      "max": 133,
+      "n": 15,
+      "p50": 87,
+      "p90": 110.0,
+      "p95": 133.0,
+      "source": "[cli] turns with 8000-1000000000 output chars"
+    },
+    "large": {
+      "max": 126,
+      "n": 85,
+      "p50": 45,
+      "p90": 85.0,
+      "p95": 100.0,
+      "source": "[cli] turns with 4000-8000 output chars"
+    },
+    "medium": {
+      "max": 131,
+      "n": 108,
+      "p50": 40.0,
+      "p90": 68.0,
+      "p95": 76.0,
+      "source": "[cli] turns with 1500-4000 output chars"
+    },
+    "short": {
+      "max": 60,
+      "n": 5,
+      "p50": 10,
+      "p90": 60.0,
+      "p95": 60.0,
+      "source": "[cli] turns with 500-1500 output chars"
+    },
+    "tiny": {
+      "max": 46,
+      "n": 24,
+      "p50": 5.0,
+      "p90": 40.0,
+      "p95": 46.0,
+      "source": "[cli] turns with 0-500 output chars"
+    }
+  },
+  "turns": 237,
+  "write_chars_per_s": {
+    "n": 230,
+    "p05": 165.0,
+    "p10": 183.5,
+    "p50": 256.3,
+    "source": "[cli] chars / (total - first text)"
+  }
+}
