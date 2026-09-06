@@ -362,14 +362,26 @@ class _Phases:
     def mark(
         self, label: str, *, model_s: Optional[float] = None,
         checked_s: Optional[float] = None, beside: bool = False,
+        ended: Optional[float] = None,
     ) -> None:
         now, wall = time.monotonic(), datetime.now()
         if beside:
             spent = model_s if model_s is not None else now - self._at
             began = wall - timedelta(seconds=spent)
         else:
-            spent = now - self._at
-            began, self._at, self._wall = self._wall, now, wall
+            # `ended` is the monotonic instant the phase actually finished,
+            # for the one caller that marks a phase AFTER a later one has
+            # already run: the program turn, when an empty bar is retried
+            # between the turn returning and the turn being graded. Measured
+            # without it -- program 0.3s, retry 0.4s -- the retry printed
+            # "took 0.7s" and the program "took 0.2s": the program's seconds
+            # credited to the retry, and the program left with the grading.
+            # The cursor advances to where the phase ENDED, not to now, so the
+            # phase marked next is measured from the right place.
+            end = now if ended is None else ended
+            spent = end - self._at
+            end_wall = wall - timedelta(seconds=now - end)
+            began, self._at, self._wall = self._wall, end, end_wall
         left = self._budget - (now - self._solve_started)
         parts = []
         if beside:
@@ -1186,11 +1198,15 @@ class _Plan:
         self.exit = ""
 
     def note_exit(self, reason: str) -> None:
-        """The FIRST reason wins: a pass that stopped is not restarted, and a
-        later pass of the same solve must not overwrite why the first one
-        ended."""
-        if not self.exit:
-            self.exit = reason
+        """The LAST reason wins.
+
+        A solve runs a second pass only when the first ended without a
+        deliverable answer -- `empty`, `cutoff`, `stalled` -- and the summary
+        line describes the answer that SHIPPED. Keeping the first reason
+        reported a solve whose second pass converged as `exit=empty`, which is
+        the one thing an operator reading that line must not be told.
+        """
+        self.exit = reason
 
 # The most of what is left that the CASES turn may spend.
 #
@@ -1697,6 +1713,9 @@ class VerifyingSolver:
         bar_started = 0.0
         # One retry of an empty cases turn, per pass. See where it fires.
         bar_retried = False
+        # Whether the program turn's phase line already went out -- it does,
+        # early, when the retry runs between the turn and its grading.
+        program_marked = False
         try:
             # BOUNDED by what is left. `BrowserFleet.open` waits for a free tab
             # up to `MINER_TAB_WAIT_S`, which ships at 120s, and nothing here
@@ -2145,6 +2164,18 @@ class VerifyingSolver:
                             and (plan is None or plan.two_phase)
                             and left_now > round_trip_floor
                         ):
+                            # The program's turn is already over, and the
+                            # retry is about to run AFTER it. Mark the turn
+                            # now, at the instant it ended, so the retry is
+                            # measured from there and not from the open --
+                            # and so the turn's own seconds are not handed to
+                            # the retry. Its grading has not happened yet;
+                            # that gets its own line below.
+                            phases.mark(
+                                "2 program", model_s=round_s,
+                                ended=round_started + round_s,
+                            )
+                            program_marked = True
                             print(
                                 f"[verify] the cases turn came back with "
                                 f"nothing, so there is no bar to grade against "
@@ -2354,11 +2385,17 @@ class VerifyingSolver:
                 # -- "3rd phase output should be full code" -- and a log that
                 # numbered them differently would be answering a question
                 # nobody asked in words nobody used.
-                phases.mark(
-                    "2 program" if attempt == 1 else f"{attempt + 1} correction",
-                    model_s=round_s,
-                    checked_s=time.monotonic() - graded_at,
-                )
+                if program_marked:
+                    # The turn went out above, before the retried bar; what is
+                    # left of this phase is the grading alone.
+                    phases.mark("2 graded", checked_s=time.monotonic() - graded_at)
+                    program_marked = False
+                else:
+                    phases.mark(
+                        "2 program" if attempt == 1 else f"{attempt + 1} correction",
+                        model_s=round_s,
+                        checked_s=time.monotonic() - graded_at,
+                    )
                 # Before anything reads it: a round that could not be graded,
                 # or one graded against itself, must not report less about a
                 # program than an earlier round already established.
@@ -2749,6 +2786,12 @@ class VerifyingSolver:
                     await conversation.close()
                 except Exception:  # noqa: BLE001 - cleanup must not mask a result
                     pass
+            # Emptied HERE, not by the caller. When this is cancelled mid-wait
+            # the re-raise skips the caller's `bar = []`, and `_attempt`'s own
+            # finally then closes the same conversations a second time --
+            # `release()` clamps at zero, so the live-session count drifts
+            # low and a real leak later reads as nothing.
+            bar.clear()
         # `beside` only when it really ran beside the program. A RETRY does
         # not: the program's turn has already returned by then, so the retry is
         # sequential and must move the phase cursor like any other phase.

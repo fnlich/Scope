@@ -14532,6 +14532,13 @@ async def test_the_retried_cases_turn_is_charged_to_itself_not_to_the_next_phase
     class _SlowRetry(_TwoSeats):
         def _seat(self, phase):
             seat = super()._seat(phase)
+            if phase == "program":
+                send = seat.send
+
+                async def _turn(text, timeout_s):
+                    await asyncio.sleep(0.3)
+                    return await send(text, timeout_s)
+                seat.send = _turn
             if phase == "cases":
                 opened.append(phase)
                 if len(opened) == 1:
@@ -14557,9 +14564,84 @@ async def test_the_retried_cases_turn_is_charged_to_itself_not_to_the_next_phase
     await solver.solve_task(DIGITS, 120.0)
 
     out = capsys.readouterr().out
-    retry = next((l for l in out.splitlines() if "1 cases again" in l), None)
+    lines = out.splitlines()
+    retry = next((l for l in lines if "1 cases again" in l), None)
     assert retry is not None, f"the retry got no phase line of its own\n{out}"
     assert "alongside" not in retry, (
         f"a sequential retry reported itself as concurrent: {retry}"
     )
-    assert float(re.search(r"took\s+([\d.]+)s", retry).group(1)) >= 0.4, retry
+    took = lambda line: float(re.search(r"took\s+([\d.]+)s", line).group(1))
+    # The retry was made to take ~0.4s. Measured from the OPEN instead of from
+    # its own start it reported 0.7s -- the program's 0.3s credited to it.
+    assert 0.35 <= took(retry) < 0.6, (
+        f"the retry is charged for time it did not spend: {retry}"
+    )
+    # ...and the program's turn keeps its own seconds, on its own line, marked
+    # BEFORE the retry it preceded; its grading follows as a line of its own.
+    program = next(l for l in lines if "2 program" in l)
+    graded = next(l for l in lines if "2 graded" in l)
+    assert took(program) >= 0.25, f"the program's turn lost its time: {program}"
+    assert "checked" not in program and "checked" in graded, (program, graded)
+    assert lines.index(program) < lines.index(retry) < lines.index(graded)
+
+
+def test_the_exit_reason_is_the_pass_that_shipped_not_the_pass_that_died():
+    """A second pass runs only when the first produced nothing deliverable.
+
+    `exit=` describes the answer that shipped. Reporting the FIRST pass's
+    reason told an operator that a solve which converged on its second pass
+    had ended `empty` -- the opposite of what happened, on the one line they
+    read.
+    """
+    from solvers.verify import _Plan
+
+    plan = _Plan()
+    plan.note_exit("empty")        # pass 1: the tab died, asking elsewhere
+    plan.note_exit("converged")    # pass 2: the answer that shipped
+    assert plan.exit == "converged"
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_solve_closes_the_cases_conversation_exactly_once():
+    """Cancelled while waiting for the bar, `_collect_bar` closes the cases
+    conversation in its own finally and re-raises. That re-raise skips the
+    caller's `bar = []`, so `_attempt`'s finally used to find the same
+    conversation still in the holder and close it AGAIN. `release()` clamps at
+    zero, so the live-session count drifted low -- and a real leak later would
+    have read as nothing. The holder is now emptied by the code that closed it.
+    """
+    closes = []
+    opened = asyncio.Event()
+
+    class _Hanging(_TwoSeats):
+        def _seat(self, phase):
+            seat = super()._seat(phase)
+            if phase == "cases":
+                async def _hang(text, timeout_s):
+                    opened.set()
+                    await asyncio.sleep(3600)
+                seat.send = _hang
+                close = seat.close
+
+                async def _close():
+                    closes.append(phase)
+                    await close()
+                seat.close = _close
+            return seat
+
+    backend = _Hanging({
+        "cases": [CASES],
+        "program": [RIGHT],
+        None: [RIGHT],
+    })
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             independent_bar=True)
+    task = asyncio.create_task(solver.solve_task(DIGITS, 120.0))
+    await opened.wait()          # the bar is being asked...
+    await asyncio.sleep(0.2)     # ...and the program has returned; we are in _collect_bar
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert closes == ["cases"], (
+        f"the cases conversation was closed {len(closes)} time(s): {closes}"
+    )

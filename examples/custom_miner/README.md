@@ -1541,6 +1541,22 @@ two the remaining passes go straight to the program, which is what
 `_Plan.two_phase` already encodes. An empty bar costs the grading, never the
 answer.
 
+When the retry fires, the phase log changes shape — three lines where there
+was one — because the retry runs *between* the program's turn and its grading:
+
+```
+[phase] 1 cases        took  0.0s  (alongside, model 0.0s)   ← the empty one, beside the program
+[phase] 2 program      took 52.2s  (model 52.2s)             ← the turn, marked at the instant it ended
+[phase] 1 cases again  took 48.1s  (model 48.1s)             ← the retry, sequential
+[phase] 2 graded       took  1.3s  (checked 1.3s)            ← the grading, once there is a bar
+```
+
+Each line is charged only its own seconds and the sequential ones sum to the
+solve. Measured before this was right, the retry printed `took 0.7s` for a
+0.4s turn and the program `took 0.2s` for a 0.3s one — the program's time
+credited to the retry — because phases were being marked in a different order
+from the one they ran in.
+
 
 ### A short deadline must still get an answer
 
