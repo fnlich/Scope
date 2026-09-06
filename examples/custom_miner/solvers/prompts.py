@@ -546,6 +546,7 @@ def build_resume_prompt(
     failures: list[str],
     defect: Optional[str] = None,
     from_self_tests: bool = False,
+    bar_is_independent: bool = False,
 ) -> str:
     """A repair round for a conversation that no longer exists.
 
@@ -563,7 +564,8 @@ def build_resume_prompt(
     """
     base = build_code_prompt(language, statement, entrypoint, examples, cases=cases)
     report = build_repair_prompt(
-        failures, language, entrypoint, defect=defect, from_self_tests=from_self_tests
+        failures, language, entrypoint, defect=defect,
+        from_self_tests=from_self_tests, bar_is_independent=bar_is_independent,
     )
     return "\n".join([
         base,
@@ -579,6 +581,28 @@ def build_resume_prompt(
     ])
 
 
+def _ran_against(target: str, independent: bool) -> str:
+    """How to describe the bar to the conversation being asked to repair.
+
+    It has to be TRUE, and which sentence is true depends on where the cases
+    were written. Sequentially they are the model's own, one turn back, and
+    "the test cases you sent" is exact. Written beside the program in another
+    conversation they are not: that model never saw them, never sent them, and
+    telling it otherwise is a false premise about the one thing the round turns
+    on. The two framings also ask for different reasoning -- "one of my two
+    answers is wrong" versus "someone else read this statement differently" --
+    and the second is the true one when the bar is independent, which is the
+    whole reason the bar is written elsewhere.
+    """
+    if independent:
+        return (
+            f"Someone else read the same statement and wrote test cases from "
+            f"it, without seeing your program. I ran {target} against them "
+            f"and got:"
+        )
+    return f"I ran {target} against the test cases you sent and got:"
+
+
 def build_repair_prompt(
     failures: list[str],
     language: str,
@@ -587,6 +611,7 @@ def build_repair_prompt(
     from_self_tests: bool = False,
     stalled: int = 0,
     insist_on_program: bool = False,
+    bar_is_independent: bool = False,
 ) -> str:
     """Ask for a fix, quoting the concrete failures the local grader found.
 
@@ -669,22 +694,25 @@ def build_repair_prompt(
         detail = "\n".join(f"  - {line}" for line in failures)
         target = "the program" if language == "rust" else f"`{entrypoint}`"
         body = (
-            f"I ran {target} against the test cases you sent and got:\n"
+            f"{_ran_against(target, bar_is_independent)}\n"
             f"{detail}\n\n"
             f"The program has not changed for several rounds now, so this time "
             f"it is the program that has to. Send back ONE fenced block, with "
             f"nothing outside it: {WHOLE_PROGRAM}."
         )
     elif from_self_tests:
-        # Deliberately not "your solution is WRONG". These cases came from the
-        # model itself, so a disagreement proves only that two things it wrote
-        # contradict each other -- and telling it the CODE is at fault when the
-        # CASE was wrong is how a repair round breaks a correct program. The
+        # Deliberately not "your solution is WRONG". A disagreement proves only
+        # that two readings of the statement contradict each other -- and
+        # telling the model the CODE is at fault when the CASE was wrong is how
+        # a repair round breaks a correct program. Measured over a production
+        # run: of the 26 solves that reached a correction round, 24 resolved
+        # the disagreement by rewriting the CASE, and a judge upheld those
+        # rewrites 22 times of 25 and sided with the original case none. The
         # output rule names both ways out and lets the model pick.
         detail = "\n".join(f"  - {line}" for line in failures)
         target = "the program" if language == "rust" else f"`{entrypoint}`"
         body = (
-            f"I ran {target} against the test cases you sent and got:\n"
+            f"{_ran_against(target, bar_is_independent)}\n"
             f"{detail}\n\n"
             f"Send back ONE fenced block: {WHOLE_PROGRAM} — or, if the case "
             f"was wrong rather than the program, a `json` array holding just "

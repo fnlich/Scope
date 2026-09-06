@@ -14286,3 +14286,57 @@ def test_a_phase_model_is_a_preference_and_never_a_pin(tmp_path, monkeypatch):
         "the outage was not cleared, so the next assertion proves nothing"
     )
     assert asyncio.run(opened(phase="cases", avoid="cli:sonnet")) != "sonnet"
+
+
+def test_a_repair_round_says_truthfully_whose_cases_it_ran():
+    """The one sentence a repair round turns on, and it has to be true.
+
+    Sequentially the bar IS the model's own, one turn back, and "the test cases
+    you sent" is exact. Written beside the program in another conversation it
+    is not: that model never saw them and never sent them. The framings ask for
+    different reasoning -- "one of my two answers is wrong" against "someone
+    else read this statement differently" -- so the false one does not merely
+    misdescribe the round, it asks the wrong question.
+    """
+    from solvers.prompts import build_repair_prompt
+
+    shared = build_repair_prompt(
+        ["g(7) -> 0, expected 7"], "python", "g", from_self_tests=True,
+        bar_is_independent=False,
+    )
+    split = build_repair_prompt(
+        ["g(7) -> 0, expected 7"], "python", "g", from_self_tests=True,
+        bar_is_independent=True,
+    )
+    assert "the test cases you sent" in shared
+    assert "you sent" not in split, split
+    assert "without seeing your program" in split, split
+    # Both keep the escape hatch: the case may be the thing that is wrong, and
+    # measured over a production run it usually was -- 24 of the 26 solves that
+    # reached a correction round resolved the disagreement by rewriting the
+    # case, and a judge upheld 22 of 25 of those and the original case none.
+    for prompt in (shared, split):
+        assert "if the case was wrong rather than the program" in prompt
+
+
+@pytest.mark.asyncio
+async def test_the_split_carries_its_framing_into_the_repair_the_model_reads():
+    """...and it reaches the model, not just the prompt builder.
+
+    `_attempt` owns the flag and the prompt builder owns the sentence; a test
+    of either alone passes while the wiring between them is missing.
+    """
+    backend = _TwoSeats({
+        "cases": [CASES],
+        "program": ["```python\ndef g(n):\n    return 0\n```"],
+        None: ["```python\ndef g(n):\n    return 0\n```"],
+    })
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             independent_bar=True)
+    await solver.solve_task(_two_seat_task(), 120.0)
+
+    repairs = [p for turns in backend.sent.values() for p in turns
+               if "expected" in p and "ran" in p]
+    assert repairs, f"no repair round was sent: {backend.sent!r}"
+    assert any("without seeing your program" in p for p in repairs), repairs[0]
+    assert not any("the test cases you sent" in p for p in repairs), repairs[0]

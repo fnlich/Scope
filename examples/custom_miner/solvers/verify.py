@@ -1993,6 +1993,7 @@ class VerifyingSolver:
                         task.public_examples, agreed, best.code,
                         best.failures, defect=best.defect,
                         from_self_tests=best.from_self_tests,
+                        bar_is_independent=self._independent_bar,
                     ),
                 )
 
@@ -2486,6 +2487,10 @@ class VerifyingSolver:
                     defect=candidate.defect,
                     from_self_tests=candidate.from_self_tests,
                     insist_on_program=insist,
+                    # WHOSE cases these are, said truthfully. The conversation
+                    # being repaired never saw the bar when the bar is written
+                    # elsewhere, and a repair round turns on exactly that.
+                    bar_is_independent=self._independent_bar,
                 )
                 # Asking the same question a second time is worth doing -- a
                 # model is stochastic and the budget is there to spend on the
@@ -2517,6 +2522,7 @@ class VerifyingSolver:
                         from_self_tests=candidate.from_self_tests,
                         stalled=stalled,
                         insist_on_program=insist,
+                        bar_is_independent=self._independent_bar,
                     )
                 prompt = report
         except asyncio.CancelledError:
