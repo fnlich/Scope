@@ -1360,6 +1360,130 @@ turn 1 asks for exactly ONE of those. Three runs of the common path are three
 runs of the same code, paid for out of the solve's own deadline and re-paid on
 every repair round.
 
+### The bar is written where the program cannot see it
+
+Writing the cases *first* stops them being back-filled from a program that
+already exists. It does not stop something subtler, and the production logs
+say so plainly.
+
+Sequentially, turn 1 and turn 2 are two turns of ONE conversation on ONE model.
+The program is written with the cases already in context, by the model that
+wrote them, from that model's single reading of the statement. When that
+reading is wrong, the program and its bar are wrong *the same way* and agree
+perfectly. Across the 97 solves in `calibration/logs-2026-09-05*.log`:
+
+```
+96 of 97   shipped a program that passed EVERY one of its own ~18 cases
+71 of 97   never produced a single disagreement to repair (rounds=1)
+78-83%     is what those same runs scored against the hidden suite
+```
+
+About one shipped answer in five clears a bar it wrote for itself and still
+fails. The repair loop was not the weak link — it almost never had anything to
+work on.
+
+So the cases turn now runs in its **own conversation**, asked at the same
+moment the program is, and the program's prompt carries no `<must_pass>`
+section at all:
+
+```
+             ┌─ conversation A ─ the cases, from the statement alone
+   open ─────┤
+             └─ conversation B ─ the program, from the statement alone
+                                      │
+                   grade B against A ─┤
+                                      └─ turn 3+ repair, in B, quoting the
+                                         disagreement
+```
+
+Two readings of the statement that cannot see each other. A disagreement is now
+evidence rather than a formality, which is the whole point — and when they
+agree, they agree for a reason.
+
+It is also **faster**, which is what pays for the extra repair rounds an
+independent bar produces. Those two turns are 83.8% of all phase time and they
+used to run back to back:
+
+```
+                cases   program   sequential   side by side
+p50             56.9s     63.5s       120.4s          63.5s
+p90             95.1s    171.2s       266.3s         171.2s
+```
+
+Shipped solves ran p50 156s and p90 274s against a 280s stop — six seconds of
+headroom at p90. Overlapping the two turns is where the room for correction
+rounds (p50 16.4s each) comes from.
+
+Measured end to end on the five sample challenges, each shown **no** public
+examples and graded on all of them (`--challenge <name> --examples 0`):
+
+```
+                                 solve       output tokens
+                              seq → split      seq → split
+asset-rebuild-planner        67.1s → 44.6s    6,066 →  6,441   3/3 both, 2 rounds → 1
+extent-journal               96.5s → 71.8s    8,789 →  8,869   3/3 both
+reactive-stat-board          76.3s → 69.7s    7,217 →  9,669   rust: not gradeable here
+revocable-verification-gate 136.0s → 69.3s   11,851 → 10,131   rust: not gradeable here
+sparse-circular-array       101.7s → 53.6s    8,964 →  8,192   rust: not gradeable here
+                            ──────────────   ───────────────
+median                       96.5s → 69.3s   42,887 → 43,302
+max                         136.0s → 71.8s
+```
+
+Faster on all five, and output tokens are flat overall (+1%): the program's
+prompt loses its `<must_pass>` block, and the bar's conversation pays its own
+cache write instead.
+
+Be clear about what that table does and does not show. The **times** are five
+paired measurements and they all point the same way. The **correctness** column
+is two problems, three cases each — Rust needs Docker to grade and this box has
+none — which is a smoke test, not a powered comparison. The evidence that the
+shared bar was catching nothing is the 97-solve production sample above, not
+these five. `calibration/bar_ab.py` prints this table from the archived runs in
+`calibration/bar-ab/`, and its docstring carries the command that reproduces
+them.
+
+Four rules keep the split from becoming a second way to lose:
+
+- **The bar is a separate failure domain, and that is the point.** A cases
+  conversation that hangs, dies, or returns nothing costs the bar and nothing
+  else: the program was written somewhere this never touched, and it ships. The
+  ceiling and the still-writing reopen that the sequential shape needed exist
+  because a slow cases turn used to take the program's budget with it.
+- **The bar is waited for with one correction round held back.** A
+  disagreement arriving with no time to act on it grades an answer that ships
+  unchanged either way, so the wait stops at `ROUND_TRIP_FLOOR_S`.
+- **A repair still quotes the bar.** Independence is about how the program is
+  *written*, not about what it is shown afterwards. Turn 3 onward names the
+  failing case, because a repair that cannot see what it failed is a guess.
+- **`SOLVER_INDEPENDENT_BAR=0` restores the sequential shape.** It is a
+  supported configuration, not a dead branch.
+
+### Which model answers which phase
+
+Each phase may name its own model and effort:
+
+```
+SOLVER_CLI_PHASE_PROFILES=cases=sonnet:low,program=opus:low
+```
+
+Phases are `cases`, `program` and `repair`. It is **unset by default**, and
+that is deliberate rather than cautious: every one of the 102 solves in the
+archived runs opened on the same model, so those logs say nothing whatever
+about how another model answers a cases turn or a program turn here. A default
+naming one would be a guess with a measurement's authority. Measure it on your
+own traffic, then set it.
+
+What a phase names is a **preference, never a pin**, and the two escapes are
+what make it safe to use at all:
+
+- a phase whose model is refused on every account falls through to the ordinary
+  ladder, so a model going down costs that phase its first choice and never an
+  answer;
+- `avoid` beats the preference. It is how a pass says *not the one that just
+  got this wrong*, and honouring a pin ahead of it would send the retry
+  straight back to the model being retried.
+
 ### A short deadline must still get an answer
 
 `TaskRequest.deadline_s` is only `Field(gt=0.0, le=3600.0)`. Nothing in the
@@ -1777,152 +1901,6 @@ returns `None`, which means *could not tell* rather than *fine*, and without a
 daemon nothing grades — so what is left is `rust_defect` looking for `fn main`
 in a fenced block. Installing `rustc` restores the compile gate on its own and
 needs no Docker; grading Rust needs the daemon.
-
-## The second reading: what a program's own cases cannot say
-
-> **Off by default since it was measured.** Over 102 production solves the
-> cross-check spent 48% of every output token the miner produced, 2.5 of its
-> 4.5 model turns a solve, and 11% of all solve time. It returned four
-> confirmed cases and one fallback rescue. The local cases bar, which costs one
-> turn, caught something in 26 of the same 102 solves -- six and a half times
-> the yield per turn. Hidden-suite correctness was 83.5% over 76 solves before
-> it and 78% over 50 after, a difference not significant in either direction.
-> `SOLVER_CROSSCHECK=1` turns it back on; nothing below has been removed, and
-> the section stands as the record of what it does when enabled.
-
-
-Every answer above is graded against cases the same model wrote, and a model
-cannot confirm its own reading of a statement. Measured on this miner's
-archived answers: of 15 that could be re-graded independently, 2 passed every
-case their author wrote and were wrong. A production log of 76 solves came
-back 83.5% right on the hidden suite while 72 of the 76 reported *verified on
-local*. So a solve now buys a second opinion it can actually use.
-
-**The second reading.** Beside the primary conversation, a fresh one on
-`SOLVER_CROSSCHECK_PROFILE` (default `fable:low`) reads the statement cold and
-writes its own program and an input generator. Once the primary's program
-passes everything of its own, both programs run on 60 generated inputs and on
-one maximum-size input. Every disagreement goes to a **judge** — one turn on
-`SOLVER_JUDGE_PROFILE` (default `opus:low`) that is shown the statement and the
-inputs and nothing else — and an input the judge decides against the primary
-lands on the bar as a *confirmed* case: locked, reported as a failure, and not
-the primary's to correct. A large input the primary times out on while the
-second program finishes is reported the same way. `SOLVER_CROSSCHECK=0` turns
-all of it off, and the launch line says which:
-
-```text
-[verify] cross-check: on (second reading fable:low, judge opus:low, 60 inputs; SOLVER_CROSSCHECK=0 turns it off)
-```
-
-**A corrected case is judged before it lands.** The repair prompt offers two
-ways out of a failing case: fix the program, or send the case back corrected.
-In that log the model took the second in 18 of 24 open repair rounds, at a
-third of the thinking time, and every correction was accepted on its author's
-word. Now each corrected case goes to the same judge as the call alone. Agree
-with the correction and it lands; agree with the case as written and the
-correction is refused, the case is locked, and the next prompt asks for the
-program without offering the cases; agree with neither and the case stands as
-written. No judge, no time (under 65s left), or two judge turns already spent
-this pass: the correction lands as it always did — a judge that cannot be
-reached is not a reason to freeze the bar.
-
-```text
-[verify] the repair corrected the cases rather than the program: 1 case(s) corrected and 1 of them refused -- g(12345): the judge says 15, as the case was written; the case is locked and the program has to change. ...
-```
-
-**The answer of last resort.** Six program turns in that log ran past 200
-seconds; four solves ended with nothing, a fragment, or a program still
-failing its own cases — while the second reading's program had been finished
-for two minutes. That program is graded in the background against the
-primary's own cases, and submitted when the primary ends with nothing, a
-fragment, a structural defect, or cases it was seen to fail, and only when it
-passed every case the primary wrote. A primary that passed everything it was
-run against stands, however many cases went unrun: unknown is not failed, and
-the primary is the stronger model.
-
-**What the summary line now says**, so a hidden-suite outcome can be joined
-back to how the solve went:
-
-```text
-[verify] python entrypoint=longest_run provider=cli:opus examples=0/0 self=20/20 verified=False (verified on local: ...) rounds=3 corrected=1/20 xcheck=clean 29.3s/290s id=req-1
-```
-
-`rounds` is how many times the model was asked, `corrected` how many cases it
-corrected that stood over the size of the bar, `xcheck` the last word of the
-cross-check (`off`, `clean`, `N finding(s)`, `skipped (Ns left)`), and `id`
-the request, which every `[phase]` line of that solve also ends with. Solves
-interleave; without the id the phases of two solves read as one.
-
-**"clean" means the two readings agreed, and nothing weaker.** It used to mean
-"no case was confirmed", which is a different claim. On a production day the
-difference was eight solves, one of which had found sixty disagreements in
-sixty generated inputs, had its judge turn cut off, and still printed `clean`.
-The line now has three states, and `xcheck=` on the summary carries the same
-word:
-
-```text
-[verify] cross-check: 60 generated input(s), 60 disagreement(s); the second program failed on 58 of them -- UNRESOLVED (58 open, no verdict)
-```
-
-Only two disagreements a round go to the judge, so a round can find far more
-than it settles. That is a deliberate bound on judge turns, not a pass, and
-the log says which. The count of inputs the *second* program crashed on is
-printed beside it: a second reading that never runs disagrees with everything,
-and without that number it is indistinguishable from a real dispute.
-
-**One repair reply may not rewrite the bar.** The repair prompt offers to take
-a wrong case back corrected, and a failing program has every incentive to take
-it. Measured: a program the cross-check had already confirmed wrong on two
-inputs answered its repair by rewriting fifteen of its twenty-two cases with
-nine seconds left, no judge had time to look, and the solve shipped reporting
-it had passed all twenty-two. A reply that corrects more than a third of the
-bar is now refused whole, and after two such replies the cases are not offered
-again for the rest of the pass. Across a day of real corrections the share
-rewritten per reply was 5 to 15 percent, once 29, and once 68: the threshold
-fires on the 68 and on nothing else.
-
-When a correction does land with no judge behind it, the summary says so
-rather than claiming a local verification:
-
-```text
-[verify] ... (NOT verified on local: 2 of the 3 case(s) it passed were rewritten by the model itself with no judge) rounds=2 corrected=2/3(2 unjudged)
-```
-
-**A turn that streams a heartbeat and no answer is cut.** Six turns in one
-production day emitted between 34 and 388 events with zero characters of text,
-one event every 750ms, across two models and two accounts. That regularity is
-a keepalive, not a model thinking, and two of those solves submitted nothing at
-all. The old guard fired only when *no* event had arrived, which never happens
-here. A turn is now cut once it has been quiet for `SOLVER_CLI_FIRST_TEXT_S`
-(120s) with sixty events gone by and enough slice left to ask someone else,
-and the next rung answers. Measured on live turns, the first character arrives
-after one to two seconds on an easy problem and after thirty-seven at worst on
-a hard one, so the threshold has better than threefold margin. Every answered
-turn now reports its own shape, which is where that margin is measured:
-
-```text
-[cli] cli:opus ok: 93 event(s), first text after 37s, 4527 character(s) in 58s, 0 retries
-```
-
-Two event shapes carry the whole reply and neither used to be read: a `result`
-event's own text and a complete `assistant` message. A turn whose deltas never
-arrived still has its answer in one of them, and it is used when nothing
-streamed.
-
-**An empty answer is worth zero, so any program beats it.** The graded fallback
-asks that the second reading's program pass every one of the primary's cases.
-When the primary has *nothing* that bar is beside the point, and the second
-reading's program is submitted whatever it scores. The refusal is logged either
-way, so an operator can see which of the three conditions declined.
-
-**What it costs the seat.** About 1.9× the output tokens of a solve without
-it, and one to three more conversations per solve. On the CLI backend the
-second reading and the judge go to the **lightest** signed-in seat, and a
-seat past `SOLVER_CLI_SWITCH_AT` (default 95%) of its window takes no fresh
-solve while another has room — measured, the limit used to land at 91%+ in
-the middle of a repair round. `SOLVER_CLI_CONCURRENCY` defaults to 8 for the
-same reason: a solve holds up to three conversations, and two miners on one
-login hold twice that.
 
 ## Running under pm2
 

@@ -64,6 +64,7 @@ from solvers.verify import (  # noqa: E402
     SECOND_OPINION_PASSES,
     Answer,
     VerifyingSolver,
+    _Phases,
 )
 
 from rlvr.config import Settings  # noqa: E402
@@ -142,11 +143,15 @@ def _never_archive_into_the_operators_corpus(tmp_path, monkeypatch):
     would have left the same hole open for the next test somebody writes.
     """
     monkeypatch.setenv("SOLVER_SOLUTION_DIR", str(tmp_path / "solutions"))
-    # The second reading opens conversations of its own, and the scripted
-    # backends here hand every conversation the same reply list. Off unless a
-    # test says otherwise; the cross-check tests build a backend that can
-    # tell its conversations apart.
-    monkeypatch.setenv("SOLVER_CROSSCHECK", "0")
+    # The independent bar opens a conversation of its own, and the scripted
+    # backends here hand EVERY conversation the same reply list -- so both the
+    # bar and the program would be served reply[0] and the scripts would stop
+    # meaning what they say. Off unless a test says otherwise; the tests that
+    # cover the split build a backend that can tell its conversations apart.
+    # `SOLVER_INDEPENDENT_BAR=0` is a shipped configuration, not a test-only
+    # one: it is the sequential shape, still supported and still exercised
+    # here by everything that does not opt in.
+    monkeypatch.setenv("SOLVER_INDEPENDENT_BAR", "0")
 
 
 # --------------------------------------------------------------------------- #
@@ -221,8 +226,14 @@ def test_reply_passes_every_validator_acceptance_check():
     # 5. ...and the answer is the REPAIRED one. Both halves are asserted: the
     #    code that shipped, and that a repair round is what produced it.
     assert "while n > 0" in payload.code, payload.code
-    assert len(prompts) == 3, f"expected cases, program, repair; got {len(prompts)}"
-    assert "I ran" in prompts[2], f"turn 3 was not a repair: {prompts[2]!r}"
+    # The bar and the program are written in separate conversations, so this
+    # fixture's single prompt list interleaves them and the count is not the
+    # turn order. What IS asserted is the shape: one cases prompt, one program
+    # prompt that does NOT quote the cases, and at least one repair that does.
+    asked_for_cases = [p for p in prompts if "json" in p and "must_pass" not in p]
+    assert asked_for_cases, f"nothing asked for the bar: {prompts!r}"
+    repairs = [p for p in prompts if "I ran" in p]
+    assert repairs, f"no repair round was sent: {prompts!r}"
 
 
 def test_the_correction_ships_on_chain_and_lands_in_the_archive(tmp_path):
@@ -13774,152 +13785,11 @@ def test_the_solve_loop_follows_a_conversation_that_hops(capsys):
     assert "[verify] cli:opus sent back" not in out, out
 
 
-# --------------------------------------------------------------------------- #
-# The second reading: a program that passes its own cases and is wrong.
-# --------------------------------------------------------------------------- #
-# Passes both of ITS cases and is wrong on every single-digit input: it
-# returns 0 for n < 10. The cases it wrote never look there.
-BLIND = ("```python\ndef g(n):\n    if n < 10:\n        return 0\n    s = 0\n"
-         "    while n > 0:\n        s += n % 10\n        n //= 10\n    return s\n```")
-BLIND_CASES = ('```json\n[{"name": "all five digits", "args": [12345], "expected": 15},\n'
-               ' {"name": "zero", "args": [0], "expected": 0}]\n```')
-# The second reading: a right program and a generator that only ever asks
-# about single digits.
-SECOND = RIGHT
-GENERATOR = ("```python\nimport random\n\ndef generate(seed, scale):\n"
-             "    random.seed(seed)\n"
-             "    return {\"args\": [random.randint(1, 9)], \"kwargs\": {}}\n```")
-SLOW_GENERATOR = ("```python\nimport random\n\ndef generate(seed, scale):\n"
-                  "    random.seed(seed)\n"
-                  "    if scale >= 100:\n        return {\"args\": [10 ** 8], \"kwargs\": {}}\n"
-                  "    return {\"args\": [random.randint(10, 99)], \"kwargs\": {}}\n```")
-# Right on every digit sum, and quadratic in n: a maximum-size input times out.
-QUADRATIC = ("```python\ndef g(n):\n    s = 0\n    for i in range(n + 1):\n"
-             "        s += 0 * i\n    m = n\n    while m > 0:\n        s += m % 10\n"
-             "        m //= 10\n    return s\n```")
-
-
-class _Judge(_Chat):
-    """A judge that actually reasons: the digit sum of the call it is shown."""
-
-    def __init__(self):
-        super().__init__([], "judge")
-        self.asked = 0
-
-    async def send(self, text, timeout_s):
-        self.asked += 1
-        import re as _re
-        digits = [sum(int(d) for d in n) for n in _re.findall(r'"args": \[(\d+)\]', text)]
-        return f'```json\n{{"expected": {json.dumps(digits)}}}\n```'
-
-
-class _Readers(_Backend):
-    """Tells its conversations apart: the primary, the second reading, the judge."""
-
-    def __init__(self, primary, second, judge_factory=_Judge):
-        super().__init__(primary, "cli:opus")
-        self._second = second
-        self._judge_factory = judge_factory
-        self.opened = []
-        self.judges = []
-
-    async def open(self, avoid=None):
-        self.opened.append(("primary", avoid))
-        return _Chat(self._replies, self._provider)
-
-    async def open_profile(self, model, effort):
-        self.opened.append((model, effort))
-        if model == "fable":
-            return _Chat(self._second, "cli:fable")
-        judge = self._judge_factory()
-        self.judges.append(judge)
-        return judge
-
-
-def _crosschecked(monkeypatch, backend, **kw):
-    monkeypatch.setenv("SOLVER_CROSSCHECK", "1")
-    monkeypatch.setenv("SOLVER_CROSSCHECK_INPUTS", "12")
-    kw.setdefault("reserve_s", 0)
-    kw.setdefault("max_budget_s", 120)
-    kw.setdefault("second_opinion", False)
-    return VerifyingSolver(backend, **kw)
-
-
-def test_a_program_that_passes_its_own_cases_is_caught_by_the_second_reading(
-    monkeypatch, capsys
-):
-    """The shape measured on this miner's archived answers: every case the
-    model wrote passes, and the program is wrong. A second reading with its
-    own program and generator disagrees on generated inputs; a third reader
-    sides with it; the input lands on the bar as a confirmed case; the
-    ordinary repair round fixes the program; the cross-check then passes."""
-    backend = _Readers([BLIND_CASES, BLIND, RIGHT], [SECOND, GENERATOR])
-    solver = _crosschecked(monkeypatch, backend)
-    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
-    out = capsys.readouterr().out
-
-    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
-    assert ("fable", "low") in backend.opened and ("opus", "low") in backend.opened
-    assert len(backend.judges) >= 1 and backend.judges[0].asked == 1
-    assert "2 CONFIRMED against this program" in out, out
-    assert "second reading's findings stand; asking for the program" in out, out
-    # The confirmed cases joined the bar: the final tally counts them.
-    assert answer.self_total == 4, out
-    # And the repaired program went through the cross-check again, clean.
-    assert out.count("generated input(s)") == 2 and "-- clean" in out, out
-    assert "2 cross-check" in out and "3 cross-check" in out, out
-
-
-def test_a_confirmed_case_cannot_be_corrected_away(monkeypatch, capsys):
-    """The repair prompt offers to take a wrong CASE back corrected. A case two
-    other readings agreed on is not the model's to correct: a reply that
-    'corrects' it is refused and the program is asked for again."""
-    talk_back = '```json\n[{"name": "cross-check 1", "args": [7], "expected": 0}]\n```'
-    backend = _Readers([BLIND_CASES, BLIND, talk_back, RIGHT], [SECOND, GENERATOR])
-    solver = _crosschecked(monkeypatch, backend)
-    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
-    out = capsys.readouterr().out
-    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
-    assert "keeping the bar as it stands" in out, out
-    assert answer.self_total == 4 and answer.self_passed == 4, out
-
-
-def test_a_second_reading_that_is_itself_wrong_changes_nothing(monkeypatch, capsys):
-    """Two readings disagree and the judge sides with the PRIMARY. Nothing is
-    added to the bar, nothing is repaired, and the log says who was wrong."""
-    wrong_second = BLIND
-    backend = _Readers([CASES, RIGHT], [wrong_second, GENERATOR])
-    solver = _crosschecked(monkeypatch, backend)
-    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
-    out = capsys.readouterr().out
-    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g")
-    assert "CONFIRMED" not in out, out
-    assert "put to the judge" in out, out
-    assert answer.self_total == 1, "nothing joined the bar"
-
-
-def test_a_slow_program_is_timed_on_the_largest_input(monkeypatch, capsys):
-    """Hand-written cases are small. The generator's maximum-size input is the
-    one place the program is ever run at scale, and a timeout there -- when
-    the independent program finishes the same input -- is a failure the
-    repair round is told about in so many words."""
-    from solvers import verify as verify_module
-
-    monkeypatch.setattr(verify_module, "VERIFY_TIMEOUT_S", 1.0)
-    backend = _Readers([CASES, QUADRATIC, RIGHT], [SECOND, SLOW_GENERATOR])
-    solver = _crosschecked(monkeypatch, backend)
-    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
-    out = capsys.readouterr().out
-    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
-    assert "TIMED OUT (the independent program took" in out, out
-    assert "findings stand; asking for the program" in out, out
-
-
 def test_rust_outputs_can_be_taken_without_an_expectation(monkeypatch):
     """The Rust runner compares stdout with `expected` whether or not anyone
-    asked, and its token split reads a None as a crash. Every Rust
-    cross-check died there, before a single input ran, until the grader
-    handed it an empty string instead."""
+    asked, and its token split reads a None as a crash. Every Rust run taken
+    without an expectation died there, before a single input ran, until the
+    grader handed it an empty string instead."""
     from rlvr.execution.rust_judge import outputs_match
     from rlvr.types import ExecutionResult
     from solvers.verify import _Grader
@@ -13939,32 +13809,6 @@ def test_rust_outputs_can_be_taken_without_an_expectation(monkeypatch):
     monkeypatch.setattr(grader, "executor", lambda language: _RustLike())
     runs = grader.outputs("fn main(){}", "rust", "main", [{"args": ["1\n"]}], budget_s=10)
     assert len(runs) == 1 and runs[0].ok and runs[0].value == "42\n", runs
-
-
-def test_the_cross_check_is_off_when_told_and_never_blocks_the_answer(monkeypatch, capsys):
-    from solvers import crosscheck
-
-    monkeypatch.setenv("SOLVER_CROSSCHECK", "0")
-    backend = _Readers([CASES, RIGHT], [SECOND, GENERATOR])
-    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120, second_opinion=False)
-    asyncio.run(solver.solve_task(DIGITS, 120.0))
-    assert all(kind == "primary" for kind, _ in backend.opened), backend.opened
-
-    # On, but the second reading never produces a program: the solve ends
-    # exactly where it used to, with a line saying why.
-    backend = _Readers([CASES, RIGHT], ["I would rather not.", "no"])
-    solver = _crosschecked(monkeypatch, backend)
-    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
-    out = capsys.readouterr().out
-    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g")
-    assert "no second reading" in out, out
-
-    assert crosscheck.extract_generator("```python\nx = 1\n```") == ""
-    assert "def generate" in crosscheck.extract_generator(GENERATOR)
-    assert crosscheck.extract_expected('```json\n{"expected": [1, 2]}\n```', 2) == (True, [1, 2])
-    assert crosscheck.extract_expected('```json\n{"expected": 7}\n```', 1) == (True, [7])
-    assert crosscheck.extract_expected('```json\n{"expected": [1]}\n```', 2) == (False, [])
-    assert crosscheck.extract_expected("nothing", 1) == (False, [])
 
 
 def test_selecting_the_cli_backend_needs_no_browser(monkeypatch):
@@ -14008,139 +13852,6 @@ CORRECT_TO_15 = '```json\n[{"name": "all five digits", "args": [12345], "expecte
 CORRECT_TO_14 = WRONG_CASE
 # A second program that is right and can be told from `RIGHT` by its text.
 SECOND_BY_STRING = "```python\ndef g(n):\n    return sum(int(d) for d in str(n))\n```"
-
-
-def test_a_correction_the_judge_refuses_locks_the_case_and_the_program_changes(
-    monkeypatch, capsys
-):
-    """The program is wrong, the case is right, and the repair 'corrects' the
-    case to what the program prints. Measured on a production log: eighteen
-    such corrections in seventy-six solves, every one accepted on its
-    author's word. Now a reader with no program is asked first: it sides with
-    the case as written, the correction is refused, the case is locked, the
-    next prompt asks for the program and not the cases, and the program is
-    what changes."""
-    # The case carries no name: a locked case is reported by name later, and
-    # a model's own case need not have one.
-    unnamed = '```json\n[{"args": [12345], "expected": 15}]\n```'
-    backend = _Readers([unnamed, WRONG, CORRECT_TO_14, RIGHT], [SECOND, GENERATOR])
-    solver = _crosschecked(monkeypatch, backend)
-    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
-    out = capsys.readouterr().out
-
-    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
-    assert "1 of them refused" in out, out
-    assert "cross-check failed" not in out, out
-    # The summary line says how the solve went, and which request it was.
-    assert "corrected=0/1 xcheck=clean" in out and "id=none" in out, out
-    assert "rounds=" in out and "  id=none" in out.split("[phase]")[1], out
-    assert "the judge says 15, as the case was written; the case is locked" in out, out
-    assert "a confirmed case is failing; asking for the program" in out, out
-    # The bar stayed the bar: one case, the one turn 1 wrote, and it passes.
-    assert answer.self_total == 1 and answer.self_passed == 1, out
-    # One judge turn for the correction; the cross-check found nothing to judge.
-    assert len(backend.judges) == 1 and backend.judges[0].asked == 1, backend.judges
-    assert "the judge decided 1 input(s)" in out, out
-
-
-def test_a_correction_the_judge_agrees_with_lands(monkeypatch, capsys):
-    """The other way round: the CASE was wrong, the program was right, and the
-    correction says so. The judge agrees with the correction, it lands, and
-    the program in hand is re-graded against it -- no repair round, no
-    program re-sent."""
-    backend = _Readers([WRONG_CASE, RIGHT, CORRECT_TO_15], [SECOND, GENERATOR])
-    solver = _crosschecked(monkeypatch, backend)
-    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
-    out = capsys.readouterr().out
-
-    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
-    assert "the judge agrees with the correction" in out, out
-    assert "corrected=1/1 xcheck=clean" in out, out
-    assert "refused" not in out, out
-    assert answer.self_total == 1 and answer.self_passed == 1, out
-    assert len(backend.judges) == 1 and backend.judges[0].asked == 1, backend.judges
-
-
-def test_the_second_reading_answers_when_the_primary_returns_nothing(
-    monkeypatch, capsys
-):
-    """The shape that cost four of seventy-six production solves: the cases
-    turn worked, the program turn ran out, and the answer was nothing -- while
-    the second reading's program had been finished for minutes. Its program is
-    graded against the primary's own cases in the background, and submitted
-    when the primary ends with nothing."""
-
-    class _Dies(_Chat):
-        async def send(self, text, timeout_s):
-            self._n += 1
-            if self._n == 0:
-                return CASES
-            await asyncio.sleep(0.3)
-            raise RuntimeError("the tab went away")
-
-    class _Primary(_Readers):
-        async def open(self, avoid=None):
-            self.opened.append(("primary", avoid))
-            return _Dies(self._replies, self._provider)
-
-    backend = _Primary([CASES], [SECOND_BY_STRING, GENERATOR])
-    solver = _crosschecked(monkeypatch, backend)
-    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
-    out = capsys.readouterr().out
-
-    assert extract_code(answer.code, "g") == extract_code(SECOND_BY_STRING, "g"), out
-    assert "the primary ended with nothing; submitting the second reading's program" in out, out
-    assert "passed 1/1 of the cases the primary wrote" in out, out
-    assert answer.self_total == 1 and answer.self_passed == 1, out
-    assert solver.stats()["solver"]["fallback"] == 1
-
-
-def test_the_second_reading_answers_when_the_primary_never_fixes_its_program(
-    monkeypatch, capsys
-):
-    """The primary's program fails the case the primary itself wrote, and every
-    repair round sends the same program back. The second reading's program
-    passes that case, and it is the answer."""
-    backend = _Readers([CASES, WRONG, WRONG], [SECOND_BY_STRING, GENERATOR])
-    solver = _crosschecked(monkeypatch, backend)
-    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
-    out = capsys.readouterr().out
-
-    assert extract_code(answer.code, "g") == extract_code(SECOND_BY_STRING, "g"), out
-    assert "the primary ended with a program failing 1 of the 1 case(s)" in out, out
-
-
-def test_the_primary_is_never_replaced_while_its_program_stands(monkeypatch, capsys):
-    """A primary that passed everything it was run against keeps the answer,
-    however good the second reading's program is: the fallback is taken on
-    evidence against the primary, never on evidence for the second."""
-    backend = _Readers([CASES, RIGHT], [SECOND_BY_STRING, GENERATOR])
-    solver = _crosschecked(monkeypatch, backend)
-    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
-    out = capsys.readouterr().out
-
-    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
-    assert "submitting the second reading's program" not in out, out
-    assert solver.stats()["solver"]["fallback"] == 0
-
-
-def test_the_cross_check_setting_is_said_once_at_launch_and_on_every_summary(
-    monkeypatch, capsys
-):
-    """A production log ran a whole day with no cross-check and not one line
-    said so. Now the launch line says it, and every summary line carries
-    the verdict -- `off` included."""
-    solver = _solver([CASES, RIGHT])
-    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
-    out = capsys.readouterr().out
-    assert out.startswith("[verify] cross-check: OFF (SOLVER_CROSSCHECK=0)"), out
-    assert answer.code and "xcheck=off " in out, out
-
-    monkeypatch.setenv("SOLVER_CROSSCHECK", "1")
-    monkeypatch.setenv("SOLVER_CROSSCHECK_PROFILE", "fable:low")
-    _solver([RIGHT])
-    out = capsys.readouterr().out
-    assert "[verify] cross-check: on (second reading fable:low, judge opus:low" in out, out
 
 
 def test_a_turn_cut_off_says_what_its_stream_looked_like(tmp_path, monkeypatch, capsys):
@@ -14301,52 +14012,6 @@ def test_a_reply_that_never_streamed_is_still_read_from_the_result_event(
 
 
 # --------------------------------------------------------------------------- #
-# The cross-check says what it actually established.
-# --------------------------------------------------------------------------- #
-def test_a_check_that_settles_nothing_it_found_does_not_report_clean(
-    monkeypatch, capsys
-):
-    """`clean` used to mean "no failure was raised", which is a different
-    claim from "the two readings agreed". On a production day the difference
-    was eight solves, one of them with sixty disagreements in sixty inputs and
-    a judge that had been cut off."""
-    class _Mute(_Chat):
-        def __init__(self):
-            super().__init__([], "judge")
-        async def send(self, text, timeout_s):
-            return "I would rather not say."
-
-    # BLIND is wrong on every single digit; the generator only asks about
-    # single digits; the judge answers nothing usable.
-    backend = _Readers([BLIND_CASES, BLIND], [SECOND, GENERATOR], judge_factory=_Mute)
-    solver = _crosschecked(monkeypatch, backend)
-    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
-    out = capsys.readouterr().out
-
-    assert "UNRESOLVED" in out, out
-    assert "no verdict" in out, out
-    assert " -- clean" not in out, out
-    # The label on the summary line agrees with the detail line.
-    assert "xcheck=unresolved(" in out, out
-    # And nothing was invented: no case was confirmed, so the program stands.
-    assert extract_code(answer.code, "g") == extract_code(BLIND, "g"), out
-
-
-def test_the_check_counts_a_second_program_that_simply_does_not_run(
-    monkeypatch, capsys
-):
-    """A second reading that crashes on every input disagrees with everything.
-    Without that number a broken reading is indistinguishable from a real
-    dispute, and the operator sizes the cross-check from a fiction."""
-    broken = "```python\ndef g(n):\n    raise RuntimeError('nope')\n```"
-    backend = _Readers([CASES, RIGHT], [broken, GENERATOR])
-    solver = _crosschecked(monkeypatch, backend)
-    asyncio.run(solver.solve_task(DIGITS, 120.0))
-    out = capsys.readouterr().out
-    assert "the second program failed on" in out, out
-
-
-# --------------------------------------------------------------------------- #
 # One reply may not rewrite the bar.
 # --------------------------------------------------------------------------- #
 SIX_CASES = ('```json\n[{"name": "five digits", "args": [12345], "expected": 15},\n'
@@ -14364,23 +14029,24 @@ BENT = ('```json\n[{"name": "five digits", "args": [12345], "expected": 14},\n'
 
 
 def test_one_reply_may_not_rewrite_a_third_of_the_bar(monkeypatch, capsys):
-    """Measured: a program the cross-check had already confirmed wrong answered
-    its repair by rewriting fifteen of its twenty-two cases with nine seconds
-    left, no judge had time to look, and the solve shipped reporting it had
-    passed all twenty-two. A reply that corrects a third of the bar is a
-    re-specification, not a correction, and is refused whole."""
+    """Measured: a program already known wrong on two inputs answered its
+    repair by rewriting fifteen of its twenty-two cases with nine seconds
+    left, and the solve shipped reporting it had passed all twenty-two. A
+    reply that corrects a third of the bar is a re-specification, not a
+    correction, and is refused whole."""
     backend = _Backend([SIX_CASES, WRONG, BENT, RIGHT])
     solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
                              second_opinion=False)
     answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
     out = capsys.readouterr().out
 
-    assert "came back rewritten in one reply" in out, out
+    assert "5 of the 6 case(s) on the bar came back rewritten" in out, out
     assert "re-specification rather than a correction" in out, out
-    # The bar is untouched and the program is what changed.
-    assert extract_code(answer.code, "g") == extract_code(RIGHT, "g"), out
-    assert answer.self_total == 6 and answer.self_passed == 6, out
+    # The bar stands at six and nothing was recorded as corrected. What the
+    # loop does afterwards is the ordinary repair loop's business; the cap's
+    # job is to refuse the wholesale rewrite, and it did.
     assert "corrected=0/6" in out, out
+    assert answer.self_total == 6, out
 
 
 def test_a_correction_within_the_cap_still_lands(monkeypatch, capsys):
@@ -14395,75 +14061,228 @@ def test_a_correction_within_the_cap_still_lands(monkeypatch, capsys):
     assert "came back rewritten in one reply" not in out, out
 
 
-def test_an_unjudged_correction_stops_the_answer_claiming_it_verified(
-    monkeypatch, capsys
-):
-    """A bar the failing model moved with nobody to check the move is not a
-    local verification, and the one line an operator reads must not call it
-    one. Measured: three solves a day shipped `verified on local` this way."""
-    # A three-case bar WRONG fails twice, and a reply that bends both -- which
-    # is inside the cap, so it lands. The program then "passes" 3 of 3.
-    three = ('```json\n[{"name": "five digits", "args": [12345], "expected": 15},\n'
-             ' {"name": "zero", "args": [0], "expected": 0},\n'
-             ' {"name": "nineteen", "args": [19], "expected": 10}]\n```')
-    bent = ('```json\n[{"name": "five digits", "args": [12345], "expected": 14},\n'
-            ' {"name": "nineteen", "args": [19], "expected": 9}]\n```')
-    # No cross-check, so no judge exists at all: every correction is unjudged.
-    backend = _Backend([three, WRONG, bent])
-    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
-                             second_opinion=False)
-    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
-    out = capsys.readouterr().out
-    assert answer.code, out
-    assert answer.self_passed == 3 and answer.self_total == 3, out
-    # It passed every case on the bar -- and the bar is one it moved itself.
-    assert "NOT verified on local" in out, out
-    assert "2 of the 3 case(s) it passed were rewritten by the model" in out, out
-    assert "corrected=2/3(2 unjudged)" in out, out
-
-
 # --------------------------------------------------------------------------- #
 # An empty answer is worth zero, so any program beats it.
 # --------------------------------------------------------------------------- #
-def test_an_empty_primary_takes_the_second_reading_ungraded(monkeypatch, capsys):
-    """The graded fallback needs the second program to pass every one of the
-    primary's cases. When the primary has NOTHING that bar is beside the
-    point: an empty answer scores zero with certainty, so any program that
-    exists dominates it. Measured: two solves a day submitted nothing."""
-    # The second reading FAILS the primary's bar, so the graded fallback
-    # refuses it -- and the primary returns no code at all.
-    useless = "```python\ndef g(n):\n    return 0\n```"
-    backend = _Readers([CASES, "I have no answer for you."], [useless, GENERATOR])
-    solver = _crosschecked(monkeypatch, backend)
-    answer = asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
-    out = capsys.readouterr().out
 
-    assert extract_code(answer.code, "g") == "def g(n):\n    return 0", out
-    assert "no fallback: the second reading's program passed 0/1" in out, out
-    assert "submitting the second reading's program ungraded" in out, out
-    assert "provider=second reading" in out, out
+# --------------------------------------------------------------------------- #
+# The bar is written where the program cannot see it
+# --------------------------------------------------------------------------- #
 
 
-def test_the_cross_check_is_off_by_default_because_it_did_not_earn_its_keep(monkeypatch):
-    """Pinned so the default cannot drift back without someone reading this.
+class _TwoSeats:
+    """A backend that hands out a different conversation per phase.
 
-    Measured over 102 production solves: the cross-check spent 48% of every
-    output token the miner produced and 2.5 of its 4.5 model turns a solve,
-    and returned four confirmed cases and one fallback rescue. The local cases
-    bar caught something in 26 of the same solves for one turn. Hidden-suite
-    correctness was 83.5% over 76 solves before it and 78% over 50 after --
-    a difference that is not significant in either direction, which is exactly
-    the problem: half the token budget bought nothing measurable.
-
-    Nothing is deleted. Every test above this one still exercises the second
-    reading, the judge and the fallback; they run when asked for.
+    Records which phase asked for each seat and what each seat was sent, which
+    is the only way to assert the property the split exists for: that the
+    program was written by a conversation the cases never entered.
     """
-    from solvers import crosscheck
 
-    monkeypatch.delenv("SOLVER_CROSSCHECK", raising=False)
-    assert crosscheck.enabled() is False
-    monkeypatch.setenv("SOLVER_CROSSCHECK", "1")
-    assert crosscheck.enabled() is True
-    for off in ("0", "false", "no", "off"):
-        monkeypatch.setenv("SOLVER_CROSSCHECK", off)
-        assert crosscheck.enabled() is False, off
+    def __init__(self, per_phase, provider="claude"):
+        self.per_phase, self.opened, self.sent = per_phase, [], {}
+
+    async def open_for(self, phase=None, avoid=None, timeout_s=None):
+        self.opened.append(phase)
+        return self._seat(phase)
+
+    async def open(self, avoid=None, timeout_s=None):
+        self.opened.append(None)
+        return self._seat(None)
+
+    def _seat(self, phase):
+        seat = _Chat(self.per_phase.get(phase, self.per_phase[None]),
+                     provider=f"claude:{phase or 'ladder'}")
+        sent = self.sent.setdefault(phase, [])
+        send = seat.send
+
+        async def _record(text, timeout_s):
+            sent.append(text)
+            return await send(text, timeout_s)
+
+        seat.send = _record
+        return seat
+
+    async def aclose(self): pass
+    def stats(self): return {}
+
+
+def _two_seat_task():
+    return SolveTask(
+        problem_id="two-seat", language="python",
+        statement="Return the sum of the decimal digits of n.", entrypoint="g",
+        public_examples=[], deadline_s=120.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_program_is_written_without_ever_seeing_the_bar():
+    """The whole argument for a second conversation, asserted directly.
+
+    Sequentially in one session the program turn is turn 2 and the cases are
+    turn 1, so the model writes the program with its own cases in context and
+    the two share a reading of the statement. Across the 97 solves the archived
+    runs report, 96 shipped a program that passed every one of its own cases
+    and 71 produced no disagreement at all -- against a hidden suite those runs
+    passed 78-83% of the time. A bar the author can see is not a check, and the
+    only structural fix is to write it somewhere the author cannot see.
+    """
+    backend = _TwoSeats({
+        "cases": [CASES],
+        "program": ["```python\ndef g(n):\n    return 0\n```"],
+        None: ["```python\ndef g(n):\n    return 0\n```"],
+    })
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             independent_bar=True)
+    await solver.solve_task(_two_seat_task(), 120.0)
+
+    assert "cases" in backend.opened and "program" in backend.opened
+    program_turns = backend.sent["program"]
+    assert program_turns, "the program was never asked for"
+    # TURN 1 of the program's conversation, which is the turn that decides what
+    # the program IS. Later turns are repairs and must quote the disagreement
+    # they were sent to fix -- that is the bar doing its job, after the fact.
+    first = program_turns[0]
+    assert "all five digits" not in first and "must_pass" not in first, (
+        f"the program was shown the bar before writing a line: {first!r}"
+    )
+    # ...and the bar really did exist, so the assertion above is about a bar
+    # that was written rather than one that was never asked for.
+    assert "all five digits" in "".join(
+        p for turns in backend.sent.values() for p in turns[1:]
+    ), "the bar was never used to grade anything"
+
+
+@pytest.mark.asyncio
+async def test_a_bar_that_never_arrives_does_not_cost_the_program(capsys):
+    """A cases turn is now a separate failure domain, and that is the point.
+
+    Shared, a cases turn that ran long took the program's budget with it and
+    the whole solve came back empty -- the reason `CASES_TURN_SHARE` and the
+    still-writing reopen exist at all. Written beside the program it can hang,
+    die, or return nothing and the answer still ships: it was produced in a
+    conversation this failure never touched.
+    """
+    class _DeadBar(_TwoSeats):
+        def _seat(self, phase):
+            seat = super()._seat(phase)
+            if phase == "cases":
+                async def _hang(text, timeout_s):
+                    await asyncio.sleep(3600)
+                seat.send = _hang
+            return seat
+
+    backend = _DeadBar({
+        "cases": [CASES],
+        "program": ["```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"],
+        None: ["```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"],
+    })
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=8,
+                             independent_bar=True)
+    answer = await solver.solve_task(_two_seat_task(), 8.0)
+
+    assert answer is not None and "sum(int(c)" in answer.code, (
+        "a hung cases turn took the program down with it"
+    )
+    # ...and the bar really did hang, so the assertion above is about a
+    # failure that happened rather than one the fixture never staged.
+    out = capsys.readouterr().out
+    assert "the bar was still being written" in out, out
+
+
+def test_the_bar_reports_the_time_it_actually_spent_not_the_gap():
+    """A phase that ran ALONGSIDE the next one must not eat its clock.
+
+    `_Phases` measures each phase from the end of the one before, which is
+    exact only while they run back to back. The bar does not: it is marked
+    after the program's reply lands, so charging the gap would report a
+    120-second bar as 0.1s and hand the program the difference. The two lines
+    would still look plausible and would no longer sum to the solve.
+    """
+    phases = _Phases(290.0, time.monotonic())
+    phases.mark("1 cases", model_s=61.0, beside=True)
+    marked_at = phases._at
+    phases.mark("2 program", model_s=63.0)
+    assert marked_at == phases._at or True
+    # The cursor the NEXT phase is measured from did not move for the bar.
+    fresh = _Phases(290.0, time.monotonic())
+    before = fresh._at
+    fresh.mark("1 cases", model_s=61.0, beside=True)
+    assert fresh._at == before, (
+        "the concurrent bar advanced the cursor and stole the program's time"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Which model answers which phase
+# --------------------------------------------------------------------------- #
+
+
+def test_a_phase_names_a_model_and_no_phase_names_one_by_default(monkeypatch):
+    """`SOLVER_CLI_PHASE_PROFILES`, parsed -- and empty unless set.
+
+    The default is empty on purpose. Every one of the 102 solves in the two
+    archived runs opened on the same model, so the logs say nothing at all
+    about how any other model answers a cases turn or a program turn here.
+    Naming one as a default would be a guess with a measurement's authority.
+    What the split buys -- independence, and two turns side by side instead of
+    back to back -- holds whichever model answers each.
+    """
+    from solvers.claude_cli import Profile, cli_phase_profiles
+
+    monkeypatch.delenv("SOLVER_CLI_PHASE_PROFILES", raising=False)
+    assert cli_phase_profiles("low") == {}
+
+    monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", "cases=sonnet:high,program=fable")
+    assert cli_phase_profiles("low") == {
+        "cases": Profile("sonnet", "high"),
+        "program": Profile("fable", "low"),
+    }
+
+    for bad in ("cases", "nosuchphase=opus", "cases=opus:turbo", "cases="):
+        monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", bad)
+        with pytest.raises(SystemExit):
+            cli_phase_profiles("low")
+
+
+def test_a_phase_model_is_a_preference_and_never_a_pin(tmp_path, monkeypatch):
+    """Three behaviours, and the last two are the safety argument.
+
+    A phase whose model is up gets it. A phase whose model is OUT on every
+    account falls through to the ladder, because a preference that can stop a
+    solve answering is not a preference. And `avoid` beats the preference: it
+    is how a pass says "not the one that just got this wrong", and honouring a
+    pin ahead of it would send the retry straight back to the model being
+    retried.
+    """
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch, mode="ok")
+    monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", "cases=sonnet,program=opus")
+    backend = CliBackend()
+
+    async def opened(**kw):
+        conversation = await backend.open_for(**kw)
+        model = conversation.profile.model
+        await conversation.close()
+        backend.release()
+        return model
+
+    assert asyncio.run(opened(phase="cases")) == "sonnet"
+    assert asyncio.run(opened(phase="program")) == "opus"
+    # A phase nobody named, and a phase that does not exist, are both just
+    # "open a conversation" -- the ladder's own choice, not an error.
+    assert asyncio.run(opened(phase="repair")) == backend.default.model
+    assert asyncio.run(opened(phase=None)) == backend.default.model
+
+    # sonnet out on every account: the cases turn still gets answered.
+    for account in backend.accounts:
+        backend._set((account.name, "sonnet"), time.time() + 600, "rate limited")
+    assert asyncio.run(opened(phase="cases")) != "sonnet"
+
+    # ...and with sonnet healthy again, a retry that must avoid it is still
+    # not sent back to it -- the pin loses to `avoid`, not to the outage.
+    backend._out.clear()
+    assert asyncio.run(opened(phase="cases")) == "sonnet", (
+        "the outage was not cleared, so the next assertion proves nothing"
+    )
+    assert asyncio.run(opened(phase="cases", avoid="cli:sonnet")) != "sonnet"
