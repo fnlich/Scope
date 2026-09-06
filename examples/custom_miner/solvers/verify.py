@@ -1170,6 +1170,27 @@ class _Plan:
         # measurable rather than guessable: without it there is no way to ask
         # whether the bar's model changed anything.
         self.bar_provider: Optional[str] = None
+        # What the FIRST grade found, before any repair: how many of the
+        # program's cases it failed the moment it was written. This is phase
+        # 3's trigger rate, and it is the number the correction phase turns on.
+        # Measured over the 102 archived solves, 76 of them never entered a
+        # correction round at all -- so the loop that converges 25 times out of
+        # 26 was only ever offered a quarter of the traffic, and the ~20 wrong
+        # answers those runs shipped are mostly among the 76 it never saw. A
+        # log that reports `rounds=1` cannot tell "the program was right" from
+        # "the cases could not tell", and those need opposite work.
+        self.disagreed: Optional[tuple[int, int]] = None
+        # Which condition ended the correction loop. Every exit is a `break`
+        # falling through to the same return, so without this the log says a
+        # solve stopped and never why.
+        self.exit = ""
+
+    def note_exit(self, reason: str) -> None:
+        """The FIRST reason wins: a pass that stopped is not restarted, and a
+        later pass of the same solve must not overwrite why the first one
+        ended."""
+        if not self.exit:
+            self.exit = reason
 
 # The most of what is left that the CASES turn may spend.
 #
@@ -1575,6 +1596,17 @@ class VerifyingSolver:
                 else ""
             )
             + f"rounds={plan.rounds} corrected={plan.corrected}/{best.self_total}"
+            # What the FIRST grade found and what ended the loop. `rounds=1`
+            # alone cannot tell a program that was right from one whose cases
+            # could not tell, and those need opposite work: 76 of the 102
+            # archived solves reported rounds=1, and most of that run's wrong
+            # answers are among them.
+            + (
+                f" disagreed={plan.disagreed[0]}/{plan.disagreed[1]}"
+                if plan.disagreed is not None
+                else " disagreed=none"
+            )
+            + (f" exit={plan.exit}" if plan.exit else "")
             + " "
             + f"{elapsed:.1f}s/{budget:.0f}s"
             + (f" id={_ident(task)}" if _ident(task) else "")
@@ -1663,6 +1695,8 @@ class VerifyingSolver:
         bar: list = []
         bar_task: Optional[asyncio.Task] = None
         bar_started = 0.0
+        # One retry of an empty cases turn, per pass. See where it fires.
+        bar_retried = False
         try:
             # BOUNDED by what is left. `BrowserFleet.open` waits for a free tab
             # up to `MINER_TAB_WAIT_S`, which ships at 120s, and nothing here
@@ -2034,6 +2068,8 @@ class VerifyingSolver:
                             else ""
                         )
                     )
+                    if plan is not None:
+                        plan.note_exit("budget")
                     break
                 if self._max_attempts and attempt > self._max_attempts:
                     print(
@@ -2045,6 +2081,8 @@ class VerifyingSolver:
                             else ""
                         )
                     )
+                    if plan is not None:
+                        plan.note_exit("maxattempts")
                     break
                 # Every round reads against EVERYTHING that is left. Earlier
                 # builds handed the first attempt a fraction (60% with public
@@ -2084,6 +2122,52 @@ class VerifyingSolver:
                         bar_task, bar, phases, budget, started, bar_started
                     )
                     bar_task, bar = None, []
+                    if not agreed and not bar_retried:
+                        # A bar that came back with nothing leaves the solve
+                        # with NOTHING TO GRADE: `self_total` is 0, there are
+                        # no failures, the loop breaks on the next line and the
+                        # answer ships ungraded. Measured over the 102 archived
+                        # solves, that is 5 of them -- phase 2 and phase 3 both
+                        # inert -- while the median solve hands back 134s of
+                        # its 290s unspent. One more ask is the cheapest thing
+                        # that budget can buy.
+                        #
+                        # ONCE, and only while the plan still believes a cases
+                        # turn is affordable here. Whatever made the first one
+                        # come back empty -- a refusal, a reply that carried no
+                        # JSON, a turn cut off -- belongs to the task and the
+                        # site as often as not, and `_Plan.two_phase` is where
+                        # that lesson already lives.
+                        bar_retried = True
+                        left_now = budget - (time.monotonic() - started)
+                        if (
+                            self._self_tests
+                            and (plan is None or plan.two_phase)
+                            and left_now > round_trip_floor
+                        ):
+                            print(
+                                f"[verify] the cases turn came back with "
+                                f"nothing, so there is no bar to grade against "
+                                f"and the repair loop has nothing to work on; "
+                                f"asking once more with {left_now:.0f}s left"
+                            )
+                            bar, bar_started = [], time.monotonic()
+                            retry = asyncio.create_task(
+                                self._write_the_bar(
+                                    bar, task, budget, started, avoid, plan
+                                )
+                            )
+                            agreed = await self._collect_bar(
+                                retry, bar, phases, budget, started,
+                                bar_started, beside=False,
+                                label="1 cases again",
+                            )
+                            bar = []
+                            if not agreed and plan is not None:
+                                # Twice is evidence about the task, not the
+                                # tab. The remaining passes go straight to the
+                                # program rather than paying for a third.
+                                plan.two_phase = False
                 # A repair reply may carry a CORRECTED case array: the repair
                 # prompt offers it outright ("or, if the case was wrong rather
                 # than the program, a `json` array holding ALL of the cases").
@@ -2278,6 +2362,20 @@ class VerifyingSolver:
                 # Before anything reads it: a round that could not be graded,
                 # or one graded against itself, must not report less about a
                 # program than an earlier round already established.
+                # The trigger rate, taken at the FIRST grade that actually
+                # ran the program against cases -- before any repair moved
+                # either side. `self_total` is zero when the round produced a
+                # defect or there were no cases, and neither of those is a
+                # disagreement, so both correctly leave this unset.
+                if (
+                    plan is not None
+                    and plan.disagreed is None
+                    and candidate.self_total
+                ):
+                    plan.disagreed = (
+                        candidate.self_total - candidate.self_passed,
+                        candidate.self_total,
+                    )
                 key = candidate.code.strip()
                 if key:
                     prior = judged.get(key)
@@ -2327,6 +2425,8 @@ class VerifyingSolver:
                 ):
                     best, best_provider = candidate, provider
                 if candidate.verified and not candidate.failures:
+                    if plan is not None:
+                        plan.note_exit("verified")
                     break
 
                 if getattr(conversation, "still_writing", False):
@@ -2361,6 +2461,8 @@ class VerifyingSolver:
                         )
                         + " rather than interrupting it with a repair prompt"
                     )
+                    if plan is not None:
+                        plan.note_exit("cutoff")
                     break
                 if not candidate.code.strip() and (
                     getattr(conversation, "empty_reason", None)
@@ -2413,6 +2515,8 @@ class VerifyingSolver:
                             else "asking elsewhere"
                         )
                     )
+                    if plan is not None:
+                        plan.note_exit("empty")
                     break
                 if duplicate:
                     # Same program, same failures: the round changed nothing.
@@ -2454,13 +2558,17 @@ class VerifyingSolver:
                             f"the tab is replaying an old reply rather than "
                             f"answering; submitting the last version"
                         )
+                        if plan is not None:
+                            plan.note_exit("stalled")
                         break
                 if not candidate.defect and not candidate.failures:
-                    # Nothing the model's OWN cases can say against it. That
-                    # is where the loop used to end, and where the second
-                    # reading begins: a program that agrees with its author's
-                    # reading of the statement has not yet been compared with
-                    # anyone else's.
+                    # Nothing the program's cases can say against it. Reported
+                    # as `converged`, and the summary line says beside it how
+                    # many cases DISAGREED to begin with -- because converging
+                    # from nothing and converging from four failures are the
+                    # same word here and very different evidence.
+                    if plan is not None:
+                        plan.note_exit("converged")
                     break
                 # Kept apart, not merged into one list of "problems": a defect
                 # means the code never ran, and the repair prompt has to say so
@@ -2586,7 +2694,7 @@ class VerifyingSolver:
 
     async def _collect_bar(
         self, bar_task, bar: list, phases, budget: float, started: float,
-        bar_started: float,
+        bar_started: float, beside: bool = True, label: str = "1 cases",
     ) -> list[dict]:
         """The independent cases turn's result, or an empty bar.
 
@@ -2641,7 +2749,13 @@ class VerifyingSolver:
                     await conversation.close()
                 except Exception:  # noqa: BLE001 - cleanup must not mask a result
                     pass
-        phases.mark("1 cases", model_s=spent, beside=True)
+        # `beside` only when it really ran beside the program. A RETRY does
+        # not: the program's turn has already returned by then, so the retry is
+        # sequential and must move the phase cursor like any other phase.
+        # Marking it alongside would leave the cursor behind it and charge the
+        # next correction round with the retry's seconds -- the same
+        # misreporting, pointed the other way.
+        phases.mark(label, model_s=spent, beside=beside)
         if cases:
             print(f"[verify] the bar holds {len(cases)} case(s), written "
                   f"without sight of the program")

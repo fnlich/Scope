@@ -14399,3 +14399,167 @@ async def test_the_bar_reports_its_own_turn_not_the_program_it_raced(capsys):
         f"{program_s}s and finished strictly later — that is the maximum of "
         f"the two wearing the bar's name\n{cases_line}\n{program_line}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# A bar that came back empty is asked for once more
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_an_empty_cases_turn_is_asked_once_more_before_shipping_ungraded(
+    capsys,
+):
+    """A cases turn that returns nothing leaves NOTHING to grade.
+
+    `agreed` is empty, so `self_total` is 0, so there are no failures, so the
+    loop breaks on its first pass and the answer ships having been run against
+    nothing at all: phase 2 and phase 3 are both inert. Measured over the 102
+    archived solves that is 5 of them, while the median solve hands back 134s
+    of its 290s unspent. One more ask is the cheapest thing that budget buys.
+    """
+    opened = []
+
+    class _EmptyFirst(_TwoSeats):
+        """The cases session says nothing usable the first time it is opened."""
+
+        def _seat(self, phase):
+            seat = super()._seat(phase)
+            if phase == "cases":
+                opened.append(phase)
+                if len(opened) == 1:
+                    async def _nothing(text, timeout_s):
+                        return "I could not write cases for this."
+                    seat.send = _nothing
+            return seat
+
+    backend = _EmptyFirst({
+        "cases": [CASES],
+        "program": [WRONG, RIGHT],
+        None: [WRONG, RIGHT],
+    })
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             independent_bar=True)
+    answer = await solver.solve_task(DIGITS, 120.0)
+
+    out = capsys.readouterr().out
+    assert "asking once more" in out, out
+    assert len(opened) == 2, f"the cases turn was asked {len(opened)} time(s)"
+    # ...and the retry actually bought a graded answer rather than a log line.
+    assert answer.self_total > 0, (
+        f"still shipped against nothing: self={answer.self_passed}/"
+        f"{answer.self_total}\n{out}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_empty_cases_turn_is_asked_once_and_not_forever(capsys):
+    """Twice is evidence about the TASK, not the tab.
+
+    Whatever makes a cases turn come back empty -- a refusal, a reply carrying
+    no JSON, a turn cut off -- belongs to the problem and the site as often as
+    not, so a third ask would repeat it. The remaining passes go straight to
+    the program, which is what `_Plan.two_phase` already encodes.
+    """
+    opened = []
+
+    class _AlwaysEmpty(_TwoSeats):
+        def _seat(self, phase):
+            seat = super()._seat(phase)
+            if phase == "cases":
+                opened.append(phase)
+
+                async def _nothing(text, timeout_s):
+                    return "no cases"
+                seat.send = _nothing
+            return seat
+
+    backend = _AlwaysEmpty({
+        "cases": [CASES],
+        "program": ["```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"],
+        None: ["```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"],
+    })
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             independent_bar=True)
+    answer = await solver.solve_task(DIGITS, 120.0)
+
+    assert len(opened) == 2, (
+        f"asked the cases turn {len(opened)} times; one retry, not a loop"
+    )
+    # The answer still ships -- an empty bar costs the grading, never the answer.
+    assert answer is not None and "sum(int(c)" in answer.code
+
+
+def test_the_summary_line_says_what_disagreed_and_why_the_loop_stopped(capsys):
+    """`rounds=1` cannot tell a program that was RIGHT from one whose cases
+    could not tell, and those need opposite work.
+
+    76 of the 102 archived solves reported rounds=1, and most of the ~20 wrong
+    answers those runs shipped are among them -- programs that agreed with
+    their own cases on the first try. Without the trigger rate on the line
+    there is no way to know that from a log, and the correction phase is being
+    tuned blind.
+    """
+    backend = _Backend([CASES, WRONG, RIGHT])
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             second_opinion=False)
+    asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    line = next(l for l in capsys.readouterr().out.splitlines()
+                if "entrypoint=" in l)
+    assert "disagreed=" in line, line
+    assert "exit=" in line, line
+    # WRONG fails the digit-sum case, so the first grade must record a
+    # disagreement rather than reporting none.
+    assert "disagreed=none" not in line, line
+    assert re.search(r"disagreed=[1-9]\d*/\d+", line), line
+
+
+@pytest.mark.asyncio
+async def test_the_retried_cases_turn_is_charged_to_itself_not_to_the_next_phase(
+    capsys,
+):
+    """The retry is SEQUENTIAL, and its phase line has to say so.
+
+    The first cases turn genuinely runs beside the program, so it reports its
+    own elapsed time and leaves the phase cursor where it was. A retry does
+    not: the program's turn has already returned by the time it is asked. Left
+    marked `alongside` it would hold the cursor behind it and hand its seconds
+    to whatever phase came next -- the same misreporting the concurrent bar
+    was fixed for, pointed the other way.
+    """
+    opened = []
+
+    class _SlowRetry(_TwoSeats):
+        def _seat(self, phase):
+            seat = super()._seat(phase)
+            if phase == "cases":
+                opened.append(phase)
+                if len(opened) == 1:
+                    async def _nothing(text, timeout_s):
+                        return "no cases"
+                    seat.send = _nothing
+                else:
+                    send = seat.send
+
+                    async def _slow(text, timeout_s):
+                        await asyncio.sleep(0.4)
+                        return await send(text, timeout_s)
+                    seat.send = _slow
+            return seat
+
+    backend = _SlowRetry({
+        "cases": [CASES],
+        "program": [WRONG, RIGHT],
+        None: [WRONG, RIGHT],
+    })
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             independent_bar=True)
+    await solver.solve_task(DIGITS, 120.0)
+
+    out = capsys.readouterr().out
+    retry = next((l for l in out.splitlines() if "1 cases again" in l), None)
+    assert retry is not None, f"the retry got no phase line of its own\n{out}"
+    assert "alongside" not in retry, (
+        f"a sequential retry reported itself as concurrent: {retry}"
+    )
+    assert float(re.search(r"took\s+([\d.]+)s", retry).group(1)) >= 0.4, retry

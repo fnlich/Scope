@@ -1484,6 +1484,64 @@ what make it safe to use at all:
   got this wrong*, and honouring a pin ahead of it would send the retry
   straight back to the model being retried.
 
+### The correction phase says what triggered it and why it stopped
+
+Phase 3 converges. Over the 102 archived solves it entered 26 of them and
+converged in 25 — it is not failing at its job. The trouble is what it never
+sees:
+
+```
+102 solves
+   76  (75%)  never entered a correction round at all   rounds=1
+   26  (25%)  entered one, and 25 of 26 converged
+    5         shipped with NO cases at all — nothing to grade, nothing to repair
+  ~20         wrong answers implied by the 78–83% hidden-suite rate
+```
+
+Most of those wrong answers are among the 76, not the 26. A program that agreed
+with its own cases on the first try and submitted is exactly what a wrong answer
+looks like from inside. **You cannot correct what never disagreed**, so the
+number that matters is not how well the loop converges but how often anything
+disagrees at all — and `rounds=1` cannot tell a program that was RIGHT from one
+whose cases could not tell.
+
+So the summary line carries both:
+
+```
+[verify] python entrypoint=g provider=cli:opus bar=cli:opus examples=0/0
+         self=18/18 verified=False rounds=1 corrected=0/18
+         disagreed=0/18 exit=converged  44.6s/290s id=…
+```
+
+- **`disagreed=N/M`** — how many cases the program failed on the FIRST grade,
+  before any repair moved either side. This is the trigger rate. `disagreed=none`
+  means no grade ever ran: a defect, or no cases at all.
+- **`exit=`** — which condition ended the loop: `converged`, `verified`,
+  `budget`, `stalled`, `cutoff`, `empty`, `maxattempts`. Every exit is a `break`
+  falling through to one return, so without this a log says a solve stopped and
+  never why.
+
+Read them together. `rounds=1 disagreed=0/18 exit=converged` is a program
+nothing could fault. `rounds=1 disagreed=none exit=converged` is a program
+nothing was ABLE to fault, which is the failure this instrumentation exists to
+count.
+
+### An empty cases turn is asked for once more
+
+A cases turn that comes back with nothing leaves the solve with nothing to
+grade: no cases, so no failures, so the loop breaks immediately and the answer
+ships having been run against nothing at all. Both later phases are inert.
+Measured, that is 5 of 102 solves — while the median solve hands back 134s of
+its 290s unspent.
+
+So it is asked once more, and once only. Whatever made the first turn come back
+empty — a refusal, a reply carrying no JSON, a turn cut off — belongs to the
+task and the site as often as to the tab, and a third ask would repeat it; after
+two the remaining passes go straight to the program, which is what
+`_Plan.two_phase` already encodes. An empty bar costs the grading, never the
+answer.
+
+
 ### A short deadline must still get an answer
 
 `TaskRequest.deadline_s` is only `Field(gt=0.0, le=3600.0)`. Nothing in the
