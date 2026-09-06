@@ -14442,3 +14442,28 @@ def test_an_empty_primary_takes_the_second_reading_ungraded(monkeypatch, capsys)
     assert "no fallback: the second reading's program passed 0/1" in out, out
     assert "submitting the second reading's program ungraded" in out, out
     assert "provider=second reading" in out, out
+
+
+def test_the_cross_check_is_off_by_default_because_it_did_not_earn_its_keep(monkeypatch):
+    """Pinned so the default cannot drift back without someone reading this.
+
+    Measured over 102 production solves: the cross-check spent 48% of every
+    output token the miner produced and 2.5 of its 4.5 model turns a solve,
+    and returned four confirmed cases and one fallback rescue. The local cases
+    bar caught something in 26 of the same solves for one turn. Hidden-suite
+    correctness was 83.5% over 76 solves before it and 78% over 50 after --
+    a difference that is not significant in either direction, which is exactly
+    the problem: half the token budget bought nothing measurable.
+
+    Nothing is deleted. Every test above this one still exercises the second
+    reading, the judge and the fallback; they run when asked for.
+    """
+    from solvers import crosscheck
+
+    monkeypatch.delenv("SOLVER_CROSSCHECK", raising=False)
+    assert crosscheck.enabled() is False
+    monkeypatch.setenv("SOLVER_CROSSCHECK", "1")
+    assert crosscheck.enabled() is True
+    for off in ("0", "false", "no", "off"):
+        monkeypatch.setenv("SOLVER_CROSSCHECK", off)
+        assert crosscheck.enabled() is False, off

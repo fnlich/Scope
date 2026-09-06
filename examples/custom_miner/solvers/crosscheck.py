@@ -87,7 +87,29 @@ def _flag(name: str, default: str = "") -> str:
 
 
 def enabled() -> bool:
-    raw = _flag("SOLVER_CROSSCHECK", "1").lower()
+    """Off by default, on measurement.
+
+    Over 102 production solves the cross-check spent 48% of every output token
+    the miner produced, 2.5 of its 4.5 model turns per solve, and 11% of all
+    solve time. What it returned in those 102 solves was four confirmed cases
+    -- the only verdict that forces a repair -- and one fallback rescue.
+
+    The local cases bar, which costs one turn, caught something in 26 of the
+    same 102 solves. It is six and a half times more productive per turn, and
+    it was already there.
+
+    Hidden-suite correctness did not improve either: 83.5% over 76 solves
+    before the cross-check, 78% over 50 after. That difference is not
+    statistically significant in
+    either direction, which is the point -- two model turns a solve bought no
+    measurable correctness, and a change that cannot be measured at this sample
+    size is not worth half the token budget.
+
+    `SOLVER_CROSSCHECK=1` turns it back on. Nothing was deleted: the second
+    reading, the judge and the fallback all still work, and if a later log
+    shows them earning their keep the default is one character away.
+    """
+    raw = _flag("SOLVER_CROSSCHECK", "0").lower()
     return raw not in ("0", "false", "no", "off")
 
 

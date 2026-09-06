@@ -1780,6 +1780,17 @@ needs no Docker; grading Rust needs the daemon.
 
 ## The second reading: what a program's own cases cannot say
 
+> **Off by default since it was measured.** Over 102 production solves the
+> cross-check spent 48% of every output token the miner produced, 2.5 of its
+> 4.5 model turns a solve, and 11% of all solve time. It returned four
+> confirmed cases and one fallback rescue. The local cases bar, which costs one
+> turn, caught something in 26 of the same 102 solves -- six and a half times
+> the yield per turn. Hidden-suite correctness was 83.5% over 76 solves before
+> it and 78% over 50 after, a difference not significant in either direction.
+> `SOLVER_CROSSCHECK=1` turns it back on; nothing below has been removed, and
+> the section stands as the record of what it does when enabled.
+
+
 Every answer above is graded against cases the same model wrote, and a model
 cannot confirm its own reading of a statement. Measured on this miner's
 archived answers: of 15 that could be re-graded independently, 2 passed every
