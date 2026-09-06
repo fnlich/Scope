@@ -46,16 +46,15 @@ are whole numbers are compared as integers for the same reason.
 
     python -m calibration.two_bar_overlap opus,sonnet <request>.json ...
 """
-import asyncio, json, os, sys, re
+import asyncio
+import json
+import os
+import sys
 sys.path.insert(0, '/home/user/Scope/examples/custom_miner')
 sys.path.insert(0, '/home/user/Scope')
 
 from solvers.claude_cli import CliBackend
 from solvers.prompts import build_tests_prompt, extract_self_tests
-from rlvr.execution.rust_judge import outputs_match
-
-NUM = re.compile(r'^-?\d+\.0+$')
-
 
 def norm(v, lang):
     """One comparable form, by language."""
@@ -85,7 +84,8 @@ async def bar(backend, task, model):
             task['public_examples']), 200.0)
         return extract_self_tests(r, task['entrypoint'], task['language'])
     finally:
-        await conv.close(); backend.release()
+        await conv.close()
+        backend.release()
 
 
 async def main(paths, models):
@@ -93,18 +93,22 @@ async def main(paths, models):
     tot_shared = tot_agreed = tot_contested = 0
     for p in paths:
         task = json.load(open(p))['request']
-        lang = task['language']; name = os.path.basename(p)[:8]
+        lang = task['language']
+        name = os.path.basename(p)[:8]
         try:
             got = await asyncio.gather(*[bar(backend, task, m) for m in models])
         except Exception as e:
-            print(f"{name}: FAILED {e}"); continue
+            print(f"{name}: FAILED {e}")
+            continue
         if not all(got):
-            print(f"{name} ({lang}): a bar came back empty; skipping"); continue
+            print(f"{name} ({lang}): a bar came back empty; skipping")
+            continue
         A = {key(c, lang): norm(c.get("expected"), lang) for c in got[0]}
         B = {key(c, lang): norm(c.get("expected"), lang) for c in got[1]}
         both = set(A) & set(B)
         agreed = {k for k in both if A[k] == B[k]}
-        tot_shared += len(both); tot_agreed += len(agreed)
+        tot_shared += len(both)
+        tot_agreed += len(agreed)
         tot_contested += len(both) - len(agreed)
         print(f"{name} ({lang:6s}) [{models[0]} {len(A)} | {models[1]} {len(B)}] "
               f"shared={len(both):2d}  AGREED={len(agreed):2d}  "
