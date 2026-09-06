@@ -1595,6 +1595,17 @@ ones that mattered:
   the model that refused. Read after the turn.
 - **A bar that timed out reported the time its wait *began*.** Measured at
   the end now.
+- **`rounds=` counted loop entries, not prompts sent.** The budget and
+  max-attempts breaks sit after the increment and send nothing, so every solve
+  ending either way reported one round more than it asked for.
+- **`close()` was not idempotent** while more than one owner calls it by
+  design, so each double release decremented the live-session count twice and
+  the clamp at zero hid the drift instead of reporting it.
+- **The line could describe a pass that lost.** A second pass runs with an
+  answer in hand whenever public examples ran and something failed; a pass that
+  then scored lower did not replace the answer but had already overwritten the
+  plan. `exit=`, `bar=`, `rounds=` and `corrected=` are snapshotted as a pass
+  wins, the way `provider=` always has been.
 - **`bar_task.cancel()` was fire-and-forget.** On Python 3.11 `asyncio.wait_for`
   can swallow a cancel that lands as its inner future completes — at the bar's
   slot acquire, that meant a cases turn nobody would read ran to the end of its

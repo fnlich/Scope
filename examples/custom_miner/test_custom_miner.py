@@ -14773,3 +14773,82 @@ def test_a_backend_failure_and_an_unanswered_cases_turn_each_record_their_exit(c
     asyncio.run(solver.solve_task(NO_EXAMPLES, 30.0))
     line = next(ln for ln in capsys.readouterr().out.splitlines() if "entrypoint=" in ln)
     assert "exit=cases" in line, line
+
+
+def test_rounds_counts_the_prompts_sent_not_the_loop_entries(capsys):
+    """The budget and max-attempts breaks sit between the top of the loop and
+    the send, so counting entries reported one round more than was ever asked
+    for on every solve that ended either way."""
+    # max-attempts: two prompts go out, the third entry breaks before sending
+    backend = _Backend([CASES, WRONG, WRONG, WRONG])
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             max_attempts=2, second_opinion=False)
+    asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "entrypoint=" in ln)
+    assert "exit=maxattempts" in line, line
+    assert "rounds=2 " in line, line
+
+
+@pytest.mark.asyncio
+async def test_closing_a_conversation_twice_releases_the_seat_once():
+    """`_collect_bar`'s finally and `_attempt`'s finally both close the bar's
+    conversation, and a close-then-reopen site leaves the old object bound
+    where a raising reopen closes it again. Each double release decremented
+    the live-session count twice, and the clamp at zero then hid the drift
+    rather than reporting it."""
+    from solvers.claude_cli import CliBackend
+
+    backend = CliBackend.__new__(CliBackend)      # no subprocess, no accounts
+    backend._live = 0
+    released = []
+    backend.release = lambda: (released.append(1), setattr(backend, "_live", max(0, backend._live - 1)))
+
+    from solvers.claude_cli import CliConversation
+    conv = CliConversation.__new__(CliConversation)
+    conv._backend = backend
+    conv._closed = False
+
+    await conv.close()
+    await conv.close()
+    await conv.close()
+    assert len(released) == 1, f"the seat was released {len(released)} times"
+
+
+def test_the_summary_line_describes_the_pass_that_shipped_not_one_that_lost(capsys):
+    """A second pass runs with an answer already IN HAND whenever public
+    examples ran and something failed. A pass that then scores lower does not
+    replace `best` -- but it did overwrite the plan, so the line described a
+    pass whose program was thrown away. `provider=` has always come from
+    `won_with` for this reason; `exit=`, `bar=` and `rounds=` now do too.
+    """
+    opens = []
+
+    class _WinThenLose(_Backend):
+        """Pass 1 answers and fails a public example, so a second pass runs.
+        Pass 2 goes blind, scores lower, and must not describe the solve."""
+
+        async def open(self, avoid=None, timeout_s=None):
+            opens.append(1)
+            if len(opens) == 1:
+                return _Chat([CASES, WRONG], self._provider)
+            chat = _Chat([""], self._provider)
+
+            async def _blind(text, timeout_s):
+                chat.empty_reason = "unreadable"
+                return ""
+            chat.send = _blind
+            return chat
+
+    solver = VerifyingSolver(_WinThenLose([]), reserve_s=0, max_budget_s=120)
+    answer = asyncio.run(solver.solve_task(DIGITS, 120.0))
+
+    assert len(opens) >= 2, f"only {len(opens)} pass(es) ran; the case needs two"
+    # Pass 1 spends three rounds and ends `empty` (its carried repair returns
+    # nothing), and its program is what ships. Pass 2 finds a dead tab and ends
+    # `cases` with no rounds at all, holding nothing.
+    assert "while n > 9" in answer.code, answer.code
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "entrypoint=" in ln)
+    assert "exit=empty" in line and "rounds=3" in line, (
+        f"the line describes the pass that lost, not the one that shipped: {line}"
+    )
+    assert "exit=cases" not in line and "rounds=0" not in line, line

@@ -1458,6 +1458,11 @@ class VerifyingSolver:
         # unattributable, which made "is one of these tabs doing worse than the
         # others" an unanswerable question.
         won_with: Optional[str] = None
+        # (exit, bar_provider, rounds, corrected) of the pass that produced
+        # `best`, or None when no pass ever beat the empty candidate it starts
+        # as -- every pass failed, and the LAST one's reason is then the only
+        # account of the solve there is. See where it is captured and resolved.
+        shipped: Optional[tuple] = None
         plan = _Plan()
         # A ceiling, not a plan. Every ordinary path breaks out after one or
         # two: the loop only keeps going while it is holding NOTHING, which is
@@ -1487,6 +1492,15 @@ class VerifyingSolver:
             if candidate is not None and candidate.score > best.score:
                 best = candidate
                 won_with = provider
+                # What the SHIPPING pass did, captured as it wins. A second
+                # pass runs with an answer already in hand whenever public
+                # examples ran and something failed, and a pass that then
+                # scores lower does not replace `best` -- but it did overwrite
+                # `plan`, so the line described a pass whose program was
+                # thrown away. `provider=` has always come from `won_with` for
+                # exactly this reason; these three now do too.
+                shipped = (plan.exit, plan.bar_provider, plan.rounds,
+                           plan.corrected)
             if best.verified and not best.failures:
                 break
             # Nothing RAN, whether or not anything was shipped to run. The
@@ -1592,11 +1606,17 @@ class VerifyingSolver:
                 self._cache[key] = (best.code, best.raw)
         else:
             self._counts["empty"] += 1
+        # Nothing ever won, so there is no shipping pass to describe: fall
+        # back to the last one, which is what `exit=failed` and `exit=cases`
+        # exist to report. Resolved here rather than at the capture so a solve
+        # that DID ship is never described by a later pass that lost.
+        if shipped is None:
+            shipped = (plan.exit, plan.bar_provider, plan.rounds, plan.corrected)
         elapsed = time.monotonic() - started
         print(
             f"[verify] {task.language} entrypoint={task.entrypoint} "
             f"provider={won_with or 'none'} "
-            + (f"bar={plan.bar_provider} " if plan.bar_provider else "")
+            + (f"bar={shipped[1]} " if shipped[1] else "")
             + f"examples={best.passed}/{best.total} "
             + (
                 f"self={best.self_passed}/{best.self_total} "
@@ -1620,7 +1640,7 @@ class VerifyingSolver:
                 if best.self_verified
                 else ""
             )
-            + f"rounds={plan.rounds} corrected={plan.corrected}/{best.self_total}"
+            + f"rounds={shipped[2]} corrected={shipped[3]}/{best.self_total}"
             # What the FIRST grade found and what ended the loop. `rounds=1`
             # alone cannot tell a program that was right from one whose cases
             # could not tell, and those need opposite work: 76 of the 102
@@ -1631,7 +1651,7 @@ class VerifyingSolver:
                 if plan.disagreed is not None
                 else " disagreed=none"
             )
-            + (f" exit={plan.exit}" if plan.exit else "")
+            + (f" exit={shipped[0]}" if shipped[0] else "")
             + " "
             + f"{elapsed:.1f}s/{budget:.0f}s"
             + (f" id={_ident(task)}" if _ident(task) else "")
@@ -2082,8 +2102,6 @@ class VerifyingSolver:
             )
             while True:
                 attempt += 1
-                if plan is not None:
-                    plan.rounds += 1
                 left = budget - (time.monotonic() - started)
                 if attempt > 1 and left < round_trip_floor:
                     # Not enough left to be worth another ROUND TRIP -- which is
@@ -2141,6 +2159,15 @@ class VerifyingSolver:
                 # No `extend_to_s`: `left` already runs to the point the
                 # answer stops being deliverable, so there is nothing past it to
                 # extend into.
+                # Counted HERE, where a prompt is about to go out -- not at the
+                # top of the loop, which counts entries. The budget and
+                # max-attempts breaks sit between the two and send nothing, so
+                # every solve that ended either way reported one round more
+                # than it asked for. Before the send rather than after it: a
+                # round whose send raises or is cut off was still asked, and
+                # `exit=cutoff` should not also lose its round.
+                if plan is not None:
+                    plan.rounds += 1
                 round_started = time.monotonic()
                 correction_refused = False
                 reply = await conversation.send(prompt, max(1.0, left))

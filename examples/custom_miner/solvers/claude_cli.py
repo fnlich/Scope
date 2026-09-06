@@ -576,6 +576,13 @@ class CliConversation:
         # The whole reply, when it arrived in one piece rather than as deltas.
         # See `_consume`: two event shapes carry it and neither used to be read.
         self._final_text = ""
+        # `close` is idempotent: `_collect_bar`'s finally and `_attempt`'s
+        # finally both close the bar's conversation "just in case", and a
+        # close-then-reopen site leaves the old object bound where a raising
+        # reopen would close it again. Every one of those double-releases
+        # decremented `_live` twice, and `release`'s clamp at zero then hid
+        # the drift instead of reporting it.
+        self._closed = False
         # The slice this turn was given, so the watchdog can tell a cut that
         # leaves room to re-ask from one that does not.
         self._slice_s = 0.0
@@ -1153,6 +1160,9 @@ class CliConversation:
             pass
 
     async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._backend.release()
 
 
