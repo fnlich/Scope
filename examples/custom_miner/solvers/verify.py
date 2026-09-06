@@ -367,7 +367,8 @@ class _Phases:
         now, wall = time.monotonic(), datetime.now()
         if beside:
             spent = model_s if model_s is not None else now - self._at
-            began = wall - timedelta(seconds=spent)
+            end_wall = wall if ended is None else wall - timedelta(seconds=now - ended)
+            began = end_wall - timedelta(seconds=spent)
         else:
             # `ended` is the monotonic instant the phase actually finished,
             # for the one caller that marks a phase AFTER a later one has
@@ -1199,9 +1200,10 @@ class _Plan:
         # fresh program cleared the same bar. Unlike `exit`, which describes
         # how the solve ended and so takes the LAST pass.
         self.disagreed: Optional[tuple[int, int]] = None
-        # Which condition ended the correction loop. Every exit is a `break`
-        # falling through to the same return, so without this the log says a
-        # solve stopped and never why.
+        # Which condition ended the correction loop. Every way out of the pass
+        # notes a reason before returning -- the seven `break`s, the cases
+        # turn that never answered, and the backend failure -- so the line
+        # never carries an earlier pass's reason for this one, or nothing.
         self.exit = ""
 
     def note_exit(self, reason: str) -> None:
@@ -1732,6 +1734,13 @@ class VerifyingSolver:
             # budget 40s, elapsed 50.1s, `open()` called at t=0 and t=25.1,
             # prompts sent 0.
             phases = _Phases(budget, started, pass_no, ident=_ident(task))
+            if plan is not None:
+                # Per pass, like `exit=`: the summary line describes the pass
+                # that shipped, and a second pass runs only after the first
+                # delivered nothing. Left accumulating, a solve whose first
+                # pass spent three rounds and died reported `rounds=4` for
+                # the one round its second pass actually took.
+                plan.rounds = 0
             conversation = await self._open_within(
                 budget, started, avoid, phase="program"
             )
@@ -1919,6 +1928,11 @@ class VerifyingSolver:
                         print(f"[verify] {left_after:.0f}s left; not asking for "
                               f"cases again this task, the remaining attempts "
                               f"go straight to the program")
+                    # The cases turn never answered, so no program was asked
+                    # for this pass. Unrecorded, `exit=` kept whatever an
+                    # earlier pass had left in it -- or nothing.
+                    if plan is not None:
+                        plan.note_exit("cases")
                     return best, best_provider
             prompt = build_code_prompt(
                 task.language, task.statement, task.entrypoint,
@@ -2312,6 +2326,13 @@ class VerifyingSolver:
                     allowed = max(2, len(agreed) // BULK_CORRECTION_SHARE)
                     if moved > allowed:
                         bulk_refusals += 1
+                        # A refused correction is not the model repeating
+                        # itself about the PROGRAM -- the program was never
+                        # asked for -- and the duplicate guard below must not
+                        # read it as one. Both setters of this flag went out
+                        # with the judge in d6c9fc6; this is the one that is
+                        # still needed.
+                        correction_refused = True
                         print(
                             f"[verify] {moved} of the {len(agreed)} case(s) "
                             f"on the bar came back rewritten in one reply, which is "
@@ -2336,6 +2357,13 @@ class VerifyingSolver:
                                 f"stand; if it still disagrees the loop keeps "
                                 f"going."
                             )
+                            # What the summary line's `corrected=` counts. The
+                            # increment went out with the judge in d6c9fc6 and
+                            # the line has printed 0 ever since; `moved` is the
+                            # number of cases whose expectation this reply
+                            # actually changed, counted above for the bulk cap.
+                            if plan is not None:
+                                plan.corrected += moved
                         # Kept even when the merge changed nothing, because
                         # `revised` is not only the new bar -- it is what tells
                         # the branches below that this reply carried CASES. A
@@ -2643,6 +2671,7 @@ class VerifyingSolver:
                     # being repaired never saw the bar when the bar is written
                     # elsewhere, and a repair round turns on exactly that.
                     bar_is_independent=self._independent_bar,
+                    failed_cases=candidate.failed_cases,
                 )
                 # Asking the same question a second time is worth doing -- a
                 # model is stochastic and the budget is there to spend on the
@@ -2675,12 +2704,15 @@ class VerifyingSolver:
                         stalled=stalled,
                         insist_on_program=insist,
                         bar_is_independent=self._independent_bar,
+                        failed_cases=candidate.failed_cases,
                     )
                 prompt = report
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a failed solve scores zero, never crashes
             print(f"[verify] backend failure: {type(exc).__name__}: {exc}")
+            if plan is not None:
+                plan.note_exit("failed")
         finally:
             # The bar's turn outlives the pass whenever the pass ended before
             # the program's first reply -- a backend failure, a cancelled
@@ -2695,6 +2727,25 @@ class VerifyingSolver:
                     await live.close()
                 except Exception:  # noqa: BLE001 - cleanup must not mask a result
                     pass
+            # Observe the cancellation, bounded, AFTER the closes so a cancel
+            # of this pass mid-wait cannot skip them. On this interpreter
+            # (3.11) `asyncio.wait_for` can swallow a cancel that lands in the
+            # loop iteration where its inner future has just completed -- at
+            # the bar's slot acquire, that means the cases turn spawns a
+            # child and runs to the end of its slice on the seat's quota,
+            # with nothing left holding a reference to cancel it again.
+            # Reproduced through this method with the real backend: cancels
+            # landing 1-3 iterations after the send began returned normally.
+            # So: wait a bounded moment, and if it is still running, cancel
+            # once more. The wait is `asyncio.wait`, which does not cancel
+            # what it waits on, and a cancel of THIS task during it
+            # propagates, as it should, with the re-cancel in the finally.
+            if bar_task is not None and not bar_task.done():
+                try:
+                    await asyncio.wait({bar_task}, timeout=6.0)
+                finally:
+                    if not bar_task.done():
+                        bar_task.cancel()
         return best, best_provider
 
     async def _write_the_bar(
@@ -2723,8 +2774,6 @@ class VerifyingSolver:
             budget, started, avoid, phase="cases"
         )
         holder.append(conversation)
-        if plan is not None:
-            plan.bar_provider = getattr(conversation, "provider", None)
         left = budget - (time.monotonic() - started)
         # Timed HERE, and handed back with the cases. Timing it where it is
         # collected instead measures from the bar's start to the moment the
@@ -2734,6 +2783,12 @@ class VerifyingSolver:
         # comparison the split exists to let an operator make.
         began = time.monotonic()
         cases = await self._ask_for_cases(conversation, task, max(1.0, left))
+        # Read AFTER the turn, not at open: the ladder may hop the
+        # conversation to another model inside the turn, and `bar=` on the
+        # summary line is the instrument for deciding which model should
+        # write the bar -- bound at open it credited the one that refused.
+        if plan is not None:
+            plan.bar_provider = getattr(conversation, "provider", None)
         return cases, time.monotonic() - began
 
     async def _collect_bar(
@@ -2763,7 +2818,7 @@ class VerifyingSolver:
         # How long the bar's own turn took, as measured beside it. Falls back
         # to the elapsed wall time only when the turn never reported one,
         # which is every path where there are no cases to report anyway.
-        spent = time.monotonic() - bar_started
+        spent: Optional[float] = None
         try:
             cases, spent = await asyncio.wait_for(
                 bar_task, timeout=max(1.0, left)
@@ -2778,6 +2833,9 @@ class VerifyingSolver:
             raise
         except asyncio.TimeoutError:
             bar_task.cancel()
+            # Measured NOW, when the wait ended -- not before it began, which
+            # reported a bar that ran out the budget as having taken no time.
+            spent = time.monotonic() - bar_started
             print(
                 f"[verify] the bar was still being written with only "
                 f"{ROUND_TRIP_FLOOR_S:.0f}s of the {budget:.0f}s budget left — "
@@ -2785,6 +2843,7 @@ class VerifyingSolver:
                 f"is graded against the public examples alone"
             )
         except Exception as exc:  # noqa: BLE001 - the program ships regardless
+            spent = time.monotonic() - bar_started
             print(f"[verify] the bar came back unusable ({exc}); the program "
                   f"is graded against the public examples alone")
         finally:
@@ -2805,7 +2864,11 @@ class VerifyingSolver:
         # Marking it alongside would leave the cursor behind it and charge the
         # next correction round with the retry's seconds -- the same
         # misreporting, pointed the other way.
-        phases.mark(label, model_s=spent, beside=beside)
+        phases.mark(
+            label,
+            model_s=spent if spent is not None else time.monotonic() - bar_started,
+            beside=beside,
+        )
         if cases:
             print(f"[verify] the bar holds {len(cases)} case(s), written "
                   f"without sight of the program")

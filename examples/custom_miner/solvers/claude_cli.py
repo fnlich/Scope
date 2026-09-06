@@ -515,6 +515,26 @@ class _Outage:
     reason: str
 
 
+async def _acquire_within(slot: asyncio.Semaphore, timeout_s: float) -> None:
+    """`slot.acquire()` under a timeout, without swallowing a cancel.
+
+    On 3.10/3.11 `asyncio.wait_for` handles an outer cancel with
+    `if fut.done(): return fut.result()` -- so a cancel that lands in the loop
+    iteration where the acquire has just completed returns the slot and drops
+    the CancelledError (CPython gh-86296, rewritten in 3.12). For a cases turn
+    being cancelled because its pass is over, that meant the turn went on to
+    spawn its child and run to the end of its slice. `asyncio.timeout` does
+    not have the swallow; where it is missing (3.10) the old call stands and
+    `_attempt`'s finally re-cancels.
+    """
+    timeout = getattr(asyncio, "timeout", None)
+    if timeout is None:
+        await asyncio.wait_for(slot.acquire(), timeout=timeout_s)
+        return
+    async with timeout(timeout_s):
+        await slot.acquire()
+
+
 class CliConversation:
     """One `claude` session, driven one turn per subprocess.
 
@@ -645,7 +665,7 @@ class CliConversation:
             # solve queued behind four others waited with no bound at all, and
             # the wait was invisible to every clock in `verify.py`.
             try:
-                await asyncio.wait_for(self._backend.slot.acquire(), timeout=max(0.0, left))
+                await _acquire_within(self._backend.slot, max(0.0, left))
             except asyncio.TimeoutError:
                 print(f"[cli] {self.provider}: no free slot inside {budget:.0f}s "
                       f"({self._backend.concurrency} allowed at once)")

@@ -14645,3 +14645,131 @@ async def test_a_cancelled_solve_closes_the_cases_conversation_exactly_once():
     assert closes == ["cases"], (
         f"the cases conversation was closed {len(closes)} time(s): {closes}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Audit fixes before production: what the repair loop lost with the judge, and
+# what the independent bar needs that the sequential one did not.
+# --------------------------------------------------------------------------- #
+from solvers.prompts import build_resume_prompt  # noqa: E402
+
+
+def _line(out):
+    return next(ln for ln in out.splitlines() if "entrypoint=" in ln)
+
+
+def test_F1_corrected_counts_a_landed_case_correction(capsys):
+    """d6c9fc6 removed `plan.corrected += landed`; the line printed 0 since."""
+    # cases -> WRONG program -> a reply that corrects the CASE -> done
+    corrected = CASES.replace('"expected": 15', '"expected": 14')
+    backend = _Backend([CASES, WRONG, corrected])
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120, second_opinion=False)
+    asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    line = _line(capsys.readouterr().out)
+    assert re.search(r"corrected=[1-9]", line), line
+
+
+def test_F2_a_bulk_refused_reply_is_not_scored_as_the_model_repeating_itself(capsys):
+    """Both `correction_refused = True` setters went out with the judge, so the
+    duplicate guard read a refused rewrite as the same program twice."""
+    backend = _Backend([SIX_CASES, WRONG, BENT, BENT, RIGHT])
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120, second_opinion=False)
+    asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    out = capsys.readouterr().out
+    assert "re-specification" in out, out
+    # a refused correction must NOT trip the duplicate/stalled path
+    assert "sent back the same program" not in out, out
+    assert "exit=stalled" not in _line(out), _line(out)
+
+
+def test_F3_rounds_is_per_pass_like_exit(capsys):
+    """`rounds=` describes the pass that shipped, as `exit=` already does. A
+    plan arriving at a pass with rounds left over from an earlier, abandoned
+    pass must not carry them onto the line."""
+    from solvers import verify as V
+    real = V.VerifyingSolver._attempt
+    async def spy(self, task, remaining, avoid=None, plan=None, pass_no=1):
+        if plan is not None and pass_no == 1:
+            plan.rounds = 7          # what an abandoned earlier pass would leave
+        return await real(self, task, remaining, avoid=avoid, plan=plan, pass_no=pass_no)
+    V.VerifyingSolver._attempt = spy
+    try:
+        backend = _Backend([CASES, WRONG, RIGHT])
+        solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120, second_opinion=False)
+        asyncio.run(solver.solve_task(NO_EXAMPLES, 120.0))
+    finally:
+        V.VerifyingSolver._attempt = real
+    line = _line(capsys.readouterr().out)
+    # this pass: program (WRONG) + one correction (RIGHT) = 2 rounds; 9 is the bug
+    assert re.search(r"rounds=[12]\b", line), line
+
+
+def test_F5_a_bar_that_times_out_reports_the_time_it_actually_took(capsys):
+    class _Slow(_TwoSeats):
+        def _seat(self, phase):
+            seat = super()._seat(phase)
+            if phase == "cases":
+                async def _hang(text, timeout_s):
+                    await asyncio.sleep(3600)
+                seat.send = _hang
+            return seat
+    backend = _Slow({"cases": [CASES], "program": [RIGHT], None: [RIGHT]})
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=8, independent_bar=True)
+    asyncio.run(solver.solve_task(DIGITS, 8.0))
+    out = capsys.readouterr().out
+    cases = next(ln for ln in out.splitlines() if "1 cases" in ln and "phase" in ln)
+    model_s = float(re.search(r"model ([\d.]+)s", cases).group(1))
+    # the bar waited ~ (8 - ROUND_TRIP_FLOOR) floored at 1s; reporting ~0 is the bug
+    assert model_s >= 0.9, cases
+
+
+def test_F7_the_repair_prompt_carries_the_whole_failing_case_under_the_independent_bar():
+    long_stdin = "3\n" + "1 2 3\n" * 60          # far past the 160-char clip
+    case = {"args": [long_stdin], "kwargs": {}, "expected": "6\n", "name": "long"}
+    clipped = f"stdin={long_stdin[:157]!r}..."
+    p = build_repair_prompt([clipped + " -> got 0, expected 6"], "rust", "main",
+                            from_self_tests=True, bar_is_independent=True,
+                            failed_cases=[case])
+    assert long_stdin[-20:] in p or "1 2 3\\n1 2 3\\n" in p, "full stdin not in prompt"
+    assert "in full" in p
+
+
+def test_F9_the_resume_prompt_does_not_call_the_bar_the_models_own_when_it_is_not():
+    p = build_resume_prompt("python", "sum digits", "g", [], [dict(NO_EXAMPLES.__dict__).get("x") or
+                            {"args": [7], "kwargs": {}, "expected": 7, "name": "seven"}],
+                            "def g(n): return 0", ["g(7) -> 0, expected 7"],
+                            from_self_tests=True, bar_is_independent=True)
+    assert "YOUR OWN cases" not in p, "still claims the bar is the model's own"
+    assert "has not seen your program" in p
+
+
+def test_a_backend_failure_and_an_unanswered_cases_turn_each_record_their_exit(capsys):
+    """Two ways out of a pass that never reached a `break`, and so never
+    recorded why. Left unrecorded, `exit=` printed whatever an earlier pass
+    had left in it -- or nothing at all -- for exactly the solves an operator
+    most needs explained."""
+    # A: the backend raises mid-solve -> exit=failed
+    class _Raises(_Backend):
+        async def open(self, avoid=None, timeout_s=None):
+            raise RuntimeError("seat gone")
+    solver = VerifyingSolver(_Raises([RIGHT]), reserve_s=0, max_budget_s=30,
+                             second_opinion=False)
+    asyncio.run(solver.solve_task(NO_EXAMPLES, 30.0))
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "entrypoint=" in ln)
+    assert "exit=failed" in line, line
+
+    # B: sequential shape, the cases turn comes back unreadable -> exit=cases
+    class _BlindCases(_Backend):
+        async def open(self, avoid=None, timeout_s=None):
+            chat = _Chat(self._replies, self._provider)
+            async def _blind(text, timeout_s):
+                chat.empty_reason = "unreadable"
+                return ""
+            chat.send = _blind
+            return chat
+    solver = VerifyingSolver(_BlindCases([CASES, RIGHT]), reserve_s=0,
+                             max_budget_s=30, second_opinion=False,
+                             independent_bar=False)
+    asyncio.run(solver.solve_task(NO_EXAMPLES, 30.0))
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "entrypoint=" in ln)
+    assert "exit=cases" in line, line

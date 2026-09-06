@@ -1523,9 +1523,10 @@ So the summary line carries both:
   first, because the question is whether the bar found anything on this task —
   unlike `exit=`, which describes how the solve ended and so reports the last.
 - **`exit=`** — which condition ended the loop: `converged`, `verified`,
-  `budget`, `stalled`, `cutoff`, `empty`, `maxattempts`. Every exit is a `break`
-  falling through to one return, so without this a log says a solve stopped and
-  never why.
+  `budget`, `stalled`, `cutoff`, `empty`, `maxattempts`, plus `cases` (the cases
+  turn never answered, so no program was asked for) and `failed` (the backend
+  raised). Every way out of a pass records one, so the line never carries an
+  earlier pass's reason for this one, or nothing.
 
 Read them together. `rounds=1 disagreed=0/18 exit=converged` is a program
 nothing could fault. `rounds=1 disagreed=none exit=converged` is a program
@@ -1562,6 +1563,45 @@ solve. Measured before this was right, the retry printed `took 0.7s` for a
 0.4s turn and the program `took 0.2s` for a 0.3s one — the program's time
 credited to the retry — because phases were being marked in a different order
 from the one they ran in.
+
+### What an audit before production found, and fixed
+
+Thirty findings from six independent readers of the shipped code, each one
+adversarially verified against the real source before it was acted on. The
+ones that mattered:
+
+- **`corrected=` had printed 0 since `d6c9fc6`.** Removing the judge removed
+  the one line that incremented it. The production logs' `corrected=1…15`
+  all predate that commit. It counts again, from the same `moved` figure the
+  bulk cap already computes.
+- **A bulk-refused correction was scored as the model repeating itself.**
+  Both `correction_refused = True` setters went out with the judge; the
+  duplicate guard then read a refused rewrite as the same program twice and
+  could end the pass as `stalled`. The one setter still needed is back.
+- **Under the independent bar, a Rust repair could not see its input.** The
+  failure line clips stdin to 160 characters, which was a summary when the
+  model had the full case one turn back in its own context and is the *only*
+  thing it knows when the case was written elsewhere. The repair prompt now
+  carries the failing case(s) in full, exactly as the grader runs them — so
+  the model can reproduce the failure, and a corrected case can match the
+  original by key.
+- **The resume prompt contradicted itself.** Carried to a fresh conversation
+  it said `YOUR OWN cases` in `<must_pass>` and *someone who has not seen
+  your program* a paragraph later. The block now says whose they are.
+- **`rounds=` accumulated across passes** while `exit=` described only the
+  last; a solve whose first pass spent three rounds and died reported
+  `rounds=4` for its second pass's one. Per pass now, like `exit=`.
+- **`bar=` was bound at open.** A ladder hop inside the bar's turn credited
+  the model that refused. Read after the turn.
+- **A bar that timed out reported the time its wait *began*.** Measured at
+  the end now.
+- **`bar_task.cancel()` was fire-and-forget.** On Python 3.11 `asyncio.wait_for`
+  can swallow a cancel that lands as its inner future completes — at the bar's
+  slot acquire, that meant a cases turn nobody would read ran to the end of its
+  slice on the seat's quota. Reproduced through `_attempt` with the real
+  backend. The slot acquire no longer uses the swallowing form, and the pass's
+  cleanup observes the cancellation, bounded, and cancels once more if it was
+  swallowed.
 
 
 ### A short deadline must still get an answer
