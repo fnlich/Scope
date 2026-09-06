@@ -1191,6 +1191,13 @@ class _Plan:
         # answers those runs shipped are mostly among the 76 it never saw. A
         # log that reports `rounds=1` cannot tell "the program was right" from
         # "the cases could not tell", and those need opposite work.
+        #
+        # The first grade of the SOLVE, not of the pass that shipped. A second
+        # pass runs only after the first failed to deliver, and this asks
+        # whether the bar found anything on this task at all -- so a 3/18 from
+        # an abandoned first pass is the answer even when the second pass's
+        # fresh program cleared the same bar. Unlike `exit`, which describes
+        # how the solve ended and so takes the LAST pass.
         self.disagreed: Optional[tuple[int, int]] = None
         # Which condition ended the correction loop. Every exit is a `break`
         # falling through to the same return, so without this the log says a

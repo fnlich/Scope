@@ -1515,7 +1515,13 @@ So the summary line carries both:
 
 - **`disagreed=N/M`** — how many cases the program failed on the FIRST grade,
   before any repair moved either side. This is the trigger rate. `disagreed=none`
-  means no grade ever ran: a defect, or no cases at all.
+  means no grade ever ran: a defect, no cases at all, or an executor that could
+  not run them — on a Rust box without Docker that is every Rust solve, and the
+  line then says `rounds=1 disagreed=none exit=converged` for an answer nothing
+  was able to check. It is the first grade
+  of the *solve*: when a second pass runs, it reports what the bar found on the
+  first, because the question is whether the bar found anything on this task —
+  unlike `exit=`, which describes how the solve ended and so reports the last.
 - **`exit=`** — which condition ended the loop: `converged`, `verified`,
   `budget`, `stalled`, `cutoff`, `empty`, `maxattempts`. Every exit is a `break`
   falling through to one return, so without this a log says a solve stopped and
