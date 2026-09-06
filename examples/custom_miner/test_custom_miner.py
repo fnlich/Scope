@@ -14340,3 +14340,62 @@ async def test_the_split_carries_its_framing_into_the_repair_the_model_reads():
     assert repairs, f"no repair round was sent: {backend.sent!r}"
     assert any("without seeing your program" in p for p in repairs), repairs[0]
     assert not any("the test cases you sent" in p for p in repairs), repairs[0]
+
+
+@pytest.mark.asyncio
+async def test_the_bar_reports_its_own_turn_not_the_program_it_raced(capsys):
+    """The bar's time must be the BAR's, even when the program is slower.
+
+    Timed where it is collected rather than where it runs, the number is the
+    span from the bar's start to the moment the program's turn finished and got
+    round to awaiting it -- `max(bar, program)`, which reads as the bar
+    whenever the program is the slower of the two. Three of the five archived
+    split runs are exactly that case, and their logs reported the bar as having
+    taken what the program took. Comparing those two phases is the one thing
+    the split exists to let an operator do, so a number that silently reports
+    the larger of them is worse than no number.
+    """
+    bar_done = asyncio.Event()
+
+    class _Racing(_TwoSeats):
+        """The bar finishes at once; the program only after it, and slowly."""
+
+        def _seat(self, phase):
+            seat = super()._seat(phase)
+            send = seat.send
+            if phase == "cases":
+                async def _quick(text, timeout_s):
+                    reply = await send(text, timeout_s)
+                    bar_done.set()
+                    return reply
+                seat.send = _quick
+            elif phase == "program":
+                async def _slow(text, timeout_s):
+                    await bar_done.wait()
+                    await asyncio.sleep(0.4)
+                    return await send(text, timeout_s)
+                seat.send = _slow
+            return seat
+
+    backend = _Racing({
+        "cases": [CASES],
+        "program": ["```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"],
+        None: ["```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"],
+    })
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             independent_bar=True)
+    await solver.solve_task(_two_seat_task(), 120.0)
+
+    out = capsys.readouterr().out
+    cases_line = next(l for l in out.splitlines() if "1 cases" in l)
+    program_line = next(l for l in out.splitlines() if "2 program" in l)
+    cases_s = float(re.search(r"model ([\d.]+)s", cases_line).group(1))
+    program_s = float(re.search(r"model ([\d.]+)s", program_line).group(1))
+    # The program was made to take at least 0.4s longer than the bar, so a bar
+    # timed at collection would report AT LEAST the program's number.
+    assert program_s >= 0.4, program_line
+    assert cases_s < program_s, (
+        f"the bar reported {cases_s}s against a program that took "
+        f"{program_s}s and finished strictly later — that is the maximum of "
+        f"the two wearing the bar's name\n{cases_line}\n{program_line}"
+    )

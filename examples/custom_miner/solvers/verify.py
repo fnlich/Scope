@@ -2548,8 +2548,10 @@ class VerifyingSolver:
     async def _write_the_bar(
         self, holder: list, task, budget: float, started: float,
         avoid: Optional[str], plan,
-    ) -> Optional[list]:
+    ) -> tuple[Optional[list], float]:
         """Open a conversation of the bar's own and ask it for the cases.
+
+        Returns the cases and how long the TURN itself took.
 
         Runs as a task beside the program turn, which is why the open is in
         here: a backend that queues would otherwise make the program wait for
@@ -2572,7 +2574,15 @@ class VerifyingSolver:
         if plan is not None:
             plan.bar_provider = getattr(conversation, "provider", None)
         left = budget - (time.monotonic() - started)
-        return await self._ask_for_cases(conversation, task, max(1.0, left))
+        # Timed HERE, and handed back with the cases. Timing it where it is
+        # collected instead measures from the bar's start to the moment the
+        # program's turn happened to finish and got round to awaiting it --
+        # which is `max(bar, program)`, not the bar, and reads as the bar
+        # whenever the program is the slower of the two. That is the one
+        # comparison the split exists to let an operator make.
+        began = time.monotonic()
+        cases = await self._ask_for_cases(conversation, task, max(1.0, left))
+        return cases, time.monotonic() - began
 
     async def _collect_bar(
         self, bar_task, bar: list, phases, budget: float, started: float,
@@ -2598,8 +2608,14 @@ class VerifyingSolver:
         """
         left = budget - (time.monotonic() - started) - ROUND_TRIP_FLOOR_S
         cases: Optional[list] = None
+        # How long the bar's own turn took, as measured beside it. Falls back
+        # to the elapsed wall time only when the turn never reported one,
+        # which is every path where there are no cases to report anyway.
+        spent = time.monotonic() - bar_started
         try:
-            cases = await asyncio.wait_for(bar_task, timeout=max(1.0, left))
+            cases, spent = await asyncio.wait_for(
+                bar_task, timeout=max(1.0, left)
+            )
         except asyncio.CancelledError:
             # The SOLVE was cancelled, not the bar. `wait_for` raises the same
             # exception either way, and swallowing it here would leave a
@@ -2625,9 +2641,7 @@ class VerifyingSolver:
                     await conversation.close()
                 except Exception:  # noqa: BLE001 - cleanup must not mask a result
                     pass
-        phases.mark(
-            "1 cases", model_s=time.monotonic() - bar_started, beside=True
-        )
+        phases.mark("1 cases", model_s=spent, beside=True)
         if cases:
             print(f"[verify] the bar holds {len(cases)} case(s), written "
                   f"without sight of the program")
