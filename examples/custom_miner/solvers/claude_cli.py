@@ -124,15 +124,30 @@ LIMIT_RECHECK_S = 1800.0
 # for the conversations already on it. SOLVER_CLI_SWITCH_AT.
 SWITCH_AT = 0.95
 
-# A turn that has emitted this many events without one character of the
-# answer, for this long, is not writing. Both gates matter: the time alone
-# would cut a model that thinks before it writes, and the event count alone
-# would cut a quiet-but-healthy stream. Together they name the heartbeat.
+# How long a turn may stream events without one character of the answer
+# before it is cut as not writing -- OFF, and the measurement that turned it
+# off is the reason there is no other number here.
 #
-# The threshold is deliberately well past any first token seen in practice,
-# because the cost of cutting a working turn is a wasted round trip while the
-# cost of not cutting a wedged one is the entire solve. SOLVER_CLI_FIRST_TEXT_S.
-FIRST_TEXT_S = 120.0
+# It shipped at 120s, chosen as "well past any first token seen in practice".
+# It was not. Across 238 first-texts in one production day: p50 26s, p90 62s,
+# p95 75s, MAX 119s. The threshold sat one second above the observed maximum,
+# so the tail of the ordinary distribution crossed it -- and every one of the
+# thirteen cuts that day fired at 120-122s with zero retries, which is what a
+# healthy long think looks like and not what a wedged stream looks like.
+#
+# What the cut then bought is on the same log: after one, the rung hopped to
+# reported `first text after 119s`. The hop did not find a faster answer, it
+# restarted the same wait, and the second one was one second from being cut
+# too. Three rehearsal solves later showed the end of it -- two hops at 120s
+# each, ~241s of a 290s budget spent discovering nothing, and both solves
+# submitted NOTHING AT ALL.
+#
+# There is one deadline on a turn and it is the response deadline the caller
+# passes in. A turn that truly never speaks is bounded by it and reported as
+# unfinished, keeping whatever arrived; that costs the turn. This cut cost the
+# solve. Set SOLVER_CLI_FIRST_TEXT_S to a positive number of seconds to arm it
+# again -- the machinery below is unchanged and still tested.
+FIRST_TEXT_S = 0.0
 SILENT_EVENTS = 60
 # ...and only when enough of the slice is left for the next rung to do
 # something with it. Cutting a wedged turn at the buzzer buys nothing and
@@ -1079,12 +1094,20 @@ class CliConversation:
     def _check_silent(self) -> None:
         """Raise `_Silent` on a turn that is streaming a heartbeat and no answer.
 
-        Four conditions, and every one of them is load-bearing:
+        Off unless `SOLVER_CLI_FIRST_TEXT_S` arms it, because no threshold
+        that fits the measured first-text distribution leaves room to tell a
+        long think from a wedge -- see `FIRST_TEXT_S`.
+
+        Armed, four conditions, and every one of them is load-bearing:
         nothing of the answer has arrived, enough events have gone by to know
         the stream is alive rather than merely slow, enough time has passed to
-        be well clear of a model that thinks first, and enough of the slice is
+        be well clear of a reply that thinks first, and enough of the slice is
         left that hopping can still produce something.
         """
+        if self._first_text_after <= 0:
+            # Disarmed, which is the default: see `FIRST_TEXT_S`. The turn is
+            # bounded by the response deadline alone, like every other wait.
+            return
         if self._text_chars or self._final_text:
             return
         if self._events < SILENT_EVENTS:

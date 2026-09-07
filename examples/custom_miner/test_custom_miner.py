@@ -14998,3 +14998,69 @@ def test_authentication_failed_is_read_as_an_auth_failure():
     assert classify("overloaded") == "server"
     assert classify("rate limit reached") == "limit"
     assert classify("ECONNRESET") == "server"
+
+
+def test_a_long_think_is_not_cut_as_a_silent_turn_by_default(
+    tmp_path, monkeypatch
+):
+    """The threshold sat one second above the measured maximum first-text.
+
+    238 first-texts over a production day: p50 26s, p90 62s, p95 75s, max
+    119s, against a cut at 120s. So the cut fired on the tail of the ORDINARY
+    distribution, and the log shows exactly that -- thirteen cuts, every one
+    at 120-122s with zero retries, and the rung one of them hopped to then
+    reported `first text after 119s`. Two of three rehearsal solves that hit
+    it twice submitted nothing at all.
+
+    Nothing distinguishes a long think from a wedge at any threshold that
+    distribution leaves room for, so there is no threshold: the turn is
+    bounded by the response deadline, and by that alone."""
+    from solvers.claude_cli import CliBackend, SILENT_EVENTS
+
+    _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.delenv("SOLVER_CLI_FIRST_TEXT_S", raising=False)
+    backend = CliBackend()
+    conversation = asyncio.run(backend.open())
+
+    # A stream that has been alive and wordless for ten minutes, with an hour
+    # of slice left -- past every gate the armed watchdog reads.
+    conversation._turn_started = time.monotonic() - 600.0
+    conversation._events = SILENT_EVENTS * 10
+    conversation._text_chars = 0
+    conversation._final_text = ""
+    conversation._slice_s = 3600.0
+    conversation._check_silent()   # must not raise
+
+    # And the operator can still arm it, for the same conversation.
+    monkeypatch.setenv("SOLVER_CLI_FIRST_TEXT_S", "45")
+    armed = asyncio.run(backend.open())
+    assert armed._first_text_after == 45.0, armed._first_text_after
+
+
+def test_the_response_deadline_still_cuts_a_turn_that_never_speaks(
+    tmp_path, monkeypatch, capsys
+):
+    """Disarming the first-text cut must not leave a wedged turn unbounded.
+
+    The response deadline is the one deadline that remains, so a stream that
+    never says a word ends at the slice, is reported as unfinished rather
+    than as silent, and costs the turn instead of the solve."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.delenv("SOLVER_CLI_FIRST_TEXT_S", raising=False)
+    _cli_modes(log, {"*": "heartbeat"})
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open()
+        started = time.monotonic()
+        return await conversation.send("solve it", 3.0), time.monotonic() - started
+
+    body, spent = asyncio.run(go())
+    out = capsys.readouterr().out
+    assert body == "", out
+    assert "did not finish inside" in out, out
+    assert "has sent no answer text at all" not in out, out
+    # Bounded by the slice it was given, and not by a second clock.
+    assert 3.0 <= spent < 12.0, (spent, out)
