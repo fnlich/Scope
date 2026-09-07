@@ -460,12 +460,24 @@ def _render_examples(language: str, examples: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+OWN_CASES_NOTE = (
+    "YOUR OWN cases from the previous message. Every one of these is RUN "
+    "against your program before it is submitted."
+)
+INDEPENDENT_CASES_NOTE = (
+    "Test cases written from the same statement by someone who has not seen "
+    "your program. Every one of these is RUN against your program before it "
+    "is submitted."
+)
+
+
 def build_code_prompt(
     language: str,
     statement: str,
     entrypoint: str,
     examples: list[dict[str, Any]],
     cases: Optional[Sequence[dict[str, Any]]] = None,
+    cases_note: Optional[str] = None,
 ) -> str:
     """Turn 2: ask for the program, and only the program.
 
@@ -526,10 +538,14 @@ def build_code_prompt(
         #
         # Last in the message, which is where it belongs: it is what the
         # program has to clear, read immediately before the program is written.
+        # `cases_note` says WHOSE these are. Sequentially they are the model's
+        # own, one turn back; carried to a fresh conversation under the
+        # independent bar they are not, and a message that says "YOUR OWN"
+        # here and "someone who has not seen your program" a paragraph later
+        # is contradicting itself about the one fact the round turns on.
         parts += [
             "",
-            '<must_pass note="YOUR OWN cases from the previous message. Every '
-            'one of these is RUN against your program before it is submitted.">',
+            f'<must_pass note="{cases_note or OWN_CASES_NOTE}">',
             _render_cases(given, language, entrypoint),
             "</must_pass>",
         ]
@@ -546,6 +562,7 @@ def build_resume_prompt(
     failures: list[str],
     defect: Optional[str] = None,
     from_self_tests: bool = False,
+    bar_is_independent: bool = False,
 ) -> str:
     """A repair round for a conversation that no longer exists.
 
@@ -561,9 +578,13 @@ def build_resume_prompt(
     turn 2 states it, the program that was produced, and what happened when it
     ran. A fresh tab has no history, so nothing here may assume any.
     """
-    base = build_code_prompt(language, statement, entrypoint, examples, cases=cases)
+    base = build_code_prompt(
+        language, statement, entrypoint, examples, cases=cases,
+        cases_note=INDEPENDENT_CASES_NOTE if bar_is_independent else None,
+    )
     report = build_repair_prompt(
-        failures, language, entrypoint, defect=defect, from_self_tests=from_self_tests
+        failures, language, entrypoint, defect=defect,
+        from_self_tests=from_self_tests, bar_is_independent=bar_is_independent,
     )
     return "\n".join([
         base,
@@ -579,6 +600,28 @@ def build_resume_prompt(
     ])
 
 
+def _ran_against(target: str, independent: bool) -> str:
+    """How to describe the bar to the conversation being asked to repair.
+
+    It has to be TRUE, and which sentence is true depends on where the cases
+    were written. Sequentially they are the model's own, one turn back, and
+    "the test cases you sent" is exact. Written beside the program in another
+    conversation they are not: that model never saw them, never sent them, and
+    telling it otherwise is a false premise about the one thing the round turns
+    on. The two framings also ask for different reasoning -- "one of my two
+    answers is wrong" versus "someone else read this statement differently" --
+    and the second is the true one when the bar is independent, which is the
+    whole reason the bar is written elsewhere.
+    """
+    if independent:
+        return (
+            f"Someone else read the same statement and wrote test cases from "
+            f"it, without seeing your program. I ran {target} against them "
+            f"and got:"
+        )
+    return f"I ran {target} against the test cases you sent and got:"
+
+
 def build_repair_prompt(
     failures: list[str],
     language: str,
@@ -587,6 +630,8 @@ def build_repair_prompt(
     from_self_tests: bool = False,
     stalled: int = 0,
     insist_on_program: bool = False,
+    bar_is_independent: bool = False,
+    failed_cases: Optional[Sequence[dict[str, Any]]] = None,
 ) -> str:
     """Ask for a fix, quoting the concrete failures the local grader found.
 
@@ -637,6 +682,18 @@ def build_repair_prompt(
     repetition is what makes the next round a different question -- still not
     method, and still no advice about the problem itself.
     """
+    detail = "\n".join(f"  - {line}" for line in failures)
+    if bar_is_independent and failed_cases:
+        # The conversation being repaired has NEVER seen these cases: the
+        # failure line above is the only thing it knows about the input, and
+        # for Rust that line clips the stdin to 160 characters. A model that
+        # cannot see the whole input cannot reproduce the failure, and a
+        # corrected case it sends back cannot match the original by key. So
+        # the failing case(s) go in whole, exactly as the grader runs them.
+        detail += (
+            "\n\nThe failing case(s) in full, exactly as they are run:\n"
+            + _render_cases(list(failed_cases), language, entrypoint)
+        )
     if defect == NO_CODE:
         body = (
             "Your previous reply did not reach me as code. I can only read the "
@@ -666,32 +723,32 @@ def build_repair_prompt(
         # true here. Telling a model that re-sent identical code that it had
         # "already corrected the cases" is a false premise, and a false premise
         # is answered by arguing with it.
-        detail = "\n".join(f"  - {line}" for line in failures)
         target = "the program" if language == "rust" else f"`{entrypoint}`"
         body = (
-            f"I ran {target} against the test cases you sent and got:\n"
+            f"{_ran_against(target, bar_is_independent)}\n"
             f"{detail}\n\n"
             f"The program has not changed for several rounds now, so this time "
             f"it is the program that has to. Send back ONE fenced block, with "
             f"nothing outside it: {WHOLE_PROGRAM}."
         )
     elif from_self_tests:
-        # Deliberately not "your solution is WRONG". These cases came from the
-        # model itself, so a disagreement proves only that two things it wrote
-        # contradict each other -- and telling it the CODE is at fault when the
-        # CASE was wrong is how a repair round breaks a correct program. The
+        # Deliberately not "your solution is WRONG". A disagreement proves only
+        # that two readings of the statement contradict each other -- and
+        # telling the model the CODE is at fault when the CASE was wrong is how
+        # a repair round breaks a correct program. Measured over a production
+        # run: of the 26 solves that reached a correction round, 24 resolved
+        # the disagreement by rewriting the CASE, and a judge upheld those
+        # rewrites 22 times of 25 and sided with the original case none. The
         # output rule names both ways out and lets the model pick.
-        detail = "\n".join(f"  - {line}" for line in failures)
         target = "the program" if language == "rust" else f"`{entrypoint}`"
         body = (
-            f"I ran {target} against the test cases you sent and got:\n"
+            f"{_ran_against(target, bar_is_independent)}\n"
             f"{detail}\n\n"
             f"Send back ONE fenced block: {WHOLE_PROGRAM} — or, if the case "
             f"was wrong rather than the program, a `json` array holding just "
             f"the case(s) above, corrected. Send one or the other, not both."
         )
     else:
-        detail = "\n".join(f"  - {line}" for line in failures)
         target = "the program" if language == "rust" else f"`{entrypoint}`"
         body = (
             f"I ran {target} against the examples and got:\n"

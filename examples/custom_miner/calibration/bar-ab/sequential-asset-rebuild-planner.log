@@ -1,0 +1,49 @@
+[rehearse] browsers: claude CLI (opus/low > fable/low > sonnet/low; 1 account)
+[cli] account primary: subscription (OAuth)
+[cli] /opt/node22/bin/claude ready: 1 account(s), ladder opus/low, fable/low, sonnet/low, 8 at a time; a refused model is tried again after 10 minute(s)
+[rehearse] backend ready in 0.3s at 06:32:01
+[verify] the rust executor could not be built, so no rust answer can be graded here: no repair rounds, and verified=False however good the answer is. Not probing again for 300s. Once per run.
+           RuntimeError: DockerExecutor could not contact the Docker daemon ('docker info' rc=1: failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /var/run/docker.sock: connect: no such file or directory). Is Docker running?
+           Docker is not installed. See the README's "Rust needs Docker" section.
+[verify] rust: compile gate rustc at /root/.cargo/bin/rustc, grading unavailable: DockerExecutor could not contact the Docker daemon ('docker info' rc=1: failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /var/run/docker.sock: connect: no such file or directory). Is Docker running?
+[rehearse] python problem asset-rebuild-planner from the sample challenges
+[rehearse] entrypoint=plan_rebuild examples=0 deadline=300s
+[rehearse] request sent 06:32:01
+[phase] open cli:opus  06:32:01.1 took    0.0s  — 290s of 290s left  id=asset-rebuil
+[cli] cli:opus ok: 70 event(s), first text after 21s, 4872 character(s) in 41s, 0 retries
+[phase] 1 cases        06:32:01.1 took   41.2s  (model 41.2s)  — 249s of 290s left  id=asset-rebuil
+[cli] cli:opus ok: 294 event(s), first text after 2s, 5494 character(s) in 19s, 0 retries
+[phase] 2 program      06:32:42.4 took   19.9s  (model 18.7s, checked 1.2s)  — 229s of 290s left  id=asset-rebuil
+[cli] cli:opus ok: 21 event(s), first text after 3s, 321 character(s) in 5s, 0 retries
+[verify] the repair corrected the cases rather than the program: 1 failing case(s) corrected. The program is re-graded against the 16 that now stand; if it still disagrees the loop keeps going.
+[phase] 3 correction   06:33:02.3 took    6.0s  (model 4.8s, checked 1.2s)  — 223s of 290s left  id=asset-rebuil
+[verify] python entrypoint=plan_rebuild provider=cli:opus examples=0/0 self=16/16 verified=False (verified on local: passed all 16 of its own cases; no public examples exist to confirm it) rounds=2 corrected=0/16 67.1s/290s id=asset-rebuil
+[rehearse] the miner answered 200 in 67.1s at 06:33:08 (it would have cut itself off at 305s: the 300s deadline plus its grace)
+[rehearse] submitted 5480 chars of python
+    ----- what a validator would grade -----
+    | import hashlib
+    | 
+    | 
+    | def _frame(s):
+    |     b = s.encode("utf-8")
+    |     return len(b).to_bytes(8, "big") + b
+    | 
+    | 
+    | def _full_hash(local, pairs):
+    |     parts = [b"ASSETv1\0", _frame(local), len(pairs).to_bytes(8, "big")]
+    |     for name, h in sorted(pairs, key=lambda p: p[0]):
+    |         parts.append(_frame(name))
+    |         parts.append(_frame(h))
+    |     return hashlib.sha256(b"".join(parts)).hexdigest()
+    | 
+    | 
+    | def plan_rebuild(local_hashes, dependencies, cache, transaction_log):
+    |     # ---- transaction log analysis ----
+    |     invalid = False
+    |     begun_ids = set()
+    | ... 168 more line(s)
+    ----------------------------------------
+[rehearse] archived under /tmp/claude-0/-home-user-Scope/696e92a5-91cd-56cb-8e39-fad928a8c630/scratchpad/ab/out-0 (asset-rebuild-planner.py, and the exchange beside it)
+[rehearse] SCORES: passed all 3 test(s) (graded in 0.2s, which is the validator's time, not the miner's)
+[rehearse] checked against all 3 public case(s), 3 of which the model was not shown
+[rehearse] seat: 3 turn(s), 6,066 output tokens, 12,443 written and 12,337 read from the cache; list price $0.28

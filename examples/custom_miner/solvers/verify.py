@@ -36,12 +36,11 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional, Protocol
 
 from rlvr.types import TestCase
 
-from . import crosscheck as _crosscheck
 from .prompts import (
     build_code_prompt,
     build_repair_prompt,
@@ -149,9 +148,9 @@ MAX_JUDGED_CORRECTIONS = 2
 # Measured on a production day: the share of the bar rewritten by each of the
 # thirteen correction replies was 5, 7, 7, 8, 8, 10, 10, 10, 10, 11, 15, 29
 # and 68 percent. A third fires on the 68 and on nothing else. That reply came
-# from a program the cross-check had already confirmed wrong on two inputs: it
-# rewrote fifteen of its twenty-two cases with nine seconds left, no judge had
-# time to look, and the solve shipped reporting it had passed all twenty-two.
+# from a program already known wrong on two inputs: it rewrote fifteen of its
+# twenty-two cases with nine seconds left, and the solve shipped reporting it
+# had passed all twenty-two.
 BULK_CORRECTION_SHARE = 3
 # How many bulk rewrites a pass tolerates before the case offer is withdrawn
 # for good. Refusing without this is a spin: the reply comes back the same.
@@ -337,6 +336,14 @@ class _Phases:
     Each phase is measured from the end of the one before it, which is exact
     because they run back to back, and it means the caller records nothing and
     only says when a phase ended.
+
+    Except for the ones that do not. A phase marked `beside=True` ran
+    CONCURRENTLY with the phase after it -- the independent bar is written
+    while the program is -- so it reports its own elapsed time, passed in by
+    the caller who started it, and does not move the cursor the next phase is
+    measured from. Letting it move the cursor would charge the program turn
+    only the sliver between the two returning and quietly show a solve whose
+    phases no longer sum to its duration.
     """
 
     def __init__(
@@ -354,13 +361,32 @@ class _Phases:
 
     def mark(
         self, label: str, *, model_s: Optional[float] = None,
-        checked_s: Optional[float] = None,
+        checked_s: Optional[float] = None, beside: bool = False,
+        ended: Optional[float] = None,
     ) -> None:
         now, wall = time.monotonic(), datetime.now()
-        spent = now - self._at
-        began, self._at, self._wall = self._wall, now, wall
+        if beside:
+            spent = model_s if model_s is not None else now - self._at
+            end_wall = wall if ended is None else wall - timedelta(seconds=now - ended)
+            began = end_wall - timedelta(seconds=spent)
+        else:
+            # `ended` is the monotonic instant the phase actually finished,
+            # for the one caller that marks a phase AFTER a later one has
+            # already run: the program turn, when an empty bar is retried
+            # between the turn returning and the turn being graded. Measured
+            # without it -- program 0.3s, retry 0.4s -- the retry printed
+            # "took 0.7s" and the program "took 0.2s": the program's seconds
+            # credited to the retry, and the program left with the grading.
+            # The cursor advances to where the phase ENDED, not to now, so the
+            # phase marked next is measured from the right place.
+            end = now if ended is None else ended
+            spent = end - self._at
+            end_wall = wall - timedelta(seconds=now - end)
+            began, self._at, self._wall = self._wall, end, end_wall
         left = self._budget - (now - self._solve_started)
         parts = []
+        if beside:
+            parts.append("alongside")
         if model_s is not None:
             parts.append(f"model {model_s:.1f}s")
         if checked_s is not None:
@@ -912,7 +938,7 @@ class _Grader:
         """Run ``code`` on ``inputs`` and return what it produced, judged by
         nobody: one `_Run` per input, in order, with the sandbox's own value.
 
-        The cross-check's primitive. `check` decides pass or fail against an
+        Grading without a bar. `check` decides pass or fail against an
         expectation; this has none, because the point is to compare two
         programs' outputs with each other and put the difference to a reader.
         Same executor, same per-case timeout, same budget discipline: the run
@@ -1141,19 +1167,55 @@ class _Plan:
 
     two_phase: bool = True
 
-    def __init__(self, xcheck: str = "not run") -> None:
+    def __init__(self) -> None:
         # What the summary line reports beside the tally, so a hidden-suite
-        # outcome can be joined back to how the solve went: rounds asked,
-        # cases the model corrected and that stood, and the last word of
-        # the cross-check. Measured need: a log of 76 solves graded 83.5%
-        # right, and no way to tell a corrected-bar solve from a clean one.
+        # outcome can be joined back to how the solve went: rounds asked, and
+        # cases the model corrected that stood. Measured need: a log of 76
+        # solves graded 83.5% right, and no way to tell a corrected-bar solve
+        # from a clean one.
         self.rounds = 0
         self.corrected = 0
-        # Corrected cases that landed with NO judge verdict behind them. The
-        # summary line stops claiming the answer passed its own cases when
-        # this is non-zero: the bar it passed is one the failing model moved.
-        self.unjudged = 0
-        self.xcheck = xcheck
+        # Which model wrote the BAR, when it was written somewhere other than
+        # where the program was. The summary line is what a hidden-suite
+        # outcome is joined back to, and with a cases model and a program
+        # model that can differ, "which model answered" is two questions.
+        # This is also the instrument that makes `SOLVER_CLI_PHASE_PROFILES`
+        # measurable rather than guessable: without it there is no way to ask
+        # whether the bar's model changed anything.
+        self.bar_provider: Optional[str] = None
+        # What the FIRST grade found, before any repair: how many of the
+        # program's cases it failed the moment it was written. This is phase
+        # 3's trigger rate, and it is the number the correction phase turns on.
+        # Measured over the 102 archived solves, 76 of them never entered a
+        # correction round at all -- so the loop that converges 25 times out of
+        # 26 was only ever offered a quarter of the traffic, and the ~20 wrong
+        # answers those runs shipped are mostly among the 76 it never saw. A
+        # log that reports `rounds=1` cannot tell "the program was right" from
+        # "the cases could not tell", and those need opposite work.
+        #
+        # The first grade of the SOLVE, not of the pass that shipped. A second
+        # pass runs only after the first failed to deliver, and this asks
+        # whether the bar found anything on this task at all -- so a 3/18 from
+        # an abandoned first pass is the answer even when the second pass's
+        # fresh program cleared the same bar. Unlike `exit`, which describes
+        # how the solve ended and so takes the LAST pass.
+        self.disagreed: Optional[tuple[int, int]] = None
+        # Which condition ended the correction loop. Every way out of the pass
+        # notes a reason before returning -- the seven `break`s, the cases
+        # turn that never answered, and the backend failure -- so the line
+        # never carries an earlier pass's reason for this one, or nothing.
+        self.exit = ""
+
+    def note_exit(self, reason: str) -> None:
+        """The LAST reason wins.
+
+        A solve runs a second pass only when the first ended without a
+        deliverable answer -- `empty`, `cutoff`, `stalled` -- and the summary
+        line describes the answer that SHIPPED. Keeping the first reason
+        reported a solve whose second pass converged as `exit=empty`, which is
+        the one thing an operator reading that line must not be told.
+        """
+        self.exit = reason
 
 # The most of what is left that the CASES turn may spend.
 #
@@ -1245,6 +1307,7 @@ class VerifyingSolver:
         cache_size: int = 256,
         second_opinion: bool = True,
         self_tests: bool = True,
+        independent_bar: Optional[bool] = None,
     ):
         self._backend = backend
         # 0 means UNLIMITED, and that is the default. Correctness is the whole
@@ -1256,25 +1319,17 @@ class VerifyingSolver:
         self._max_budget = max(5.0, float(max_budget_s))
         self._second_opinion = bool(second_opinion)
         self._self_tests = bool(self_tests)
+        # Where the cases are written -- see `_attempt`. Read from the
+        # environment when the caller says nothing, because it decides how
+        # many conversations a solve holds open and a scripted backend that
+        # hands every conversation the same replies cannot serve two.
+        self._independent_bar = (
+            os.environ.get("SOLVER_INDEPENDENT_BAR", "true").strip().lower()
+            not in ("0", "false", "no")
+            if independent_bar is None
+            else bool(independent_bar)
+        )
         self._grader = _Grader()
-        # The second reading. Off only by `SOLVER_CROSSCHECK=0`; see
-        # `crosscheck.py` for what it found on this miner's own answers.
-        self._crosscheck = _crosscheck.enabled()
-        # Said once, at launch. A production log ran a whole day with no
-        # cross-check and not one line said so; the operator read 76 solves
-        # as checked that were not.
-        if self._crosscheck:
-            reader, judge = _crosscheck.reader_profile(), _crosscheck.judge_profile()
-            print(
-                f"[verify] cross-check: on (second reading {reader[0]}:{reader[1]}, "
-                f"judge {judge[0]}:{judge[1]}, {_crosscheck.inputs_wanted()} inputs; "
-                f"SOLVER_CROSSCHECK=0 turns it off)"
-            )
-        else:
-            print(
-                "[verify] cross-check: OFF (SOLVER_CROSSCHECK=0): no second reading, "
-                "no judge, and a corrected case is accepted as sent"
-            )
         self._cache: dict[str, tuple[str, str]] = {}
         self._cache_size = max(0, int(cache_size))
         self._counts = {
@@ -1403,8 +1458,12 @@ class VerifyingSolver:
         # unattributable, which made "is one of these tabs doing worse than the
         # others" an unanswerable question.
         won_with: Optional[str] = None
-        plan = _Plan(xcheck="off" if not self._crosscheck else "not run")
-        checker = self._start_crosscheck(task, budget)
+        # (exit, bar_provider, rounds, corrected) of the pass that produced
+        # `best`, or None when no pass ever beat the empty candidate it starts
+        # as -- every pass failed, and the LAST one's reason is then the only
+        # account of the solve there is. See where it is captured and resolved.
+        shipped: Optional[tuple] = None
+        plan = _Plan()
         # A ceiling, not a plan. Every ordinary path breaks out after one or
         # two: the loop only keeps going while it is holding NOTHING, which is
         # the one state where another ask cannot make things worse.
@@ -1426,13 +1485,22 @@ class VerifyingSolver:
             attempt_no += 1
             candidate, provider = await self._attempt(
                 task, remaining, avoid=asked[-1] if asked else None, plan=plan,
-                pass_no=attempt_no, checker=checker,
+                pass_no=attempt_no,
             )
             if provider:
                 asked.append(provider)
             if candidate is not None and candidate.score > best.score:
                 best = candidate
                 won_with = provider
+                # What the SHIPPING pass did, captured as it wins. A second
+                # pass runs with an answer already in hand whenever public
+                # examples ran and something failed, and a pass that then
+                # scores lower does not replace `best` -- but it did overwrite
+                # `plan`, so the line described a pass whose program was
+                # thrown away. `provider=` has always come from `won_with` for
+                # exactly this reason; these three now do too.
+                shipped = (plan.exit, plan.bar_provider, plan.rounds,
+                           plan.corrected)
             if best.verified and not best.failures:
                 break
             # Nothing RAN, whether or not anything was shipped to run. The
@@ -1505,11 +1573,6 @@ class VerifyingSolver:
                     )
                     + "; asking another model"
                 )
-        if checker is not None:
-            best, won_with = await self._fallback(
-                checker, best, won_with, budget - (time.monotonic() - started)
-            )
-            await checker.close()
         if asked:
             # `won_with`, not `asked[-1]`. They usually coincide -- a verified
             # answer ends the loop, so the winner is normally the last one asked
@@ -1543,11 +1606,18 @@ class VerifyingSolver:
                 self._cache[key] = (best.code, best.raw)
         else:
             self._counts["empty"] += 1
+        # Nothing ever won, so there is no shipping pass to describe: fall
+        # back to the last one, which is what `exit=failed` and `exit=cases`
+        # exist to report. Resolved here rather than at the capture so a solve
+        # that DID ship is never described by a later pass that lost.
+        if shipped is None:
+            shipped = (plan.exit, plan.bar_provider, plan.rounds, plan.corrected)
         elapsed = time.monotonic() - started
         print(
             f"[verify] {task.language} entrypoint={task.entrypoint} "
             f"provider={won_with or 'none'} "
-            f"examples={best.passed}/{best.total} "
+            + (f"bar={shipped[1]} " if shipped[1] else "")
+            + f"examples={best.passed}/{best.total} "
             + (
                 f"self={best.self_passed}/{best.self_total} "
                 + (
@@ -1567,19 +1637,22 @@ class VerifyingSolver:
             + (
                 f"(verified on local: passed all {best.self_total} of its "
                 f"own cases; no public examples exist to confirm it) "
-                if best.self_verified and not plan.unjudged
-                # The bar it passed is one the failing model moved, with
-                # nobody to check the move. That is not a local verification
-                # and the line that an operator reads must not call it one.
-                else f"(NOT verified on local: {plan.unjudged} of the "
-                f"{best.self_total} case(s) it passed were rewritten by the "
-                f"model itself with no judge) "
                 if best.self_verified
                 else ""
             )
-            + f"rounds={plan.rounds} corrected={plan.corrected}/{best.self_total}"
-            + (f"({plan.unjudged} unjudged)" if plan.unjudged else "") + " "
-            + f"xcheck={plan.xcheck} "
+            + f"rounds={shipped[2]} corrected={shipped[3]}/{best.self_total}"
+            # What the FIRST grade found and what ended the loop. `rounds=1`
+            # alone cannot tell a program that was right from one whose cases
+            # could not tell, and those need opposite work: 76 of the 102
+            # archived solves reported rounds=1, and most of that run's wrong
+            # answers are among them.
+            + (
+                f" disagreed={plan.disagreed[0]}/{plan.disagreed[1]}"
+                if plan.disagreed is not None
+                else " disagreed=none"
+            )
+            + (f" exit={shipped[0]}" if shipped[0] else "")
+            + " "
             + f"{elapsed:.1f}s/{budget:.0f}s"
             + (f" id={_ident(task)}" if _ident(task) else "")
         )
@@ -1632,7 +1705,6 @@ class VerifyingSolver:
         avoid: Optional[str],
         plan: Optional["_Plan"] = None,
         pass_no: int = 1,
-        checker: Optional["_crosscheck.CrossCheck"] = None,
     ) -> tuple[Optional[Candidate], Optional[str]]:
         """One model, one conversation: initial answer plus repair rounds.
 
@@ -1660,6 +1732,19 @@ class VerifyingSolver:
         # raise, the handler below catches it, and the return then reads a name
         # the try block never got to bind.
         best_provider: Optional[str] = None
+        # The cases conversation and the turn running in it, when the bar is
+        # written somewhere other than where the program is. Bound out here
+        # beside `best_provider` and for the same reason: the cleanup below
+        # runs for every way this returns, including the ones that never got
+        # as far as opening them.
+        bar: list = []
+        bar_task: Optional[asyncio.Task] = None
+        bar_started = 0.0
+        # One retry of an empty cases turn, per pass. See where it fires.
+        bar_retried = False
+        # Whether the program turn's phase line already went out -- it does,
+        # early, when the retry runs between the turn and its grading.
+        program_marked = False
         try:
             # BOUNDED by what is left. `BrowserFleet.open` waits for a free tab
             # up to `MINER_TAB_WAIT_S`, which ships at 120s, and nothing here
@@ -1669,7 +1754,16 @@ class VerifyingSolver:
             # budget 40s, elapsed 50.1s, `open()` called at t=0 and t=25.1,
             # prompts sent 0.
             phases = _Phases(budget, started, pass_no, ident=_ident(task))
-            conversation = await self._open_within(budget, started, avoid)
+            if plan is not None:
+                # Per pass, like `exit=`: the summary line describes the pass
+                # that shipped, and a second pass runs only after the first
+                # delivered nothing. Left accumulating, a solve whose first
+                # pass spent three rounds and died reported `rounds=4` for
+                # the one round its second pass actually took.
+                plan.rounds = 0
+            conversation = await self._open_within(
+                budget, started, avoid, phase="program"
+            )
             provider = best_provider = getattr(conversation, "provider", None)
             phases.mark(f"open {provider or 'tab'}")
             # Turn 1: the cases, before the program exists. Cases written
@@ -1679,7 +1773,48 @@ class VerifyingSolver:
             # trip here.
             cases: Optional[list] = None
             two_phase = plan is None or plan.two_phase
-            if self._self_tests and two_phase:
+            if self._self_tests and two_phase and self._independent_bar:
+                # A SECOND conversation, on the `cases` phase's model, asked at
+                # the same moment the program is. Two things follow, and both
+                # are what the archived runs say is missing.
+                #
+                # Independence. Sequentially in one session the program turn is
+                # written with the cases already in its context, by the model
+                # that wrote them, from that model's one reading of the
+                # statement. A bar the author can see is not a check. Measured
+                # across the 97 solves the two archived runs report: 96 shipped
+                # a program that passed EVERY one of its own ~18 cases, and 71
+                # never had a single disagreement to repair -- against a hidden
+                # suite those runs passed 78-83% of the time. About one shipped
+                # answer in five clears a bar it wrote for itself and still
+                # fails, which is what a bar and a program wrong the same way
+                # looks like from outside.
+                #
+                # Time. Those two turns are 83.8% of all phase time and they
+                # run back to back: cases p50 56.9s, program p50 63.5s, so
+                # p50 120.4s of a 280s budget spent before the first grade.
+                # Side by side that is max() rather than sum: p50 ~63.5s, and
+                # at p90 (95.1s and 171.2s) ~171s instead of ~266s. Shipped
+                # solves ran p90 274s against a 280s stop; this is where the
+                # headroom for the repair rounds comes from.
+                bar_started = time.monotonic()
+                # The OPEN goes inside the task too, not just the turn. A
+                # fleet backend waits for a free tab, and awaiting that here
+                # would put the bar's queue on the program's critical path --
+                # the one thing the split exists to take it off. `bar` is a
+                # one-element list so the cleanup below can close whatever the
+                # task got as far as opening.
+                bar = []
+                bar_task = asyncio.create_task(
+                    self._write_the_bar(bar, task, budget, started, avoid, plan)
+                )
+                print(
+                    f"[verify] the bar is being written in a separate "
+                    f"conversation while {provider or 'this one'} writes the "
+                    f"program, so neither reading of the statement can see the "
+                    f"other"
+                )
+            elif self._self_tests and two_phase:
                 asked_at = time.monotonic()
                 left_for_cases = budget - (time.monotonic() - started)
                 # Half, so the turn that produces the ANSWER keeps the other
@@ -1813,6 +1948,11 @@ class VerifyingSolver:
                         print(f"[verify] {left_after:.0f}s left; not asking for "
                               f"cases again this task, the remaining attempts "
                               f"go straight to the program")
+                    # The cases turn never answered, so no program was asked
+                    # for this pass. Unrecorded, `exit=` kept whatever an
+                    # earlier pass had left in it -- or nothing.
+                    if plan is not None:
+                        plan.note_exit("cases")
                     return best, best_provider
             prompt = build_code_prompt(
                 task.language, task.statement, task.entrypoint,
@@ -1825,16 +1965,6 @@ class VerifyingSolver:
             # with no answer. A crash that looks like a dead tab is the worst
             # kind, so the line does not depend on the guard above surviving.
             agreed = list(cases or [])
-            if checker is not None and checker.confirmed:
-                # Cases an earlier round or pass confirmed against the primary
-                # are on the bar from the start of this one.
-                have = {checker.key(c) for c in agreed}
-                agreed += [c for c in checker.confirmed if checker.key(c) not in have]
-            if checker is not None and agreed:
-                # The second reading's program, graded against this bar in the
-                # background, so that an answer of last resort is in hand the
-                # moment this pass runs out. See `_fallback`.
-                checker.pregrade(agreed, budget - (time.monotonic() - started))
             # The program the LAST round produced, so a repair that corrects a
             # case can be told apart from one that rewrites both -- and the
             # reply that carried it, so a correction sent WITHOUT the program
@@ -1870,6 +2000,9 @@ class VerifyingSolver:
             # Consecutive rounds that left the program exactly as it was. See
             # `CASES_ONLY_ROUNDS`.
             program_unchanged = 0
+            # Replies refused whole for rewriting too much of the bar at once.
+            # See `BULK_CORRECTION_SHARE`.
+            bulk_refusals = 0
             # Whether the prompt just sent WITHDREW the offer to correct a
             # case. A withdrawal the reply can ignore is not one.
             program_only = False
@@ -1936,7 +2069,15 @@ class VerifyingSolver:
                     await conversation.close()
                 except Exception:  # noqa: BLE001 - it may already be broken
                     pass
-                fresh = await self._open_within(budget, started, avoid)
+                # `phase="repair"` -- which matters on exactly one of the two
+                # call sites. A resume that names an `avoid` is fleeing a model
+                # that just got this wrong, and `open_for` lets `avoid` beat
+                # the preference for that reason; a resume with none is fleeing
+                # a DEAD TAB, where the model was never the problem and the
+                # operator's choice for repairs is the right seat to land on.
+                fresh = await self._open_within(
+                    budget, started, avoid, phase="repair"
+                )
                 phases.mark(f"open {getattr(fresh, 'provider', None) or 'tab'}")
                 return (
                     fresh,
@@ -1946,206 +2087,9 @@ class VerifyingSolver:
                         task.public_examples, agreed, best.code,
                         best.failures, defect=best.defect,
                         from_self_tests=best.from_self_tests,
+                        bar_is_independent=self._independent_bar,
                     ),
                 )
-
-            # Keys of cases whose correction a judge REFUSED this pass, so the
-            # same correction is not put to the judge twice; and how many
-            # judge turns corrections have cost. See `MAX_JUDGED_CORRECTIONS`.
-            stood: set[tuple] = set()
-            judged_corrections = 0
-            # Replies refused whole for rewriting too much of the bar at once.
-            # See `BULK_CORRECTION_SHARE` and `MAX_BULK_REFUSALS`.
-            bulk_refusals = 0
-            # Whether THIS round's correction was refused by the judge. Such a
-            # round re-grades the program in hand against the bar as it was,
-            # which looks exactly like the model repeating itself -- and it is
-            # the opposite: the case is now locked, and the next prompt is
-            # the first one to insist on the program. See `duplicate`.
-            correction_refused = False
-
-            async def judged_correction(
-                before: list[dict], merged: list[dict], failed: list[dict], changed: str
-            ) -> tuple[list[dict], str, int]:
-                """The bar after a correction, once a reader with no program in
-                hand has said which side of the disagreement was wrong.
-
-                Returns (the cases that now stand, what to say about it, how
-                many corrected cases landed).
-
-                Every correction used to land on the model's own say-so, and
-                the author of a program is the one party with a reason to want
-                its cases changed. Measured on a production log of 76 solves:
-                eighteen corrections in fifteen of them, every one accepted
-                unread, and the answers from that log were graded right 83.5%
-                of the time against 98% for the miners beside it. The same
-                judge that settles a cross-check settles these: each corrected
-                case is put to it as the call alone, and its answer decides.
-
-                  * It agrees with the CORRECTION: the correction lands.
-                  * It agrees with the case AS WRITTEN: the correction is
-                    refused and the case is locked -- two readers now stand
-                    behind it, and the program has to change.
-                  * It agrees with NEITHER: the correction is refused and the
-                    case stands as written, unlocked. Three readings and three
-                    answers is a contested case, not a verdict, and the least
-                    that can be done with it is to leave the bar alone.
-                  * No verdict -- no judge, no time, or the turn cap reached:
-                    the correction lands as it always did. A judge that cannot
-                    be reached is not a reason to freeze the bar.
-
-                A correction the judge refused once is refused again without
-                asking: the case is locked when the judge sided with it, and
-                is in `stood` either way.
-                """
-                nonlocal judged_corrections, correction_refused, bulk_refusals
-                originals = {_case_key(c): c for c in failed}
-                held = {_case_key(c): _expectation(c) for c in before}
-                disputes: list[tuple[dict, dict]] = []
-                for case in merged:
-                    key = _case_key(case)
-                    if held.get(key) == _expectation(case):
-                        continue
-                    disputes.append((originals.get(key, case), case))
-                if not disputes:
-                    return merged, changed, 0
-                # A reply that rewrites a THIRD of the bar is not correcting a
-                # case. Refused whole, before the judge is even consulted --
-                # the judge is capped at a couple of cases a turn and could not
-                # speak to fifteen of them anyway. The cases are NOT added to
-                # `stood`: the model is free to correct two or three of them
-                # next round, where a judge can actually look.
-                allowed = max(2, len(before) // BULK_CORRECTION_SHARE)
-                if len(disputes) > allowed:
-                    bulk_refusals += 1
-                    correction_refused = True
-                    return list(before), (
-                        f"{len(disputes)} of the {len(before)} case(s) on the bar "
-                        f"came back rewritten in one reply, which is a "
-                        f"re-specification rather than a correction; the bar "
-                        f"stands and the program is re-graded against it"
-                        + ("" if bulk_refusals < MAX_BULK_REFUSALS
-                           else " -- and the cases are not offered again this pass")
-                    ), 0
-                if checker is None:
-                    # No cross-check running means no judge exists, so every
-                    # correction lands unread. That is the old behaviour and
-                    # it stays -- but the summary line has to say so.
-                    if plan is not None:
-                        plan.unjudged += len(disputes)
-                    return merged, changed, len(disputes)
-                fresh = [(o, c) for o, c in disputes if _case_key(c) not in stood]
-                verdict_of: dict[tuple, tuple[str, Any]] = {}
-                unjudged = ""
-                if fresh:
-                    left = budget - (time.monotonic() - started)
-                    floor = _crosscheck.JUDGE_FLOOR_S + _crosscheck.REPAIR_RESERVE_S
-                    if judged_corrections >= MAX_JUDGED_CORRECTIONS:
-                        unjudged = (
-                            f"the judge has decided corrections {judged_corrections} "
-                            f"time(s) this pass already"
-                        )
-                    elif left < floor:
-                        unjudged = f"{left:.0f}s left is too little to judge and then repair"
-                    else:
-                        judged_corrections += 1
-                        for (_, case), verdict in zip(
-                            fresh, await checker.judge_corrections(fresh, left)
-                        ):
-                            verdict_of[_case_key(case)] = verdict
-                accepted: list[dict] = []
-                notes: list[str] = []
-                for original, case in disputes:
-                    key = _case_key(case)
-                    verdict, expected = verdict_of.get(
-                        key, ("repeat" if key in stood else "no verdict", None)
-                    )
-                    call = _crosscheck._render_call(task.language, task.entrypoint, case)
-                    if verdict in ("corrected", "no verdict"):
-                        accepted.append(case)
-                        if verdict == "corrected":
-                            notes.append(f"{call}: the judge agrees with the correction")
-                        continue
-                    stood.add(key)
-                    shown = json.dumps(expected, default=str)[:200]
-                    if verdict == "original":
-                        if original is not case:
-                            checker.confirm(original)
-                        notes.append(
-                            f"{call}: the judge says {shown}, as the case was "
-                            f"written; the case is locked and the program has to change"
-                        )
-                    elif verdict == "neither":
-                        notes.append(
-                            f"{call}: the judge says {shown}, which is neither side; "
-                            f"the case stands as written"
-                        )
-                    else:
-                        notes.append(f"{call}: refused before this pass; not asked again")
-                if unjudged:
-                    notes.append(f"{len(fresh)} unjudged ({unjudged}) and accepted as sent")
-                    if plan is not None:
-                        plan.unjudged += len(fresh)
-                refused = len(disputes) - len(accepted)
-                if refused:
-                    correction_refused = True
-                    merged, _ = _merge_cases(before, accepted, failed)
-                    changed = (
-                        f"{len(disputes)} case(s) corrected and {refused} of them "
-                        f"refused -- " + "; ".join(notes)
-                    )
-                elif notes:
-                    changed = f"{changed} -- " + "; ".join(notes)
-                return merged, changed, len(accepted)
-
-            async def second_reading_says(candidate: Candidate, attempt: int) -> list[str]:
-                """Cross-check a program its own cases pass; see `crosscheck.py`.
-
-                Returns what the second reading held against it -- confirmed
-                cases, a timed-out large input -- as failure lines, and leaves
-                them on the candidate for the repair round that follows.
-                Empty when the check is clean, unavailable, or out of time,
-                and the loop ends exactly where it used to.
-                """
-                nonlocal agreed
-                left_now = budget - (time.monotonic() - started)
-                if checker is None:
-                    return []
-                if left_now < _crosscheck.XCHECK_FLOOR_S + _crosscheck.REPAIR_RESERVE_S:
-                    if plan is not None:
-                        plan.xcheck = f"skipped ({left_now:.0f}s left)"
-                    return []
-                checked_at = time.monotonic()
-                verdict = await checker.run(candidate.code, left_now)
-                phases.mark(
-                    f"{attempt + 1} cross-check",
-                    model_s=time.monotonic() - checked_at,
-                )
-                print(f"[verify] cross-check: {_crosscheck.describe(verdict)}")
-                if plan is not None:
-                    plan.xcheck = (
-                        f"{len(verdict.failures)} finding(s)" if verdict.failures
-                        else f"unresolved({verdict.unresolved} open)"
-                        if verdict.unresolved
-                        else f"unresolved({verdict.undecided} undecided)"
-                        if verdict.undecided
-                        else "clean" if verdict.inputs
-                        else (verdict.note or "no verdict")[:60]
-                    )
-                if not verdict.failures:
-                    return []
-                # Wrong where two other readings agree. Into the ordinary
-                # repair round it goes, with cases it cannot correct: on the
-                # bar, locked, and named as such in the report.
-                candidate.failures = list(verdict.failures)
-                candidate.from_self_tests = True
-                candidate.failed_cases = []
-                candidate.self_total += len(verdict.new_cases)
-                have = {checker.key(c) for c in agreed}
-                agreed = agreed + [
-                    c for c in verdict.new_cases if checker.key(c) not in have
-                ]
-                return list(verdict.failures)
 
             attempt = 0
             # A backend may know its own round trip is longer than the floor
@@ -2158,9 +2102,6 @@ class VerifyingSolver:
             )
             while True:
                 attempt += 1
-                if plan is not None:
-                    plan.rounds += 1
-                objections: list[str] = []
                 left = budget - (time.monotonic() - started)
                 if attempt > 1 and left < round_trip_floor:
                     # Not enough left to be worth another ROUND TRIP -- which is
@@ -2185,6 +2126,8 @@ class VerifyingSolver:
                             else ""
                         )
                     )
+                    if plan is not None:
+                        plan.note_exit("budget")
                     break
                 if self._max_attempts and attempt > self._max_attempts:
                     print(
@@ -2196,6 +2139,8 @@ class VerifyingSolver:
                             else ""
                         )
                     )
+                    if plan is not None:
+                        plan.note_exit("maxattempts")
                     break
                 # Every round reads against EVERYTHING that is left. Earlier
                 # builds handed the first attempt a fraction (60% with public
@@ -2214,13 +2159,94 @@ class VerifyingSolver:
                 # No `extend_to_s`: `left` already runs to the point the
                 # answer stops being deliverable, so there is nothing past it to
                 # extend into.
+                # Counted HERE, where a prompt is about to go out -- not at the
+                # top of the loop, which counts entries. The budget and
+                # max-attempts breaks sit between the two and send nothing, so
+                # every solve that ended either way reported one round more
+                # than it asked for. Before the send rather than after it: a
+                # round whose send raises or is cut off was still asked, and
+                # `exit=cutoff` should not also lose its round.
+                if plan is not None:
+                    plan.rounds += 1
                 round_started = time.monotonic()
                 correction_refused = False
                 reply = await conversation.send(prompt, max(1.0, left))
                 provider = getattr(conversation, "provider", provider)
                 # How long the round trip actually took. Used only by the
                 # duplicate branch below, and only to tell a model from a tab.
+                # Read BEFORE the bar is collected: a round that came back in
+                # no time is how a replayed reply is caught, and charging it
+                # for a bar that was still being written elsewhere would hide
+                # exactly the case it exists to find.
                 round_s = time.monotonic() - round_started
+                if bar_task is not None:
+                    # The bar, now that the program it grades exists. Awaited
+                    # HERE rather than before the send, because awaiting it
+                    # before the send is the sequential shape this replaced;
+                    # and here rather than at first use, because `revised`
+                    # below already reasons about what the bar holds.
+                    agreed = await self._collect_bar(
+                        bar_task, bar, phases, budget, started, bar_started
+                    )
+                    bar_task, bar = None, []
+                    if not agreed and not bar_retried:
+                        # A bar that came back with nothing leaves the solve
+                        # with NOTHING TO GRADE: `self_total` is 0, there are
+                        # no failures, the loop breaks on the next line and the
+                        # answer ships ungraded. Measured over the 102 archived
+                        # solves, that is 5 of them -- phase 2 and phase 3 both
+                        # inert -- while the median solve hands back 134s of
+                        # its 290s unspent. One more ask is the cheapest thing
+                        # that budget can buy.
+                        #
+                        # ONCE, and only while the plan still believes a cases
+                        # turn is affordable here. Whatever made the first one
+                        # come back empty -- a refusal, a reply that carried no
+                        # JSON, a turn cut off -- belongs to the task and the
+                        # site as often as not, and `_Plan.two_phase` is where
+                        # that lesson already lives.
+                        bar_retried = True
+                        left_now = budget - (time.monotonic() - started)
+                        if (
+                            self._self_tests
+                            and (plan is None or plan.two_phase)
+                            and left_now > round_trip_floor
+                        ):
+                            # The program's turn is already over, and the
+                            # retry is about to run AFTER it. Mark the turn
+                            # now, at the instant it ended, so the retry is
+                            # measured from there and not from the open --
+                            # and so the turn's own seconds are not handed to
+                            # the retry. Its grading has not happened yet;
+                            # that gets its own line below.
+                            phases.mark(
+                                "2 program", model_s=round_s,
+                                ended=round_started + round_s,
+                            )
+                            program_marked = True
+                            print(
+                                f"[verify] the cases turn came back with "
+                                f"nothing, so there is no bar to grade against "
+                                f"and the repair loop has nothing to work on; "
+                                f"asking once more with {left_now:.0f}s left"
+                            )
+                            bar, bar_started = [], time.monotonic()
+                            retry = asyncio.create_task(
+                                self._write_the_bar(
+                                    bar, task, budget, started, avoid, plan
+                                )
+                            )
+                            agreed = await self._collect_bar(
+                                retry, bar, phases, budget, started,
+                                bar_started, beside=False,
+                                label="1 cases again",
+                            )
+                            bar = []
+                            if not agreed and plan is not None:
+                                # Twice is evidence about the task, not the
+                                # tab. The remaining passes go straight to the
+                                # program rather than paying for a third.
+                                plan.two_phase = False
                 # A repair reply may carry a CORRECTED case array: the repair
                 # prompt offers it outright ("or, if the case was wrong rather
                 # than the program, a `json` array holding ALL of the cases").
@@ -2303,11 +2329,46 @@ class VerifyingSolver:
                     # way to game this -- delete the case you cannot pass -- is
                     # not reachable. See `_merge_cases`.
                     # A confirmed case is not the model's to correct.
-                    correctable = [
-                        c for c in reported_failed
-                        if checker is None or checker.key(c) not in checker.locked
-                    ]
-                    merged, changed = _merge_cases(agreed, revised, correctable)
+                    # A reply that rewrites a THIRD of the bar is not
+                    # correcting a case, it is re-specifying the problem.
+                    #
+                    # Kept after the judge was removed, and on narrower grounds
+                    # than it was built on. The judge upheld the model's rewrite
+                    # in 22 of the 25 corrections it ever checked and sided with
+                    # the original case in none of them, so "the model launders
+                    # its own bar" is not what the logs show and is not why this
+                    # is here. What the logs do NOT contain is a single judged
+                    # BULK rewrite -- the one that replaced fifteen of twenty-two
+                    # cases with nine seconds left was never checked by anything.
+                    # The cap costs one correction in thirteen and covers the
+                    # case no evidence speaks to.
+                    # How many cases actually CHANGED, not how many were sent.
+                    # The repair prompt asks for "a json array holding ALL of
+                    # the cases, corrected", so a well-behaved reply carries the
+                    # whole bar every time; counting the array's length refused
+                    # every correct correction and left the bar frozen.
+                    held = {_case_key(c): _expectation(c) for c in agreed}
+                    moved = sum(1 for c in revised
+                                if held.get(_case_key(c)) != _expectation(c))
+                    allowed = max(2, len(agreed) // BULK_CORRECTION_SHARE)
+                    if moved > allowed:
+                        bulk_refusals += 1
+                        # A refused correction is not the model repeating
+                        # itself about the PROGRAM -- the program was never
+                        # asked for -- and the duplicate guard below must not
+                        # read it as one. Both setters of this flag went out
+                        # with the judge in d6c9fc6; this is the one that is
+                        # still needed.
+                        correction_refused = True
+                        print(
+                            f"[verify] {moved} of the {len(agreed)} case(s) "
+                            f"on the bar came back rewritten in one reply, which is "
+                            f"a re-specification rather than a correction; the bar "
+                            f"stands and the program is re-graded against it"
+                        )
+                        merged, changed = list(agreed), ""
+                    else:
+                        merged, changed = _merge_cases(agreed, revised, reported_failed)
                     if changed.startswith("REFUSED"):
                         print(f"[verify] {changed[len('REFUSED:'):].strip()}")
                         revised = []
@@ -2316,28 +2377,20 @@ class VerifyingSolver:
                         revised = merged
                     else:
                         if changed:
-                            # Judged BEFORE it is announced or graded against:
-                            # see `judged_correction` for what a correction
-                            # accepted on its author's word cost.
-                            merged, changed, landed = await judged_correction(
-                                agreed, merged, correctable, changed
-                            )
-                            if plan is not None:
-                                plan.corrected += landed
                             print(
-                                "[verify] "
-                                + (
-                                    "the repair corrected the cases rather than "
-                                    "the program: " if landed
-                                    # Nothing landed, so the lead-in must not
-                                    # say the bar moved. It did not.
-                                    else "the repair sent cases and none of "
-                                    "them stand: "
-                                )
-                                + f"{changed}. The program is re-graded against "
-                                f"the {len(merged)} that now stand; if it still "
-                                f"disagrees the loop keeps going."
+                                f"[verify] the repair corrected the cases rather "
+                                f"than the program: {changed}. The program is "
+                                f"re-graded against the {len(merged)} that now "
+                                f"stand; if it still disagrees the loop keeps "
+                                f"going."
                             )
+                            # What the summary line's `corrected=` counts. The
+                            # increment went out with the judge in d6c9fc6 and
+                            # the line has printed 0 ever since; `moved` is the
+                            # number of cases whose expectation this reply
+                            # actually changed, counted above for the bulk cap.
+                            if plan is not None:
+                                plan.corrected += moved
                         # Kept even when the merge changed nothing, because
                         # `revised` is not only the new bar -- it is what tells
                         # the branches below that this reply carried CASES. A
@@ -2394,14 +2447,34 @@ class VerifyingSolver:
                 # -- "3rd phase output should be full code" -- and a log that
                 # numbered them differently would be answering a question
                 # nobody asked in words nobody used.
-                phases.mark(
-                    "2 program" if attempt == 1 else f"{attempt + 1} correction",
-                    model_s=round_s,
-                    checked_s=time.monotonic() - graded_at,
-                )
+                if program_marked:
+                    # The turn went out above, before the retried bar; what is
+                    # left of this phase is the grading alone.
+                    phases.mark("2 graded", checked_s=time.monotonic() - graded_at)
+                    program_marked = False
+                else:
+                    phases.mark(
+                        "2 program" if attempt == 1 else f"{attempt + 1} correction",
+                        model_s=round_s,
+                        checked_s=time.monotonic() - graded_at,
+                    )
                 # Before anything reads it: a round that could not be graded,
                 # or one graded against itself, must not report less about a
                 # program than an earlier round already established.
+                # The trigger rate, taken at the FIRST grade that actually
+                # ran the program against cases -- before any repair moved
+                # either side. `self_total` is zero when the round produced a
+                # defect or there were no cases, and neither of those is a
+                # disagreement, so both correctly leave this unset.
+                if (
+                    plan is not None
+                    and plan.disagreed is None
+                    and candidate.self_total
+                ):
+                    plan.disagreed = (
+                        candidate.self_total - candidate.self_passed,
+                        candidate.self_total,
+                    )
                 key = candidate.code.strip()
                 if key:
                     prior = judged.get(key)
@@ -2451,9 +2524,9 @@ class VerifyingSolver:
                 ):
                     best, best_provider = candidate, provider
                 if candidate.verified and not candidate.failures:
-                    objections = await second_reading_says(candidate, attempt)
-                    if not objections:
-                        break
+                    if plan is not None:
+                        plan.note_exit("verified")
+                    break
 
                 if getattr(conversation, "still_writing", False):
                     # The model had not finished when the read stopped, so
@@ -2487,6 +2560,8 @@ class VerifyingSolver:
                         )
                         + " rather than interrupting it with a repair prompt"
                     )
+                    if plan is not None:
+                        plan.note_exit("cutoff")
                     break
                 if not candidate.code.strip() and (
                     getattr(conversation, "empty_reason", None)
@@ -2539,6 +2614,8 @@ class VerifyingSolver:
                             else "asking elsewhere"
                         )
                     )
+                    if plan is not None:
+                        plan.note_exit("empty")
                     break
                 if duplicate:
                     # Same program, same failures: the round changed nothing.
@@ -2580,16 +2657,18 @@ class VerifyingSolver:
                             f"the tab is replaying an old reply rather than "
                             f"answering; submitting the last version"
                         )
+                        if plan is not None:
+                            plan.note_exit("stalled")
                         break
                 if not candidate.defect and not candidate.failures:
-                    # Nothing the model's OWN cases can say against it. That
-                    # is where the loop used to end, and where the second
-                    # reading begins: a program that agrees with its author's
-                    # reading of the statement has not yet been compared with
-                    # anyone else's.
-                    objections = await second_reading_says(candidate, attempt)
-                    if not objections:
-                        break
+                    # Nothing the program's cases can say against it. Reported
+                    # as `converged`, and the summary line says beside it how
+                    # many cases DISAGREED to begin with -- because converging
+                    # from nothing and converging from four failures are the
+                    # same word here and very different evidence.
+                    if plan is not None:
+                        plan.note_exit("converged")
+                    break
                 # Kept apart, not merged into one list of "problems": a defect
                 # means the code never ran, and the repair prompt has to say so
                 # rather than blame logic that was never executed.
@@ -2599,12 +2678,6 @@ class VerifyingSolver:
                     # third of its bar has said what it has to say about the
                     # cases. The offer does not come back.
                     or bulk_refusals >= MAX_BULK_REFUSALS
-                    or bool(
-                        objections
-                        or (checker is not None and checker.locked and any(
-                            checker.key(c) in checker.locked
-                            for c in candidate.failed_cases))
-                    )
                 )
                 program_only = insist and candidate.from_self_tests
                 if program_only and program_unchanged >= CASES_ONLY_ROUNDS:
@@ -2613,16 +2686,7 @@ class VerifyingSolver:
                         f"{program_unchanged} round(s); asking for the program "
                         f"this time and not offering the cases"
                     )
-                elif program_only and objections:
-                    print(
-                        "[verify] the second reading's findings stand; asking "
-                        "for the program and not offering the cases"
-                    )
-                elif program_only:
-                    print(
-                        "[verify] a confirmed case is failing; asking for the "
-                        "program and not offering the cases"
-                    )
+
                 report = build_repair_prompt(
                     candidate.failures,
                     task.language,
@@ -2630,6 +2694,11 @@ class VerifyingSolver:
                     defect=candidate.defect,
                     from_self_tests=candidate.from_self_tests,
                     insist_on_program=insist,
+                    # WHOSE cases these are, said truthfully. The conversation
+                    # being repaired never saw the bar when the bar is written
+                    # elsewhere, and a repair round turns on exactly that.
+                    bar_is_independent=self._independent_bar,
+                    failed_cases=candidate.failed_cases,
                 )
                 # Asking the same question a second time is worth doing -- a
                 # model is stochastic and the budget is there to spend on the
@@ -2661,123 +2730,181 @@ class VerifyingSolver:
                         from_self_tests=candidate.from_self_tests,
                         stalled=stalled,
                         insist_on_program=insist,
+                        bar_is_independent=self._independent_bar,
+                        failed_cases=candidate.failed_cases,
                     )
                 prompt = report
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a failed solve scores zero, never crashes
             print(f"[verify] backend failure: {type(exc).__name__}: {exc}")
+            if plan is not None:
+                plan.note_exit("failed")
         finally:
-            if conversation is not None:
+            # The bar's turn outlives the pass whenever the pass ended before
+            # the program's first reply -- a backend failure, a cancelled
+            # solve. Left alone it would hold a CLI process and a seat for as
+            # long as the model kept writing, for a bar nothing will read.
+            if bar_task is not None and not bar_task.done():
+                bar_task.cancel()
+            for live in (conversation, *bar):
+                if live is None:
+                    continue
+                try:
+                    await live.close()
+                except Exception:  # noqa: BLE001 - cleanup must not mask a result
+                    pass
+            # Observe the cancellation, bounded, AFTER the closes so a cancel
+            # of this pass mid-wait cannot skip them. On this interpreter
+            # (3.11) `asyncio.wait_for` can swallow a cancel that lands in the
+            # loop iteration where its inner future has just completed -- at
+            # the bar's slot acquire, that means the cases turn spawns a
+            # child and runs to the end of its slice on the seat's quota,
+            # with nothing left holding a reference to cancel it again.
+            # Reproduced through this method with the real backend: cancels
+            # landing 1-3 iterations after the send began returned normally.
+            # So: wait a bounded moment, and if it is still running, cancel
+            # once more. The wait is `asyncio.wait`, which does not cancel
+            # what it waits on, and a cancel of THIS task during it
+            # propagates, as it should, with the re-cancel in the finally.
+            if bar_task is not None and not bar_task.done():
+                try:
+                    await asyncio.wait({bar_task}, timeout=6.0)
+                finally:
+                    if not bar_task.done():
+                        bar_task.cancel()
+        return best, best_provider
+
+    async def _write_the_bar(
+        self, holder: list, task, budget: float, started: float,
+        avoid: Optional[str], plan,
+    ) -> tuple[Optional[list], float]:
+        """Open a conversation of the bar's own and ask it for the cases.
+
+        Returns the cases and how long the TURN itself took.
+
+        Runs as a task beside the program turn, which is why the open is in
+        here: a backend that queues would otherwise make the program wait for
+        a tab the program does not use.
+
+        `holder` receives the conversation as soon as there is one, so
+        `_attempt`'s cleanup can close it however this ends -- including the
+        ways that never return, where the task is cancelled mid-open.
+
+        The whole remaining budget is offered, and no share of it withheld.
+        The share existed because the program turn had to wait its turn; it no
+        longer does, and a ceiling here would cost the bar without buying the
+        program anything. What bounds the wait is `_collect_bar`, on the other
+        side, where the cost is actually paid.
+        """
+        conversation = await self._open_within(
+            budget, started, avoid, phase="cases"
+        )
+        holder.append(conversation)
+        left = budget - (time.monotonic() - started)
+        # Timed HERE, and handed back with the cases. Timing it where it is
+        # collected instead measures from the bar's start to the moment the
+        # program's turn happened to finish and got round to awaiting it --
+        # which is `max(bar, program)`, not the bar, and reads as the bar
+        # whenever the program is the slower of the two. That is the one
+        # comparison the split exists to let an operator make.
+        began = time.monotonic()
+        cases = await self._ask_for_cases(conversation, task, max(1.0, left))
+        # Read AFTER the turn, not at open: the ladder may hop the
+        # conversation to another model inside the turn, and `bar=` on the
+        # summary line is the instrument for deciding which model should
+        # write the bar -- bound at open it credited the one that refused.
+        if plan is not None:
+            plan.bar_provider = getattr(conversation, "provider", None)
+        return cases, time.monotonic() - began
+
+    async def _collect_bar(
+        self, bar_task, bar: list, phases, budget: float, started: float,
+        bar_started: float, beside: bool = True, label: str = "1 cases",
+    ) -> list[dict]:
+        """The independent cases turn's result, or an empty bar.
+
+        Bounded by what is left of the solve, less one correction round. The
+        program is already written by the time this is awaited, so every second
+        spent here is a second the repair rounds do not get -- and a bar that
+        arrives with no time left to act on it grades an answer that ships
+        unchanged either way. `ROUND_TRIP_FLOOR_S` is already the least a
+        correction round is worth starting with, so waiting past it buys a
+        disagreement nothing can be done about.
+
+        Returns `[]` for every way the BAR can fail -- a cases turn still
+        writing, an unreadable tab, a reply carrying nothing usable. None of
+        them are the program's problem: the program was written in a
+        conversation this one never touched, and it ships either way. That is
+        the difference this split buys and the reason no failure here is
+        allowed to propagate. A cancelled SOLVE is the one exception and is
+        re-raised; see below.
+        """
+        left = budget - (time.monotonic() - started) - ROUND_TRIP_FLOOR_S
+        cases: Optional[list] = None
+        # How long the bar's own turn took, as measured beside it. Falls back
+        # to the elapsed wall time only when the turn never reported one,
+        # which is every path where there are no cases to report anyway.
+        spent: Optional[float] = None
+        try:
+            cases, spent = await asyncio.wait_for(
+                bar_task, timeout=max(1.0, left)
+            )
+        except asyncio.CancelledError:
+            # The SOLVE was cancelled, not the bar. `wait_for` raises the same
+            # exception either way, and swallowing it here would leave a
+            # cancelled solve grading and reporting an answer nobody is
+            # waiting for -- `CancelledError` is a BaseException precisely so
+            # that a blanket handler cannot do that.
+            bar_task.cancel()
+            raise
+        except asyncio.TimeoutError:
+            bar_task.cancel()
+            # Measured NOW, when the wait ended -- not before it began, which
+            # reported a bar that ran out the budget as having taken no time.
+            spent = time.monotonic() - bar_started
+            print(
+                f"[verify] the bar was still being written with only "
+                f"{ROUND_TRIP_FLOOR_S:.0f}s of the {budget:.0f}s budget left — "
+                f"too little to repair anything it might have said; the program "
+                f"is graded against the public examples alone"
+            )
+        except Exception as exc:  # noqa: BLE001 - the program ships regardless
+            spent = time.monotonic() - bar_started
+            print(f"[verify] the bar came back unusable ({exc}); the program "
+                  f"is graded against the public examples alone")
+        finally:
+            for conversation in bar:
                 try:
                     await conversation.close()
                 except Exception:  # noqa: BLE001 - cleanup must not mask a result
                     pass
-        return best, best_provider
-
-    async def _fallback(
-        self, checker: "_crosscheck.CrossCheck", best: Candidate,
-        won_with: Optional[str], left_s: float,
-    ) -> tuple[Candidate, Optional[str]]:
-        """The answer of last resort: the second reading's program, when the
-        primary ran out and that program passed every case the primary wrote.
-
-        Measured on a production log of 76 solves: the program turn ran past
-        200 seconds six times, and four of those solves ended with nothing,
-        a fragment, or a program still failing its own cases -- while the
-        second reading's program had been finished for two minutes and was
-        used only to argue with. Graded in the background against the
-        primary's own bar (see `CrossCheck.pregrade`), so it costs nothing
-        here: the verdict is either in hand or it is not.
-
-        It replaces the primary's answer only on evidence AGAINST that answer,
-        never on evidence for its own: an empty or partial program, a
-        structural defect, or cases the primary was seen to fail. A program
-        the primary finished and that passed everything it was run against
-        stands, however many cases went unrun -- unknown is not failed, and
-        the primary is the stronger model.
-        """
-        if best.verified:
-            return best, won_with
-        failed = best.self_observed - best.self_passed if best.from_self_tests else 0
-        why = (
-            "nothing" if not best.code.strip()
-            else "a fragment of a program" if best.partial
-            else f"a defective program ({best.defect[:120]})" if best.defect
-            else f"a program failing {failed} of the {best.self_observed} case(s) it was run against"
-            if failed > 0
-            else ""
+            # Emptied HERE, not by the caller. When this is cancelled mid-wait
+            # the re-raise skips the caller's `bar = []`, and `_attempt`'s own
+            # finally then closes the same conversations a second time --
+            # `release()` clamps at zero, so the live-session count drifts
+            # low and a real leak later reads as nothing.
+            bar.clear()
+        # `beside` only when it really ran beside the program. A RETRY does
+        # not: the program's turn has already returned by then, so the retry is
+        # sequential and must move the phase cursor like any other phase.
+        # Marking it alongside would leave the cursor behind it and charge the
+        # next correction round with the retry's seconds -- the same
+        # misreporting, pointed the other way.
+        phases.mark(
+            label,
+            model_s=spent if spent is not None else time.monotonic() - bar_started,
+            beside=beside,
         )
-        if not why:
-            return best, won_with
-        # A grading still running is worth a short wait only now that the
-        # primary's answer is known to be no answer; half of what is left,
-        # and never long enough to matter to delivery.
-        found = await checker.fallback(min(max(0.0, left_s) * 0.5, 30.0))
-        if found is None and not best.code.strip():
-            # The one case that needs no verdict: there is NOTHING to ship.
-            # An empty answer scores zero with certainty, so any program that
-            # exists dominates it -- graded, half-graded or not graded at all.
-            # Measured: two solves a day submit nothing while a finished
-            # program from the second reading sits unused, because the
-            # background grading had not returned in time to bless it.
-            ungraded = checker.ungraded()
-            if ungraded:
-                self._counts["fallback"] += 1
-                print(
-                    "[verify] the primary ended with nothing and there is no "
-                    "graded fallback; submitting the second reading's program "
-                    "ungraded rather than submitting nothing"
-                )
-                return Candidate(code=ungraded, raw=ungraded), "second reading"
-        if found is None:
-            return best, won_with
-        code, passed, total = found
-        self._counts["fallback"] += 1
-        print(
-            f"[verify] the primary ended with {why}; submitting the second "
-            f"reading's program instead -- it passed {passed}/{total} of the "
-            f"cases the primary wrote"
-        )
-        return Candidate(
-            code=code, raw=code, self_passed=passed, self_total=total,
-            from_self_tests=True, self_cases=total, self_observed=total,
-        ), "second reading"
+        if cases:
+            print(f"[verify] the bar holds {len(cases)} case(s), written "
+                  f"without sight of the program")
+        return list(cases or [])
 
-    def _start_crosscheck(self, task, budget: float) -> Optional["_crosscheck.CrossCheck"]:
-        """The second reading, started beside the solve. None when off."""
-        if not self._crosscheck or budget < _crosscheck.XCHECK_FLOOR_S:
-            return None
-        backend = self._backend
-
-        def opener_for(profile: tuple[str, str]):
-            async def opener(timeout_s: float = 30.0):
-                # Bounded, as `_open_within` bounds the primary's: a fleet
-                # backend waits for a free tab on a clock of its own.
-                if hasattr(backend, "open_profile"):
-                    return await asyncio.wait_for(
-                        backend.open_profile(*profile), timeout=max(1.0, timeout_s)
-                    )
-                try:
-                    return await backend.open(avoid=None, timeout_s=max(1.0, timeout_s))
-                except TypeError:
-                    return await asyncio.wait_for(
-                        backend.open(avoid=None), timeout=max(1.0, timeout_s)
-                    )
-            return opener
-
-        try:
-            reading = _crosscheck.SecondReading(
-                opener_for(_crosscheck.reader_profile()), task, budget
-            ).start()
-        except Exception as exc:  # noqa: BLE001 - never costs the solve
-            print(f"[verify] no second reading: {type(exc).__name__}: {exc}")
-            return None
-        return _crosscheck.CrossCheck(
-            self._grader, task, reading, opener_for(_crosscheck.judge_profile())
-        )
-
-    async def _open_within(self, budget: float, started: float, avoid: Optional[str]):
+    async def _open_within(
+        self, budget: float, started: float, avoid: Optional[str],
+        phase: Optional[str] = None,
+    ):
         """`backend.open`, bounded by the solve's own clock.
 
         A fleet backend waits for a free tab, and the wait it defaults to is an
@@ -2794,6 +2921,16 @@ class VerifyingSolver:
         """
         left = budget - (time.monotonic() - started)
         share = max(OPEN_FLOOR_S, left * 0.5)
+        # `open_for` is the CLI backend's; a browser fleet has no models to
+        # choose between and never grew one. Asked for by name rather than by
+        # duck-typed keyword, because a backend that HAS `open` and not
+        # `open_for` is the normal case, not an error to report.
+        opener = getattr(self._backend, "open_for", None)
+        if phase and opener is not None:
+            try:
+                return await opener(phase=phase, avoid=avoid, timeout_s=share)
+            except TypeError:
+                pass
         try:
             return await self._backend.open(avoid=avoid, timeout_s=share)
         except TypeError:
