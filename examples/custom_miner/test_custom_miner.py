@@ -15050,3 +15050,66 @@ def test_the_response_deadline_still_cuts_a_turn_that_never_speaks(
     assert "has sent no answer text at all" not in out, out
     # Bounded by the slice it was given, and not by a second clock.
     assert 3.0 <= spent < 12.0, (spent, out)
+
+
+def test_only_a_usage_limit_moves_a_turn_to_the_backup_account(
+    tmp_path, monkeypatch
+):
+    """The backup account is for the primary's usage limit and nothing else.
+
+    The ladder was profile-major -- the default model on EVERY account before
+    any second model on any -- so the first hop crossed accounts whatever went
+    wrong: a 5xx, a wedged stream, a lost session, a token refresh racing a
+    second miner. Each of those spent the backup's quota to discover something
+    the primary's own next model would have answered.
+
+    Account-major makes the ordering carry the rule. A hop changes the model
+    while the seat can still answer; the seat changes only when nothing on it
+    can, and only two things take a whole seat out -- a usage limit the CLI
+    reported for the account, and the CLI saying the seat is signed out."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOLVER_CLI_BACKUP_ACCOUNTS", str(tmp_path / "seat2"))
+    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:low,fable:low")
+    backend = CliBackend()
+    primary, backup = backend.accounts[0], backend.accounts[1]
+    assert backup is not primary, backend.accounts
+
+    def hop_from_primary():
+        return backend.next_pair(primary, backend.default.model, same_account=False)
+
+    # Every model on the seat comes before any model on the next seat.
+    ladder = [(a.name, p.model) for a, p in backend.pairs()]
+    assert [n for n, _ in ladder] == [primary.name] * len(backend.profiles) + [
+        backup.name
+    ] * len(backend.profiles), ladder
+
+    # A service refusal, a wedge, an unexplained failure: the MODEL moves.
+    for note in (
+        lambda: backend.note_degraded(backend.default.model, "500 internal"),
+        lambda: backend.note_stall(primary, backend.default.model),
+    ):
+        backend._out.clear()
+        note()
+        seat, profile = hop_from_primary()
+        assert seat is primary, (
+            f"a failure that is not a usage limit moved the turn to "
+            f"{seat.name}; the backup is for the limit"
+        )
+        assert profile.model != backend.default.model, profile
+
+    # A per-model window is scoped to one model on one seat, and moves only it.
+    backend._out.clear()
+    backend.note_limit(primary, backend.default.model, None, "seven_day_opus")
+    seat, profile = hop_from_primary()
+    assert seat is primary and profile.model != backend.default.model, (
+        f"a per-model window moved the whole seat: {seat.name}/{profile.model}"
+    )
+
+    # The account's own usage limit, and only then, is the backup's turn.
+    backend._out.clear()
+    backend.note_limit(primary, "*", None, "five_hour rejected")
+    seat, _ = hop_from_primary()
+    assert seat is backup, f"a usage limit did not reach the backup: {seat.name}"
+    assert backend.pick()[0] is backup, backend.pick()[0].name

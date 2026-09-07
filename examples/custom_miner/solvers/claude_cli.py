@@ -1416,13 +1416,26 @@ class CliBackend:
     def pairs(self) -> list[tuple[Account, Profile]]:
         """Every (account, profile), in the order a solve is offered around.
 
-        Profile-major: the default model on every account before any
-        emergency profile on any. A usage limit is an account's and a refusal
-        is a model's, so for those two the order makes no difference; it
-        decides the third case, a turn that failed for no stated reason,
-        and there the cheaper move -- same model, other seat -- comes first.
+        ACCOUNT-MAJOR, and this ordering is the whole rule for when the backup
+        account gets used: every model on a seat before any model on the next
+        seat. So a hop changes the MODEL while the seat can still answer, and
+        the seat changes only when nothing on it can -- which is what the
+        outage table already means by an account-wide entry, and only two
+        things write one. `note_limit(account, "*")` does, from the CLI's own
+        `rateLimitEvent`, and that is the usage limit. `note_unauthorised`
+        does, from the CLI saying the seat is signed out, and a seat that is
+        not signed in cannot serve any model at all.
+
+        Profile-major was the order until this, on the argument that "the
+        cheaper move -- same model, other seat -- comes first". It made the
+        FIRST hop cross accounts for every failure the ladder has an answer
+        to: a 5xx, a wedged stream, a lost session, a token refresh racing
+        another process. None of those are a usage limit, and each one spent
+        the backup's quota to discover it. A per-model window
+        (`seven_day_opus`) is scoped to one model on one seat and still moves
+        only the model, because that is the scope the CLI reported it with.
         """
-        return [(a, p) for p in self.profiles for a in self.accounts]
+        return [(a, p) for a in self.accounts for p in self.profiles]
 
     def outage_for(self, account: Account, model: str) -> tuple[float, str]:
         """(seconds this pair is known to be out, why). (0, "") if it is not."""
