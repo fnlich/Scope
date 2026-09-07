@@ -13869,9 +13869,14 @@ def test_a_nearly_spent_seat_hands_fresh_solves_and_readings_to_the_other(
     tmp_path, monkeypatch, capsys
 ):
     """The limit used to land mid-conversation at 91%+. Past `switch_at` a
-    seat takes no FRESH solve while another has room; the second reading and
-    the judge go to the lightest seat at all times; and a window that has
-    reset counts as empty again."""
+    seat takes no FRESH solve while another has room, and a pinned-model read
+    follows the same rule -- one answer to "which seat", whether the caller
+    wanted a particular model or the best available one. A window that has
+    reset counts as empty again.
+
+    A read used to go to the LIGHTEST seat at all times, which sent turns to
+    the backup while the primary was healthy. The backup is for the primary's
+    usage limit; being merely heavier is not one."""
     from solvers.claude_cli import CliBackend
 
     _fake_cli(tmp_path, monkeypatch, backups=1)
@@ -13890,11 +13895,11 @@ def test_a_nearly_spent_seat_hands_fresh_solves_and_readings_to_the_other(
     # Nothing reported: the ladder's order, primary first, everywhere.
     assert backend.pick()[0] is primary
     assert asyncio.run(backend.open_profile("fable", "low")).account is primary
-    # The primary is heavier than the backup: readings go to the backup,
-    # fresh solves stay on the primary while it has room.
+    # The primary is heavier than the backup and still has room: BOTH stay
+    # on it. Half a window spent is not a usage limit.
     report(primary, 0.5)
     assert backend.pick()[0] is primary
-    assert asyncio.run(backend.open_profile("fable", "low")).account is backup
+    assert asyncio.run(backend.open_profile("fable", "low")).account is primary
     assert backend.stats()["usage"] == {"primary": 0.5, "claude-2": 0.0}
     # Past the switch point: fresh solves go to the backup as well, and the
     # log says why -- and that nothing is OUT.
@@ -13902,6 +13907,7 @@ def test_a_nearly_spent_seat_hands_fresh_solves_and_readings_to_the_other(
     assert backend.pick()[0] is backup
     assert backend.pick()[1].model == "opus", "same model, other seat"
     assert asyncio.run(backend.open()).account is backup
+    assert asyncio.run(backend.open_profile("fable", "low")).account is backup
     out = capsys.readouterr().out
     assert "NEAR THE LIMIT" in out and "96%" in out and "EMERGENCY" not in out, out
     # Both seats past it: the ladder decides again.
@@ -13911,6 +13917,7 @@ def test_a_nearly_spent_seat_hands_fresh_solves_and_readings_to_the_other(
     report(primary, 0.96, resets_at=time.time() - 1)
     assert backend.usage_of(primary) == 0.0
     assert backend.pick()[0] is primary
+    assert asyncio.run(backend.open_profile("fable", "low")).account is primary
     assert asyncio.run(backend.open_profile("fable", "low")).account is primary
     asyncio.run(backend.open())
     assert "back to normal" in capsys.readouterr().out
@@ -15050,3 +15057,66 @@ def test_the_response_deadline_still_cuts_a_turn_that_never_speaks(
     assert "has sent no answer text at all" not in out, out
     # Bounded by the slice it was given, and not by a second clock.
     assert 3.0 <= spent < 12.0, (spent, out)
+
+
+def test_only_a_usage_limit_moves_a_turn_to_the_backup_account(
+    tmp_path, monkeypatch
+):
+    """The backup account is for the primary's usage limit and nothing else.
+
+    The ladder was profile-major -- the default model on EVERY account before
+    any second model on any -- so the first hop crossed accounts whatever went
+    wrong: a 5xx, a wedged stream, a lost session, a token refresh racing a
+    second miner. Each of those spent the backup's quota to discover something
+    the primary's own next model would have answered.
+
+    Account-major makes the ordering carry the rule. A hop changes the model
+    while the seat can still answer; the seat changes only when nothing on it
+    can, and only two things take a whole seat out -- a usage limit the CLI
+    reported for the account, and the CLI saying the seat is signed out."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOLVER_CLI_BACKUP_ACCOUNTS", str(tmp_path / "seat2"))
+    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:low,fable:low")
+    backend = CliBackend()
+    primary, backup = backend.accounts[0], backend.accounts[1]
+    assert backup is not primary, backend.accounts
+
+    def hop_from_primary():
+        return backend.next_pair(primary, backend.default.model, same_account=False)
+
+    # Every model on the seat comes before any model on the next seat.
+    ladder = [(a.name, p.model) for a, p in backend.pairs()]
+    assert [n for n, _ in ladder] == [primary.name] * len(backend.profiles) + [
+        backup.name
+    ] * len(backend.profiles), ladder
+
+    # A service refusal, a wedge, an unexplained failure: the MODEL moves.
+    for note in (
+        lambda: backend.note_degraded(backend.default.model, "500 internal"),
+        lambda: backend.note_stall(primary, backend.default.model),
+    ):
+        backend._out.clear()
+        note()
+        seat, profile = hop_from_primary()
+        assert seat is primary, (
+            f"a failure that is not a usage limit moved the turn to "
+            f"{seat.name}; the backup is for the limit"
+        )
+        assert profile.model != backend.default.model, profile
+
+    # A per-model window is scoped to one model on one seat, and moves only it.
+    backend._out.clear()
+    backend.note_limit(primary, backend.default.model, None, "seven_day_opus")
+    seat, profile = hop_from_primary()
+    assert seat is primary and profile.model != backend.default.model, (
+        f"a per-model window moved the whole seat: {seat.name}/{profile.model}"
+    )
+
+    # The account's own usage limit, and only then, is the backup's turn.
+    backend._out.clear()
+    backend.note_limit(primary, "*", None, "five_hour rejected")
+    seat, _ = hop_from_primary()
+    assert seat is backup, f"a usage limit did not reach the backup: {seat.name}"
+    assert backend.pick()[0] is backup, backend.pick()[0].name
