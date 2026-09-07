@@ -14852,3 +14852,149 @@ def test_the_summary_line_describes_the_pass_that_shipped_not_one_that_lost(caps
         f"the line describes the pass that lost, not the one that shipped: {line}"
     )
     assert "exit=cases" not in line and "rounds=0" not in line, line
+
+
+def test_a_claude_ai_login_is_a_subscription_not_metered_billing():
+    """`authMethod` has more than one subscription value, and calling a real
+    one metered is the expensive mistake.
+
+    A production run reported `authMethod=claude.ai — NOT a subscription;
+    this bills per token` for a Max login on both seats. The CLI's own strings
+    settle it: `"claude.ai": " from the saved claude.ai login"`, and
+    `case "claude.ai": return "claude /logout to sign out of claude.ai."`.
+    `oauth_token` is the CLAUDE_CODE_OAUTH_TOKEN form of the same thing. The
+    metered methods are api_key, bedrock and vertex.
+    """
+    from solvers.claude_cli import billing_of, is_subscription
+
+    for method in ("claude.ai", "oauth_token"):
+        assert "subscription" in billing_of(method), method
+        assert "bills per token" not in billing_of(method), method
+        # The doctor reads the same question through the predicate, and had
+        # the same one-value test, so it called a Max seat metered too.
+        assert is_subscription(method), method
+    for method in ("api_key", "bedrock", "vertex", "something_new", None):
+        assert not is_subscription(method), method
+    for method in ("api_key", "bedrock", "vertex"):
+        assert "bills per token" in billing_of(method), method
+    # A method neither list knows is reported as unrecognised rather than as
+    # metered: a NEW name for a subscription is how the false alarm happened,
+    # and the recovery from it must not be another false alarm.
+    for method in ("something_new", None):
+        said = billing_of(method)
+        assert "unrecognised" in said, said
+        assert "NOT a subscription" not in said, said
+
+
+def test_a_token_refresh_race_is_not_a_sign_out(tmp_path, monkeypatch):
+    """Two miners share a login by design, so their CLIs race to refresh its
+    token. The CLI says so plainly -- "another Claude Code process is
+    refreshing it ... This is usually transient; retry in a minute" -- but the
+    message contains "OAuth token", which `classify` reads as auth, so a
+    healthy account was held for the half hour a real sign-out gets. Measured
+    on a production replay: the primary went out for 30 minutes and every
+    solve in the window went to the backup seat.
+    """
+    from solvers.claude_cli import (
+        AUTH_HOLD_S, AUTH_RACE_HOLD_S, CliBackend, classify,
+    )
+
+    race = ("Failed to refresh OAuth token: another Claude Code process is "
+            "refreshing it or exited mid-refresh. This is usually transient; "
+            "retry in a minute, and if it persists close other Claude Code "
+            "processes or sign in again")
+    gone = "Invalid authentication: please run /login"
+    # Both still route the same way -- hop to another seat, which is right.
+    assert classify(race) == "auth" and classify(gone) == "auth"
+
+    _fake_cli(tmp_path, monkeypatch, mode="ok")
+    backend = CliBackend()
+    account = backend.accounts[0]
+
+    backend.note_unauthorised(account, race)
+    racing = backend.outage_for(account, backend.default.model)[0]
+    backend._out.clear()
+    backend.note_unauthorised(account, gone)
+    signed_out = backend.outage_for(account, backend.default.model)[0]
+
+    assert racing <= AUTH_RACE_HOLD_S + 1, f"race held for {racing:.0f}s"
+    assert signed_out > AUTH_RACE_HOLD_S * 5, f"sign-out held for {signed_out:.0f}s"
+    assert signed_out <= AUTH_HOLD_S + 1
+
+
+def test_a_retrying_auth_error_waits_for_the_cli_instead_of_hopping():
+    """The CLI retries a failed request itself, up to ten times with a growing
+    delay, and says so on the stream. Auth used to be the one class that
+    abandoned the seat on retry ONE while a 5xx got API_RETRIES_TOLERATED.
+
+    Measured on a production replay: `retry 1/10: authentication_failed, next
+    wait 1s` -- two miners racing to refresh one login's token, transient by
+    the CLI's own account of it -- and the miner left a healthy account and
+    spent the backup's quota. A sign-out that is real exhausts the retries and
+    hops a few seconds later; a usage limit still hops at once, because no
+    amount of waiting fixes it.
+    """
+    from solvers.claude_cli import (
+        API_RETRIES_TOLERATED, LONG_RETRY_MS, CliConversation,
+        _Degraded, _Limited, _Unauthorised,
+    )
+
+    class _Backend2:
+        last_error = ""
+
+        def note_limit(self, *a, **k):
+            pass
+
+        def provider_of(self, account, profile):
+            return "cli:opus@primary"
+
+    conv = CliConversation.__new__(CliConversation)
+    conv._backend = _Backend2()
+    conv._retries = 0
+    conv.account = None
+    conv.profile = None
+
+    def retry(**event):
+        return conv._retry(event, [])
+
+    # retry 1 of an auth failure: the CLI is trying again, so we wait.
+    retry(attempt=1, max_retries=10, retry_delay_ms=1000,
+          error="authentication_failed")
+    assert conv._retries == 1
+
+    # ...and only once it has run out of patience does the seat change.
+    try:
+        for _ in range(API_RETRIES_TOLERATED):
+            retry(attempt=9, max_retries=10, retry_delay_ms=1000,
+                  error="authentication_failed")
+        raise AssertionError("never hopped on a persistent auth failure")
+    except _Unauthorised:
+        pass
+
+    # A usage limit is the one answer that settles it: no waiting helps.
+    conv._retries = 0
+    with pytest.raises(_Limited):
+        retry(attempt=1, max_retries=10, retry_delay_ms=1000,
+              error="rate limit reached")
+
+    # A wait this turn cannot afford is not worth staying for either.
+    conv._retries = 0
+    with pytest.raises(_Degraded):
+        retry(attempt=1, max_retries=10, retry_delay_ms=LONG_RETRY_MS + 1,
+              error="overloaded")
+
+
+def test_authentication_failed_is_read_as_an_auth_failure():
+    """`_AUTH_MARKS` carried "authentication_error" and a production log
+    carried `authentication_failed`, which matched nothing here -- so an auth
+    failure was routed as a SERVER one and `note_degraded` set the model out
+    on EVERY account rather than the seat that refused it."""
+    from solvers.claude_cli import classify
+
+    for text in ("authentication_failed", "authentication_error",
+                 "API Error: authentication_failed"):
+        assert classify(text) == "auth", text
+    # ...without swallowing the classes either side of it.
+    assert classify("overloaded") == "server"
+    assert classify("rate limit reached") == "limit"
+    assert classify("ECONNRESET") == "server"

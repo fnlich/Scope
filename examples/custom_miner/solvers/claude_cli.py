@@ -159,6 +159,26 @@ PAIR_HOLD_S = 300.0
 # is enough to notice one without spending turns on a seat that is not there.
 AUTH_HOLD_S = 1800.0
 
+# How long an account is left alone when the CLI could not refresh its token
+# because ANOTHER Claude Code process was refreshing it. That is not a
+# sign-out and no operator action fixes it: it is two processes sharing one
+# login, which is the supported way to run a second miner. The CLI's own words
+# are "This is usually transient; retry in a minute", so a minute is what this
+# is -- against the half hour a real sign-out gets. Measured on a production
+# replay: a healthy primary was taken out for 30 minutes by this race, and
+# every solve in that window went to the backup seat.
+AUTH_RACE_HOLD_S = 60.0
+
+# The CLI's own description of that race. Matched against the same text
+# `classify` reads, and checked BEFORE the hold is chosen -- `_AUTH_MARKS`
+# contains "oauth token", which this message also contains, so it classifies
+# as auth and must not be held as one.
+_AUTH_RACE_MARKS = (
+    "another claude code process",
+    "exited mid-refresh",
+    "usually transient",
+)
+
 # The retry event, counted from one, at which the model is declared out. The
 # CLI retries an overloaded or failing request itself, with a growing delay
 # between attempts, and each retry is reported on the stream as a
@@ -182,8 +202,46 @@ FAILURES_BEFORE_HOLD = 2
 # What an error says, sorted into what it means for the ladder. Checked
 # against the CLI's error text lower-cased; the status codes as whole words
 # so a session id cannot match one.
+# What `claude auth status` calls a seat that BILLS PER TOKEN. Named as the
+# metered set rather than the subscription set, because the two mistakes are
+# not equally bad: an unrecognised method wrongly called metered sends an
+# operator to change a working subscription, and that is what happened --
+# `claude.ai` was reported as "NOT a subscription" for a Max login. The CLI's
+# own strings settle it: `"claude.ai": " from the saved claude.ai login"` and
+# `case "claude.ai": return "claude /logout to sign out of claude.ai."`, while
+# `oauth_token` is the CLAUDE_CODE_OAUTH_TOKEN form. Both are subscriptions.
+_METERED_METHODS = ("api_key", "bedrock", "vertex")
+_SUBSCRIPTION_METHODS = ("oauth_token", "claude.ai")
+
+
+def is_subscription(method: Optional[str]) -> bool:
+    """Whether this seat is paid for by a subscription rather than per token."""
+    return str(method or "?") in _SUBSCRIPTION_METHODS
+
+
+def billing_of(method: Optional[str]) -> str:
+    """How a seat is paid for, in the operator's words.
+
+    Three answers, not two: a method this does not recognise is reported as
+    unrecognised rather than as metered, because a new name for a
+    subscription is exactly how the false alarm above happened.
+    """
+    name = str(method or "?")
+    if is_subscription(name):
+        return f"subscription ({name})"
+    if name in _METERED_METHODS:
+        return f"authMethod={name} — NOT a subscription; this bills per token"
+    return (f"authMethod={name} — unrecognised; check whether it is a "
+            f"subscription before running a long shift on it")
+
+
+# "authentication_" rather than the two spellings of it: a production log
+# carried `authentication_failed`, which matched neither "authentication_error"
+# nor anything else here, so an auth failure was routed as a SERVER one and
+# `note_degraded` set the model out on every account instead of the seat that
+# refused. The prefix covers both, and any third spelling.
 _AUTH_MARKS = ("not logged in", "please run /login", "invalid authentication",
-               "authentication_error", "oauth token", "invalid api key",
+               "authentication_", "oauth token", "invalid api key",
                "permission_error", "unauthorized")
 _LIMIT_MARKS = ("rate limit", "rate_limit", "usage limit", "limit reached",
                 "out of extra usage", "out_of_credits")
@@ -1120,15 +1178,29 @@ class CliConversation:
               + (f"/{int(limit)}" if limit else "")
               + f": {error or (f'HTTP {code}' if code else 'connection error')}"
               + f", next wait {delay_ms / 1000:.0f}s")
-        if code in (401, 403) or classify(error) == "auth":
-            raise _Unauthorised(error or f"HTTP {code}")
+        # A LIMIT is the one answer that settles it: this account cannot serve
+        # this turn no matter how long anyone waits, so the seat changes now.
         if code == 429 or classify(error) == "limit":
             self._backend.note_limit(self.account, "*", None, error or "HTTP 429")
             raise _Limited()
-        # Anything else the CLI would retry is the service not answering:
-        # a 5xx, a 529 overload, a connection with no status at all.
+        # Everything else -- auth included -- is the CLI saying it is TRYING
+        # AGAIN, and it is worth letting it. Measured on a production replay:
+        # `retry 1/10: authentication_failed, next wait 1s`, and the miner
+        # abandoned a healthy seat on that first retry and spent the backup
+        # account's quota instead. The cause was two miners racing to refresh
+        # one login's token -- transient by the CLI's own account of it, and
+        # over in about a second.
+        #
+        # Auth used to bail here on retry 1 with no patience at all, while a
+        # 5xx got `API_RETRIES_TOLERATED`. There is no reason for the
+        # asymmetry: a sign-out that is real exhausts the retries and arrives
+        # at `_failed_result` or a non-zero exit, which hop just the same, a
+        # few seconds later. What is NOT recoverable is a wait this turn
+        # cannot afford, and that is what the two tests below are for.
         if attempt >= API_RETRIES_TOLERATED or delay_ms >= LONG_RETRY_MS:
             what = error or (f"HTTP {code}" if code else "connection error")
+            if code in (401, 403) or classify(error) == "auth":
+                raise _Unauthorised(what)
             raise _Degraded(f"{what}, {attempt} retr{'y' if attempt == 1 else 'ies'} "
                             f"in, next wait {delay_ms / 1000:.0f}s")
 
@@ -1479,15 +1551,11 @@ class CliBackend:
                       f"({account.config_dir}) is not signed in; run "
                       f"`{account.login_command}`. It is skipped until it is.")
                 continue
-            method = str(status.get("authMethod") or "?")
             # Said out loud because it is the whole point of this backend, and
             # because the failure it warns about is invisible: an API key
             # answers every solve just as well and bills for every one of them.
-            billing = (
-                "subscription (OAuth)" if method == "oauth_token"
-                else f"authMethod={method} — NOT a subscription; this bills per token"
-            )
-            print(f"[cli] account {account.name}: {billing}")
+            print(f"[cli] account {account.name}: "
+                  f"{billing_of(status.get('authMethod'))}")
         ladder = ", ".join(p.label for p in self.profiles)
         print(f"[cli] {binary} ready: {len(self.accounts)} account(s), ladder "
               f"{ladder}, {self._limit} at a time; a refused model is tried "
@@ -1623,7 +1691,14 @@ class CliBackend:
 
     def note_unauthorised(self, account: Account, reason: str) -> None:
         self.last_error = f"{account.name} refused: {reason}"
-        self._set((account.name, "*"), time.time() + AUTH_HOLD_S, f"signed out: {reason}")
+        low = (reason or "").lower()
+        racing = any(mark in low for mark in _AUTH_RACE_MARKS)
+        self._set(
+            (account.name, "*"),
+            time.time() + (AUTH_RACE_HOLD_S if racing else AUTH_HOLD_S),
+            (f"token refresh raced another Claude Code process: {reason}"
+             if racing else f"signed out: {reason}"),
+        )
 
     def note_limit(
         self, account: Account, scope: str, resets_at: Optional[float], reason: str
@@ -1810,7 +1885,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             where = account.config_dir or "default login"
             if status.get("loggedIn"):
                 method = status.get("authMethod")
-                seat = "subscription" if method == "oauth_token" else f"authMethod={method}"
+                seat = ("subscription" if is_subscription(method)
+                        else f"authMethod={method}")
                 # Who, when the CLI says: two directories signed in as the
                 # SAME account share one limit, and this is where to see it.
                 who = " ".join(str(status[k]) for k in ("email", "subscriptionType")
