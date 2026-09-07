@@ -14920,3 +14920,81 @@ def test_a_token_refresh_race_is_not_a_sign_out(tmp_path, monkeypatch):
     assert racing <= AUTH_RACE_HOLD_S + 1, f"race held for {racing:.0f}s"
     assert signed_out > AUTH_RACE_HOLD_S * 5, f"sign-out held for {signed_out:.0f}s"
     assert signed_out <= AUTH_HOLD_S + 1
+
+
+def test_a_retrying_auth_error_waits_for_the_cli_instead_of_hopping():
+    """The CLI retries a failed request itself, up to ten times with a growing
+    delay, and says so on the stream. Auth used to be the one class that
+    abandoned the seat on retry ONE while a 5xx got API_RETRIES_TOLERATED.
+
+    Measured on a production replay: `retry 1/10: authentication_failed, next
+    wait 1s` -- two miners racing to refresh one login's token, transient by
+    the CLI's own account of it -- and the miner left a healthy account and
+    spent the backup's quota. A sign-out that is real exhausts the retries and
+    hops a few seconds later; a usage limit still hops at once, because no
+    amount of waiting fixes it.
+    """
+    from solvers.claude_cli import (
+        API_RETRIES_TOLERATED, LONG_RETRY_MS, CliConversation,
+        _Degraded, _Limited, _Unauthorised,
+    )
+
+    class _Backend2:
+        last_error = ""
+
+        def note_limit(self, *a, **k):
+            pass
+
+        def provider_of(self, account, profile):
+            return "cli:opus@primary"
+
+    conv = CliConversation.__new__(CliConversation)
+    conv._backend = _Backend2()
+    conv._retries = 0
+    conv.account = None
+    conv.profile = None
+
+    def retry(**event):
+        return conv._retry(event, [])
+
+    # retry 1 of an auth failure: the CLI is trying again, so we wait.
+    retry(attempt=1, max_retries=10, retry_delay_ms=1000,
+          error="authentication_failed")
+    assert conv._retries == 1
+
+    # ...and only once it has run out of patience does the seat change.
+    try:
+        for _ in range(API_RETRIES_TOLERATED):
+            retry(attempt=9, max_retries=10, retry_delay_ms=1000,
+                  error="authentication_failed")
+        raise AssertionError("never hopped on a persistent auth failure")
+    except _Unauthorised:
+        pass
+
+    # A usage limit is the one answer that settles it: no waiting helps.
+    conv._retries = 0
+    with pytest.raises(_Limited):
+        retry(attempt=1, max_retries=10, retry_delay_ms=1000,
+              error="rate limit reached")
+
+    # A wait this turn cannot afford is not worth staying for either.
+    conv._retries = 0
+    with pytest.raises(_Degraded):
+        retry(attempt=1, max_retries=10, retry_delay_ms=LONG_RETRY_MS + 1,
+              error="overloaded")
+
+
+def test_authentication_failed_is_read_as_an_auth_failure():
+    """`_AUTH_MARKS` carried "authentication_error" and a production log
+    carried `authentication_failed`, which matched nothing here -- so an auth
+    failure was routed as a SERVER one and `note_degraded` set the model out
+    on EVERY account rather than the seat that refused it."""
+    from solvers.claude_cli import classify
+
+    for text in ("authentication_failed", "authentication_error",
+                 "API Error: authentication_failed"):
+        assert classify(text) == "auth", text
+    # ...without swallowing the classes either side of it.
+    assert classify("overloaded") == "server"
+    assert classify("rate limit reached") == "limit"
+    assert classify("ECONNRESET") == "server"

@@ -235,8 +235,13 @@ def billing_of(method: Optional[str]) -> str:
             f"subscription before running a long shift on it")
 
 
+# "authentication_" rather than the two spellings of it: a production log
+# carried `authentication_failed`, which matched neither "authentication_error"
+# nor anything else here, so an auth failure was routed as a SERVER one and
+# `note_degraded` set the model out on every account instead of the seat that
+# refused. The prefix covers both, and any third spelling.
 _AUTH_MARKS = ("not logged in", "please run /login", "invalid authentication",
-               "authentication_error", "oauth token", "invalid api key",
+               "authentication_", "oauth token", "invalid api key",
                "permission_error", "unauthorized")
 _LIMIT_MARKS = ("rate limit", "rate_limit", "usage limit", "limit reached",
                 "out of extra usage", "out_of_credits")
@@ -1173,15 +1178,29 @@ class CliConversation:
               + (f"/{int(limit)}" if limit else "")
               + f": {error or (f'HTTP {code}' if code else 'connection error')}"
               + f", next wait {delay_ms / 1000:.0f}s")
-        if code in (401, 403) or classify(error) == "auth":
-            raise _Unauthorised(error or f"HTTP {code}")
+        # A LIMIT is the one answer that settles it: this account cannot serve
+        # this turn no matter how long anyone waits, so the seat changes now.
         if code == 429 or classify(error) == "limit":
             self._backend.note_limit(self.account, "*", None, error or "HTTP 429")
             raise _Limited()
-        # Anything else the CLI would retry is the service not answering:
-        # a 5xx, a 529 overload, a connection with no status at all.
+        # Everything else -- auth included -- is the CLI saying it is TRYING
+        # AGAIN, and it is worth letting it. Measured on a production replay:
+        # `retry 1/10: authentication_failed, next wait 1s`, and the miner
+        # abandoned a healthy seat on that first retry and spent the backup
+        # account's quota instead. The cause was two miners racing to refresh
+        # one login's token -- transient by the CLI's own account of it, and
+        # over in about a second.
+        #
+        # Auth used to bail here on retry 1 with no patience at all, while a
+        # 5xx got `API_RETRIES_TOLERATED`. There is no reason for the
+        # asymmetry: a sign-out that is real exhausts the retries and arrives
+        # at `_failed_result` or a non-zero exit, which hop just the same, a
+        # few seconds later. What is NOT recoverable is a wait this turn
+        # cannot afford, and that is what the two tests below are for.
         if attempt >= API_RETRIES_TOLERATED or delay_ms >= LONG_RETRY_MS:
             what = error or (f"HTTP {code}" if code else "connection error")
+            if code in (401, 403) or classify(error) == "auth":
+                raise _Unauthorised(what)
             raise _Degraded(f"{what}, {attempt} retr{'y' if attempt == 1 else 'ies'} "
                             f"in, next wait {delay_ms / 1000:.0f}s")
 
