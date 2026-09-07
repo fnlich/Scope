@@ -1633,19 +1633,35 @@ class CliBackend:
     async def open_profile(self, model: str, effort: str) -> CliConversation:
         """A fresh session on a NAMED model and effort, where the ladder allows.
 
-        For the second reading and the judge, which want a particular model
-        rather than the best available one. The first signed-in account on
-        which that model is not out gets it; if the model is out everywhere,
-        the ladder's own choice answers instead, and says so through
-        `provider`, so the caller can tell.
+        For the second reading, the judge, and any phase the operator pinned
+        a model to -- all of which want a particular model rather than the
+        best available one. The first signed-in account on which that model
+        is not out gets it; if the model is out everywhere, the ladder's own
+        choice answers instead, and says so through `provider`, so the caller
+        can tell.
+
+        THE FIRST SEAT, not the lightest. It sorted by usage once, to spread
+        turns that belong to no conversation and can go anywhere -- measured
+        as a five-hour window holding 35 solves rather than 18 with the
+        second reading and the judge both on the primary. That measurement is
+        about the RATE one seat is spent at, and spreading does not create
+        capacity: two windows hold what two windows hold, whether they are
+        drained together or in turn. What it does do is send turns to the
+        backup while the primary is healthy, which is the one thing the
+        backup is not for. Draining the primary first and moving when it is
+        actually out is the same total and reserves the seat -- and it is
+        what this docstring said all along, before the sort disagreed with
+        it.
+
+        `_with_room_first` still applies, so this and `pick` answer "which
+        seat" the same way: the ladder's order, except that a seat at or past
+        `switch_at` goes last. One rule, whether the caller wanted a
+        particular model or the best available one.
         """
         wanted = Profile(model, effort if effort in EFFORTS else self.effort)
-        # The LIGHTEST seat, not the first: these turns belong to no
-        # conversation and can go anywhere, and spreading them is what keeps
-        # the primary's window for the primary's own turns. Measured: with
-        # the second reading and the judge on the primary, a five-hour
-        # window that held 35 solves holds about 18.
-        for account in sorted(self.accounts, key=self.usage_of):
+        for account in sorted(
+            self.accounts, key=lambda a: self.usage_of(a) >= self.switch_at
+        ):
             if self.outage_for(account, wanted.model)[0] <= 0:
                 self._opened += 1
                 self._live += 1

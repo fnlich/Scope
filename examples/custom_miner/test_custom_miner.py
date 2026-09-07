@@ -13869,9 +13869,14 @@ def test_a_nearly_spent_seat_hands_fresh_solves_and_readings_to_the_other(
     tmp_path, monkeypatch, capsys
 ):
     """The limit used to land mid-conversation at 91%+. Past `switch_at` a
-    seat takes no FRESH solve while another has room; the second reading and
-    the judge go to the lightest seat at all times; and a window that has
-    reset counts as empty again."""
+    seat takes no FRESH solve while another has room, and a pinned-model read
+    follows the same rule -- one answer to "which seat", whether the caller
+    wanted a particular model or the best available one. A window that has
+    reset counts as empty again.
+
+    A read used to go to the LIGHTEST seat at all times, which sent turns to
+    the backup while the primary was healthy. The backup is for the primary's
+    usage limit; being merely heavier is not one."""
     from solvers.claude_cli import CliBackend
 
     _fake_cli(tmp_path, monkeypatch, backups=1)
@@ -13890,11 +13895,11 @@ def test_a_nearly_spent_seat_hands_fresh_solves_and_readings_to_the_other(
     # Nothing reported: the ladder's order, primary first, everywhere.
     assert backend.pick()[0] is primary
     assert asyncio.run(backend.open_profile("fable", "low")).account is primary
-    # The primary is heavier than the backup: readings go to the backup,
-    # fresh solves stay on the primary while it has room.
+    # The primary is heavier than the backup and still has room: BOTH stay
+    # on it. Half a window spent is not a usage limit.
     report(primary, 0.5)
     assert backend.pick()[0] is primary
-    assert asyncio.run(backend.open_profile("fable", "low")).account is backup
+    assert asyncio.run(backend.open_profile("fable", "low")).account is primary
     assert backend.stats()["usage"] == {"primary": 0.5, "claude-2": 0.0}
     # Past the switch point: fresh solves go to the backup as well, and the
     # log says why -- and that nothing is OUT.
@@ -13902,6 +13907,7 @@ def test_a_nearly_spent_seat_hands_fresh_solves_and_readings_to_the_other(
     assert backend.pick()[0] is backup
     assert backend.pick()[1].model == "opus", "same model, other seat"
     assert asyncio.run(backend.open()).account is backup
+    assert asyncio.run(backend.open_profile("fable", "low")).account is backup
     out = capsys.readouterr().out
     assert "NEAR THE LIMIT" in out and "96%" in out and "EMERGENCY" not in out, out
     # Both seats past it: the ladder decides again.
@@ -13911,6 +13917,7 @@ def test_a_nearly_spent_seat_hands_fresh_solves_and_readings_to_the_other(
     report(primary, 0.96, resets_at=time.time() - 1)
     assert backend.usage_of(primary) == 0.0
     assert backend.pick()[0] is primary
+    assert asyncio.run(backend.open_profile("fable", "low")).account is primary
     assert asyncio.run(backend.open_profile("fable", "low")).account is primary
     asyncio.run(backend.open())
     assert "back to normal" in capsys.readouterr().out
