@@ -12566,6 +12566,22 @@ def test_no_prompt_contradicts_its_own_output_contract():
         for phrase in two_blocks:
             assert phrase not in tests, f"the cases turn mentions {phrase!r}"
 
+        # The SIZE PROBE turn is the one place two blocks are asked for, and
+        # the invariant is the same one, not an exception to it: its contract
+        # says TWO, its task asks for the second, and it never says ONE.
+        probed = build_tests_prompt(
+            language, "Do a thing.", entry, [], want_probe=True
+        )
+        assert "TWO fenced blocks" in probed, probed[:200]
+        assert "ONE fenced block" not in probed, (
+            "the probe turn asks for two blocks and also for one"
+        )
+        assert "def generate" in probed or "`generate`" in probed, (
+            "the contract names a second block the task never asks for"
+        )
+        # And the cases are still the FIRST block, where the parser looks.
+        assert probed.index("FIRST block") < probed.index("SECOND block")
+
         # Turn 2, both flavours: cases agreed, and cases never obtained.
         for cases in ([{"name": "n", "args": [[]], "expected": 0}], [], None):
             prompt = build_code_prompt(
@@ -12590,6 +12606,14 @@ def test_no_prompt_contradicts_its_own_output_contract():
     for name in dir(prompts_mod):
         value = getattr(prompts_mod, name)
         if isinstance(value, str) and name.isupper():
+            if name == "TESTS_OUTPUT_CONTRACT_WITH_PROBE":
+                # The one exception, and it is not the banned thing. What was
+                # removed asked for a PROGRAM and its cases in one reply, so
+                # the cases were back-filled from the program's own behaviour.
+                # This asks for cases and a generator, before any program
+                # exists, and the generator is never graded against anything --
+                # it only supplies an input to time.
+                continue
             assert "TWO fenced blocks" not in value, f"{name} still asks for two"
 
 
@@ -15230,3 +15254,100 @@ def test_the_reserve_is_offered_only_with_nothing_finished_to_lose(
         solver._send_within(_TwoArg(), "p", 5.0, extend_to_s=99.0)
     )
     assert got == "", got
+
+
+def test_a_quadratic_program_that_passes_every_case_is_caught_at_size():
+    """The failure class the bar cannot reach, by a rule it cannot relax.
+
+    Every case on the bar carries an `expected` the model derives BY HAND, so
+    no case is ever the size the validator runs. A quadratic program passes all
+    twenty small cases and then times out on the hidden tests, which use the
+    same five-second `per_test_timeout_s` this grader does — measured:
+    rlvr/config.py:46 default 5.0, solvers/verify.py VERIFY_TIMEOUT_S 5.
+
+    The probe asks the one question that needs no expected value at all."""
+    from solvers.verify import VerifyingSolver, VERIFY_TIMEOUT_S
+
+    from solvers import verify as verify_mod
+
+    solver = VerifyingSolver.__new__(VerifyingSolver)
+    solver._grader = verify_mod._Grader()
+
+    class _Task:
+        language, entrypoint = "python", "solve"
+
+    generator = (
+        "import random\n"
+        "def generate(seed, scale):\n"
+        "    random.seed(seed)\n"
+        "    n = max(2, scale // 8)\n"
+        "    return {'args': [[random.randint(0, 10**6) for _ in range(n)]]}\n"
+    )
+    quadratic = (
+        "def solve(xs):\n"
+        "    best = 0\n"
+        "    for i in range(len(xs)):\n"
+        "        for j in range(len(xs)):\n"
+        "            if xs[i] + xs[j] > best:\n"
+        "                best = xs[i] + xs[j]\n"
+        "    return best\n"
+    )
+    linear = "def solve(xs):\n    return max(xs) * 2 if xs else 0\n"
+
+    slow = asyncio.run(
+        solver._timed_out_at_scale(quadratic, generator, _Task(), 60.0)
+    )
+    assert slow is not None, "a quadratic program ran to size without complaint"
+    assert "did not finish" in slow and "bytes" in slow, slow
+
+    fast = asyncio.run(
+        solver._timed_out_at_scale(linear, generator, _Task(), 60.0)
+    )
+    assert fast is None, f"a linear program was reported too slow: {fast}"
+
+    # And the same suite the validator uses agrees the small cases are silent:
+    # both programs pass a hand-sized case, which is what makes the probe the
+    # only thing that could have told them apart.
+    for code in (quadratic, linear):
+        ran = solver._grader.outputs(
+            code, "python", "solve", [{"args": [[1, 2, 3]]}], VERIFY_TIMEOUT_S * 2
+        )
+        assert ran[0].ok and ran[0].value == 6, (code[:20], ran[0].error)
+
+
+def test_the_probe_never_costs_the_answer(tmp_path, monkeypatch):
+    """Every way the probe can fail must end with the solve exactly as it was.
+
+    It rides a turn taken for something else and runs on borrowed budget, so
+    it is allowed to find nothing and never allowed to cost anything."""
+    from solvers.verify import VerifyingSolver, PROBE_MAX_BYTES
+
+    from solvers import verify as verify_mod
+
+    solver = VerifyingSolver.__new__(VerifyingSolver)
+    solver._grader = verify_mod._Grader()
+
+    class _Task:
+        language, entrypoint = "python", "solve"
+
+    code = "def solve(xs):\n    return 1\n"
+    run = lambda gen, left=60.0: asyncio.run(
+        solver._timed_out_at_scale(code, gen, _Task(), left)
+    )
+
+    assert run("") is None, "no generator must not be a verdict"
+    assert run("def generate(seed, scale):\n    raise ValueError('x')\n") is None
+    assert run("def generate(seed, scale):\n    return 'not a case'\n") is None
+    assert run("def generate(seed, scale):\n    return {'args': 5}\n") is None
+    # A generator that ignores the byte budget: its output cannot come back
+    # through the sandbox at all, and that is a skip, never a crash report.
+    assert run(
+        "def generate(seed, scale):\n    return {'args': ['x' * 900000]}\n"
+    ) is None
+    # No time to run it and act on it.
+    assert run("def generate(seed, scale):\n    return {'args': [[1]]}\n", 1.0) is None
+
+    # The ceiling is the measured transport limit, not a guess: the sandbox
+    # keeps only the last 256 KiB of stdout, so a framed reply above that
+    # loses its opening marker and reads as a crashed generator.
+    assert PROBE_MAX_BYTES < 256 * 1024, PROBE_MAX_BYTES

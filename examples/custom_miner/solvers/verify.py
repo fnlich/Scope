@@ -49,6 +49,7 @@ from .prompts import (
     build_tests_prompt,
     dropped_definitions,
     extract_code,
+    extract_generator,
     extract_self_tests,
     python_defect,
     rust_defect,
@@ -131,6 +132,41 @@ DELIVERY_RESERVE_S = 15.0
 # 0.95, and the validator listens until `deadline_s + 10` while this miner
 # stops at `deadline_s + 5`.
 WIRE_TAIL_S = 6.0
+
+# ---------------------------------------------------------------- the probe --
+# The largest input the sandbox can hand back, MEASURED against the real
+# executor rather than assumed.
+#
+# `subprocess_executor` caps captured stdout at `_MAX_OUTPUT_BYTES` = 256 KiB
+# and keeps the TAIL of it, so a framed status line longer than that loses its
+# opening marker and `_extract_framed` returns None. The caller is then told
+# "sandbox produced no verdict (crashed or exited early)" -- which reads as a
+# broken generator and is nothing of the kind. Bisected on this machine
+# through `_Grader.outputs`: 261,093 bytes comes back, 262,187 does not, and
+# 256 KiB is 262,144.
+#
+# The arm this replaces set its own limit to 1,000,000 and checked it AFTER
+# the run, so the check could never fire: the run had already died. Measured
+# over 102 production solves, that arm obtained 8 large inputs and reported 26
+# crashed generators.
+#
+# 240 KiB, for the framing and the JSON quoting around the payload.
+PROBE_MAX_BYTES = 240 * 1024
+
+# The byte budgets offered to the generator, in order, until one comes back.
+# Descending because the reason a budget fails is nearly always that what came
+# back was too big for the pipe, and a program that is quadratic at the limit
+# is quadratic at a quarter of it: 60 KiB of input is tens of thousands of
+# values, where an O(n^2) loop is billions of operations and a five-second
+# limit is not close.
+PROBE_SCALES = (PROBE_MAX_BYTES, PROBE_MAX_BYTES // 4, PROBE_MAX_BYTES // 16)
+
+# The least that must be left to run the probe AND act on what it says. The
+# probe itself is one generator run plus one program run, each bounded by
+# `VERIFY_TIMEOUT_S`; the round it may cause is a full round trip. Below this
+# the probe is skipped rather than run to produce a verdict nothing can be
+# done about.
+PROBE_FLOOR_S = 45.0
 
 # The least a correction round can be worth starting with: one prompt out, one
 # reply back, and something read from the page at the end of it. Below this the
@@ -1334,6 +1370,13 @@ class VerifyingSolver:
             if independent_bar is None
             else bool(independent_bar)
         )
+        # The size probe: one extra fenced block on the cases turn, and one
+        # local run of the finished program on a large valid input. No extra
+        # model turn, and no oracle -- see `_timed_out_at_scale`.
+        self._size_probe = (
+            os.environ.get("SOLVER_SIZE_PROBE", "true").strip().lower()
+            not in ("0", "false", "no")
+        )
         self._grader = _Grader()
         self._cache: dict[str, tuple[str, str]] = {}
         self._cache_size = max(0, int(cache_size))
@@ -1668,7 +1711,7 @@ class VerifyingSolver:
             self_passed=best.self_passed, self_total=best.self_total,
         )
 
-    async def _ask_for_cases(self, conversation, task, left: float):
+    async def _ask_for_cases(self, conversation, task, left: float, probe=None):
         """Turn 1: the model's cases, before it has written the program.
 
         Returns the cases, or ``[]`` when the reply carried none usable, or
@@ -1681,8 +1724,16 @@ class VerifyingSolver:
         `_Plan` for why every version of that cap was a mistake.
         """
         slice_s = max(1.0, left)
+        # `probe` is a list the caller passes to receive the generator, rather
+        # than a second return value: this returns cases, [] and None with
+        # three different meanings the whole solve turns on, and widening that
+        # to a tuple to carry an optional extra would put the probe in the way
+        # of the bar. Absent list, no ask, and the turn is byte-identical to
+        # what it was.
+        want_probe = probe is not None
         prompt = build_tests_prompt(
-            task.language, task.statement, task.entrypoint, task.public_examples
+            task.language, task.statement, task.entrypoint, task.public_examples,
+            want_probe=want_probe,
         )
         # The slice IS everything left, and everything left runs to the point
         # the answer stops being deliverable. Nothing is held back to extend to.
@@ -1697,6 +1748,10 @@ class VerifyingSolver:
                 f"not answered the last one"
             )
             return None
+        if want_probe:
+            found = extract_generator(reply)
+            if found:
+                probe.append(found)
         cases = extract_self_tests(reply, task.entrypoint, task.language)
         if not cases:
             print("[verify] the cases turn produced none usable; "
@@ -1747,6 +1802,13 @@ class VerifyingSolver:
         bar_started = 0.0
         # One retry of an empty cases turn, per pass. See where it fires.
         bar_retried = False
+        # The size probe's generator, filled in by the cases turn, and whether
+        # the probe has already had its one run. ONE run per pass: it exists to
+        # answer "is this too slow at size", and asking twice about the same
+        # program answers the same. A round that changes the program in
+        # response clears it, so the replacement is asked in its turn.
+        probe: list = []
+        probed = False
         # Whether the program turn's phase line already went out -- it does,
         # early, when the retry runs between the turn and its grading.
         program_marked = False
@@ -1811,7 +1873,10 @@ class VerifyingSolver:
                 # task got as far as opening.
                 bar = []
                 bar_task = asyncio.create_task(
-                    self._write_the_bar(bar, task, budget, started, avoid, plan)
+                    self._write_the_bar(
+                        bar, task, budget, started, avoid, plan,
+                        probe=probe if self._size_probe else None,
+                    )
                 )
                 print(
                     f"[verify] the bar is being written in a separate "
@@ -2496,6 +2561,16 @@ class VerifyingSolver:
                 ):
                     best, best_provider = candidate, provider
                 if candidate.verified and not candidate.failures:
+                    slow = await self._probe_now(
+                        candidate, probe, probed, task, budget, started
+                    )
+                    if slow is not None:
+                        probed = True
+                        prompt = build_repair_prompt(
+                            [], task.language, task.entrypoint, too_slow=slow
+                        )
+                        continue
+                    probed = True
                     if plan is not None:
                         plan.note_exit("verified")
                     break
@@ -2633,11 +2708,26 @@ class VerifyingSolver:
                             plan.note_exit("stalled")
                         break
                 if not candidate.defect and not candidate.failures:
-                    # Nothing the program's cases can say against it. Reported
-                    # as `converged`, and the summary line says beside it how
-                    # many cases DISAGREED to begin with -- because converging
-                    # from nothing and converging from four failures are the
-                    # same word here and very different evidence.
+                    # Nothing the program's cases can say against it -- and the
+                    # cases are all small, by a rule this file cannot relax: an
+                    # `expected` is derived by hand, so no case on the bar is
+                    # ever the size the validator will run. The probe asks the
+                    # one question the bar cannot, and asks it before this
+                    # counts as converged.
+                    slow = await self._probe_now(
+                        candidate, probe, probed, task, budget, started
+                    )
+                    if slow is not None:
+                        probed = True
+                        prompt = build_repair_prompt(
+                            [], task.language, task.entrypoint, too_slow=slow
+                        )
+                        continue
+                    probed = True
+                    # Reported as `converged`, and the summary line says beside
+                    # it how many cases DISAGREED to begin with -- because
+                    # converging from nothing and converging from four failures
+                    # are the same word here and very different evidence.
                     if plan is not None:
                         plan.note_exit("converged")
                     break
@@ -2749,7 +2839,7 @@ class VerifyingSolver:
 
     async def _write_the_bar(
         self, holder: list, task, budget: float, started: float,
-        avoid: Optional[str], plan,
+        avoid: Optional[str], plan, probe=None,
     ) -> tuple[Optional[list], float]:
         """Open a conversation of the bar's own and ask it for the cases.
 
@@ -2781,7 +2871,9 @@ class VerifyingSolver:
         # whenever the program is the slower of the two. That is the one
         # comparison the split exists to let an operator make.
         began = time.monotonic()
-        cases = await self._ask_for_cases(conversation, task, max(1.0, left))
+        cases = await self._ask_for_cases(
+            conversation, task, max(1.0, left), probe=probe
+        )
         # Read AFTER the turn, not at open: the ladder may hop the
         # conversation to another model inside the turn, and `bar=` on the
         # summary line is the instrument for deciding which model should
@@ -2904,6 +2996,119 @@ class VerifyingSolver:
                 prompt, timeout_s, extend_to_s=float(extend_to_s)
             )
         return await conversation.send(prompt, timeout_s)
+
+    async def _probe_now(
+        self, candidate, probe: list, probed: bool, task, budget: float,
+        started: float,
+    ) -> Optional[str]:
+        """The size probe's verdict at a success exit, or None to go ahead.
+
+        None means SHIP -- and it means that for every reason: the probe is
+        off, no generator came back, there is not enough budget left to act on
+        an answer, this pass has already asked, or the program finished in
+        time. Only a program that actually ran out of clock on a large valid
+        input returns a sentence, and only then does the loop keep going.
+
+        The budget floor is the point of `PROBE_FLOOR_S` and it is not
+        conservatism: a probe run with no room for the round it may cause
+        produces a verdict nothing can be done about, having spent the last of
+        the clock to produce it. Below the floor the answer already in hand is
+        the answer, and it ships unprobed rather than late.
+        """
+        if not self._size_probe or probed or not probe:
+            return None
+        if not candidate.code.strip():
+            return None
+        left = budget - (time.monotonic() - started)
+        if left < PROBE_FLOOR_S:
+            print(
+                f"[verify] the size probe: {max(0.0, left):.0f}s left, too "
+                f"little to run it and still act on what it says; submitting "
+                f"the answer as it stands"
+            )
+            return None
+        return await self._timed_out_at_scale(
+            candidate.code, probe[0], task, left
+        )
+
+    async def _timed_out_at_scale(
+        self, code: str, generator: str, task, left: float
+    ) -> Optional[str]:
+        """One large valid input, run under the validator's own per-test limit.
+
+        Returns the sentence the repair prompt reports, or None when the
+        program finished, when no input could be had, or when there was no
+        time to ask. NEVER raises into the solve: every way this can fail ends
+        with the answer shipping exactly as it would have without it.
+
+        This is the one check here that needs no oracle. Every other verdict
+        in this file compares what the program produced against what something
+        else said it should produce, and is therefore only as good as that
+        second opinion -- which is written by the same model reading the same
+        statement. "Did it finish in five seconds" has no second opinion in it
+        at all, and the validator asks exactly that question, of
+        `per_test_timeout_s`, at sizes the bar structurally cannot reach: every
+        case on the bar carries an `expected` derived by hand, and nobody
+        derives one by hand for two hundred thousand elements.
+        """
+        if not code.strip() or not generator.strip():
+            return None
+        began = time.monotonic()
+
+        def remaining() -> float:
+            return left - (time.monotonic() - began)
+
+        for scale in PROBE_SCALES:
+            # Two runs per rung, each bounded by the per-case limit, and the
+            # rung is not started unless both still fit. A probe cut half way
+            # through reports nothing and has spent the round it was meant to
+            # leave room for.
+            if remaining() < VERIFY_TIMEOUT_S * 2:
+                break
+            made = await asyncio.to_thread(
+                self._grader.outputs, generator, "python", "generate",
+                [{"args": [424242, scale]}],
+                max(1.0, min(remaining(), VERIFY_TIMEOUT_S * 2)),
+            )
+            if not made or not made[0].ok:
+                # Nearly always the transport, not the generator: a return
+                # value over `PROBE_MAX_BYTES` comes back as a crash. Try a
+                # smaller budget rather than conclude anything.
+                continue
+            case = made[0].value
+            if not isinstance(case, dict) or not isinstance(case.get("args"), list):
+                continue
+            size = len(json.dumps(case, default=str))
+            if size > PROBE_MAX_BYTES:
+                continue
+            ran = await asyncio.to_thread(
+                self._grader.outputs, code, task.language, task.entrypoint,
+                [case], max(1.0, min(remaining(), VERIFY_TIMEOUT_S * 2)),
+            )
+            if not ran:
+                return None
+            if ran[0].timed_out:
+                print(
+                    f"[verify] the size probe: the program did not finish on a "
+                    f"valid {size:,}-byte input inside {VERIFY_TIMEOUT_S:.0f}s — "
+                    f"the bar's own cases are all small by construction, and the "
+                    f"validator runs the hidden tests at the statement's limits"
+                )
+                return (
+                    f"I ran the program on one valid input of {size:,} bytes, "
+                    f"generated to the limits this statement states, and it did "
+                    f"not finish within {VERIFY_TIMEOUT_S:.0f} seconds."
+                )
+            print(
+                f"[verify] the size probe: finished a valid {size:,}-byte input "
+                f"in {ran[0].runtime_ms / 1000.0:.1f}s of {VERIFY_TIMEOUT_S:.0f}s"
+            )
+            return None
+        print(
+            "[verify] the size probe: no large input could be had; the program "
+            "is graded on the bar's own cases alone"
+        )
+        return None
 
     async def _open_within(
         self, budget: float, started: float, avoid: Optional[str],

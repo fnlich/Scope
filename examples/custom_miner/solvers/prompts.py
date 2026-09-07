@@ -231,6 +231,31 @@ TESTS_OUTPUT_CONTRACT = _ONE_BLOCK + """\
 That block is `json`, and it holds test cases. Do NOT write the program yet —
 you will be asked for it next."""
 
+# ...and the same contract when a SIZE PROBE is wanted as well. Two blocks, in
+# a fixed order, because the second one is not a test case and must not be
+# parsed as one.
+#
+# Why the probe cannot be a case. Every case on the bar carries an `expected`
+# the model derives BY HAND from the statement, which is what makes the bar
+# evidence rather than an echo of the program. That rule puts a hard ceiling on
+# case SIZE: nobody hand-computes the answer for n = 200000. So the bar is,
+# structurally and permanently, a suite of small inputs -- and a program that
+# is right on every small input can still be quadratic, and the validator runs
+# it at the statement's real limits with `per_test_timeout_s` of five seconds.
+#
+# A timeout needs no expected value. "Did it finish" is answerable with no
+# oracle at all, which is what makes this affordable: one more fenced block on
+# a turn that is already paid for, and no judgement about what the answer
+# should be.
+TESTS_OUTPUT_CONTRACT_WITH_PROBE = """\
+Send TWO fenced blocks and nothing else — no preamble, nothing between or
+after them. Only what is inside the fences is ever read.
+
+The FIRST block is `json` and holds the test cases.
+The SECOND block is `python` and holds one function, `generate`.
+
+Do NOT write the program yet — you will be asked for it next."""
+
 CODE_OUTPUT_CONTRACT = _ONE_BLOCK + """\
 That block is the {language} program. Nothing else is graded."""
 
@@ -343,13 +368,88 @@ You have not written the program yet, and that is deliberate: a case computed
 from code agrees with the code's bugs."""
 
 
+# What the size probe asks for, appended to the cases task when one is wanted.
+#
+# `scale` is a BYTE BUDGET, not a percentage, and that is the whole lesson of
+# the arm this replaces. That one asked for "1 to 100, where 100 means the
+# largest input every limit in the statement allows" and then shipped the
+# result back through the sandbox's framed status line -- which caps captured
+# stdout at 256 KiB and keeps only the TAIL, so a reply larger than that lost
+# its opening frame marker and came back as "sandbox produced no verdict
+# (crashed or exited early)". Measured over 102 production solves: 8 large
+# inputs obtained, 26 reported as a crashed generator. The generators were
+# almost certainly fine; the transport ate them, and the size check that would
+# have caught it ran AFTER the run and was set at 1000000 bytes -- 3.8 times
+# the ceiling it was meant to respect.
+#
+# Naming a byte budget puts the one number that matters where the model can
+# respect it, and `PROBE_MAX_BYTES` in `verify.py` keeps the ladder honest
+# regardless.
+GENERATOR_TASK = """\
+Then, in a second fenced `python` block, write `generate(seed, scale)`.
+
+It RETURNS one valid test input for this problem — the input only, never the
+answer. Call `random.seed(seed)` first. `scale` is a BYTE BUDGET: return the
+LARGEST input this problem allows whose serialised size stays under `scale`
+bytes, subject to every limit the statement states. If the statement's own
+limits are smaller than `scale`, return the largest input those limits allow.
+
+{shape}
+
+This exists to time the program, not to check its answer, so nothing here
+needs an expected value. Make it as large as the budget permits: a program
+that is too slow is only visibly too slow at size. Use only the standard
+library, define everything in the same block, and print nothing."""
+
+_PROBE_SHAPE_PYTHON = (
+    'Return a dict `{{"args": [...], "kwargs": {{}}}}` giving the arguments for '
+    "`{entrypoint}(*args, **kwargs)`. Every value must be JSON-serialisable: no "
+    "tuples, no sets, no `inf`, no `NaN`."
+)
+_PROBE_SHAPE_RUST = (
+    'Return a dict `{{"args": ["<the complete stdin>"]}}` — one string, the '
+    "entire standard input the program is to be run on, exactly as it would "
+    "arrive, newlines included."
+)
+
+
+def extract_generator(reply: str) -> str:
+    """The fenced block defining `generate`, or ''.
+
+    Returns '' for everything unexpected. The probe is an optional extra on a
+    turn whose real product is the bar: a reply that sends no generator, or one
+    this cannot find, must cost the solve nothing at all.
+    """
+    if not reply:
+        return ""
+    for block in fenced_blocks(sanitize_code(reply)):
+        if re.search(r"^\s*def\s+generate\s*\(", block, re.M):
+            return block
+    return ""
+
+
 def build_tests_prompt(
-    language: str, statement: str, entrypoint: str, examples: list[dict[str, Any]]
+    language: str, statement: str, entrypoint: str, examples: list[dict[str, Any]],
+    want_probe: bool = False,
 ) -> str:
-    """Turn 1: ask for the cases and nothing else."""
+    """Turn 1: ask for the cases, and optionally the size probe beside them.
+
+    `want_probe` adds one more fenced block to the SAME turn rather than
+    another turn, and that is the entire cost argument: a third model turn is
+    +50% on a two-turn solve, against seats already running at 90-95% of a
+    five-hour window, while a second block on a turn already being taken is
+    some prompt tokens and some output. What it buys is the only failure class
+    the bar cannot reach -- see `TESTS_OUTPUT_CONTRACT_WITH_PROBE`.
+
+    It is optional at every step. No generator in the reply, a generator that
+    will not run, an input too big for the sandbox to hand back: each ends with
+    the probe skipped and the solve exactly as it was.
+    """
     is_rust = language == "rust"
     parts = [
-        "<output>", TESTS_OUTPUT_CONTRACT, "</output>", "",
+        "<output>",
+        TESTS_OUTPUT_CONTRACT_WITH_PROBE if want_probe else TESTS_OUTPUT_CONTRACT,
+        "</output>", "",
         f'<problem language="{"rust" if is_rust else "python"}" '
         f'entrypoint="{entrypoint}">',
         statement.strip(),
@@ -362,13 +462,16 @@ def build_tests_prompt(
             'cases must AGREE with these and go far beyond them.">',
             rendered, "</examples>", "",
         ]
-    parts += [
-        "<task>",
-        (TESTS_TASK_RUST if is_rust else TESTS_TASK_PYTHON).format(
-            entrypoint=entrypoint, limit=MAX_SELF_TESTS
-        ),
-        "</task>",
-    ]
+    task = (TESTS_TASK_RUST if is_rust else TESTS_TASK_PYTHON).format(
+        entrypoint=entrypoint, limit=MAX_SELF_TESTS
+    )
+    if want_probe:
+        task += "\n\n" + GENERATOR_TASK.format(
+            shape=(_PROBE_SHAPE_RUST if is_rust else _PROBE_SHAPE_PYTHON).format(
+                entrypoint=entrypoint
+            )
+        )
+    parts += ["<task>", task, "</task>"]
     return "\n".join(parts)
 
 
@@ -632,6 +735,7 @@ def build_repair_prompt(
     insist_on_program: bool = False,
     bar_is_independent: bool = False,
     failed_cases: Optional[Sequence[dict[str, Any]]] = None,
+    too_slow: Optional[str] = None,
 ) -> str:
     """Ask for a fix, quoting the concrete failures the local grader found.
 
@@ -694,7 +798,30 @@ def build_repair_prompt(
             "\n\nThe failing case(s) in full, exactly as they are run:\n"
             + _render_cases(list(failed_cases), language, entrypoint)
         )
-    if defect == NO_CODE:
+    if too_slow:
+        # A TIMEOUT, and it gets its own branch because it is the one failure
+        # here that has no expectation behind it. Every other line in this
+        # prompt reports that the program produced X where the bar said Y, and
+        # the bar may be the party that is wrong -- which is why the case
+        # escape hatch exists a few branches down. "It did not finish in five
+        # seconds" has no second party. Nothing about the answer is in dispute
+        # and there is nothing on the bar to correct, so the offer is not made
+        # and the whole of the round goes to the one thing that can change.
+        #
+        # It also never says the answer was wrong, because it is not known to
+        # be: the program may be perfectly correct and merely too slow, and a
+        # model told its logic is broken rewrites logic that was right.
+        body = (
+            f"{too_slow}\n\n"
+            f"The validator runs every hidden test under the same five-second "
+            f"limit, at the sizes the statement allows, so this is a failure "
+            f"there whatever the answer would have been. Nothing is known to be "
+            f"wrong with what the program COMPUTES — do not change the answer "
+            f"it gives on the cases it already passes.\n\n"
+            f"Send back ONE fenced block, with nothing outside it: "
+            f"{WHOLE_PROGRAM}, with an algorithm that finishes at that size."
+        )
+    elif defect == NO_CODE:
         body = (
             "Your previous reply did not reach me as code. I can only read the "
             "chat message itself.\n\n"
