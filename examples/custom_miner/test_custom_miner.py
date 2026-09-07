@@ -7779,10 +7779,17 @@ def test_a_repair_ends_on_the_rule_for_what_may_come_back():
     )
 
     mine = build_repair_prompt(failure, "python", "g", from_self_tests=True)
-    assert mine.rstrip().endswith(
-        "a `json` array holding just the case(s) above, corrected. Send one or "
-        "the other, not both."
-    ), mine
+    assert mine.rstrip().endswith("Send one or the other, not both."), mine
+    assert "a `json` array holding just the case(s) above, corrected" in mine, mine
+    # ...and it NAMES THE KEYS, because the conversation being repaired has
+    # never seen them. `_case_items` requires `expected`; those key names are
+    # stated only in the cases task, which since the bar went independent goes
+    # to a different conversation. A reply in the only dialect this one has
+    # seen -- the `stdin "..." -> stdout "..."` failure line -- is dropped by
+    # the parser without a word, and `corrected=` fell from 20 solves of 102
+    # to 0 of 11 when the bar moved.
+    for key in ('"args"', '"expected"'):
+        assert key in mine, f"the offer does not name {key}: {mine[-300:]}"
     # The FAILING cases on one side, ALL of the program on the other, and the
     # asymmetry is deliberate. A program sent in pieces cannot run; a case
     # array sent in pieces is merged into the suite by `_merge_cases`, where
@@ -10563,20 +10570,64 @@ def test_correction_keeps_going_past_the_round_that_used_to_be_the_last():
     a program still wrong on the fourth round pays what no answer pays.
 
     Four wrong programs here, each different from the last, and the right one
-    fifth. Under the old cap the first wrong one shipped."""
-    wrong = [
-        _WRONG_PROGRAM.replace("while n > 9", f"while n > {k}") for k in (9, 8, 7, 6)
-    ]
-    solver, sent = _solver_seeing([_CASES_ONLY, *wrong, _RIGHT_PROGRAM])
+    fifth. Under the old cap the first wrong one shipped.
+
+    What replaced the cap is not another one. `FIRST_PHASE_ROUNDS` bounds the
+    rounds one CONVERSATION gets, and running out of them carries the repair to
+    another model holding the program and the whole bar -- so the fourth repair
+    still happens, and still receives the right program, just not from the
+    conversation that had already missed three times. The solve is bounded now,
+    at `1 + FIRST_PHASE_ROUNDS + HANDOFF_ROUNDS`, and the thing the old cap did
+    -- ship the first wrong program -- is still refused."""
+    from solvers.verify import FIRST_PHASE_ROUNDS
+
+    replies = iter([
+        _CASES_ONLY,
+        *[_WRONG_PROGRAM.replace("while n > 9", f"while n > {k}")
+          for k in (9, 8, 7, 6)],
+        _RIGHT_PROGRAM,
+    ])
+    sent: list[str] = []
+
+    class _Chat:
+        provider = "claude"
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            # One cursor across conversations: the handoff continues the run
+            # rather than replaying it from the cases turn.
+            sent.append(text)
+            return next(replies)
+
+        async def close(self):
+            pass
+
+    class _Fleet:
+        async def open(self, avoid=None):
+            return _Chat()
+
+        async def aclose(self):
+            pass
+
+        def stats(self):
+            return {}
+
+    solver = VerifyingSolver(_Fleet())
     answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=300.0))
 
     assert "while n > 0" in answer.code, f"gave up early: {answer.code!r}"
     # cases, program, and FOUR repairs -- three more than the old cap allowed.
     assert len(sent) == 6, [s[:40] for s in sent]
-    for i in range(2, 6):
+    # The first `FIRST_PHASE_ROUNDS` repairs stay in the conversation that
+    # wrote the program; the one after that is a resume, which reconstitutes
+    # the whole context because a fresh tab has no history to build on.
+    for i in range(2, 2 + FIRST_PHASE_ROUNDS):
         assert "the test cases you sent" in sent[i], (
             f"round {i} was not a repair: {sent[i][:120]}"
         )
+    carried = sent[2 + FIRST_PHASE_ROUNDS]
+    assert "<previous_attempt" in carried, (
+        f"the round after the budget was not carried elsewhere: {carried[:200]}"
+    )
 
 
 def test_a_round_that_changed_nothing_moves_to_a_different_model(capsys):
@@ -12566,6 +12617,22 @@ def test_no_prompt_contradicts_its_own_output_contract():
         for phrase in two_blocks:
             assert phrase not in tests, f"the cases turn mentions {phrase!r}"
 
+        # The SIZE PROBE turn is the one place two blocks are asked for, and
+        # the invariant is the same one, not an exception to it: its contract
+        # says TWO, its task asks for the second, and it never says ONE.
+        probed = build_tests_prompt(
+            language, "Do a thing.", entry, [], want_probe=True
+        )
+        assert "TWO fenced blocks" in probed, probed[:200]
+        assert "ONE fenced block" not in probed, (
+            "the probe turn asks for two blocks and also for one"
+        )
+        assert "def generate" in probed or "`generate`" in probed, (
+            "the contract names a second block the task never asks for"
+        )
+        # And the cases are still the FIRST block, where the parser looks.
+        assert probed.index("FIRST block") < probed.index("SECOND block")
+
         # Turn 2, both flavours: cases agreed, and cases never obtained.
         for cases in ([{"name": "n", "args": [[]], "expected": 0}], [], None):
             prompt = build_code_prompt(
@@ -12590,6 +12657,14 @@ def test_no_prompt_contradicts_its_own_output_contract():
     for name in dir(prompts_mod):
         value = getattr(prompts_mod, name)
         if isinstance(value, str) and name.isupper():
+            if name == "TESTS_OUTPUT_CONTRACT_WITH_PROBE":
+                # The one exception, and it is not the banned thing. What was
+                # removed asked for a PROGRAM and its cases in one reply, so
+                # the cases were back-filled from the program's own behaviour.
+                # This asks for cases and a generator, before any program
+                # exists, and the generator is never graded against anything --
+                # it only supplies an input to time.
+                continue
             assert "TWO fenced blocks" not in value, f"{name} still asks for two"
 
 
@@ -15230,3 +15305,212 @@ def test_the_reserve_is_offered_only_with_nothing_finished_to_lose(
         solver._send_within(_TwoArg(), "p", 5.0, extend_to_s=99.0)
     )
     assert got == "", got
+
+
+def test_a_quadratic_program_that_passes_every_case_is_caught_at_size():
+    """The failure class the bar cannot reach, by a rule it cannot relax.
+
+    Every case on the bar carries an `expected` the model derives BY HAND, so
+    no case is ever the size the validator runs. A quadratic program passes all
+    twenty small cases and then times out on the hidden tests, which use the
+    same five-second `per_test_timeout_s` this grader does — measured:
+    rlvr/config.py:46 default 5.0, solvers/verify.py VERIFY_TIMEOUT_S 5.
+
+    The probe asks the one question that needs no expected value at all."""
+    from solvers.verify import VerifyingSolver, VERIFY_TIMEOUT_S
+
+    from solvers import verify as verify_mod
+
+    solver = VerifyingSolver.__new__(VerifyingSolver)
+    solver._grader = verify_mod._Grader()
+
+    class _Task:
+        language, entrypoint = "python", "solve"
+
+    generator = (
+        "import random\n"
+        "def generate(seed, scale):\n"
+        "    random.seed(seed)\n"
+        "    n = max(2, scale // 8)\n"
+        "    return {'args': [[random.randint(0, 10**6) for _ in range(n)]]}\n"
+    )
+    quadratic = (
+        "def solve(xs):\n"
+        "    best = 0\n"
+        "    for i in range(len(xs)):\n"
+        "        for j in range(len(xs)):\n"
+        "            if xs[i] + xs[j] > best:\n"
+        "                best = xs[i] + xs[j]\n"
+        "    return best\n"
+    )
+    linear = "def solve(xs):\n    return max(xs) * 2 if xs else 0\n"
+
+    slow = asyncio.run(
+        solver._timed_out_at_scale(quadratic, generator, _Task(), 60.0)
+    )
+    assert slow is not None, "a quadratic program ran to size without complaint"
+    assert "did not finish" in slow and "bytes" in slow, slow
+
+    fast = asyncio.run(
+        solver._timed_out_at_scale(linear, generator, _Task(), 60.0)
+    )
+    assert fast is None, f"a linear program was reported too slow: {fast}"
+
+    # And the same suite the validator uses agrees the small cases are silent:
+    # both programs pass a hand-sized case, which is what makes the probe the
+    # only thing that could have told them apart.
+    for code in (quadratic, linear):
+        ran = solver._grader.outputs(
+            code, "python", "solve", [{"args": [[1, 2, 3]]}], VERIFY_TIMEOUT_S * 2
+        )
+        assert ran[0].ok and ran[0].value == 6, (code[:20], ran[0].error)
+
+
+def test_the_probe_never_costs_the_answer(tmp_path, monkeypatch):
+    """Every way the probe can fail must end with the solve exactly as it was.
+
+    It rides a turn taken for something else and runs on borrowed budget, so
+    it is allowed to find nothing and never allowed to cost anything."""
+    from solvers.verify import VerifyingSolver, PROBE_MAX_BYTES
+
+    from solvers import verify as verify_mod
+
+    solver = VerifyingSolver.__new__(VerifyingSolver)
+    solver._grader = verify_mod._Grader()
+
+    class _Task:
+        language, entrypoint = "python", "solve"
+
+    code = "def solve(xs):\n    return 1\n"
+    run = lambda gen, left=60.0: asyncio.run(
+        solver._timed_out_at_scale(code, gen, _Task(), left)
+    )
+
+    assert run("") is None, "no generator must not be a verdict"
+    assert run("def generate(seed, scale):\n    raise ValueError('x')\n") is None
+    assert run("def generate(seed, scale):\n    return 'not a case'\n") is None
+    assert run("def generate(seed, scale):\n    return {'args': 5}\n") is None
+    # A generator that ignores the byte budget: its output cannot come back
+    # through the sandbox at all, and that is a skip, never a crash report.
+    assert run(
+        "def generate(seed, scale):\n    return {'args': ['x' * 900000]}\n"
+    ) is None
+    # No time to run it and act on it.
+    assert run("def generate(seed, scale):\n    return {'args': [[1]]}\n", 1.0) is None
+
+    # The ceiling is the measured transport limit, not a guess: the sandbox
+    # keeps only the last 256 KiB of stdout, so a framed reply above that
+    # loses its opening marker and reads as a crashed generator.
+    assert PROBE_MAX_BYTES < 256 * 1024, PROBE_MAX_BYTES
+
+
+def test_the_correction_phase_hands_off_and_then_stops():
+    """The loop had no terminator but the deadline, and the deadline is slow.
+
+    Measured over 102 production solves: 76 needed no correction, 20 finished
+    after one round of it, 4 after two, 1 after three, 1 ran to eight. So a
+    third round on the first conversation costs one solve in a hundred.
+
+    Measured on a later log, after the case-escape hatch fell silent: three
+    solves of eleven spent seven, nine and nine correction rounds alternating
+    between a reply the parser dropped and a rewrite that failed the same case
+    — 115-200s each, one ending `exit=cutoff` with nothing submitted.
+    `SOLVER_MAX_ATTEMPTS` defaults to 0, which is unlimited."""
+    from solvers.verify import FIRST_PHASE_ROUNDS, HANDOFF_ROUNDS
+
+    # The first conversation gets its rounds, then the repair is carried; the
+    # second gets fewer, then the pass stops. Bounded, and bounded low.
+    from solvers.verify import CASES_ONLY_ROUNDS
+
+    assert FIRST_PHASE_ROUNDS >= 3, "two rounds would cost the 4-round solves"
+    # Each budget must leave a round for the case-offer WITHDRAWAL to act in.
+    # Equal to the threshold, the withdrawal fires and the conversation ends on
+    # the same round, so "this time it is the program that has to change" is
+    # never actually sent -- the one prompt the withdrawal exists to produce.
+    for budget in (FIRST_PHASE_ROUNDS, HANDOFF_ROUNDS):
+        assert budget > CASES_ONLY_ROUNDS, (
+            f"a budget of {budget} against a withdrawal at {CASES_ONLY_ROUNDS} "
+            f"never sends the insist-on-program round"
+        )
+    ceiling = 1 + FIRST_PHASE_ROUNDS + HANDOFF_ROUNDS
+    assert ceiling <= 7, f"a pass may still send {ceiling} prompts"
+
+    # A DIFFERENT wrong program every round, so the duplicate guard and the
+    # stale-round guard never fire: this test is about the one terminator that
+    # has to work when a model keeps genuinely trying and keeps missing.
+    #
+    # A local backend, because `_solver_seeing` restarts its reply list for
+    # each new conversation -- which would hand the conversation this test
+    # exists to reach the cases turn's reply and end the pass on a replay.
+    sent: list[str] = []
+    wrong = iter(
+        _WRONG_PROGRAM.replace("while n > 9", f"while n > {9 + i}")
+        for i in range(60)
+    )
+
+    class _Chat:
+        provider = "claude"
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            # Keyed on WHAT WAS ASKED, never on call order: the bar is written
+            # in its own conversation beside the program, so the two turns race
+            # and an order-keyed fake decides this test by scheduling.
+            sent.append(text)
+            if "holds test cases" in text:
+                return _CASES_ONLY
+            return next(wrong)
+
+        async def close(self):
+            pass
+
+    class _Fleet:
+        async def open(self, avoid=None):
+            return _Chat()
+
+        async def aclose(self):
+            pass
+
+        def stats(self):
+            return {}
+
+    solver = VerifyingSolver(_Fleet(), reserve_s=0, max_budget_s=600)
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=600.0))
+
+    logged = out.getvalue()
+    # It stopped on the ROUND budget, not on the clock: there were 600 seconds
+    # and a backend that would have answered forty times.
+    assert "submitting the best version in hand" in logged, logged[-900:]
+    assert len(sent) <= ceiling + 1, (
+        f"{len(sent)} prompts went out against a ceiling of {ceiling}: {logged[-600:]}"
+    )
+    assert answer.code, "the round budget threw the answer away"
+
+
+def test_a_pinned_repair_seat_survives_the_avoid_that_sends_it_there(
+    tmp_path, monkeypatch
+):
+    """`repair=fable:low` names where a handoff lands, and the handoff that
+    most needed it was the one path that ignored it.
+
+    `open_for` fell through to the ladder whenever `avoid` was set — and every
+    handoff fleeing a model that just failed its rounds sets one. The two only
+    conflict when they name the SAME model; when they do not, the pin already
+    satisfies the avoid."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "fable:low,sonnet:low")
+    monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", "repair=fable:medium")
+    backend = CliBackend()
+
+    # Fleeing the default model: the pin is a different one, so it is honoured
+    # — model AND effort.
+    fled = asyncio.run(backend.open_for(phase="repair", avoid="cli:opus"))
+    assert fled.model == "fable", fled.provider
+    assert fled.profile.effort == "medium", fled.profile
+
+    # Fleeing the pinned model itself: avoid wins, or the retry goes straight
+    # back to the model being retried.
+    same = asyncio.run(backend.open_for(phase="repair", avoid="cli:fable"))
+    assert same.model != "fable", same.provider
