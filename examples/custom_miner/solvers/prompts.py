@@ -666,6 +666,7 @@ def build_resume_prompt(
     defect: Optional[str] = None,
     from_self_tests: bool = False,
     bar_is_independent: bool = False,
+    failed_cases: Optional[Sequence[dict[str, Any]]] = None,
 ) -> str:
     """A repair round for a conversation that no longer exists.
 
@@ -688,6 +689,13 @@ def build_resume_prompt(
     report = build_repair_prompt(
         failures, language, entrypoint, defect=defect,
         from_self_tests=from_self_tests, bar_is_independent=bar_is_independent,
+        # The ones that FAILED, rendered in full beside the whole bar above.
+        # `build_repair_prompt` only renders them when it is given them, and
+        # this caller never was -- so the one prompt that reaches a second
+        # model arrived with the failing cases in the clipped failure line
+        # only. For Rust that line cuts stdin at 160 characters, which is not
+        # enough to reproduce the failure and not enough to correct the case.
+        failed_cases=failed_cases,
     )
     return "\n".join([
         base,
@@ -723,6 +731,31 @@ def _ran_against(target: str, independent: bool) -> str:
             f"and got:"
         )
     return f"I ran {target} against the test cases you sent and got:"
+
+
+# The shape a corrected case has to arrive in, said in the prompt that asks
+# for one. It was not said anywhere the repairing conversation could see.
+#
+# `_case_items` requires `expected`, and for Rust an `args` of exactly one
+# string. Those key names appear only in `TESTS_TASK_RUST`/`TESTS_TASK_PYTHON`
+# -- sent to the CASES conversation, which since the bar went independent is a
+# DIFFERENT conversation, and the program prompt carries no `<must_pass>` block
+# on that path at all. So the only rendering of a case the repairing model had
+# ever seen was the failure line, `stdin "..." -> stdout "..."`, and a reply
+# mirroring that dialect is dropped by the parser without a word.
+#
+# The reply then fails `extract_code` too -- a `[` is not a program -- so the
+# next prompt is "your previous reply did not reach me as code", the model
+# re-sends the program, it fails the same case, and the offer comes back. That
+# is the loop, and it cannot end: `corrected=` was non-zero on 20 of 102 solves
+# before the bar moved and 0 of 11 after.
+_CASE_SHAPE_RUST = (
+    '`{"args": ["<the complete stdin, as one string>"], '
+    '"expected": "<the complete stdout, as a string>"}`'
+)
+_CASE_SHAPE_PYTHON = (
+    '`{"args": [...], "kwargs": {}, "expected": <the value it should return>}`'
+)
 
 
 def build_repair_prompt(
@@ -873,7 +906,9 @@ def build_repair_prompt(
             f"{detail}\n\n"
             f"Send back ONE fenced block: {WHOLE_PROGRAM} — or, if the case "
             f"was wrong rather than the program, a `json` array holding just "
-            f"the case(s) above, corrected. Send one or the other, not both."
+            f"the case(s) above, corrected — each element "
+            f"{_CASE_SHAPE_RUST if language == 'rust' else _CASE_SHAPE_PYTHON}"
+            f", those key names exactly. Send one or the other, not both."
         )
     else:
         target = "the program" if language == "rust" else f"`{entrypoint}`"

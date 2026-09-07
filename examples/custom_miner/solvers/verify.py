@@ -193,6 +193,35 @@ STALE_ROUND_S = 2.0
 # because the first correction is the ordinary case this whole path was built
 # for.
 CASES_ONLY_ROUNDS = 2
+
+# ------------------------------------------------------- the round budget --
+# How many correction rounds one conversation gets before the repair is
+# carried to another model, and how many that one gets before the answer in
+# hand is the answer.
+#
+# Measured over 102 production solves: 76 needed no correction at all, 20
+# finished after ONE round of it, 4 after two, 1 after three, and 1 ran to
+# eight. So 96 of 102 are done inside two correction rounds and 101 inside
+# three -- a third round on the first conversation costs one solve in a
+# hundred, and everything past it has never once paid.
+#
+# What it prevents is on a later log, after the case-escape hatch fell silent:
+# three solves of eleven spent SEVEN, NINE and NINE correction rounds
+# alternating between a reply the parser dropped and a rewrite that failed the
+# same case, 115-200s each, one of them ending `exit=cutoff` with the budget
+# gone. Nothing in the loop stopped it: `SOLVER_MAX_ATTEMPTS` defaults to 0,
+# which is unlimited, and the deadline was the only terminator.
+#
+# Both are `CASES_ONLY_ROUNDS + 1`, and that is a relationship rather than two
+# numbers that happen to be equal. The case offer is withdrawn after
+# CASES_ONLY_ROUNDS rounds that left the program untouched, and the withdrawal
+# is worth nothing unless a round remains for it to act in: a budget equal to
+# the threshold would fire the withdrawal and end the conversation on the same
+# round, so the one prompt that says "this time it is the program that has to
+# change" would never be sent. One more, and it is sent exactly once, which is
+# what it is for. The handoff gets the same for the same reason.
+FIRST_PHASE_ROUNDS = CASES_ONLY_ROUNDS + 1
+HANDOFF_ROUNDS = CASES_ONLY_ROUNDS + 1
 # How many times per pass a CORRECTED case is put to the judge before the
 # rest are accepted as they arrive. One judge turn decides every case a reply
 # corrected, so this is a cap on turns, not on cases; a pass that keeps
@@ -1809,6 +1838,10 @@ class VerifyingSolver:
         # response clears it, so the replacement is asked in its turn.
         probe: list = []
         probed = False
+        # Correction rounds sent into the conversation now in hand. Reset when
+        # the repair is carried elsewhere, so each conversation is judged on
+        # what it did rather than on what the pass has spent.
+        rounds_here = 0
         # Whether the program turn's phase line already went out -- it does,
         # early, when the retry runs between the turn and its grading.
         program_marked = False
@@ -2052,6 +2085,7 @@ class VerifyingSolver:
                 truth for what it is talking to.
                 """
                 nonlocal resumed, program_only, program_unchanged, reported_failed
+                nonlocal rounds_here
                 left_now = budget - (time.monotonic() - started)
                 if (
                     resumed
@@ -2077,6 +2111,7 @@ class VerifyingSolver:
                 # whatever the last round happened to leave behind.
                 program_only = False
                 program_unchanged = 0
+                rounds_here = 0
                 reported_failed = list(best.failed_cases)
                 print(
                     f"[verify] {why}; carrying the repair to a fresh "
@@ -2105,6 +2140,7 @@ class VerifyingSolver:
                         best.failures, defect=best.defect,
                         from_self_tests=best.from_self_tests,
                         bar_is_independent=self._independent_bar,
+                        failed_cases=best.failed_cases,
                     ),
                 )
 
@@ -2185,6 +2221,11 @@ class VerifyingSolver:
                 # `exit=cutoff` should not also lose its round.
                 if plan is not None:
                     plan.rounds += 1
+                if attempt > 1:
+                    # CORRECTION rounds only. Attempt 1 is the program itself,
+                    # and counting it would spend a third of this
+                    # conversation's budget before a single failure existed.
+                    rounds_here += 1
                 round_started = time.monotonic()
                 correction_refused = False
                 # Empty-handed: nothing finished is in hand to ship, so a cut
@@ -2734,6 +2775,44 @@ class VerifyingSolver:
                 # Kept apart, not merged into one list of "problems": a defect
                 # means the code never ran, and the repair prompt has to say so
                 # rather than blame logic that was never executed.
+                # The round did not clear it. Whether to ask THIS conversation
+                # again is a question about the conversation, not the budget:
+                # the deadline will stop the loop eventually, and eventually is
+                # measured -- seven, nine and nine correction rounds on three
+                # solves of eleven, alternating between a reply the parser
+                # dropped and a rewrite that failed the same case, one ending
+                # with the budget gone and nothing submitted.
+                if rounds_here >= (
+                    HANDOFF_ROUNDS if resumed else FIRST_PHASE_ROUNDS
+                ):
+                    carried = await _resume_elsewhere(
+                        f"{rounds_here} correction round(s) with "
+                        f"{provider or 'this model'} did not clear it",
+                        avoid=provider,
+                    )
+                    if carried is not None:
+                        # Holding the program and the whole bar, so its first
+                        # round starts where this conversation's last one
+                        # ended. Where it LANDS is the operator's, through the
+                        # `repair` phase profile -- `open_for` honours that pin
+                        # now even against an `avoid`, provided the pin is not
+                        # the model being fled.
+                        conversation, provider, prompt = carried
+                        continue
+                    # Already carried once, or nowhere to carry it to. A second
+                    # model that has not moved it in `HANDOFF_ROUNDS` is not a
+                    # model that moves it in five, and the answer in hand is
+                    # the best this pass is going to hold.
+                    print(
+                        f"[verify] {rounds_here} correction round(s) here and "
+                        + ("no other model to carry it to"
+                           if not resumed else
+                           "the repair has already been carried once")
+                        + "; submitting the best version in hand"
+                    )
+                    if plan is not None:
+                        plan.note_exit("exhausted")
+                    break
                 insist = (
                     program_unchanged >= CASES_ONLY_ROUNDS
                     # A pass that has twice answered a repair by rewriting a

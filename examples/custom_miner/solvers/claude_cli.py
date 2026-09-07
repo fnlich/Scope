@@ -1694,12 +1694,22 @@ class CliBackend:
         safety argument for pinning a phase at all: the preference decides who
         answers on a good day and never decides whether anyone answers.
 
-        `avoid` wins over the preference. It is how a pass says "not the one
-        that just got this wrong", and honouring a phase pin ahead of it would
-        send the retry straight back to the model being retried.
+        `avoid` and the pin are reconciled rather than ranked. `avoid` says
+        "not the one that just got this wrong"; the pin says "this model, for
+        this phase". They only conflict when they name the SAME model, and
+        then avoid wins -- honouring the pin there would send the retry
+        straight back to the model being retried. When they name different
+        models the pin already satisfies avoid, and it is honoured: an
+        operator who pinned `repair` chose which seat a handoff lands on, and
+        falling through to the ladder made that choice apply to every repair
+        except the one that most needed it, the one fleeing a model that had
+        just failed three rounds running.
         """
         wanted = self.phases.get(phase or "")
-        if wanted is None or (avoid or "").strip():
+        if wanted is None:
+            return await self.open(avoid=avoid, timeout_s=timeout_s)
+        shunned, _ = self._parse_provider(avoid or "")
+        if shunned and (shunned in wanted.model or wanted.model in shunned):
             return await self.open(avoid=avoid, timeout_s=timeout_s)
         return await self.open_profile(wanted.model, wanted.effort)
 
