@@ -106,10 +106,6 @@ RESUME_FLOOR_S = 40.0
 # the reads 285s rather than 280s.
 DELIVERY_RESERVE_S = 15.0
 
-# The least a lease wait may be cut to. Below this, waiting is pointless and
-# failing fast lets the pass end while another tab might still be tried.
-OPEN_FLOOR_S = 5.0
-
 # The least a correction round can be worth starting with: one prompt out, one
 # reply back, and something read from the page at the end of it. Below this the
 # loop stops and the last version in hand goes out as it stands.
@@ -1217,11 +1213,12 @@ class _Plan:
         """
         self.exit = reason
 
-# The most of what is left that the CASES turn may spend.
+# There is no cap on what the CASES turn may spend, and there has never been a
+# version of one that paid. It carried a private cap three times: two removed
+# before this, and the half-budget ceiling removed here.
 #
-# Turn 1 carried a private cap twice before and both were removed, for an
-# argument that was right about the caps and wrong about one thing. The
-# argument: `send` returns the moment the model finishes, so a slice is a
+# The argument that kept bringing it back: `send` returns the moment the model
+# finishes, so a slice is a
 # ceiling and never a wait -- a cases turn that takes 90 seconds hands the
 # program the other 190 whether a cap exists or not. The only case a cap
 # changes is the one where the model has NOT finished, "and there it converts
@@ -1252,29 +1249,11 @@ class _Plan:
 # at 90.8s and a truncated Rust program went out. That is a zero, and it is the
 # only zero in the run.
 #
-# A half, rather than a tuned number of seconds: the turn that produces the
-# answer gets at least half the clock, at any deadline the protocol allows. On
-# that same run it would have bound on two solves of thirteen and changed
-# nothing about the other eleven, because a ceiling that is never reached costs
-# nothing.
-CASES_TURN_SHARE = 0.5
-
-# ...and the least the program must be left with for that ceiling to be applied
-# at all. Below this the ceiling becomes the disease it was meant to cure: half
-# of a small budget is not a program turn, so stopping turn 1 there leases a
-# second tab and asks a second account for a whole program with seconds on the
-# clock, arriving at the same empty answer having spent someone's quota to get
-# there. Measured at a 40-second deadline: a 25-second budget, a 12.5-second
-# ceiling, and 12.5 seconds in which to produce a program.
-#
-# 90 seconds, from the same live run: the program turn ran 31.5s to 141.7s with
-# a mean of 66.7s, so a program half below 90 is not comfortably above what a
-# program turn actually costs. The effect is that the ceiling binds only on the
-# deadlines this subnet advertises -- at 300s it caps the cases turn at 142.5s,
-# which is where both of the run's expensive cases turns (161.6s and 197.9s)
-# were -- and leaves every shorter deadline exactly as it was.
-PROGRAM_TURN_FLOOR_S = 90.0
-
+# So the cases turn is bounded by the solve deadline and by nothing else.
+# The recovery path that made a ceiling safe -- drop the cases, open a fresh
+# conversation, ask it for the program with what the ceiling withheld -- goes
+# with it: there is no withheld half to recover, and a turn still writing when
+# the whole budget is gone has nothing left to be reopened with.
 
 # Nothing here passes `extend_to_s` any more, and that is the end of a long
 # argument rather than an oversight. It existed so a read could spend a repair
@@ -1817,16 +1796,12 @@ class VerifyingSolver:
             elif self._self_tests and two_phase:
                 asked_at = time.monotonic()
                 left_for_cases = budget - (time.monotonic() - started)
-                # Half, so the turn that produces the ANSWER keeps the other
-                # half. See `CASES_TURN_SHARE`. A ceiling, never a wait: a
-                # cases turn that finishes sooner hands the rest straight on,
-                # which on the run this was measured from is eleven solves of
-                # thirteen.
-                cases_slice = left_for_cases
-                if left_for_cases * (1.0 - CASES_TURN_SHARE) >= PROGRAM_TURN_FLOOR_S:
-                    cases_slice = max(1.0, left_for_cases * CASES_TURN_SHARE)
+                # Everything left. A ceiling here is a second deadline on a
+                # solve that has one, and the only thing it can do that the
+                # deadline does not is cut a model off mid-answer -- which
+                # costs the whole turn, because half a bar is worse than none.
                 cases = await self._ask_for_cases(
-                    conversation, task, cases_slice
+                    conversation, task, left_for_cases
                 )
                 # Re-read after EVERY turn, here and below: a backend may move
                 # a conversation to another model or seat inside a turn (the
@@ -1836,55 +1811,6 @@ class VerifyingSolver:
                 # was "anyone but the one that just answered".
                 provider = best_provider = getattr(conversation, "provider", provider)
                 phases.mark("1 cases", model_s=time.monotonic() - asked_at)
-                if (
-                    cases is None
-                    and getattr(conversation, "still_writing", False)
-                    and cases_slice < left_for_cases - 1.0
-                    # ...and there is time to be worth a second tab. Without
-                    # this the ceiling recreated the failure `_burning_backend`
-                    # was written for: a 40s deadline gives a 20s budget and a
-                    # 10s ceiling, and recovering there leases a second tab and
-                    # asks a second account for a whole program with ten
-                    # seconds on the clock, arriving at the same empty answer
-                    # having spent someone's quota to get there.
-                    #
-                    # `EMPTY_HANDED_FLOOR_S` is the number this file already
-                    # uses for exactly this question -- is another ask worth it
-                    # while holding NOTHING -- and its argument applies here
-                    # unchanged: a failed extra ask costs nothing that was not
-                    # already lost, so the floor is the mechanical minimum.
-                    and budget - (time.monotonic() - started) >= EMPTY_HANDED_FLOOR_S
-                ):
-                    # OUR ceiling stopped it, not the deadline, and the model
-                    # is mid-answer rather than the tab being broken. The cases
-                    # are gone -- nothing is waited for and nothing partial is
-                    # kept, because half a bar is worse than none -- but the
-                    # SOLVE is not. What cannot happen is turn 2 going into
-                    # this conversation, which is still writing turn 1; so it
-                    # goes into a fresh one, and the program gets the half of
-                    # the budget this turn was not allowed to spend.
-                    #
-                    # This branch is the whole reason a ceiling is safe here.
-                    # Without it the ceiling would do exactly what the two
-                    # removed ones did: turn a slow cases turn into no answer.
-                    try:
-                        await conversation.close()
-                    except Exception:  # noqa: BLE001 - it may already be broken
-                        pass
-                    conversation = await self._open_within(budget, started, avoid)
-                    provider = best_provider = getattr(
-                        conversation, "provider", provider
-                    )
-                    phases.mark(f"open {provider or 'tab'}")
-                    cases = []
-                    print(
-                        f"[verify] the cases turn was still writing at its "
-                        f"{cases_slice:.0f}s share of the budget; dropping the "
-                        f"cases and asking a fresh conversation for the program "
-                        f"with {budget - (time.monotonic() - started):.0f}s left "
-                        f"— the program is the answer, the cases were only the "
-                        f"bar it would have been checked against"
-                    )
                 if cases is None:
                     # The tab could not be read, or the model was still writing.
                     # Sending turn 2 into it would queue behind an answer that
@@ -2824,13 +2750,14 @@ class VerifyingSolver:
     ) -> list[dict]:
         """The independent cases turn's result, or an empty bar.
 
-        Bounded by what is left of the solve, less one correction round. The
-        program is already written by the time this is awaited, so every second
-        spent here is a second the repair rounds do not get -- and a bar that
-        arrives with no time left to act on it grades an answer that ships
-        unchanged either way. `ROUND_TRIP_FLOOR_S` is already the least a
-        correction round is worth starting with, so waiting past it buys a
-        disagreement nothing can be done about.
+        Bounded by what is left of the solve, and by nothing else. Reserving a
+        correction round out of it was a second deadline on a phase: it bought
+        the repair loop time to act on a disagreement, at the price of
+        sometimes discarding the bar that would have found one. A bar that
+        arrives too late to repair against is still the difference between an
+        answer graded and an answer shipped unchecked -- `disagreed=` and
+        `self=` on the summary line are worth more than a round nobody may
+        need, and 74% of solves never use one.
 
         Returns `[]` for every way the BAR can fail -- a cases turn still
         writing, an unreadable tab, a reply carrying nothing usable. None of
@@ -2840,7 +2767,7 @@ class VerifyingSolver:
         allowed to propagate. A cancelled SOLVE is the one exception and is
         re-raised; see below.
         """
-        left = budget - (time.monotonic() - started) - ROUND_TRIP_FLOOR_S
+        left = budget - (time.monotonic() - started)
         cases: Optional[list] = None
         # How long the bar's own turn took, as measured beside it. Falls back
         # to the elapsed wall time only when the turn never reported one,
@@ -2864,10 +2791,9 @@ class VerifyingSolver:
             # reported a bar that ran out the budget as having taken no time.
             spent = time.monotonic() - bar_started
             print(
-                f"[verify] the bar was still being written with only "
-                f"{ROUND_TRIP_FLOOR_S:.0f}s of the {budget:.0f}s budget left — "
-                f"too little to repair anything it might have said; the program "
-                f"is graded against the public examples alone"
+                f"[verify] the bar was still being written when the "
+                f"{budget:.0f}s budget ran out; the program is graded against "
+                f"the public examples alone"
             )
         except Exception as exc:  # noqa: BLE001 - the program ships regardless
             spent = time.monotonic() - bar_started
@@ -2909,9 +2835,10 @@ class VerifyingSolver:
 
         A fleet backend waits for a free tab, and the wait it defaults to is an
         operator setting about fleet capacity that knows nothing about this
-        request's deadline. Half of what is left, floored at `OPEN_FLOOR_S`: a
-        lease that has not come free in half the remaining budget will not leave
-        time to use it, and the caller has other passes to spend.
+        request's deadline -- `MINER_TAB_WAIT_S` ships at 120s and a solve
+        could spend it three times over against a 280s budget. So the wait is
+        bounded by THIS request's clock, and by nothing else: everything that
+        is left, which is the same bound every other read in this file gets.
 
         The bound is offered as a keyword and the two-argument form is bounded
         from out here instead. `Backend.open` has always been `open(avoid=...)`,
@@ -2919,8 +2846,7 @@ class VerifyingSolver:
         `timeout_s` -- and a keyword it does not take would be a TypeError
         inside the one call the whole solve depends on.
         """
-        left = budget - (time.monotonic() - started)
-        share = max(OPEN_FLOOR_S, left * 0.5)
+        share = max(1.0, budget - (time.monotonic() - started))
         # `open_for` is the CLI backend's; a browser fleet has no models to
         # choose between and never grew one. Asked for by name rather than by
         # duck-typed keyword, because a backend that HAS `open` and not
