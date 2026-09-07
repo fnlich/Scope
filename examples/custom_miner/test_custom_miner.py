@@ -14852,3 +14852,71 @@ def test_the_summary_line_describes_the_pass_that_shipped_not_one_that_lost(caps
         f"the line describes the pass that lost, not the one that shipped: {line}"
     )
     assert "exit=cases" not in line and "rounds=0" not in line, line
+
+
+def test_a_claude_ai_login_is_a_subscription_not_metered_billing():
+    """`authMethod` has more than one subscription value, and calling a real
+    one metered is the expensive mistake.
+
+    A production run reported `authMethod=claude.ai — NOT a subscription;
+    this bills per token` for a Max login on both seats. The CLI's own strings
+    settle it: `"claude.ai": " from the saved claude.ai login"`, and
+    `case "claude.ai": return "claude /logout to sign out of claude.ai."`.
+    `oauth_token` is the CLAUDE_CODE_OAUTH_TOKEN form of the same thing. The
+    metered methods are api_key, bedrock and vertex.
+    """
+    from solvers.claude_cli import billing_of, is_subscription
+
+    for method in ("claude.ai", "oauth_token"):
+        assert "subscription" in billing_of(method), method
+        assert "bills per token" not in billing_of(method), method
+        # The doctor reads the same question through the predicate, and had
+        # the same one-value test, so it called a Max seat metered too.
+        assert is_subscription(method), method
+    for method in ("api_key", "bedrock", "vertex", "something_new", None):
+        assert not is_subscription(method), method
+    for method in ("api_key", "bedrock", "vertex"):
+        assert "bills per token" in billing_of(method), method
+    # A method neither list knows is reported as unrecognised rather than as
+    # metered: a NEW name for a subscription is how the false alarm happened,
+    # and the recovery from it must not be another false alarm.
+    for method in ("something_new", None):
+        said = billing_of(method)
+        assert "unrecognised" in said, said
+        assert "NOT a subscription" not in said, said
+
+
+def test_a_token_refresh_race_is_not_a_sign_out(tmp_path, monkeypatch):
+    """Two miners share a login by design, so their CLIs race to refresh its
+    token. The CLI says so plainly -- "another Claude Code process is
+    refreshing it ... This is usually transient; retry in a minute" -- but the
+    message contains "OAuth token", which `classify` reads as auth, so a
+    healthy account was held for the half hour a real sign-out gets. Measured
+    on a production replay: the primary went out for 30 minutes and every
+    solve in the window went to the backup seat.
+    """
+    from solvers.claude_cli import (
+        AUTH_HOLD_S, AUTH_RACE_HOLD_S, CliBackend, classify,
+    )
+
+    race = ("Failed to refresh OAuth token: another Claude Code process is "
+            "refreshing it or exited mid-refresh. This is usually transient; "
+            "retry in a minute, and if it persists close other Claude Code "
+            "processes or sign in again")
+    gone = "Invalid authentication: please run /login"
+    # Both still route the same way -- hop to another seat, which is right.
+    assert classify(race) == "auth" and classify(gone) == "auth"
+
+    _fake_cli(tmp_path, monkeypatch, mode="ok")
+    backend = CliBackend()
+    account = backend.accounts[0]
+
+    backend.note_unauthorised(account, race)
+    racing = backend.outage_for(account, backend.default.model)[0]
+    backend._out.clear()
+    backend.note_unauthorised(account, gone)
+    signed_out = backend.outage_for(account, backend.default.model)[0]
+
+    assert racing <= AUTH_RACE_HOLD_S + 1, f"race held for {racing:.0f}s"
+    assert signed_out > AUTH_RACE_HOLD_S * 5, f"sign-out held for {signed_out:.0f}s"
+    assert signed_out <= AUTH_HOLD_S + 1
