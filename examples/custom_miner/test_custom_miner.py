@@ -4650,7 +4650,13 @@ def test_every_round_reads_against_everything_that_is_left():
     assert "first_share" not in source, "the private slice is back"
     # `left` is the whole of what remains: one reserve is taken out of the
     # deadline, and it is taken out before `budget` is computed.
-    assert "conversation.send(prompt, max(1.0, left))" in source, source[:200]
+    assert "max(1.0, left)" in source, source[:200]
+    # And the one thing a round may read PAST it is the delivery reserve, on
+    # the one condition that makes the reserve worthless -- nothing finished
+    # in hand, so a cut ships a fragment or nothing and both score zero.
+    assert "best is None or not best.code.strip()" in source, (
+        "the extension is offered without checking there is nothing to lose"
+    )
 
 
 def test_the_examples_decide_when_the_statement_is_ambiguous():
@@ -11047,15 +11053,25 @@ def test_the_cases_turn_does_not_shrink_the_read_the_program_gets():
     # instantly, so turn 2 still opens on essentially the whole budget.
     assert slices[1] > 200.0, f"the program only got {slices[1]:.0f}s"
 
-    # Nothing is held back from either read, so there is nothing to extend
-    # into: one reserve, `DELIVERY_RESERVE_S`, and the budget already runs right
-    # up to it. A cap here would mean a slice that is a SHARE of the budget,
-    # which is exactly what this test exists to refuse.
+    # A cap BELOW the slice is the thing this test refuses: it would mean the
+    # read was given a share of the budget and told to stop inside it. A cap
+    # above it is the opposite and is allowed exactly once -- the program read,
+    # empty-handed, offered the delivery reserve less `WIRE_TAIL_S`, because a
+    # cut there ships a fragment that scores zero and the reserve is then
+    # guarding the delivery of a zero.
+    from solvers.verify import DELIVERY_RESERVE_S, WIRE_TAIL_S
+
     for i, cap in enumerate(caps):
-        assert cap is None or cap <= slices[i] + 0.01, (
+        assert cap is None or cap >= slices[i] - 0.01, (
             f"turn {i + 1} is reading against a share of the budget rather than "
             f"the whole of it"
         )
+        if cap is not None and cap > slices[i] + 0.01:
+            assert i == 1, f"turn {i + 1} was extended; only the program read is"
+            assert cap - slices[i] <= DELIVERY_RESERVE_S - WIRE_TAIL_S + 0.01, (
+                f"the program read was extended {cap - slices[i]:.1f}s past its "
+                f"slice, beyond the reserve there is to give"
+            )
 
 
 def test_every_deadline_asks_for_the_cases_first():
@@ -12691,6 +12707,21 @@ if mode in ("overloaded", "overloaded0"):
         time.sleep(delay / 1000.0)
     sys.exit(1)
 if mode == "silent":
+    emit({"type": "result", "is_error": False, "session_id": session})
+    sys.exit(0)
+if mode == "latewrite":
+    # A reply that is still being written when an ordinary slice would end.
+    # The delay is however long SOLVER_FAKE_WRITE_S says; the answer that
+    # follows is whole, which is the point -- cut at the slice it is a
+    # fragment that cannot compile, read to the end it is a program.
+    time.sleep(float(os.environ.get("SOLVER_FAKE_WRITE_S", "1")))
+    emit({"type": "stream_event",
+          "event": {"type": "content_block_delta",
+                    "delta": {"type": "text_delta",
+                              "text": "```python\ndef g(n):\n"}}})
+    emit({"type": "stream_event",
+          "event": {"type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "    return n\n```"}}})
     emit({"type": "result", "is_error": False, "session_id": session})
     sys.exit(0)
 if mode == "heartbeat":
@@ -15120,3 +15151,82 @@ def test_only_a_usage_limit_moves_a_turn_to_the_backup_account(
     seat, _ = hop_from_primary()
     assert seat is backup, f"a usage limit did not reach the backup: {seat.name}"
     assert backend.pick()[0] is backup, backend.pick()[0].name
+
+
+def test_a_reply_still_being_written_at_the_budget_reads_into_the_reserve(
+    tmp_path, monkeypatch, capsys
+):
+    """A program cut mid-write is a zero, so the reserve is guarding nothing.
+
+    `DELIVERY_RESERVE_S` is 15s, sized for the browser backend's 11-second
+    post-read tail. The CLI backend has none: after its last read there is a
+    process kill worth at most 5s and a delivery measured at 3.2ms worst over
+    thirty runs. So about nine seconds sits idle -- and it sits hardest in the
+    one case worth least, a program turn cut mid-write, which ships code that
+    does not compile.
+
+    Read to the end, the same reply is a program. The payment rule is why that
+    trade is free: correctness is a hard gate and speed is a multiplier
+    floored at 0.95."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch)
+    monkeypatch.setenv("SOLVER_FAKE_WRITE_S", "3")
+    _cli_modes(log, {"*": "latewrite"})
+    backend = CliBackend()
+
+    async def go(**kw):
+        conversation = await backend.open()
+        try:
+            return await conversation.send("solve it", 1.5, **kw)
+        finally:
+            await conversation.close()
+
+    # The slice alone: the write is still going when it ends, and the turn is
+    # cut with nothing whole to show for it.
+    cut = asyncio.run(go())
+    assert not extract_code(cut, "g"), f"the fake finished inside the slice: {cut!r}"
+    assert "did not finish inside" in capsys.readouterr().out
+
+    # The same turn, offered the reserve: the reply lands whole.
+    whole = asyncio.run(go(extend_to_s=20.0))
+    assert extract_code(whole, "g"), f"the extension did not reach the end: {whole!r}"
+
+
+def test_the_reserve_is_offered_only_with_nothing_finished_to_lose(
+    tmp_path, monkeypatch
+):
+    """The extension spends the time that delivers the answer, so it is
+    offered only when there is no answer to deliver. With a finished program
+    in hand the budget stands -- there the reserve protects something that can
+    actually be paid for, and `_supersedes` already refuses to let a fragment
+    displace it."""
+    from solvers import verify
+
+    seen: list[Optional[float]] = []
+
+    class _Watched:
+        provider = "claude"
+        empty_reason = None
+        still_writing = False
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            seen.append(extend_to_s)
+            return _RIGHT_PROGRAM
+
+        async def close(self):
+            pass
+
+    solver = verify.VerifyingSolver.__new__(verify.VerifyingSolver)
+    assert solver._takes_extension(_Watched()), "the keyword was not detected"
+
+    # A backend whose `send` takes two arguments is never handed a third.
+    class _TwoArg:
+        async def send(self, text, timeout_s):
+            return ""
+
+    assert not solver._takes_extension(_TwoArg())
+    got = asyncio.run(
+        solver._send_within(_TwoArg(), "p", 5.0, extend_to_s=99.0)
+    )
+    assert got == "", got
