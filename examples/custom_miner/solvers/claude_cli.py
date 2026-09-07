@@ -714,7 +714,9 @@ class CliConversation:
                  else ["--session-id", self._session])
         return argv
 
-    async def send(self, text: str, timeout_s: float) -> str:
+    async def send(
+        self, text: str, timeout_s: float, extend_to_s: Optional[float] = None
+    ) -> str:
         """One turn, hopping down the ladder inside its own slice when it must.
 
         Every attempt ends in a VERDICT, and the verdict decides what happens
@@ -722,9 +724,18 @@ class CliConversation:
         is returned as it is; a limit, a refusal, a stall or a repeated failure
         is a reason to ask someone else, and the slice pays for one more try
         for as long as there is one to make.
+
+        `timeout_s` is the slice; `extend_to_s`, when the caller passes one, is
+        a larger HARD bound to read to instead. The two differ only for a
+        caller holding time back that the answer does not need -- see
+        `WIRE_TAIL_S` in `verify.py`, which hands over the delivery reserve
+        when a cut would otherwise ship a program the model never finished
+        writing. Nothing changes for a caller that passes none: the read still
+        returns the moment the model finishes, and a slice is still a ceiling
+        rather than a wait.
         """
         budget = max(1.0, float(timeout_s))
-        deadline = time.monotonic() + budget
+        deadline = time.monotonic() + max(budget, float(extend_to_s or 0.0))
         self.still_writing = False
         self.empty_reason = None
         while True:
@@ -1271,7 +1282,7 @@ class CliBackend:
 
     And the ladder. `accounts` are the sign-ins, primary first; `profiles` are
     the (model, effort) pairs, the default first and the emergency profiles
-    after it. The pairs of the two, profile-major, are the order in which a
+    after it. The pairs of the two, account-major, are the order in which a
     solve is offered around; the outage table is what it skips.
     """
 

@@ -30,6 +30,7 @@ to use the container backend instead; Rust verification always requires it.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -105,6 +106,31 @@ RESUME_FLOOR_S = 40.0
 # arithmetic. One number, and it is the real one -- a 300s deadline now gives
 # the reads 285s rather than 280s.
 DELIVERY_RESERVE_S = 15.0
+
+# What must be left after the LAST read for the answer to reach the wire --
+# and so the point past which `DELIVERY_RESERVE_S` is not being saved for
+# anything, and a read still in progress may have the rest of it.
+#
+# The reserve is sized for the browser backend, whose post-read tail is real:
+# copy, stream, salvage and post-mortem, `FULL_TAIL_S`, 11 seconds. The CLI
+# backend has no such tail. What actually happens after its last read is
+# `_kill` -- and only when the turn is CUT, since a reply that finishes leaves
+# the process exiting on its own -- which waits at most 5s for the child to
+# die, and then `fit_response`, both archive writes and signing a maximum-size
+# 128 KB payload, measured at 2.4 ms median and 3.2 ms worst over thirty runs.
+# Six seconds covers the kill with the measured delivery three orders of
+# magnitude inside it.
+#
+# So on the CLI backend roughly nine seconds of the reserve is held for work
+# that costs milliseconds, and it is held hardest in the one case where it is
+# worth least: a program turn cut mid-write ships a TRUNCATED program, which
+# does not compile and scores zero, and the reserve is then protecting the
+# delivery of a zero. `_attempt` hands that time to the read instead, and only
+# when there is no finished program in hand to lose. The payment rule is why
+# this is free: correctness is a hard gate, speed is a multiplier floored at
+# 0.95, and the validator listens until `deadline_s + 10` while this miner
+# stops at `deadline_s + 5`.
+WIRE_TAIL_S = 6.0
 
 # The least a correction round can be worth starting with: one prompt out, one
 # reply back, and something read from the page at the end of it. Below this the
@@ -2096,7 +2122,27 @@ class VerifyingSolver:
                     plan.rounds += 1
                 round_started = time.monotonic()
                 correction_refused = False
-                reply = await conversation.send(prompt, max(1.0, left))
+                # Empty-handed: nothing finished is in hand to ship, so a cut
+                # here ships a fragment or nothing, and both score zero. The
+                # delivery reserve is worth more spent finishing this reply
+                # than protecting the delivery of that -- see `WIRE_TAIL_S`.
+                # With a program already in hand the budget stands: there the
+                # reserve is protecting an answer that can actually be paid
+                # for, and `_supersedes` already refuses to let a fragment
+                # displace it.
+                spare = (
+                    budget + self._reserve - WIRE_TAIL_S
+                    - (time.monotonic() - started)
+                )
+                reply = await self._send_within(
+                    conversation, prompt, max(1.0, left),
+                    extend_to_s=(
+                        spare
+                        if (best is None or not best.code.strip())
+                        and spare > left
+                        else None
+                    ),
+                )
                 provider = getattr(conversation, "provider", provider)
                 # How long the round trip actually took. Used only by the
                 # duplicate branch below, and only to tell a model from a tab.
@@ -2826,6 +2872,38 @@ class VerifyingSolver:
             print(f"[verify] the bar holds {len(cases)} case(s), written "
                   f"without sight of the program")
         return list(cases or [])
+
+    @staticmethod
+    def _takes_extension(conversation) -> bool:
+        """Whether this backend's `send` accepts `extend_to_s`.
+
+        Asked of the signature rather than found out by calling: the fallback
+        for a backend that does not take the keyword would be to call `send`
+        again, and `send` puts a PROMPT on a conversation. A TypeError raised
+        from inside a send that already went out would be answered by sending
+        it a second time.
+        """
+        try:
+            return "extend_to_s" in inspect.signature(conversation.send).parameters
+        except (TypeError, ValueError):  # a C callable, or no signature at all
+            return False
+
+    async def _send_within(
+        self, conversation, prompt: str, timeout_s: float,
+        extend_to_s: Optional[float] = None,
+    ) -> str:
+        """One turn, with the hard bound past the slice where one is offered.
+
+        `Conversation.send` is two arguments in the protocol and `extend_to_s`
+        is optional, so a backend written outside this package need not have
+        grown one -- and a keyword it does not take would be a TypeError
+        inside the one call the whole solve depends on.
+        """
+        if extend_to_s is not None and self._takes_extension(conversation):
+            return await conversation.send(
+                prompt, timeout_s, extend_to_s=float(extend_to_s)
+            )
+        return await conversation.send(prompt, timeout_s)
 
     async def _open_within(
         self, budget: float, started: float, avoid: Optional[str],
