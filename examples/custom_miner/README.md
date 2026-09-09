@@ -203,10 +203,10 @@ The public examples are the friendly ones, and on live traffic there are usually
 none at all. Grading is on the **complete hidden suite**, written to break a
 solution that only handles the shape it was shown — so the cases the program
 will be checked against are asked for *first, in their own turn*, before the
-program exists to back-fill them from. Turn 1 names five classes and their
+program exists to back-fill them from. Turn 1 names six classes and their
 order is the instruction:
 
-    THREE ORDINARY   typical inputs — the common path an all-boundary suite
+    ONE ORDINARY     a typical input — the common path an all-boundary suite
                      never checks, and where a program wrong down the middle
                      passes every other case
     EMPTY OR ZERO    empty list, empty string, 0, an empty payload
@@ -216,6 +216,17 @@ order is the instruction:
     LIKELY WRONG     what this particular problem makes easy to get wrong —
                      ties, duplicates, all-equal, sorted, reversed, a rule
                      that fires beside an input that NEARLY makes it fire
+    EVERY RESULT     one case per distinct result the statement names — each
+                     refusal, sentinel, empty answer, or differently-shaped
+                     return, including the ones no example ever shows
+
+The last class is about the SHAPE of the answer rather than the size of the
+input, and it is the one a statement can hide in a single sentence. Every
+sample problem in this repository names a result — `{"status": "cycles"}`, an
+`"invalid"` recovery, a `("rejected",)`, a `-1`, an empty `K = 0` — that none
+of its public examples demonstrates. A model that never wrote a case for that
+result usually never wrote the branch either, and the hidden suite always
+tests it.
 
 That list used to be nine classes with a per-class count, and it was restated
 almost verbatim in turn 2 as an `<edge_cases>` checklist the model was asked to

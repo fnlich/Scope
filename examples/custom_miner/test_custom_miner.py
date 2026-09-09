@@ -152,6 +152,23 @@ def _never_archive_into_the_operators_corpus(tmp_path, monkeypatch):
     # one: it is the sequential shape, still supported and still exercised
     # here by everything that does not opt in.
     monkeypatch.setenv("SOLVER_INDEPENDENT_BAR", "0")
+    # The judge and the second bar are more conversations again, and the same
+    # argument applies to both: a scripted backend hands every conversation the
+    # same reply list, so an extra one silently eats a reply another turn was
+    # written to receive. Off unless a test says otherwise; the tests that
+    # cover them build backends that can tell their conversations apart.
+    #
+    # `SOLVER_SECOND_BAR` is belt and braces -- it is already gated on the
+    # independent bar, which is off above -- but naming it here keeps that
+    # coupling from being load-bearing for the whole suite.
+    monkeypatch.setenv("SOLVER_JUDGE", "0")
+    monkeypatch.setenv("SOLVER_SECOND_BAR", "0")
+    # Grading defaults to Docker, matching the validator's limits. A test host
+    # need not have a daemon, and the tests that build a `_Grader` directly are
+    # about what the grader DOES with a verdict rather than about which backend
+    # produced it -- so they get the backend that always builds. The fallback
+    # in `_Grader._build` is covered by a test that asks for it by name.
+    monkeypatch.setenv("SOLVER_VERIFY_EXECUTOR", "subprocess")
 
 
 # --------------------------------------------------------------------------- #
@@ -5325,7 +5342,7 @@ def test_a_missing_executor_says_the_same_thing_on_live_traffic(capsys):
     def unavailable(*a, **kw):
         raise RuntimeError("DockerExecutor could not contact the Docker daemon")
 
-    solver._grader.check = unavailable
+    solver._grader.check_detailed = unavailable
     bare = SolveTask(
         problem_id="p", language="python", statement="s", entrypoint="g",
         public_examples=[], deadline_s=60.0,
@@ -5588,7 +5605,9 @@ def test_the_examples_are_not_run_once_the_budget_is_already_gone(capsys):
     for with the answer it was checking."""
     solver = _solver([RIGHT])
     ran: list = []
-    solver._grader.check = lambda *a, **kw: ran.append(a) or (2, 2, [], [])
+    solver._grader.check_detailed = (
+        lambda *a, **kw: ran.append(a) or (2, 2, [], [], [])
+    )
 
     spent = solver._grade(RIGHT, DIGITS, -0.5)
     assert ran == [], "the grader ran on a budget that was already spent"
@@ -5909,7 +5928,7 @@ def test_grading_is_not_started_when_it_cannot_finish():
     solver, _ = _solver_seeing([])
     ran = []
     solver._grader = SimpleNamespace(
-        check=lambda *a, **k: (ran.append(1), (0, 1, ["boom"]))[1]
+        check_detailed=lambda *a, **k: (ran.append(1), (0, 1, ["boom"], [], []))[1]
     )
     task = SimpleNamespace(language="python", entrypoint="g", statement="s",
                            public_examples=[])
@@ -11732,14 +11751,14 @@ def test_grading_leaves_room_for_the_round_the_evidence_is_for(monkeypatch):
 
     monkeypatch.setattr(verify, "STALE_ROUND_S", 0.0)
     seen: list[float] = []
-    real = verify._Grader.check
+    real = verify._Grader.check_detailed
 
     def spy(self, code, language, entrypoint, examples, names=None, budget_s=None):
         if budget_s is not None:
             seen.append(budget_s)
         return real(self, code, language, entrypoint, examples, names, budget_s)
 
-    monkeypatch.setattr(verify._Grader, "check", spy)
+    monkeypatch.setattr(verify._Grader, "check_detailed", spy)
     solver, sent = _solver_seeing(
         [_CASES_ONLY, _WRONG_PROGRAM, _RIGHT_PROGRAM], reserve_s=0, max_budget_s=60
     )
@@ -12318,20 +12337,29 @@ def test_a_repair_cannot_pass_a_bar_it_rewrote_in_the_same_breath():
     assert "returned 42" in prompts[3] or "returned 0" in prompts[3], prompts[3][:400]
 
 def test_the_cases_turn_asks_for_the_common_path_before_the_boundaries():
-    """Three ordinary cases FIRST, then the special values. A suite that is all
+    """The ordinary case FIRST, then the special values. A suite that is all
     boundaries never checks the common path, and a program that is wrong down
     the middle passes every one of them.
 
-    Five classes, in order, and no catalogue: the nine-class list this replaced
+    Six classes, in order, and no catalogue: the nine-class list this replaced
     was restated almost verbatim as turn 2's edge cases, so the model was told
     the same thing twice across two turns and neither telling was the one it
-    was graded against."""
+    was graded against.
+
+    The sixth is about the SHAPE of the answer rather than the size of the
+    input, and it is the one class a statement can hide in a single sentence:
+    every sample problem in this repository names a result -- a refusal word, a
+    sentinel, an empty list, a differently-shaped return -- that no example
+    ever shows. A model that never wrote a case for it usually never wrote the
+    branch either, and the hidden suite always does.
+    """
     from solvers.prompts import MAX_SELF_TESTS, build_tests_prompt
 
     for language, entry in (("python", "g"), ("rust", "main")):
         p = build_tests_prompt(language, "Sum the digits of n.", entry, [])
         classes = ["ONE ordinary case", "THE EMPTY VALUE", "ONE:",
-                   "THE BOUNDARY", "LIKELY TO BE GOT WRONG"]
+                   "THE BOUNDARY", "LIKELY TO BE GOT WRONG",
+                   "EVERY DISTINCT RESULT THE STATEMENT NAMES"]
         at = []
         for name in classes:
             assert name in p, f"{language}: the cases turn dropped {name!r}"
@@ -13794,16 +13822,27 @@ def test_a_drill_lets_the_operator_watch_the_ladder_move(
 
 
 def test_the_default_ladder_is_the_measured_one(tmp_path, monkeypatch):
-    """Measured on a real production problem, one program turn: fable 38s at
-    low effort, opus 86s, sonnet 161s; sonnet at high effort, and either
-    model at high, did not finish inside 200s. A rung that cannot answer
-    inside the deadline is not a rung, so the default order is by what
-    finishes."""
+    """Every rung is `low`, and sonnet comes before fable.
+
+    Effort is measured: on a real production problem one program turn took
+    fable 38s at low, opus 86s, sonnet 161s, and either model at high did not
+    finish inside 200s. A rung that cannot answer inside the deadline is not a
+    rung, which is why nothing above `low` is here.
+
+    The ORDER between the two is a correctness judgement, not a speed one, and
+    it goes the other way from the latency. An emergency rung answers a whole
+    solve rather than a phase, the subnet pays only for a complete pass of the
+    hidden suite, and 161s inside a 290s deadline is affordable where a wrong
+    answer at 38s earns exactly what no answer earns. Sonnet is also the one
+    rung measured against the default model on this corpus -- 91 of 97
+    expected values agreed in `calibration/fixed_inputs.py` -- so it is the
+    only one with evidence that it reads these statements the same way.
+    """
     from solvers.claude_cli import CliBackend
 
     _fake_cli(tmp_path, monkeypatch)
     monkeypatch.delenv("SOLVER_CLI_EMERGENCY_PROFILES", raising=False)
-    assert [p.label for p in CliBackend().profiles] == ["opus/low", "fable/low", "sonnet/low"]
+    assert [p.label for p in CliBackend().profiles] == ["opus/low", "sonnet/low", "fable/low"]
 
 
 def test_the_cli_backend_counts_what_a_solve_costs_the_seat(tmp_path, monkeypatch):
@@ -14317,25 +14356,42 @@ def test_the_bar_reports_the_time_it_actually_spent_not_the_gap():
 
 
 def test_a_phase_names_a_model_and_no_phase_names_one_by_default(monkeypatch):
-    """`SOLVER_CLI_PHASE_PROFILES`, parsed -- and empty unless set.
+    """`SOLVER_CLI_PHASE_PROFILES`, parsed -- and which phases ship a default.
 
-    The default is empty on purpose. Every one of the 102 solves in the two
-    archived runs opened on the same model, so the logs say nothing at all
-    about how any other model answers a cases turn or a program turn here.
+    `cases` and `program` are unset on purpose. Every one of the 102 solves in
+    the two archived runs opened on the same model, so the logs say nothing at
+    all about how any other model answers a cases turn or a program turn here.
     Naming one as a default would be a guess with a measurement's authority.
     What the split buys -- independence, and two turns side by side instead of
     back to back -- holds whichever model answers each.
+
+    `judge` and `cases2` DO ship one, and the difference is that neither is a
+    claim about which model is better. Both exist to be a reader that is not
+    the one writing the program, and `avoid=` cannot say that here: it
+    resolves against the ladder, and `cases2` is launched before the program's
+    own provider is even known. Sonnet is the name because it is the only one
+    measured against opus on this corpus -- `calibration/fixed_inputs.py`, 91
+    of 97 expected values agreed with the inputs held fixed.
     """
     from solvers.claude_cli import Profile, cli_phase_profiles
 
     monkeypatch.delenv("SOLVER_CLI_PHASE_PROFILES", raising=False)
-    assert cli_phase_profiles("low") == {}
+    assert cli_phase_profiles("low") == {
+        "judge": Profile("sonnet", "low"),
+        "cases2": Profile("sonnet", "low"),
+    }, "the independent readers are named; cases and program are not"
 
     monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", "cases=sonnet:high,program=fable")
     assert cli_phase_profiles("low") == {
         "cases": Profile("sonnet", "high"),
         "program": Profile("fable", "low"),
+        "judge": Profile("sonnet", "low"),
+        "cases2": Profile("sonnet", "low"),
     }
+
+    # An operator can still name something else for them.
+    monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", "judge=fable:low")
+    assert cli_phase_profiles("low")["judge"] == Profile("fable", "low")
 
     for bad in ("cases", "nosuchphase=opus", "cases=opus:turbo", "cases="):
         monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", bad)

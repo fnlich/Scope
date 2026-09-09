@@ -372,17 +372,24 @@ class Profile:
 def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profile, ...]:
     """What answers when the default model will not, in order.
 
-    `SOLVER_CLI_EMERGENCY_PROFILES=fable:low,sonnet:low` -- each entry a model
-    alias the CLI accepts, optionally with an effort after a colon. Those are
-    the defaults, and the order is measured rather than ranked: on a real
-    production problem the program turn took fable 38s at low effort, opus
-    86s, sonnet 161s -- and sonnet at high effort, or either model at high,
-    did not finish inside 200s. A rung that cannot answer inside the deadline
-    is not a rung. Effort above low on the ladder is for problems that
-    justify it, set by the operator who measured it.
+    `SOLVER_CLI_EMERGENCY_PROFILES=sonnet:low,fable:low` -- each entry a model
+    alias the CLI accepts, optionally with an effort after a colon.
+
+    Sonnet first, and the order is a correctness judgement rather than a speed
+    one. Latency says the opposite: on a real production problem the program
+    turn took fable 38s at low effort, opus 86s, sonnet 161s, and either model
+    at high effort did not finish inside 200s -- which is why the ladder is
+    still all `low`, and why nothing above it belongs here unless an operator
+    measures a problem that justifies it. But an emergency rung answers a
+    whole solve, not a phase, and the subnet pays only for a complete pass of
+    the hidden suite: 161s inside a 290s deadline is affordable, and a wrong
+    answer at 38s earns exactly what no answer earns. Sonnet is also the model
+    `fixed_inputs.py` measured against opus -- 94% agreement on expected
+    values with the inputs held fixed -- so it is the one rung with evidence
+    that it reads these statements the way the default model does.
     """
     default_effort = default_effort or cli_effort()
-    raw = _flag("SOLVER_CLI_EMERGENCY_PROFILES", "fable:low,sonnet:low")
+    raw = _flag("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:low,fable:low")
     profiles: list[Profile] = []
     for entry in raw.split(","):
         entry = entry.strip()
@@ -404,25 +411,49 @@ def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profil
     return tuple(profiles)
 
 
-PHASES = ("cases", "program", "repair")
+PHASES = ("cases", "program", "repair", "judge", "cases2")
+
+# The phases whose model is named here rather than left to the ladder, and the
+# reason each is: both want a reader that is NOT the one writing the program.
+#
+# `cases2` is the second bar and `judge` settles a case the first bar and the
+# program disagree about. Neither is a preference about speed or skill; both
+# exist to break the correlation that makes a self-written bar agree with the
+# bug it was supposed to catch. `avoid=` cannot express that here -- it is
+# resolved against the ladder, whose first alternative rung is whatever the
+# operator ordered, and the program's own provider is not even known at the
+# moment `cases2` is launched (the two turns start together). So the model is
+# named, and `open_for` still falls through to the ladder when it is out
+# everywhere, which keeps the preference from ever deciding whether anyone
+# answers at all.
+#
+# Sonnet is the name because it is the only one with a measurement behind it:
+# `calibration/fixed_inputs.py`, opus and sonnet each deriving `expected` for
+# the same fixed inputs, agreed on 91 of 97 -- close enough to trust a case it
+# writes, far enough apart that the 6 it split on are the statement's real
+# ambiguities rather than one model's noise.
+_INDEPENDENT_READER = "sonnet"
 
 
 def cli_phase_profiles(
     default_effort: Optional[str] = None,
 ) -> dict[str, Profile]:
-    """Which model answers which phase, when the operator has measured one.
+    """Which model answers which phase.
 
     `SOLVER_CLI_PHASE_PROFILES=cases=sonnet:low,program=opus:low` -- one entry
     per phase named in `PHASES`, each a model alias with an optional effort
     after a colon, exactly as `SOLVER_CLI_EMERGENCY_PROFILES` spells them.
 
-    EMPTY by default, and deliberately so. Every solve in the two archived
-    production runs -- 102 of them -- opened on the same model, so the logs
-    say nothing about how any other model answers a cases turn or a program
-    turn here. A default naming one would be a guess wearing a measurement's
-    clothes. What the phase split buys is independence and concurrency, and
-    those hold whatever answers each phase; which model belongs where is a
-    number to be measured on this corpus and then written down.
+    `cases` and `program` are UNSET by default, and deliberately so. Every
+    solve in the two archived production runs -- 102 of them -- opened on the
+    same model, so the logs say nothing about how any other model answers a
+    cases turn or a program turn here. A default naming one would be a guess
+    wearing a measurement's clothes; which model belongs where is a number to
+    be measured on this corpus and then written down.
+
+    `judge` and `cases2` are SET, and for a reason that is not about which
+    model is better: see `_INDEPENDENT_READER`. An operator may still name
+    something else for them, and does so the same way.
 
     A phase named here is a PREFERENCE, never a pin: `open_for` falls through
     to the ordinary ladder when that model is out on every account, so an
@@ -430,7 +461,10 @@ def cli_phase_profiles(
     """
     default_effort = default_effort or cli_effort()
     raw = _flag("SOLVER_CLI_PHASE_PROFILES", "")
-    chosen: dict[str, Profile] = {}
+    chosen: dict[str, Profile] = {
+        "judge": Profile(_INDEPENDENT_READER, "low"),
+        "cases2": Profile(_INDEPENDENT_READER, "low"),
+    }
     for entry in raw.split(","):
         entry = entry.strip()
         if not entry:
@@ -457,6 +491,50 @@ def cli_phase_profiles(
             )
         chosen[phase] = Profile(model, effort)
     return chosen
+
+
+def cli_repair_rotation(
+    default_effort: Optional[str] = None,
+) -> tuple[Profile, ...]:
+    """The models a correction round moves through, in order.
+
+    `SOLVER_REPAIR_ROTATION=opus:low,sonnet:low,fable:low`, spelled exactly as
+    the emergency ladder is.
+
+    A repair that stays where the program was written is a model being asked
+    to find a bug in its own reading of the statement, and measured over 54
+    live solves it mostly does not: of ten single-case disagreements, nine
+    ended with the model editing its own test case and keeping the program.
+    Rotating hands the same failure to a reader who has no stake in the
+    original answer.
+
+    The rotation is not the emergency ladder. That one answers "who can serve
+    at all" and is ordered by which rung still has quota; this one answers
+    "who has not already been wrong about this problem" and is ordered by
+    which model is likeliest to be right. Opus leads because it writes the
+    program; the two behind it are the readers that did not.
+    """
+    default_effort = default_effort or cli_effort()
+    raw = _flag("SOLVER_REPAIR_ROTATION", "opus:low,sonnet:low,fable:low")
+    profiles: list[Profile] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        model, _, effort = entry.partition(":")
+        model, effort = model.strip(), effort.strip() or default_effort
+        if not model or any(ch.isspace() for ch in model):
+            raise SystemExit(
+                f"SOLVER_REPAIR_ROTATION entry {entry!r}: expected "
+                f"model or model:effort"
+            )
+        if effort not in EFFORTS:
+            raise SystemExit(
+                f"SOLVER_REPAIR_ROTATION entry {entry!r}: effort must be "
+                f"one of {', '.join(EFFORTS)}"
+            )
+        profiles.append(Profile(model, effort))
+    return tuple(profiles)
 
 
 def cli_backup_dirs() -> tuple[str, ...]:
