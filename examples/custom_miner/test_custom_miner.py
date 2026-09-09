@@ -13538,26 +13538,31 @@ def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session
     assert extract_code(first, "g") and extract_code(second, "g"), (first, second)
     assert conversation.provider == "cli:sonnet" and conversation.hops == 1
     assert conversation.effort == "high"
-    # No wait was paid at all. The first retry is the signal while another
-    # rung is up, so the 1s, 4s and 16s waits behind it all went unspent.
-    assert spent < 1.0, f"paid a retry wait with a free rung on the ladder: {spent}"
+    # ONE account, so there is nowhere for the turn to go and the wait is the
+    # right answer: the first retry is sat through, the second is the signal,
+    # and the 4s and 16s behind it are never paid. Moving on is only better
+    # than waiting when somewhere else can actually take the turn -- another
+    # MODEL on this same sign-in shares its processes and its quota, so it is
+    # not somewhere else. See
+    # `test_a_retry_is_not_waited_out_when_another_seat_is_free`.
+    assert 0.9 < spent < 5.0, spent
     calls = _cli_calls(log)
     assert [(c["model"], c["effort"], c["resumed"]) for c in calls] == [
         ("opus", "low", False), ("opus", "low", True), ("sonnet", "high", True),
     ], calls
     assert len({c["session"] for c in calls}) == 1, "the session was lost in the hop"
-    # ...and NOTHING was benched. One retry is not evidence that a model is
-    # out, and `note_degraded` would set opus out on EVERY account for ten
-    # minutes -- so every later solve would pay for this one's saved second.
-    # The seat is passed over, not judged; if it really is failing, its
-    # retries run out and it is benched then, on its own evidence. That case
-    # is `test_a_model_that_exhausts_its_retries_is_still_benched`.
-    assert backend.stats()["out"] == {}, backend.stats()["out"]
-    # So the next fresh solve goes back to the default model, not the rung.
-    assert after.provider == "cli:opus", after.provider
+    # Every account, ten minutes: the service's problem, not a seat's -- and
+    # reached on the model's OWN evidence, two retries in, rather than on the
+    # first one. `_Busy` moves a turn without recording anything; this is the
+    # other path, where the retries ran out.
+    out_table = backend.stats()["out"]
+    assert "*/opus" in out_table and 500 < out_table["*/opus"]["seconds"] <= 600, out_table
+    assert "refused" in out_table["*/opus"]["why"] and "529" in out_table["*/opus"]["why"]
+    # The next fresh solve goes straight to the emergency profile.
+    assert after.provider == "cli:sonnet" and after.effort == "high"
     out = capsys.readouterr().out
     assert "hop: cli:opus -> cli:sonnet" in out, out
-    assert "is retrying" in out, out
+    assert "EMERGENCY MODE: cli:sonnet (effort high)" in out, out
 
 
 def test_a_server_error_result_is_read_the_same_way(tmp_path, monkeypatch):
@@ -13714,14 +13719,11 @@ def test_text_that_arrived_before_the_turn_failed_is_an_unfinished_reply(
 def test_the_cli_retry_events_are_counted_here_not_read_off_the_event(
     tmp_path, monkeypatch
 ):
-    """Retries are counted per TURN, whatever base the CLI numbers them from
-    -- and with another rung free, the first one is already the signal.
+    """Retries are counted per TURN, whatever base the CLI numbers them from:
+    the second retry event this turn is the signal, one wait paid, not two.
 
-    The wait used to be paid once before hopping, on the theory that a single
-    retry is ordinary weather. It is; so is an idle seat, and against one of
-    those a wait buys nothing. What is still true, and is what this test is
-    really about, is that the count belongs to this turn rather than to the
-    event's own `attempt` field.
+    `overloaded0` numbers its attempts from zero, as nothing promises the real
+    CLI will not.
     """
     from solvers.claude_cli import CliBackend
 
@@ -13738,9 +13740,10 @@ def test_the_cli_retry_events_are_counted_here_not_read_off_the_event(
     body, conversation, spent = asyncio.run(go())
     assert extract_code(body, "g"), body
     assert conversation.provider == "cli:sonnet" and conversation.hops == 1
-    # Hopped rather than waited: an overloaded model is not fixed by waiting
-    # for it when another one is up.
-    assert spent < 1.0, f"paid a retry wait with a free seat on the ladder: {spent}"
+    # One account, so the wait is paid: one retry sat through, the second the
+    # signal. What this is really about is that the count belongs to this
+    # TURN rather than to the event's own `attempt` field.
+    assert 0.9 < spent < 5.0, spent
 
 
 def test_extra_usage_is_the_seats_whatever_window_the_event_named(
@@ -16059,11 +16062,24 @@ def test_a_busy_account_is_tried_after_a_free_one(tmp_path, monkeypatch):
 
 def test_a_retry_is_not_waited_out_when_another_seat_is_free(tmp_path, monkeypatch):
     """A wait is only worth paying when there is nothing better to do with the
-    time, and an idle rung is something better."""
+    time, and an idle ACCOUNT is something better.
+
+    Another account, specifically -- not another rung. The ladder is mostly
+    other models on this same sign-in, which share its processes and its
+    quota, so moving there is not escaping a busy seat: it is answering on a
+    weaker model to avoid a one-second wait, which is the measured regression
+    `test_a_retrying_auth_error_waits_for_the_cli_instead_of_hopping` exists
+    to hold shut.
+    """
     from solvers.claude_cli import CliBackend
 
-    log = _fake_cli(tmp_path, monkeypatch)
-    _cli_modes(log, {"model:opus": "overloaded0", "*": "ok"})
+    log = _fake_cli(tmp_path, monkeypatch, backups=1)
+    # Only the PRIMARY is retrying; the backup answers. So the turn has
+    # somewhere real to go, and nothing about the ladder's other models is
+    # involved in the decision.
+    # The fake names an account after its `CLAUDE_CONFIG_DIR`, and the
+    # primary has none -- so it is `default` here, not `primary`.
+    _cli_modes(log, {"default": "overloaded0", "*": "ok"})
     backend = CliBackend()
 
     async def go():
@@ -16072,9 +16088,20 @@ def test_a_retry_is_not_waited_out_when_another_seat_is_free(tmp_path, monkeypat
         body = await conversation.send("solve it", 60.0)
         return body, conversation, time.monotonic() - started
 
-    body, conversation, spent = asyncio.run(go())
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        body, conversation, spent = asyncio.run(go())
+    log_text = out.getvalue()
+
     assert extract_code(body, "g"), body
-    assert conversation.hops == 1 and spent < 1.0, spent
+    assert conversation.hops == 1, log_text
+    # It moved to the other ACCOUNT keeping the model, rather than down the
+    # ladder to a weaker one on the same sign-in.
+    assert conversation.account.name != "primary", conversation.provider
+    assert conversation.model == "opus", conversation.provider
+    # And the 1s, 4s and 16s the CLI would have waited went unspent.
+    assert spent < 1.0, spent
+    # Nothing was benched: one retry is not evidence a model is out.
+    assert backend.stats()["out"] == {}, backend.stats()["out"]
 
 
 def test_a_short_auth_race_is_still_waited_out(tmp_path, monkeypatch):
@@ -16302,7 +16329,7 @@ def test_a_slot_hop_keeps_the_model_it_was_pinned_to(tmp_path, monkeypatch):
         # The primary's processes are all in flight.
         for _ in range(backend.concurrency):
             await backend.slot_for(primary).acquire()
-        moved = conversation._hop_for_slot()
+        moved = conversation._hop_account("no free process slot")
         return conversation, moved
 
     with contextlib.redirect_stdout(io.StringIO()):
@@ -16459,3 +16486,93 @@ def test_a_discarded_pass_does_not_vouch_for_the_program_that_shipped():
     fresh = _Shipped.of(plan)
     assert fresh.probe == "" and fresh.contested == 0
     assert fresh.adjudicated == () and fresh.repair == ()
+
+
+def test_a_judged_case_is_not_restored_by_the_round_that_corrected_another():
+    """The bar the judge writes into must be the one the round ends with.
+
+    A repair reply may carry BOTH a corrected case array and a changed
+    program. The merged bar from that array used to be applied at the END of
+    the round -- after the judge had already dropped a case as contested or
+    corrected one -- so `agreed = revised` put the judged case straight back.
+    It could never be judged again either: its key is in `adjudicated`, so the
+    guard refuses to ask twice, and the solve re-reported a disagreement an
+    independent reader had said the statement does not decide, every round
+    until the deadline.
+    """
+    from solvers.verify import _case_key, _merge_cases
+
+    # The shape of the round: a bar, a case the program failed, and a merged
+    # bar the model sent back in the same reply.
+    agreed = [
+        {"name": "a", "args": [1], "expected": 1},
+        {"name": "disputed", "args": [2], "expected": 99},
+    ]
+    failed = [agreed[1]]
+    revised, _ = _merge_cases(
+        agreed, [{"name": "disputed", "args": [2], "expected": 7}], failed
+    )
+    # The order the loop now runs in: the model's own correction lands FIRST,
+    # then the judge acts on the bar that results.
+    agreed = revised
+    dropped = {_case_key({"args": [2]})}
+    agreed = [c for c in agreed if _case_key(c) not in dropped]
+
+    assert [c["args"] for c in agreed] == [[1]], agreed
+    # Nothing left pending that could put it back.
+    assert all(_case_key(c) not in dropped for c in agreed)
+
+
+def test_the_second_bar_is_never_waited_for():
+    """It is an addition to a bar that already exists, so it is taken if it
+    has landed and abandoned if it has not.
+
+    Waiting was the bug. `_collect_bar` bounds itself by everything left of
+    the solve -- right for the first bar, since without it there is nothing to
+    grade at all, and wrong for this one: bar1 has already landed by then, so
+    a hung second model would hold the whole remaining deadline and the answer
+    would ship UNGRADED with a perfectly good bar in hand.
+    """
+    async def go():
+        started = asyncio.Event()
+
+        class _Hangs:
+            """A cases2 seat whose model never finishes."""
+            provider = "claude:cases2"
+            empty_reason = None
+            still_writing = False
+
+            async def send(self, text, timeout_s, **kw):
+                started.set()
+                await asyncio.sleep(3600)
+
+            async def close(self): pass
+
+        backend = _TwoSeats({
+            "cases": [CASES],
+            "program": ["```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"],
+            None: ["```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"],
+        })
+        opened = backend.open_for
+
+        async def hang_the_second_bar(phase=None, avoid=None, timeout_s=None):
+            if phase == "cases2":
+                backend.opened.append(phase)
+                return _Hangs()
+            return await opened(phase=phase, avoid=avoid, timeout_s=timeout_s)
+
+        backend.open_for = hang_the_second_bar
+        solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                                 independent_bar=True, second_bar=True)
+        began = time.monotonic()
+        answer = await solver.solve_task(_two_seat_task(), 120.0)
+        return answer, time.monotonic() - began
+
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        answer, spent = asyncio.run(go())
+    log = out.getvalue()
+
+    assert spent < 20.0, f"waited on the second bar: {spent:.0f}s of a 120s budget"
+    # The first bar still graded the program, which is the whole point.
+    assert answer.self_total == 1 and answer.self_passed == 1, log
+    assert "first bar stands on its own" in log, log

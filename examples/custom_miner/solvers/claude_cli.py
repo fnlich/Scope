@@ -157,6 +157,19 @@ SILENT_FLOOR_S = 20.0
 # otherwise spend the budget discovering it, at `FIRST_TEXT_S` each.
 MAX_SILENT_HOPS = 1
 
+# ...and the same bound on hopping past a seat that is merely RETRYING.
+#
+# `_Busy` deliberately benches nothing -- one retry is not evidence a model is
+# out -- and that is exactly why this has to exist. A verdict that records an
+# outage stops the turn coming back: the pair is unhealthy and `next_pair`
+# skips it. A verdict that records nothing leaves every pair healthy, so a
+# turn whose rungs are all retrying can walk the ladder in a circle, spending
+# a real subprocess call at each stop, until the deadline takes it.
+#
+# One hop, then the wait is paid where it stands. If the seats really are all
+# retrying, waiting is what was left anyway.
+MAX_BUSY_HOPS = 1
+
 # How long a MODEL is left alone after the service refused it -- an overload,
 # a 5xx, a connection that never completed. The operator's number, and the
 # recovery cadence: when it expires the default model is back at the top of
@@ -754,6 +767,11 @@ class CliConversation:
         # leaves room to re-ask from one that does not.
         self._slice_s = 0.0
         self._silent_hops = 0
+        self._busy_hops = 0
+        # This turn's hard deadline, so the stream parser can ask whether
+        # there is room to act on what it is seeing. `send` owns it; `_retry`
+        # reads it. 0.0 means no turn is running.
+        self._turn_deadline = 0.0
         try:
             self._first_text_after = float(
                 _flag("SOLVER_CLI_FIRST_TEXT_S", "") or FIRST_TEXT_S
@@ -830,6 +848,7 @@ class CliConversation:
         """
         budget = max(1.0, float(timeout_s))
         deadline = time.monotonic() + max(budget, float(extend_to_s or 0.0))
+        self._turn_deadline = deadline
         self.still_writing = False
         self.empty_reason = None
         while True:
@@ -850,7 +869,9 @@ class CliConversation:
             # solve queued behind four others waited with no bound at all, and
             # the wait was invisible to every clock in `verify.py`.
             slot = self._backend.slot_for(self.account)
-            if slot.locked() and self._hop_for_slot():
+            if slot.locked() and self._hop_account(
+                f"{self.account.name} has no free process slot"
+            ):
                 # Full right now, and another ACCOUNT is free. Move rather
                 # than queue: a second subscription is not a longer line, it
                 # is a different set of processes. Checked before waiting
@@ -902,17 +923,69 @@ class CliConversation:
             # turn, and whether there is slice enough left to ask.
             if deadline - time.monotonic() < HOP_FLOOR_S:
                 return ""
-            if not self._hop(self._backend.last_error or verdict):
+            why = self._backend.last_error or verdict
+            # `busy` is the one verdict that already named where to go: it is
+            # raised only when another ACCOUNT is free, so the ladder's answer
+            # -- another model on this same account -- would not be the seat
+            # the decision was made about.
+            moved = (
+                self._hop_account(why) if verdict == "busy"
+                else self._hop(why)
+            )
+            if not moved:
                 return ""
 
-    def _hop_for_slot(self) -> bool:
-        """Move to another ACCOUNT because this one's processes are all busy.
+    def _another_account_is_free(self) -> bool:
+        """Whether a DIFFERENT sign-in could take this turn right now.
+
+        Deliberately narrower than "the ladder has another rung". The ladder
+        is mostly other models on this same account, which share its
+        processes and its quota -- moving there is not escaping a busy seat,
+        it is answering on a weaker model to avoid a wait. Only another
+        account is a genuinely separate place for the turn to go.
+
+        A session pins its account, so once a turn has produced text there is
+        nowhere to go and the answer is no.
+        """
+        if getattr(self, "_started", False):
+            return False
+        # Every lookup guarded, because this is reached from inside the stream
+        # parser and a backend written outside this module -- or a test's --
+        # need not have a ladder, accounts, or slots at all. Nothing here is
+        # an error: a backend with nowhere else to go is precisely the case
+        # where the wait is the right answer.
+        backend = self._backend
+        for account in getattr(backend, "accounts", ()) or ():
+            if account == self.account:
+                continue
+            try:
+                if backend.outage_for(account, self.model)[0] > 0:
+                    continue
+                if backend.slot_for(account).locked():
+                    continue
+                if backend.usage_of(account) >= backend.switch_at:
+                    continue
+            except Exception:  # noqa: BLE001 - a backend without a ladder
+                return False
+            return True
+        return False
+
+    def _hop_account(self, why: str) -> bool:
+        """Move to another ACCOUNT, keeping the model. True if it moved.
 
         Deliberately not `_hop`. That one walks the ladder, and the ladder is
-        mostly other MODELS on the same account -- which shares the slot being
-        waited on, so hopping there frees nothing and the turn ricochets
-        between two models on one account until the deadline. Only a different
-        sign-in has different processes.
+        mostly other MODELS on the same account -- which shares this account's
+        processes and its quota, so moving there escapes neither a full slot
+        nor a retrying service, and the turn ricochets between two models on
+        one sign-in until the deadline. Only a different sign-in is a
+        different place to be.
+
+        The MODEL is kept, and that is the other half. This is a move about
+        seats, and the conversations that reach it most are the ones pinned to
+        a model for a reason: `judge` and `cases2` exist to be a reading the
+        program's author did not make, and answering them on whatever the next
+        account defaults to would remove the independence while leaving the
+        line that claims it.
 
         Nothing doing once the session has started: a session lives in its
         account's config directory, so it cannot move. There the wait is the
@@ -934,13 +1007,18 @@ class CliConversation:
                 continue
             if self._backend.slot_for(account).locked():
                 continue
+            # ...and not onto a seat that has nearly spent its window. Every
+            # other path that picks one demotes those (`_with_room_first`,
+            # `_healthy_accounts`); without it a momentary queue on a primary
+            # with plenty of window left would burn the tail of a backup's.
+            if self._backend.usage_of(account) >= self._backend.switch_at:
+                continue
             was = self.provider
             self._session = str(uuid.uuid4())
             self.account = account
             self.hops += 1
             self._backend.note_hop()
-            print(f"[cli] hop: {was} -> {self.provider} "
-                  f"(no free process slot on that account)")
+            print(f"[cli] hop: {was} -> {self.provider} ({why})")
             return True
         return False
 
@@ -1065,6 +1143,7 @@ class CliConversation:
             await self._kill(proc)
             errfile.close()
             self._backend.last_error = f"{self.model} is retrying: {exc}"
+            self._busy_hops += 1
             return self._verdict("", "busy")
         except _Degraded as exc:
             await self._kill(proc)
@@ -1402,13 +1481,19 @@ class CliConversation:
             any(mark in error.lower() for mark in _AUTH_RACE_MARKS)
             and delay_ms < 2000
         )
-        # `getattr`: a backend written outside this module need not have a
-        # ladder at all, and one that does not has nobody else to hop to --
-        # which is exactly the case where the wait is worth paying.
-        next_pair = getattr(self._backend, "next_pair", None)
-        others = next_pair is not None and next_pair(
-            self.account, self.model, same_account=self._started
-        ) is not None
+        # Is anyone ACTUALLY free? Not "does the ladder have another rung":
+        # `next_pair` walks account-major and its first answer for a fresh
+        # turn on the primary is another MODEL on the primary, which shares
+        # this account's processes and its quota. Hopping there abandons a
+        # healthy seat and re-sends the whole prompt to a weaker model to
+        # avoid a one-second wait -- the measured regression above, arrived
+        # at from the other direction.
+        #
+        # A free seat is a different ACCOUNT: its own subscription, its own
+        # processes, genuinely able to take this turn now. That is also the
+        # only thing the instruction behind this asks for -- never wait on a
+        # seat that cannot serve, switch to one that can.
+        others = self._another_account_is_free()
         what = error or (f"HTTP {code}" if code else "connection error")
         if attempt >= API_RETRIES_TOLERATED or delay_ms >= LONG_RETRY_MS:
             # Failed often enough to be believed about it now, so the pair is
@@ -1417,7 +1502,17 @@ class CliConversation:
                 raise _Unauthorised(what)
             raise _Degraded(f"{what}, {attempt} retr{'y' if attempt == 1 else 'ies'} "
                             f"in, next wait {delay_ms / 1000:.0f}s")
-        if others and not racing:
+        # And there has to be room to act on it. `_retry`'s other two tests
+        # are proxies for "a wait this turn cannot afford" and never read the
+        # clock; this one has to, because `send` refuses to hop below
+        # `HOP_FLOOR_S` -- so without it a turn could be killed for a hop that
+        # is then declined, ending with neither the wait nor the move. The
+        # CLI's own one-second retry would very likely have delivered.
+        room = (
+            getattr(self, "_turn_deadline", 0.0) - time.monotonic()
+            >= HOP_FLOOR_S
+        )
+        if others and room and not racing and self._busy_hops < MAX_BUSY_HOPS:
             # Moving on from ONE retry, and moving on is all it is: `_Busy`
             # records no outage. A first retry is not evidence that a model is
             # out, and `_Degraded` would bench it on every account for ten

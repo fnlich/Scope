@@ -1927,7 +1927,14 @@ class VerifyingSolver:
         # operator may have edited, truncated or copied it. `python_defect` is
         # the same structural check every fresh answer passes and it costs
         # microseconds, so a corrupted entry reads as a miss.
-        stored = solution_cache.load(key)
+        # Not when the request carries public examples. `worth_keeping`
+        # requires `self_verified`, which requires that no public example ran
+        # -- so every stored entry is an answer graded by the model's own
+        # cases alone. Examples are cheap, decisive, and shipped with the
+        # request; serving a cached answer past them would skip the better
+        # evidence for the worse. Live traffic ships none, so this costs
+        # nothing there and keeps a replay honest.
+        stored = None if task.public_examples else solution_cache.load(key)
         if stored is not None:
             code = str(stored.get("code") or "")
             defect = (
@@ -1948,6 +1955,19 @@ class VerifyingSolver:
                     code=code,
                     raw_response=str(stored.get("raw_response") or ""),
                     self_verified=True,
+                    # The archive gets what the cache knows, or the one
+                    # submission most in need of an explanation would have
+                    # none: an answer served without being re-run is exactly
+                    # the one whose "what was this checked against" a wrong
+                    # hidden-suite result asks about. It is all in `stored`.
+                    diagnostics={
+                        "cache": "hit",
+                        "cache_key": key,
+                        "saved_at": stored.get("saved_at"),
+                        "bar": stored.get("bar") or [],
+                        "probe": stored.get("probe") or "",
+                        "providers": stored.get("providers") or [],
+                    },
                 )
             print(f"[verify] a cached answer for {key[:12]} no longer reads as "
                   f"a program ({defect}); solving it again")
@@ -2898,18 +2918,38 @@ class VerifyingSolver:
                     )
                     bar_task, bar = None, []
                     if bar2_task is not None:
-                        # The second reader, joined to the first. Awaited on
-                        # the same clock and by the same rule: whatever is
-                        # left of the solve, and nothing else. A second bar
-                        # that never lands costs the union and never the
-                        # answer -- `_collect_bar` returns [] for every way it
-                        # can fail, and `quiet` keeps it from claiming the
-                        # program went ungraded when the first bar did land.
-                        extra = await self._collect_bar(
-                            bar2_task, bar2, phases, budget, started,
-                            bar2_started, label="1 bar2",
-                            who="the second bar", quiet=True,
-                        )
+                        # The second reader, joined to the first -- but only if
+                        # it has ALREADY finished. It is not waited for, and
+                        # that is not a budget, it is what the second bar is:
+                        # an addition to a bar that already exists.
+                        #
+                        # Waiting was the mistake. `_collect_bar` bounds itself
+                        # by everything left of the solve, which is right for
+                        # the first bar -- without it there is nothing to grade
+                        # at all -- and wrong for this one. Bar1 has landed by
+                        # the time this runs, so a hung second model would hold
+                        # the whole remaining deadline and the answer would
+                        # ship UNGRADED, having had a perfectly good bar in
+                        # hand the entire time. Both bars were started
+                        # together and have had the same wall-clock, so one
+                        # that is not done when the other is has already spent
+                        # longer than the program turn took.
+                        if bar2_task.done():
+                            extra = await self._collect_bar(
+                                bar2_task, bar2, phases, budget, started,
+                                bar2_started, label="1 bar2",
+                                who="the second bar", quiet=True,
+                            )
+                        else:
+                            extra = []
+                            bar2_task.cancel()
+                            print(
+                                "[verify] the second bar was still being "
+                                "written when the program was graded; the "
+                                "first bar stands on its own"
+                            )
+                            if plan is not None:
+                                plan.bar2_provider = "late"
                         bar2_task, bar2 = None, []
                         if extra:
                             before = len(agreed)
@@ -3211,6 +3251,19 @@ class VerifyingSolver:
                         candidate.self_total - candidate.self_passed,
                         candidate.self_total,
                     )
+                # The model's own case correction, applied now that the
+                # candidate has been graded against the bar as it stood when
+                # the reply arrived. It used to be applied at the END of the
+                # round, and that was where the judge's work went to die: the
+                # judge writes into `agreed`, and a reply carrying BOTH a
+                # corrected case and a changed program left `revised` pending,
+                # so `agreed = revised` restored the pre-judge bar a few lines
+                # later. The dropped case came back, and it could never be
+                # re-judged -- its key is already in `adjudicated` -- so every
+                # remaining round re-reported a disagreement an independent
+                # reader had already said the statement does not decide.
+                if revised:
+                    agreed, revised = revised, None
                 # A DISPUTED case, put to a reader with no stake in either
                 # side, before the repair prompt asks the program's own author
                 # to rule on its own reading. Here rather than beside the
@@ -3233,10 +3286,22 @@ class VerifyingSolver:
                         for case in candidate.failed_cases
                     )
                 ):
+                    # Only the ones nobody has ruled on. Asked again, a case
+                    # gets the same answer for a second turn's money, and
+                    # `note_adjudicated` would count it twice -- the archived
+                    # breakdown of how disputes were settled is the whole
+                    # reason the counters exist.
+                    fresh = [
+                        (case, actual)
+                        for case, actual in zip(
+                            candidate.failed_cases, candidate.failed_actuals
+                        )
+                        if _case_key(case) not in adjudicated
+                    ]
                     verdicts = await self._adjudicate(
-                        task, candidate.failed_cases, candidate.failed_actuals,
+                        task, [c for c, _ in fresh], [a for _, a in fresh],
                         provider, budget, started, split_keys,
-                    )
+                    ) if fresh else {}
                     adjudicated.update(verdicts)
                     corrections = [
                         dict(case, expected=verdicts[_case_key(case)][1])
@@ -3277,12 +3342,29 @@ class VerifyingSolver:
                         # Re-graded, not re-asked. The program did not change,
                         # so nothing here spends a turn: it may now pass a bar
                         # that no longer holds a case it was right to fail.
-                        candidate = self._grade(
-                            reply, task,
-                            left=budget - (time.monotonic() - started),
+                        #
+                        # `graded`, not `reply`, and the difference is a lost
+                        # answer. On a cases-only correction round `reply` is
+                        # a JSON array -- the model was asked for the case
+                        # alone and sent exactly that -- so re-grading from it
+                        # extracts no code, and a candidate that was sound a
+                        # line ago becomes a defect. `graded` is the reply the
+                        # program actually came from, which is what the round
+                        # above already used for the same reason.
+                        # `_graded`, not `_grade`: off the event loop, and
+                        # with the fallback candidate its handler builds.
+                        # Grading is a `subprocess.run` of seconds -- a
+                        # container start, or a rustc build for Rust -- and
+                        # now that Docker is the default backend, running it
+                        # straight from this coroutine would stall every other
+                        # solve in flight, including the `wait_for` that
+                        # decides whether they are paid.
+                        candidate = await self._graded(
+                            graded, task,
+                            budget - (time.monotonic() - started), agreed,
                             # `or ""`: on the first round there is no previous
-                            # program, and `_grade` compares against a string.
-                            cases=agreed, previous=last_code or "",
+                            # program, and the comparison wants a string.
+                            previous=last_code or "",
                         )
                 key = candidate.code.strip()
                 if key:
@@ -3325,8 +3407,6 @@ class VerifyingSolver:
                 if now_code:
                     last_code = now_code
                     last_program_reply = reply
-                if revised:
-                    agreed = revised
                 if best is None or _supersedes(
                     candidate, best,
                     getattr(conversation, "still_writing", False),
@@ -3340,14 +3420,19 @@ class VerifyingSolver:
                         plan.note_probe(probe_state)
                     if slow is not None:
                         # A too_slow round is a correction round like any
-                        # other, so it counts toward the handoff. It did not
-                        # used to: this `continue` jumps over the
-                        # `rounds_here` check below, and with the verdict now
-                        # cached per program a model that keeps re-sending the
-                        # same slow answer would be asked the same thing until
-                        # the deadline, never reaching the rotation that is
-                        # the one thing left to try.
-                        rounds_here += 1
+                        # other, so it faces the handoff. It did not: this
+                        # `continue` jumps over the `rounds_here` check below,
+                        # and with the verdict now cached per program a model
+                        # that keeps re-sending the same slow answer would be
+                        # asked the same thing until the deadline, never
+                        # reaching the rotation that is the one thing left.
+                        #
+                        # CHECKED, not counted. `rounds_here` is incremented
+                        # where a correction prompt is SENT, at the top of the
+                        # loop, and the prompt this branch builds is sent by
+                        # the next iteration -- so counting here too would
+                        # charge every too_slow round twice and hand off after
+                        # half the rounds the setting names.
                         if rounds_here >= (
                             ROTATE_AFTER_ROUNDS if rotation
                             else (HANDOFF_ROUNDS if rotated else FIRST_PHASE_ROUNDS)
@@ -3525,14 +3610,19 @@ class VerifyingSolver:
                         plan.note_probe(probe_state)
                     if slow is not None:
                         # A too_slow round is a correction round like any
-                        # other, so it counts toward the handoff. It did not
-                        # used to: this `continue` jumps over the
-                        # `rounds_here` check below, and with the verdict now
-                        # cached per program a model that keeps re-sending the
-                        # same slow answer would be asked the same thing until
-                        # the deadline, never reaching the rotation that is
-                        # the one thing left to try.
-                        rounds_here += 1
+                        # other, so it faces the handoff. It did not: this
+                        # `continue` jumps over the `rounds_here` check below,
+                        # and with the verdict now cached per program a model
+                        # that keeps re-sending the same slow answer would be
+                        # asked the same thing until the deadline, never
+                        # reaching the rotation that is the one thing left.
+                        #
+                        # CHECKED, not counted. `rounds_here` is incremented
+                        # where a correction prompt is SENT, at the top of the
+                        # loop, and the prompt this branch builds is sent by
+                        # the next iteration -- so counting here too would
+                        # charge every too_slow round twice and hand off after
+                        # half the rounds the setting names.
                         if rounds_here >= (
                             ROTATE_AFTER_ROUNDS if rotation
                             else (HANDOFF_ROUNDS if rotated else FIRST_PHASE_ROUNDS)

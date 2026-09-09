@@ -133,6 +133,11 @@ def save(key: str, record: dict[str, Any]) -> None:
     directory = cache_dir()
     if directory is None or not key:
         return
+    # Bound before the `try`, because the cleanup below names it. An
+    # unwritable directory or an unserialisable record raises before the
+    # assignment, and the handler would then raise `UnboundLocalError` into
+    # its own `except` -- swallowed, but swallowing the real error with it.
+    temporary: Optional[Path] = None
     try:
         directory.mkdir(parents=True, exist_ok=True)
         body = json.dumps(record, ensure_ascii=False, default=str)
@@ -141,10 +146,11 @@ def save(key: str, record: dict[str, Any]) -> None:
         os.replace(temporary, directory / f"{key}.json")
     except Exception as exc:  # noqa: BLE001 - a full disk loses no answer
         print(f"[verify] the solution cache could not be written ({exc})")
-        try:
-            temporary.unlink()
-        except Exception:  # noqa: BLE001 - it may never have been created
-            pass
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass  # never created, or already renamed away
 
 
 def record(
