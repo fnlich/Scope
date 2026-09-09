@@ -16576,3 +16576,173 @@ def test_the_second_bar_is_never_waited_for():
     # The first bar still graded the program, which is the whole point.
     assert answer.self_total == 1 and answer.self_passed == 1, log
     assert "first bar stands on its own" in log, log
+
+
+# --------------------------------------------------------------------------- #
+# End to end: every new mechanism in one solve
+# --------------------------------------------------------------------------- #
+class _Fleet:
+    """A backend with named seats AND `open_profile`, so the rotation runs.
+
+    `_TwoSeats` covers the phase split, but it has no `open_profile` -- which
+    is what `_attempt` checks to decide whether there are models to rotate
+    through at all. Without it a repair falls back to the single-handoff rule
+    and the rotation is never exercised, so the one test that puts the whole
+    solve together needs a fleet that can be asked for a model by name.
+    """
+
+    def __init__(self, per_phase, per_model=None):
+        self.per_phase = per_phase
+        self.per_model = per_model or {}
+        self.opened: list[str] = []
+        self.sent: dict[str, list[str]] = {}
+
+    def _seat(self, label, replies):
+        seat = _Chat(replies, provider=f"cli:{label}")
+        sent = self.sent.setdefault(label, [])
+        send = seat.send
+
+        async def _record(text, timeout_s, **kw):
+            sent.append(text)
+            return await send(text, timeout_s)
+
+        seat.send = _record
+        return seat
+
+    async def open_for(self, phase=None, avoid=None, timeout_s=None):
+        self.opened.append(phase or "ladder")
+        return self._seat(
+            phase or "ladder", self.per_phase.get(phase, self.per_phase[None])
+        )
+
+    async def open(self, avoid=None, timeout_s=None):
+        return await self.open_for(phase=None, avoid=avoid, timeout_s=timeout_s)
+
+    async def open_profile(self, model, effort):
+        self.opened.append(f"profile:{model}")
+        return self._seat(model, self.per_model.get(model, self.per_phase[None]))
+
+    async def aclose(self): pass
+    def stats(self): return {}
+
+
+def test_one_solve_uses_every_mechanism_and_the_next_one_is_free(
+    monkeypatch, tmp_path
+):
+    """The whole chain on one problem, and then the same problem again.
+
+    Each piece has its own test; this is the one that asks whether they
+    compose. A solve here: writes two bars on two readers, unions them, grades
+    a wrong program against the union, puts the disagreement to a third
+    reader, is told the case stands, hands the repair to a model that did not
+    write the program, gets a correct one back, times it at the statement's
+    own scale, and keeps it. The next request for the same problem is answered
+    from disk without opening a conversation at all.
+
+    What it is really checking is that no stage quietly undoes another -- the
+    failure this whole review pass kept finding. A judged case restored by the
+    round that corrected a different one, a bar overwritten after grading, a
+    verdict recorded for a program that never ran: every one of those passes
+    its own unit test and shows up here.
+    """
+    from solvers import solution_cache
+    from solvers.verify import _cache_key
+
+    monkeypatch.setenv("SOLVER_SOLUTION_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("SOLVER_REPAIR_ROTATE_FROM", "1")
+
+    wrong = "```python\ndef g(n):\n    return 0\n```"
+    right = "```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"
+    # A generator the probe can use: one large valid input.
+    gen = (
+        "```python\n"
+        "def generate(seed, scale):\n"
+        "    return {'args': [int('9' * min(scale, 200))]}\n"
+        "```"
+    )
+    fleet = _Fleet(
+        per_phase={
+            # Bar one: the case the program will fail.
+            "cases": ['```json\n[{"name": "a", "args": [12345], "expected": 15}]\n```' + "\n" + gen],
+            # Bar two: a different call entirely -- two readers share almost
+            # no inputs, which is what makes the union worth a turn. This one
+            # the wrong program happens to satisfy, so exactly one case is
+            # ever in dispute and the scripted judge is asked about it once.
+            "cases2": ['```json\n[{"name": "b", "args": [0], "expected": 0}]\n```'],
+            # The program's own conversation answers wrong, twice: the repair
+            # has to leave it to be fixed.
+            "program": [wrong, wrong],
+            # The third reader agrees with the bar, so the case stands.
+            "judge": ['```json\n[{"i": 0, "expected": 15}]\n```'],
+            None: [wrong],
+        },
+        # ...and the rotation lands somewhere that gets it right.
+        per_model={"sonnet": [right], "fable": [right]},
+    )
+    solver = VerifyingSolver(
+        fleet, reserve_s=0, max_budget_s=120,
+        independent_bar=True, second_bar=True, judge=True,
+    )
+    task = _two_seat_task()
+
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        answer = asyncio.run(solver.solve_task(task, 120.0))
+    log = out.getvalue()
+
+    # Two readers, unioned -- and the program graded against both.
+    assert "cases2" in fleet.opened, fleet.opened
+    assert "union=2(1+1)" in log, log
+    # The dispute went to a reader with no stake in it, which backed the bar.
+    assert "profile:judge" in fleet.opened or "judge" in fleet.opened, fleet.opened
+    assert "adjudicated=case:1" in log, log
+    # ...so the repair asked for the program and did NOT offer the case.
+    repair = fleet.sent["program"][-1]
+    assert "arrived at the same value the case expects" in repair, repair[-300:]
+    # The repair left the model that wrote the program.
+    assert any(o.startswith("profile:") for o in fleet.opened), fleet.opened
+    assert "repair=" in log, log
+    # A model shown someone else's program is told so.
+    carried = next(
+        text for label, texts in fleet.sent.items()
+        for text in texts if label in ("sonnet", "fable")
+    )
+    assert "not yours" in carried, carried[:400]
+    # The corrected program passed the union and was timed at scale.
+    assert answer.self_verified, log
+    assert "sum(int(c)" in answer.code
+    assert "probe=passed" in log, log
+
+    # Kept, because it passed everything and was timed.
+    stored = solution_cache.load(_cache_key(task))
+    assert stored is not None, (
+        f"an answer with every box ticked was not kept: "
+        f"self_verified={answer.self_verified} "
+        f"failures={answer.diagnostics.get('failures')} "
+        f"contested={answer.diagnostics.get('contested')} "
+        f"probe={answer.diagnostics.get('probe')!r}\n{log}"
+    )
+    assert "sum(int(c)" in stored["code"]
+    assert stored["probe"] == "passed"
+    # The bar it cleared is on disk beside it -- the question a wrong answer
+    # in the archive actually raises.
+    assert len(stored["bar"]) == 2, stored["bar"]
+
+    # And the same problem again costs no conversation at all.
+    class _NeverAsked:
+        async def open(self, avoid=None, timeout_s=None):
+            raise AssertionError("opened a conversation on a cache hit")
+        async def open_for(self, phase=None, avoid=None, timeout_s=None):
+            raise AssertionError("opened a conversation on a cache hit")
+        async def open_profile(self, model, effort):
+            raise AssertionError("opened a conversation on a cache hit")
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    again = VerifyingSolver(_NeverAsked(), reserve_s=0, max_budget_s=120)
+    with contextlib.redirect_stdout(io.StringIO()) as out2:
+        second = asyncio.run(again.solve_task(task, 120.0))
+    assert "cache=hit" in out2.getvalue(), out2.getvalue()
+    assert second.code == answer.code
+    # The archive of that submission still says what it was checked against.
+    assert second.diagnostics.get("bar"), second.diagnostics
+    assert second.diagnostics.get("probe") == "passed", second.diagnostics
