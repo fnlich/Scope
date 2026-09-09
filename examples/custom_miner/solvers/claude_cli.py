@@ -833,11 +833,23 @@ class CliConversation:
             # The slot is acquired INSIDE the slice. Acquired outside it, a
             # solve queued behind four others waited with no bound at all, and
             # the wait was invisible to every clock in `verify.py`.
+            slot = self._backend.slot_for(self.account)
+            if slot.locked() and self._hop_for_slot():
+                # Full right now, and another ACCOUNT is free. Move rather
+                # than queue: a second subscription is not a longer line, it
+                # is a different set of processes. Checked before waiting
+                # rather than after, so the turn does not spend its slice
+                # discovering what `locked()` already said.
+                continue
             try:
-                await _acquire_within(self._backend.slot, max(0.0, left))
+                await _acquire_within(slot, max(0.0, left))
             except asyncio.TimeoutError:
+                # Nobody else was free either, or this session is pinned to
+                # its account. Then the wait was the only thing to do and it
+                # ran out.
                 print(f"[cli] {self.provider}: no free slot inside {budget:.0f}s "
-                      f"({self._backend.concurrency} allowed at once)")
+                      f"({self._backend.concurrency} allowed at once on "
+                      f"{self.account.name}) and no other account is free")
                 self.empty_reason = "unreadable"
                 return ""
             try:
@@ -851,7 +863,7 @@ class CliConversation:
                     text, max(1.0, deadline - time.monotonic())
                 )
             finally:
-                self._backend.slot.release()
+                slot.release()
             if verdict == "silent":
                 # Worth exactly one hop. A second rung that also goes quiet
                 # would cost another `FIRST_TEXT_S` to find out, and the
@@ -876,6 +888,39 @@ class CliConversation:
                 return ""
             if not self._hop(self._backend.last_error or verdict):
                 return ""
+
+    def _hop_for_slot(self) -> bool:
+        """Move to another ACCOUNT because this one's processes are all busy.
+
+        Deliberately not `_hop`. That one walks the ladder, and the ladder is
+        mostly other MODELS on the same account -- which shares the slot being
+        waited on, so hopping there frees nothing and the turn ricochets
+        between two models on one account until the deadline. Only a different
+        sign-in has different processes.
+
+        Nothing doing once the session has started: a session lives in its
+        account's config directory, so it cannot move. There the wait is the
+        only option, and it is bounded by the slice like every other wait.
+        """
+        if self._started:
+            return False
+        for account, profile in self._backend.pairs():
+            if account == self.account:
+                continue
+            if self._backend.outage_for(account, profile.model)[0] > 0:
+                continue
+            if self._backend.slot_for(account).locked():
+                continue
+            was = self.provider
+            self._session = str(uuid.uuid4())
+            self.account, self.profile = account, profile
+            self.hops += 1
+            self._backend.note_hop()
+            print(f"[cli] hop: {was} -> {self.provider} "
+                  f"({was.split(':')[-1] if was else 'that seat'} account "
+                  f"has no free process slot)")
+            return True
+        return False
 
     def _hop(self, why: str) -> bool:
         """Move this conversation to the next pair that can answer, if any.
@@ -1309,7 +1354,34 @@ class CliConversation:
         # at `_failed_result` or a non-zero exit, which hop just the same, a
         # few seconds later. What is NOT recoverable is a wait this turn
         # cannot afford, and that is what the two tests below are for.
-        if attempt >= API_RETRIES_TOLERATED or delay_ms >= LONG_RETRY_MS:
+        # A wait is only worth paying when there is nothing better to do with
+        # the time. `API_RETRIES_TOLERATED` assumed there never was: it paid
+        # the first retry's wait unconditionally, on the theory that one
+        # failure is ordinary weather. It is -- but so is a second account
+        # sitting idle, and against one of those the wait buys nothing at all.
+        # So the question asked here is no longer "how bad is this failure"
+        # but "is anyone else free", and only when nobody is does the old
+        # patience apply.
+        #
+        # The exception is the one measured regression this must not undo:
+        # `retry 1/10: authentication_failed, next wait 1s` is two miners
+        # racing to refresh one login's token, transient by the CLI's own
+        # account of it and over in about a second. Hopping on that spent the
+        # backup account's quota to avoid a one-second wait. A short wait on a
+        # named auth race is still paid, whoever else is free.
+        racing = (
+            any(mark in error.lower() for mark in _AUTH_RACE_MARKS)
+            and delay_ms < 2000
+        )
+        # `getattr`: a backend written outside this module need not have a
+        # ladder at all, and one that does not has nobody else to hop to --
+        # which is exactly the case where the wait is worth paying.
+        next_pair = getattr(self._backend, "next_pair", None)
+        others = next_pair is not None and next_pair(
+            self.account, self.model, same_account=self._started
+        ) is not None
+        spent = attempt >= API_RETRIES_TOLERATED or delay_ms >= LONG_RETRY_MS
+        if spent or (others and not racing):
             what = error or (f"HTTP {code}" if code else "connection error")
             if code in (401, 403) or classify(error) == "auth":
                 raise _Unauthorised(what)
@@ -1403,7 +1475,16 @@ class CliBackend:
             1, int(_flag("SOLVER_CLI_CONCURRENCY", "8") or "8")
         )
         self.concurrency = self._limit
-        self.slot = asyncio.Semaphore(self._limit)
+        # PER ACCOUNT, not one gate across all of them. The limit is about how
+        # many `claude` processes one sign-in should have in flight; shared, it
+        # also made a busy account block a free one, and a solve queued behind
+        # four others waited for a seat while another seat sat idle. `slot`
+        # stays as the primary account's for any caller that still reads it.
+        self._slots = {
+            account.name: asyncio.Semaphore(self._limit)
+            for account in self.accounts
+        }
+        self.slot = self._slots[self.accounts[0].name]
         # One fixed, empty directory for every child, and not a temporary one
         # per conversation. The CLI keys its per-project state on the working
         # directory -- a fresh temp dir per conversation left a new entry under
@@ -1564,13 +1645,40 @@ class CliBackend:
             return 0.0
         return used
 
+    def slot_for(self, account: Account) -> asyncio.Semaphore:
+        """This account's process gate. One per sign-in; see `__init__`."""
+        return self._slots.setdefault(account.name, asyncio.Semaphore(self._limit))
+
+    def _busy(self, account: Account) -> bool:
+        """Whether this account has no free process slot right now.
+
+        Read without taking one, and used only for ORDER: a busy account is
+        tried after a free one rather than skipped, because "busy" is a
+        millisecond-old fact and the seat may well be free by the time the
+        turn asks for it.
+        """
+        slot = self._slots.get(account.name)
+        return slot is not None and slot.locked()
+
     def _with_room_first(
         self, pairs: list[tuple[Account, Profile]]
     ) -> list[tuple[Account, Profile]]:
-        """The ladder's order, except that a seat at or past `switch_at`
-        comes after every seat under it. A stable sort: among seats with
-        room the ladder decides, as it always did."""
-        return sorted(pairs, key=lambda ap: self.usage_of(ap[0]) >= self.switch_at)
+        """The ladder's order, except that a seat with no room comes last.
+
+        Two kinds of "no room", ordered the same way and for the same reason:
+        a seat at or past `switch_at` has nearly spent its window, and a seat
+        whose processes are all in flight would make this turn queue. Neither
+        is an outage -- both can serve -- so both are demoted rather than
+        skipped, and a stable sort leaves the ladder deciding among equals as
+        it always did.
+        """
+        return sorted(
+            pairs,
+            key=lambda ap: (
+                self.usage_of(ap[0]) >= self.switch_at,
+                self._busy(ap[0]),
+            ),
+        )
 
     def next_pair(
         self, account: Account, model: str, same_account: bool

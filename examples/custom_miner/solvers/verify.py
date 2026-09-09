@@ -65,6 +65,7 @@ from .prompts import (
     python_defect,
     rust_defect,
 )
+from . import solution_cache
 from .rust_compile import compile_defect, rustc_path
 
 # Per-example wall clock when checking our own candidate. Kept small: this is
@@ -321,6 +322,13 @@ class Answer:
     self_verified: bool = False
     self_passed: int = 0
     self_total: int = 0
+    # Everything the summary line says, kept as data so the archive can hold
+    # it beside the answer. The line is what an operator reads live; this is
+    # what makes a solve answerable AFTER the fact -- which bar the program
+    # cleared, which cases were disputed and how they were settled, whether
+    # it was timed at scale, which models touched it. Without the bar itself
+    # on disk, "it passed its own cases" is a claim with no way to check it.
+    diagnostics: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -366,6 +374,11 @@ class Candidate:
     # because settling which of the program and the case is wrong means
     # comparing an independent reading against both.
     failed_actuals: list["_Run"] = field(default_factory=list)
+    # The cases this program was actually graded against. Kept for the
+    # solution cache: an answer handed out again without being re-run is a
+    # question about what it was checked against, and without the bar beside
+    # it there is no way to ask.
+    self_bar: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def verified(self) -> bool:
@@ -559,18 +572,39 @@ def _case_key(case: dict) -> tuple:
     )
 
 
+def _ago(when: Any) -> str:
+    """`saved_at` as a human interval, for the cache-hit line."""
+    try:
+        seconds = max(0.0, time.time() - float(when))
+    except (TypeError, ValueError):
+        return "at an unknown time"
+    if seconds < 90:
+        return f"{seconds:.0f}s ago"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m ago"
+    if seconds < 172800:
+        return f"{seconds / 3600:.0f}h ago"
+    return f"{seconds / 86400:.0f}d ago"
+
+
 def _next_profile(rotation: Sequence, used: Sequence, provider: Optional[str]):
     """The next model on the repair rotation, or None when it is spent.
 
-    Skips anything already handed this repair, and anything the failing
-    conversation is already running: handing a model its own answer back is
-    the round the rotation exists to stop being.
+    Skips every model that has already had this repair -- `used` is the ones
+    it was handed to AND the one that is handing it on, because the model
+    answering now is the one whose reading just failed to fix it.
+
+    Recording the departing model is what makes this a rotation rather than a
+    shuttle. Without it only the CURRENT seat is skipped, so a repair that
+    went opus -> sonnet came back to opus on its next hop: `sonnet` is
+    excluded as the incumbent, `opus` is not in `used`, and the third reading
+    the rotation exists to reach is never asked.
 
     `provider` is a label like `cli:opus@primary`, so the match is on the
     model name appearing in it rather than on equality.
     """
-    seen = {profile.model for profile in used}
     here = (provider or "").lower()
+    seen = {profile.model for profile in used if profile is not None}
     for profile in rotation:
         if profile.model in seen:
             continue
@@ -792,6 +826,8 @@ def _inherit_evidence(candidate: Candidate, prior: Candidate) -> None:
         # The feature and its own evidence have to move together.
         candidate.failed_cases = list(prior.failed_cases)
         candidate.failed_actuals = list(prior.failed_actuals)
+        if not candidate.self_bar:
+            candidate.self_bar = list(prior.self_bar)
         candidate.from_self_tests = prior.from_self_tests
         candidate.defect = candidate.defect or prior.defect
     if not candidate.self_cases:
@@ -1682,6 +1718,8 @@ class VerifyingSolver:
         second_opinion: bool = True,
         self_tests: bool = True,
         independent_bar: Optional[bool] = None,
+        second_bar: Optional[bool] = None,
+        judge: Optional[bool] = None,
     ):
         self._backend = backend
         # 0 means UNLIMITED, and that is the default. Correctness is the whole
@@ -1713,6 +1751,8 @@ class VerifyingSolver:
         self._second_bar = self._independent_bar and (
             os.environ.get("SOLVER_SECOND_BAR", "true").strip().lower()
             not in ("0", "false", "no")
+            if second_bar is None
+            else bool(second_bar)
         )
         # The judge: a third reader, asked what a disputed call returns.
         # Costs a short turn and only on the rounds that have a disagreement
@@ -1720,6 +1760,8 @@ class VerifyingSolver:
         self._judge = (
             os.environ.get("SOLVER_JUDGE", "true").strip().lower()
             not in ("0", "false", "no")
+            if judge is None
+            else bool(judge)
         )
         # The models a correction round moves through. Empty for any backend
         # that has no models to choose between -- a browser fleet -- in which
@@ -1850,6 +1892,39 @@ class VerifyingSolver:
             self._counts["cache_hits"] += 1
             code, raw = self._cache[key]
             return Answer(code=code, raw_response=raw, verified=True)
+        # ...and the same question asked of the disk, which outlives the
+        # process. Before any conversation is opened, because the whole value
+        # of a hit is that it costs a second and no quota.
+        #
+        # Re-checked rather than trusted: the file was written by a previous
+        # run of this code, but the file system is not a memory and an
+        # operator may have edited, truncated or copied it. `python_defect` is
+        # the same structural check every fresh answer passes and it costs
+        # microseconds, so a corrupted entry reads as a miss.
+        stored = solution_cache.load(key)
+        if stored is not None:
+            code = str(stored.get("code") or "")
+            defect = (
+                rust_defect(code)
+                if task.language == "rust"
+                else python_defect(code, task.entrypoint)
+            )
+            if defect is None:
+                self._counts["cache_hits"] += 1
+                print(
+                    f"[verify] {task.language} entrypoint={task.entrypoint} "
+                    f"cache=hit {key[:12]} "
+                    f"(kept {_ago(stored.get('saved_at'))}; it passed its own "
+                    f"cases and was timed at scale)"
+                    + (f" id={_ident(task)}" if _ident(task) else "")
+                )
+                return Answer(
+                    code=code,
+                    raw_response=str(stored.get("raw_response") or ""),
+                    self_verified=True,
+                )
+            print(f"[verify] a cached answer for {key[:12]} no longer reads as "
+                  f"a program ({defect}); solving it again")
 
         best = Candidate(code="", raw="")
         # One pass per model. The second only happens if the first could not
@@ -2019,6 +2094,24 @@ class VerifyingSolver:
         # that DID ship is never described by a later pass that lost.
         if shipped is None:
             shipped = _Shipped.of(plan)
+        # The disk keeps a different set from the in-memory cache above, on a
+        # different gate. That one wants `verified` -- agreement with the
+        # PUBLIC examples -- which live traffic never ships, so it has never
+        # once fired on a real solve. This asks what a live answer can
+        # actually establish about itself: it passed every case its readers
+        # wrote, nothing was left contested, and it was timed at the
+        # statement's own scale. See `solution_cache.worth_keeping`.
+        if best.code.strip() and solution_cache.worth_keeping(
+            self_verified=best.self_verified,
+            failures=bool(best.failures),
+            contested=shipped.contested,
+            probe=shipped.probe,
+        ):
+            solution_cache.save(key, solution_cache.record(
+                code=best.code, raw=best.raw, task=task, bar=best.self_bar,
+                probe=shipped.probe,
+                providers=[p for p in (won_with, *shipped.repair) if p],
+            ))
         elapsed = time.monotonic() - started
         print(
             f"[verify] {task.language} entrypoint={task.entrypoint} "
@@ -2083,6 +2176,32 @@ class VerifyingSolver:
             verified=best.verified, passed=best.passed, total=best.total,
             self_verified=best.self_verified,
             self_passed=best.self_passed, self_total=best.self_total,
+            diagnostics={
+                "provider": won_with,
+                "bar_provider": shipped.bar_provider,
+                "bar2_provider": shipped.bar2_provider,
+                "union": list(shipped.union) if shipped.union else None,
+                "bar": best.self_bar,
+                "self_passed": best.self_passed,
+                "self_total": best.self_total,
+                "self_observed": best.self_observed,
+                "self_verified": best.self_verified,
+                # WHICH cases it failed, and what it produced for them, not
+                # just how many. A wrong answer in the archive is a question
+                # about one case, and a count cannot answer it.
+                "failed_cases": best.failed_cases,
+                "failures": best.failures,
+                "disagreed": list(plan.disagreed) if plan.disagreed else None,
+                "adjudicated": dict(shipped.adjudicated),
+                "contested": shipped.contested,
+                "rounds": shipped.rounds,
+                "corrected": shipped.corrected,
+                "repair": list(shipped.repair),
+                "probe": shipped.probe,
+                "exit": shipped.exit,
+                "elapsed_s": round(elapsed, 1),
+                "budget_s": round(budget, 1),
+            },
         )
 
     async def _ask_for_cases(self, conversation, task, left: float, probe=None):
@@ -2514,6 +2633,19 @@ class VerifyingSolver:
                 # that is another reading, and then another, for as long as the
                 # deadline allows -- which is what bounds this now.
                 if rotation:
+                    # The model handing this on has had its rounds with it, so
+                    # it joins the used set rather than being skipped only
+                    # while it happens to be the incumbent.
+                    leaving = next(
+                        (
+                            profile for profile in rotation
+                            if profile.model
+                            and profile.model.lower() in (provider or "").lower()
+                        ),
+                        None,
+                    )
+                    if leaving is not None and leaving not in rotated:
+                        rotated.append(leaving)
                     nxt = _next_profile(rotation, rotated, provider)
                     if nxt is None:
                         # Every model has had it. The answer in hand is the
@@ -3095,7 +3227,9 @@ class VerifyingSolver:
                         candidate = self._grade(
                             reply, task,
                             left=budget - (time.monotonic() - started),
-                            cases=agreed, previous=last_code,
+                            # `or ""`: on the first round there is no previous
+                            # program, and `_grade` compares against a string.
+                            cases=agreed, previous=last_code or "",
                         )
                 key = candidate.code.strip()
                 if key:
@@ -4068,6 +4202,7 @@ class VerifyingSolver:
         # to know exactly which of the agreed cases are in play.
         candidate.failed_cases = failed
         candidate.failed_actuals = actuals
+        candidate.self_bar = list(cases)
 
     def _grade(
         self, reply: str, task, left: Optional[float] = None,

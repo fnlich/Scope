@@ -115,6 +115,7 @@ def save_exchange(
     request: dict,
     response: dict,
     directory: Optional[str | Path] = None,
+    solve: Optional[dict] = None,
 ) -> Optional[Path]:
     """Write the validator's request and the miner's reply, side by side.
 
@@ -132,6 +133,13 @@ def save_exchange(
     grader without stripping a header first. Same stem, different extension, so
     the pair is obvious in a listing and trivial to join.
 
+    `solve` is how the answer was arrived at, when the solver reports it: the
+    bar it was graded against, which cases it failed, how a disputed one was
+    settled, whether it was timed at scale, which models touched it. The
+    request and the response together say WHAT was submitted; without this
+    there is no way to ask why it was thought to be right. It is optional
+    because the archive must keep working for a solver that reports none.
+
     Takes plain dicts rather than the wire models on purpose -- this module has
     no idea what a `TaskRequest` is and should not learn.
     """
@@ -140,6 +148,8 @@ def save_exchange(
         return None
     path = target / (_stem(problem_id) + ".json")
     record = {"problem_id": problem_id, "request": request, "response": response}
+    if solve:
+        record["solve"] = solve
     try:
         body = json.dumps(record, indent=2, ensure_ascii=False, default=str)
     except Exception:  # noqa: BLE001 - an unserialisable field is not worth a solve
