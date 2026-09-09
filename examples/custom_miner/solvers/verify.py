@@ -587,6 +587,12 @@ def _ago(when: Any) -> str:
     return f"{seconds / 86400:.0f}d ago"
 
 
+def _model_of(provider: Optional[str]) -> str:
+    """The model out of a provider label like `cli:opus@primary`."""
+    name = (provider or "").split(":")[-1]
+    return name.split("@")[0].strip().lower()
+
+
 def _next_profile(rotation: Sequence, used: Sequence, provider: Optional[str]):
     """The next model on the repair rotation, or None when it is spent.
 
@@ -641,7 +647,7 @@ def _same_expected(left: Any, right: Any, language: str) -> bool:
 
 
 def _union_bars(
-    first: list[dict], second: list[dict]
+    first: list[dict], second: list[dict], language: str = "python"
 ) -> tuple[list[dict], dict[tuple, Any]]:
     """Two independently written bars, joined. Returns (cases, split).
 
@@ -672,7 +678,16 @@ def _union_bars(
         if mine is None:
             seen[key] = case
             merged.append(case)
-        elif _expectation(mine) != _expectation(case):
+        elif not _same_expected(
+            mine.get("expected"), case.get("expected"), language
+        ):
+            # The GRADER's comparison, not `_expectation`'s string form. For
+            # Rust a verdict is stdout compared on whitespace tokens, so
+            # `"OK 2\nD 0"` and `"OK 2 D 0"` are the same answer -- and
+            # calling them a disagreement would mark the case `split`, which
+            # is what keeps it away from the judge. Two bars that agree would
+            # then look like an ambiguity, and the case would go back to being
+            # settled by the program's own author.
             split[key] = case.get("expected")
     return merged, split
 
@@ -1770,7 +1785,14 @@ class VerifyingSolver:
             from .claude_cli import cli_repair_rotation
 
             self._rotation = cli_repair_rotation()
-        except Exception:  # noqa: BLE001 - a bad rotation must not stop a solve
+        except (Exception, SystemExit):
+            # `SystemExit`, explicitly: `cli_repair_rotation` raises it on a
+            # malformed value, as every other config reader in that module
+            # does, and it is a BaseException -- so `except Exception` was a
+            # fallback that could never run. A typo in one env var must cost
+            # the rotation, not the miner.
+            print("[verify] SOLVER_REPAIR_ROTATION could not be read; "
+                  "correction rounds stay where the program was written")
             self._rotation = ()
         # The size probe: one extra fenced block on the cases turn, and one
         # local run of the finished program on a large valid input. No extra
@@ -1779,6 +1801,10 @@ class VerifyingSolver:
             os.environ.get("SOLVER_SIZE_PROBE", "true").strip().lower()
             not in ("0", "false", "no")
         )
+        # Whether the last `_timed_out_at_scale` actually ran the program at
+        # size. See it, and `_probe_now`, which turns this into the difference
+        # between `passed` and `none`.
+        self._probe_ran = False
         self._grader = _Grader()
         self._cache: dict[str, tuple[str, str]] = {}
         self._cache_size = max(0, int(cache_size))
@@ -2341,7 +2367,22 @@ class VerifyingSolver:
                 # delivered nothing. Left accumulating, a solve whose first
                 # pass spent three rounds and died reported `rounds=4` for
                 # the one round its second pass actually took.
+                #
+                # Everything here is per pass for that reason, and `probe`
+                # most of all. It gates the on-disk cache, so a first pass
+                # that timed a program at scale and then failed to deliver
+                # would have vouched for the SECOND pass's program -- a
+                # different program, never timed -- and put it on disk to be
+                # served again unexamined.
                 plan.rounds = 0
+                plan.corrected = 0
+                plan.probe = ""
+                plan.adjudicated = {}
+                plan.contested = 0
+                plan.repair = []
+                plan.union = None
+                plan.bar_provider = None
+                plan.bar2_provider = None
             conversation = await self._open_within(
                 budget, started, avoid, phase="program"
             )
@@ -2697,6 +2738,16 @@ class VerifyingSolver:
                     budget, started, avoid, phase="repair", profile=nxt,
                 )
                 landed = getattr(fresh, "provider", None)
+                # Did the MODEL actually change? A browser fleet has none to
+                # change, and `open_profile` falls through to the ladder when
+                # the one asked for is out everywhere -- so a handoff can land
+                # right back on the model that wrote the program. Telling that
+                # model it is looking at someone else's work is the same false
+                # premise the flag exists to remove, pointed the other way.
+                elsewhere = bool(
+                    landed and provider
+                    and _model_of(landed) != _model_of(provider)
+                )
                 phases.mark(f"open {landed or 'tab'}")
                 if plan is not None and landed:
                     plan.repair.append(landed)
@@ -2714,7 +2765,7 @@ class VerifyingSolver:
                         # shown. Saying otherwise is a false premise about the
                         # one thing the round turns on, and a false premise
                         # gets argued with rather than acted on.
-                        foreign=True,
+                        foreign=elsewhere,
                         case_confirmed=any(
                             adjudicated.get(_case_key(case), ("", None))[0]
                             == "case"
@@ -2862,7 +2913,9 @@ class VerifyingSolver:
                         bar2_task, bar2 = None, []
                         if extra:
                             before = len(agreed)
-                            agreed, split_keys = _union_bars(agreed, extra)
+                            agreed, split_keys = _union_bars(
+                                agreed, extra, task.language
+                            )
                             if plan is not None:
                                 plan.union = (before, len(extra), len(agreed))
                             print(
@@ -3280,18 +3333,49 @@ class VerifyingSolver:
                 ):
                     best, best_provider = candidate, provider
                 if candidate.verified and not candidate.failures:
-                    slow = await self._probe_now(
+                    slow, probe_state = await self._probe_now(
                         candidate, probe, probed, task, budget, started
                     )
+                    if plan is not None:
+                        plan.note_probe(probe_state)
                     if slow is not None:
-                        if plan is not None:
-                            plan.note_probe("too_slow")
+                        # A too_slow round is a correction round like any
+                        # other, so it counts toward the handoff. It did not
+                        # used to: this `continue` jumps over the
+                        # `rounds_here` check below, and with the verdict now
+                        # cached per program a model that keeps re-sending the
+                        # same slow answer would be asked the same thing until
+                        # the deadline, never reaching the rotation that is
+                        # the one thing left to try.
+                        rounds_here += 1
+                        if rounds_here >= (
+                            ROTATE_AFTER_ROUNDS if rotation
+                            else (HANDOFF_ROUNDS if rotated else FIRST_PHASE_ROUNDS)
+                        ):
+                            carried = await _resume_elsewhere(
+                                f"{rounds_here} round(s) with "
+                                f"{provider or 'this model'} did not make it "
+                                f"fast enough",
+                                avoid=provider,
+                            )
+                            if carried is not None:
+                                conversation, provider, prompt = carried
+                                continue
+                            # Nowhere left to take it. The answer in hand is
+                            # correct and slow, which still beats nothing.
+                            print(
+                                f"[verify] the program is still too slow after "
+                                f"{rounds_here} round(s) and there is nobody "
+                                f"else to ask; submitting it as it stands"
+                            )
+                            if plan is not None:
+                                plan.note_exit("exhausted")
+                            break
                         prompt = build_repair_prompt(
                             [], task.language, task.entrypoint, too_slow=slow
                         )
                         continue
                     if plan is not None:
-                        plan.note_probe("passed" if probe else "none")
                         plan.note_exit("verified")
                     break
 
@@ -3434,12 +3518,44 @@ class VerifyingSolver:
                     # ever the size the validator will run. The probe asks the
                     # one question the bar cannot, and asks it before this
                     # counts as converged.
-                    slow = await self._probe_now(
+                    slow, probe_state = await self._probe_now(
                         candidate, probe, probed, task, budget, started
                     )
+                    if plan is not None:
+                        plan.note_probe(probe_state)
                     if slow is not None:
-                        if plan is not None:
-                            plan.note_probe("too_slow")
+                        # A too_slow round is a correction round like any
+                        # other, so it counts toward the handoff. It did not
+                        # used to: this `continue` jumps over the
+                        # `rounds_here` check below, and with the verdict now
+                        # cached per program a model that keeps re-sending the
+                        # same slow answer would be asked the same thing until
+                        # the deadline, never reaching the rotation that is
+                        # the one thing left to try.
+                        rounds_here += 1
+                        if rounds_here >= (
+                            ROTATE_AFTER_ROUNDS if rotation
+                            else (HANDOFF_ROUNDS if rotated else FIRST_PHASE_ROUNDS)
+                        ):
+                            carried = await _resume_elsewhere(
+                                f"{rounds_here} round(s) with "
+                                f"{provider or 'this model'} did not make it "
+                                f"fast enough",
+                                avoid=provider,
+                            )
+                            if carried is not None:
+                                conversation, provider, prompt = carried
+                                continue
+                            # Nowhere left to take it. The answer in hand is
+                            # correct and slow, which still beats nothing.
+                            print(
+                                f"[verify] the program is still too slow after "
+                                f"{rounds_here} round(s) and there is nobody "
+                                f"else to ask; submitting it as it stands"
+                            )
+                            if plan is not None:
+                                plan.note_exit("exhausted")
+                            break
                         prompt = build_repair_prompt(
                             [], task.language, task.entrypoint, too_slow=slow
                         )
@@ -3449,7 +3565,6 @@ class VerifyingSolver:
                     # converging from nothing and converging from four failures
                     # are the same word here and very different evidence.
                     if plan is not None:
-                        plan.note_probe("passed" if probe else "none")
                         plan.note_exit("converged")
                     break
                 # Kept apart, not merged into one list of "problems": a defect
@@ -3895,8 +4010,18 @@ class VerifyingSolver:
     async def _probe_now(
         self, candidate, probe: list, probed: dict, task, budget: float,
         started: float,
-    ) -> Optional[str]:
-        """The size probe's verdict at a success exit, or None to go ahead.
+    ) -> tuple[Optional[str], str]:
+        """The size probe's verdict at a success exit, and what it amounts to.
+
+        Returns `(sentence, state)`. The sentence is None unless the program
+        must be repaired; the state is one of `passed`, `too_slow`, `skipped`
+        or `none`, and it exists because four different Nones used to mean
+        four different things to a caller that could only see one. "Finished
+        inside five seconds at the statement's own scale" is evidence and is
+        worth keeping an answer over; "there was no time to ask" and "no large
+        input could be built" are not, and recording either as `passed` put a
+        never-timed answer into the permanent cache.
+
 
         None means SHIP -- and it means that for every reason: the probe is
         off, no generator came back, no time is left, or the program finished
@@ -3928,18 +4053,33 @@ class VerifyingSolver:
         round that might land. The deadline is the only clock.
         """
         if not self._size_probe or not probe:
-            return None
+            return None, "none"
         code = candidate.code.strip()
         if not code:
-            return None
+            return None, "none"
         if code in probed:
-            return probed[code]
+            verdict = probed[code]
+            return verdict, ("too_slow" if verdict else "passed")
         left = budget - (time.monotonic() - started)
         if left <= 0:
-            return None
+            # Never run, so nothing is known. Reported apart from `passed`
+            # because the difference decides whether this answer may be kept
+            # and handed out again without being run: an answer that was
+            # timed at scale is evidence, and one the clock ran out on is a
+            # claim. `solution_cache.worth_keeping` is the reader that cares.
+            return None, "skipped"
+        # Cleared HERE, by the caller, so it always describes the call about
+        # to be made. Cleared inside `_timed_out_at_scale` it was a latch on
+        # whatever ran last, and any caller that replaces that method -- a
+        # test, a subclass -- would read the previous run's answer.
+        self._probe_ran = False
         verdict = await self._timed_out_at_scale(code, probe[0], task, left)
         probed[code] = verdict
-        return verdict
+        if verdict:
+            return verdict, "too_slow"
+        # `_timed_out_at_scale` also returns None when no valid large input
+        # could be generated at all, which is not a program that finished.
+        return None, ("passed" if self._probe_ran else "none")
 
     async def _timed_out_at_scale(
         self, code: str, generator: str, task, left: float
@@ -4040,6 +4180,11 @@ class VerifyingSolver:
                 f"[verify] the size probe: finished a valid {size:,}-byte input "
                 f"in {ran[0].runtime_ms / 1000.0:.1f}s of {VERIFY_TIMEOUT_S:.0f}s"
             )
+            # The one path where the program was actually timed at size and
+            # finished. Everything else that returns None here -- no generator,
+            # no valid input, no time -- knows nothing about the program, and
+            # `_probe_now` must not report it as evidence.
+            self._probe_ran = True
             return None
         print(
             "[verify] the size probe: no large input could be had; the program "

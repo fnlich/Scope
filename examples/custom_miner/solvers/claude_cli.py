@@ -302,6 +302,22 @@ class _Limited(Exception):
     """The subscription's usage limit was reported before any answer."""
 
 
+class _Busy(Exception):
+    """This seat is retrying and somebody else is free. Move, do not bench it.
+
+    Distinct from `_Degraded`, and the difference is the whole point. A
+    degraded model is one the service is failing, and the answer to that is to
+    stop asking it for ten minutes on every account. A model on its FIRST
+    retry is not that: the CLI has said it is trying again, and it usually
+    succeeds. Benching it to avoid a one-second wait would cost the next
+    twenty solves their default model -- far more than the wait was worth.
+
+    So this hops and records nothing. If the seat really is failing, its
+    retries run out and `_Degraded` follows a few seconds later on evidence
+    rather than on a guess.
+    """
+
+
 class _Degraded(Exception):
     """The service is failing this model: overloaded, erroring, unreachable."""
 
@@ -872,7 +888,7 @@ class CliConversation:
                 self._silent_hops += 1
                 if self._silent_hops > MAX_SILENT_HOPS:
                     return body
-            elif verdict not in ("limited", "stalled", "degraded", "auth"):
+            elif verdict not in ("limited", "stalled", "degraded", "auth", "busy"):
                 # An answer, a partial one, a model that chose to say nothing
                 # -- or a failure with no stated cause. That last one is NOT
                 # hopped on: nothing says another rung would do better, and
@@ -904,21 +920,27 @@ class CliConversation:
         """
         if self._started:
             return False
-        for account, profile in self._backend.pairs():
+        for account in self._backend.accounts:
             if account == self.account:
                 continue
-            if self._backend.outage_for(account, profile.model)[0] > 0:
+            # THE SAME MODEL on another account, not that account's default.
+            # This is a move about processes, and the profile is nothing to do
+            # with it -- while the conversations that most often reach here are
+            # exactly the ones pinned to a model for a reason: `cases2` and
+            # `judge` exist to be a reading the program's author did not make,
+            # and quietly answering them on the default model would remove the
+            # independence without removing the line that claims it.
+            if self._backend.outage_for(account, self.model)[0] > 0:
                 continue
             if self._backend.slot_for(account).locked():
                 continue
             was = self.provider
             self._session = str(uuid.uuid4())
-            self.account, self.profile = account, profile
+            self.account = account
             self.hops += 1
             self._backend.note_hop()
             print(f"[cli] hop: {was} -> {self.provider} "
-                  f"({was.split(':')[-1] if was else 'that seat'} account "
-                  f"has no free process slot)")
+                  f"(no free process slot on that account)")
             return True
         return False
 
@@ -1037,6 +1059,13 @@ class CliConversation:
             print(f"[cli] {self.provider} turn refused: "
                   f"{self._backend.last_error or 'limit reached'}")
             return self._verdict("", "limited")
+        except _Busy as exc:
+            # No `note_*` of any kind: the seat is not being judged, it is
+            # being passed over while it retries.
+            await self._kill(proc)
+            errfile.close()
+            self._backend.last_error = f"{self.model} is retrying: {exc}"
+            return self._verdict("", "busy")
         except _Degraded as exc:
             await self._kill(proc)
             errfile.close()
@@ -1380,13 +1409,21 @@ class CliConversation:
         others = next_pair is not None and next_pair(
             self.account, self.model, same_account=self._started
         ) is not None
-        spent = attempt >= API_RETRIES_TOLERATED or delay_ms >= LONG_RETRY_MS
-        if spent or (others and not racing):
-            what = error or (f"HTTP {code}" if code else "connection error")
+        what = error or (f"HTTP {code}" if code else "connection error")
+        if attempt >= API_RETRIES_TOLERATED or delay_ms >= LONG_RETRY_MS:
+            # Failed often enough to be believed about it now, so the pair is
+            # set aside exactly as it always was.
             if code in (401, 403) or classify(error) == "auth":
                 raise _Unauthorised(what)
             raise _Degraded(f"{what}, {attempt} retr{'y' if attempt == 1 else 'ies'} "
                             f"in, next wait {delay_ms / 1000:.0f}s")
+        if others and not racing:
+            # Moving on from ONE retry, and moving on is all it is: `_Busy`
+            # records no outage. A first retry is not evidence that a model is
+            # out, and `_Degraded` would bench it on every account for ten
+            # minutes -- spending every later solve's default model to save
+            # this one a second.
+            raise _Busy(f"{what}, retrying in {delay_ms / 1000:.0f}s")
 
     def _failed_result(self, event: dict) -> None:
         """A `result` with `is_error`: the CLI gave up, and says why."""

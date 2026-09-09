@@ -13546,15 +13546,18 @@ def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session
         ("opus", "low", False), ("opus", "low", True), ("sonnet", "high", True),
     ], calls
     assert len({c["session"] for c in calls}) == 1, "the session was lost in the hop"
-    # Every account, ten minutes: the service's problem, not a seat's.
-    out_table = backend.stats()["out"]
-    assert "*/opus" in out_table and 500 < out_table["*/opus"]["seconds"] <= 600, out_table
-    assert "refused" in out_table["*/opus"]["why"] and "529" in out_table["*/opus"]["why"]
-    # The next fresh solve goes straight to the emergency profile.
-    assert after.provider == "cli:sonnet" and after.effort == "high"
+    # ...and NOTHING was benched. One retry is not evidence that a model is
+    # out, and `note_degraded` would set opus out on EVERY account for ten
+    # minutes -- so every later solve would pay for this one's saved second.
+    # The seat is passed over, not judged; if it really is failing, its
+    # retries run out and it is benched then, on its own evidence. That case
+    # is `test_a_model_that_exhausts_its_retries_is_still_benched`.
+    assert backend.stats()["out"] == {}, backend.stats()["out"]
+    # So the next fresh solve goes back to the default model, not the rung.
+    assert after.provider == "cli:opus", after.provider
     out = capsys.readouterr().out
     assert "hop: cli:opus -> cli:sonnet" in out, out
-    assert "EMERGENCY MODE: cli:sonnet (effort high)" in out, out
+    assert "is retrying" in out, out
 
 
 def test_a_server_error_result_is_read_the_same_way(tmp_path, monkeypatch):
@@ -15861,6 +15864,7 @@ def test_the_probe_runs_again_on_a_program_it_asked_to_be_rewritten():
 
     solver = VerifyingSolver.__new__(VerifyingSolver)
     solver._size_probe = True
+    solver._probe_ran = False
     timed: list[str] = []
 
     async def fake(code, generator, task, left):
@@ -15875,11 +15879,11 @@ def test_the_probe_runs_again_on_a_program_it_asked_to_be_rewritten():
 
     async def go():
         started = time.monotonic()
-        first = await solver._probe_now(slow, ["gen"], probed, task, 300.0, started)
+        first, _ = await solver._probe_now(slow, ["gen"], probed, task, 300.0, started)
         # The SAME program again: answered from the cache, not re-run.
-        again = await solver._probe_now(slow, ["gen"], probed, task, 300.0, started)
+        again, _ = await solver._probe_now(slow, ["gen"], probed, task, 300.0, started)
         # A DIFFERENT program: timed in its turn.
-        third = await solver._probe_now(fast, ["gen"], probed, task, 300.0, started)
+        third, _ = await solver._probe_now(fast, ["gen"], probed, task, 300.0, started)
         return first, again, third
 
     first, again, third = asyncio.run(go())
@@ -15899,6 +15903,7 @@ def test_the_probe_has_no_budget_floor_under_it():
 
     solver = verify.VerifyingSolver.__new__(verify.VerifyingSolver)
     solver._size_probe = True
+    solver._probe_ran = False
     offered: list[float] = []
 
     async def fake(code, generator, task, left):
@@ -16235,3 +16240,222 @@ def test_the_archive_keeps_the_bar_and_how_the_answer_was_reached(tmp_path):
         .read_text(encoding="utf-8")
     )
     assert set(plain) == {"problem_id", "request", "response"}, plain
+
+
+def test_a_model_that_exhausts_its_retries_is_still_benched(tmp_path, monkeypatch):
+    """The other half of hopping on the first retry.
+
+    Moving on from ONE retry records nothing, because one retry is not
+    evidence -- the CLI has said it is trying again and it usually succeeds.
+    What must not be lost with that is the case where it does not: a model
+    whose retries run out has produced the evidence, and it is set aside on
+    every account for `SOLVER_CLI_RECOVERY_S` exactly as it always was.
+
+    `overloaded` numbers its attempts from one, so the second event crosses
+    `API_RETRIES_TOLERATED` and the ladder is entitled to its verdict.
+    """
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch)
+    # Nobody else to hop to, so the wait is paid and the retries are spent.
+    # Every rung, including the phase pins -- `judge` and `cases2` join the
+    # ladder so the outage table tracks their models like any other, which
+    # means leaving them on sonnet would leave somewhere to hop to.
+    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "opus:low")
+    monkeypatch.setenv(
+        "SOLVER_CLI_PHASE_PROFILES", "judge=opus:low,cases2=opus:low"
+    )
+    _cli_modes(log, {"model:opus": "overloaded", "*": "ok"})
+    backend = CliBackend()
+    assert [p.label for p in backend.profiles] == ["opus/low"], backend.profiles
+
+    async def go():
+        conversation = await backend.open()
+        await conversation.send("solve it", 60.0)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(go())
+
+    out_table = backend.stats()["out"]
+    assert "*/opus" in out_table, out_table
+    assert 500 < out_table["*/opus"]["seconds"] <= 600, out_table
+    assert "529" in out_table["*/opus"]["why"], out_table
+
+
+def test_a_slot_hop_keeps_the_model_it_was_pinned_to(tmp_path, monkeypatch):
+    """A move about PROCESSES must not quietly change the model.
+
+    The conversations that reach this most often are the ones pinned to a
+    model for a reason -- `cases2` and `judge` exist to be a reading the
+    program's author did not make. Landing them on the next account's default
+    would remove the independence without removing the line that claims it.
+    """
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch, backups=1)
+    backend = CliBackend()
+    primary, backup = backend.accounts
+
+    async def go():
+        conversation = await backend.open_profile("sonnet", "low")
+        assert conversation.model == "sonnet", conversation.provider
+        # The primary's processes are all in flight.
+        for _ in range(backend.concurrency):
+            await backend.slot_for(primary).acquire()
+        moved = conversation._hop_for_slot()
+        return conversation, moved
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        conversation, moved = asyncio.run(go())
+
+    assert moved, "did not move off a full account"
+    assert conversation.account == backup, conversation.provider
+    assert conversation.model == "sonnet", (
+        f"the slot hop changed the pinned model: {conversation.provider}"
+    )
+
+
+def test_a_probe_that_never_ran_is_not_reported_as_a_pass():
+    """`passed` is evidence and gates the on-disk cache; the other three ways
+    of returning None know nothing about the program.
+
+    Recorded as `passed`, an answer the clock ran out on would be written to
+    a permanent cache and served again unexamined -- the one thing the cache
+    gate exists to prevent."""
+    import solvers.verify as verify
+
+    solver = verify.VerifyingSolver.__new__(verify.VerifyingSolver)
+    solver._size_probe = True
+    solver._probe_ran = False
+    task = SimpleNamespace(language="python", entrypoint="g")
+    candidate = SimpleNamespace(code="def g(n): return n")
+
+    async def never_runs(code, generator, task, left):
+        return None                      # no valid input could be built
+
+    async def finishes(code, generator, task, left):
+        solver._probe_ran = True
+        return None
+
+    async def too_slow(code, generator, task, left):
+        return "did not finish"
+
+    now = time.monotonic()
+
+    solver._timed_out_at_scale = finishes
+    assert asyncio.run(solver._probe_now(
+        candidate, ["gen"], {}, task, 300.0, now)) == (None, "passed")
+
+    solver._timed_out_at_scale = never_runs
+    assert asyncio.run(solver._probe_now(
+        candidate, ["gen"], {}, task, 300.0, now)) == (None, "none")
+
+    solver._timed_out_at_scale = too_slow
+    verdict, state = asyncio.run(
+        solver._probe_now(candidate, ["gen"], {}, task, 300.0, now))
+    assert verdict == "did not finish" and state == "too_slow"
+
+    # Out of time: never asked, so nothing is known.
+    solver._timed_out_at_scale = finishes
+    assert asyncio.run(solver._probe_now(
+        candidate, ["gen"], {}, task, 0.0, now - 5.0)) == (None, "skipped")
+
+    # And no generator at all is not a pass either.
+    assert asyncio.run(solver._probe_now(
+        candidate, [], {}, task, 300.0, now)) == (None, "none")
+
+
+def test_two_bars_that_spell_rust_output_differently_have_not_disagreed():
+    """A Rust verdict is stdout on whitespace tokens, so `"OK 2\\nD 0"` and
+    `"OK 2 D 0"` are the same answer.
+
+    Called a disagreement, the case would be marked `split` -- and a split
+    case is deliberately kept away from the judge, because the second bar is
+    already the independent reading of it. So a whitespace difference would
+    hand the case back to the program's own author to rule on, which is the
+    self-adjudication the judge exists to replace.
+    """
+    from solvers.verify import _union_bars
+
+    first = [{"name": "a", "args": ["3\n1 2 3\n"], "expected": "OK 2\nD 0"}]
+    second = [{"name": "b", "args": ["3\n1 2 3\n"], "expected": "OK 2 D 0"}]
+
+    merged, split = _union_bars(first, second, "rust")
+    assert split == {}, f"whitespace read as a disagreement: {split}"
+    assert len(merged) == 1
+
+    # A real difference is still a split.
+    other = [{"name": "c", "args": ["3\n1 2 3\n"], "expected": "OK 2 D 1"}]
+    _, real = _union_bars(first, other, "rust")
+    assert real, "a genuine disagreement was missed"
+
+
+def test_a_handoff_that_lands_on_the_same_model_is_not_called_foreign():
+    """`foreign` says the model did not write this program. A browser fleet
+    has no models to change between, and `open_profile` falls through to the
+    ladder when the one asked for is out everywhere -- so a handoff can land
+    right back where it started. Telling that model it is looking at someone
+    else's work is the same false premise the flag exists to remove."""
+    from solvers.verify import _model_of
+
+    assert _model_of("cli:opus@primary") == "opus"
+    assert _model_of("cli:sonnet") == "sonnet"
+    assert _model_of(None) == ""
+    # The comparison the handoff actually makes.
+    assert _model_of("cli:opus@primary") == _model_of("cli:opus@backup"), (
+        "the same model on another account is not a different reading"
+    )
+    assert _model_of("cli:opus@primary") != _model_of("cli:sonnet@primary")
+
+
+def test_a_bad_rotation_costs_the_rotation_and_not_the_miner(monkeypatch, capsys):
+    """`cli_repair_rotation` raises SystemExit on a malformed value, as every
+    other config reader in that module does -- and SystemExit is a
+    BaseException, so `except Exception` was a fallback that could never
+    run."""
+    monkeypatch.setenv("SOLVER_REPAIR_ROTATION", "opus:turbo")
+    from solvers.verify import VerifyingSolver
+
+    class _Unused:
+        async def open(self, avoid=None, timeout_s=None): raise AssertionError
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    solver = VerifyingSolver(_Unused())
+    assert solver._rotation == ()
+    assert "SOLVER_REPAIR_ROTATION" in capsys.readouterr().out
+
+
+def test_a_discarded_pass_does_not_vouch_for_the_program_that_shipped():
+    """`_Plan` is per pass, and `probe` most of all.
+
+    A second pass runs only after the first delivered nothing, and the summary
+    line describes the pass that SHIPPED. Left accumulating, a first pass that
+    timed its program at scale would vouch for the second pass's program -- a
+    different program, never timed -- and `solution_cache.worth_keeping` reads
+    exactly that field to decide what goes on disk permanently.
+    """
+    from solvers.verify import _Plan, _Shipped
+
+    plan = _Plan()
+    plan.note_probe("passed")
+    plan.note_adjudicated("case")
+    plan.contested = 2
+    plan.repair.append("cli:sonnet")
+    plan.rounds = 3
+    assert _Shipped.of(plan).probe == "passed"
+
+    # What `_attempt` does at the top of every pass.
+    plan.rounds = 0
+    plan.corrected = 0
+    plan.probe = ""
+    plan.adjudicated = {}
+    plan.contested = 0
+    plan.repair = []
+    plan.union = None
+    plan.bar_provider = None
+    plan.bar2_provider = None
+
+    fresh = _Shipped.of(plan)
+    assert fresh.probe == "" and fresh.contested == 0
+    assert fresh.adjudicated == () and fresh.repair == ()
