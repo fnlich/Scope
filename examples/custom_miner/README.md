@@ -1470,9 +1470,13 @@ Four rules keep the split from becoming a second way to lose:
   else: the program was written somewhere this never touched, and it ships. The
   ceiling and the still-writing reopen that the sequential shape needed exist
   because a slow cases turn used to take the program's budget with it.
-- **The bar is waited for with one correction round held back.** A
-  disagreement arriving with no time to act on it grades an answer that ships
-  unchanged either way, so the wait stops at `ROUND_TRIP_FLOOR_S`.
+- **The bar is waited for, bounded by the deadline and nothing else.** There
+  is no round held back and no floor under the wait: a disagreement that
+  arrives late still turns an answer shipped unchecked into one that was
+  graded, and `disagreed=` on the summary line is worth more than a round
+  nobody may need. The second bar is never waited for at all -- it is joined
+  whenever it has landed, before every grade, and reported `late` if it never
+  does.
 - **A repair still quotes the bar.** Independence is about how the program is
   *written*, not about what it is shown afterwards. Turn 3 onward names the
   failing case, because a repair that cannot see what it failed is a guess.
@@ -2005,8 +2009,8 @@ backend that does not report one keeps the historic behaviour.
 
 Together those left the two failed tasks with 5 seconds against a 20-second
 second-opinion guard, while five healthy tabs sat idle. The pass loop now keeps
-asking while it is holding **nothing** and the clock allows one more round trip
-(`EMPTY_HANDED_FLOOR_S`, capped at `MAX_PASSES`). Holding an answer, the old
+asking while it is holding **nothing** and any deadline remains (capped at
+`MAX_PASSES`; there is no time floor -- the deadline is the only clock). Holding an answer, the old
 policy stands: one second opinion, because there is then something worth
 submitting and each further ask spends a real account's quota.
 

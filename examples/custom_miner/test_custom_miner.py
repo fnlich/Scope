@@ -7924,8 +7924,8 @@ def test_a_model_repeating_itself_keeps_being_corrected_while_time_remains(monke
     clock would still have paid for. Models are stochastic: the next ask is a
     real chance, and a real chance is what the remaining budget is for.
 
-    The budget below is under `RESUME_FLOOR_S`, so carrying the repair to a
-    fresh conversation is not on the table and the duplicate branch is what
+    The backend below has one seat and no rotation, so carrying the repair to
+    a fresh conversation is not on the table and the duplicate branch is what
     decides. Each round takes a real round trip."""
     from solvers import verify
 
