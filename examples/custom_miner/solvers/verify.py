@@ -66,6 +66,7 @@ from .prompts import (
     rust_defect,
 )
 from . import solution_cache
+from .config import env_on
 from .rust_compile import compile_defect, rustc_path
 
 # Per-case wall clock for every local run: grading against the bar, the size
@@ -77,20 +78,8 @@ from .rust_compile import compile_defect, rustc_path
 VERIFY_TIMEOUT_S = float(os.environ.get("SOLVER_VERIFY_TIMEOUT_S", "5"))
 
 
-def _env_on(name: str, default: bool = True) -> bool:
-    """A boolean setting, read with the one grammar the whole `.env` uses.
-
-    `0`, `false`, `no` and `off` are off; anything else set is on; unset is
-    the default. The CLI backend's `_on` reads its settings the same way, and
-    this used to differ from it by exactly `off` -- so an operator who had
-    written `SOLVER_CLI_ALLOW_OVERAGE=off` and then `SOLVER_JUDGE=off` turned
-    the first thing off and left the second on, with no word that the value
-    was not understood.
-    """
-    raw = os.environ.get(name, "").strip().lower()
-    if not raw:
-        return default
-    return raw not in ("0", "false", "no", "off")
+# The one boolean grammar every solver setting is read with; see `config`.
+_env_on = env_on
 
 # The least a case may be given when the budget cannot afford the full timeout.
 #
@@ -2824,7 +2813,7 @@ class VerifyingSolver:
                 install, so the loop's own bindings stay the single source of
                 truth for what it is talking to.
                 """
-                nonlocal rotated, program_only, program_unchanged, reported_failed
+                nonlocal program_only, program_unchanged, reported_failed
                 nonlocal rounds_here
                 left_now = budget - (time.monotonic() - started)
                 if best is None or not best.code.strip():
@@ -3077,7 +3066,7 @@ class VerifyingSolver:
                     # runs until the answer passes or the clock stops it -- so
                     # it is the last thing that should happen without a word.
                     print(
-                        f"[verify] the deadline is gone; submitting the last version"
+                        "[verify] the deadline is gone; submitting the last version"
                         + (
                             " unverified"
                             if best is None or not best.verified

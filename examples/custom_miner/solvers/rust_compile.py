@@ -35,6 +35,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from .config import env_on
 from pathlib import Path
 from typing import Optional
 
@@ -77,7 +78,7 @@ def _look_for_rustc() -> Optional[str]:
     """
     global _rustc, _looked
     try:
-        if os.environ.get("SOLVER_RUST_COMPILE", "1") == "0":
+        if not env_on("SOLVER_RUST_COMPILE"):
             print("[verify] local Rust compile checking is off (SOLVER_RUST_COMPILE=0)")
             return None
         _rustc = shutil.which("rustc")

@@ -49,6 +49,24 @@ from typing import Optional, Sequence
 DEFAULT_SOLVE_TIMEOUT_S = "3600"
 
 
+def env_on(name: str, default: bool = True) -> bool:
+    """A boolean setting, read with the one grammar the whole `.env` uses.
+
+    `0`, `false`, `no` and `off` are off; anything else set is on; unset is
+    the default. Every boolean the solver reads goes through here -- the
+    solver's switches, the roster's, the browser sites' stream flags, the
+    Rust compile check -- because they used to disagree: `SOLVER_JUDGE=off`
+    left the judge on while `SOLVER_CLI_ALLOW_OVERAGE=off` turned overage off,
+    `CLAUDE_STREAM=false` left streaming on, and `CLAUDE_STREAM_FIRST=true`
+    did nothing at all. An operator who writes one spelling for one knob
+    writes it for the next.
+    """
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
 def apply_solve_timeout_default() -> None:
     """Fill in ``GLM_REQUEST_TIMEOUT_S`` when nothing else has.
 

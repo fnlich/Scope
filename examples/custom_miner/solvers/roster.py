@@ -23,7 +23,7 @@ import os
 from typing import Any, Optional, Sequence
 
 from .browser_pool import DEFAULT_CDP_PORT, Browser, BrowserFleet, Site, normalize_cdp
-from .verify import VerifyingSolver
+from .verify import VerifyingSolver, _env_on
 
 PROVIDERS = ("claude", "chatgpt")
 
@@ -138,8 +138,9 @@ def build_solver(browsers: Optional[Sequence[Browser]] = None) -> VerifyingSolve
         # private deadline that throws away answers the validator would still
         # have paid for -- see VerifyingSolver.solve_task.
         max_budget_s=float(os.environ.get("SOLVER_MAX_BUDGET_S", "3600")),
-        second_opinion=os.environ.get("SOLVER_SECOND_OPINION", "true").strip().lower()
-        not in ("0", "false", "no"),
+        # One boolean grammar for the whole `.env` (`off` included) -- see
+        # `verify._env_on`.
+        second_opinion=_env_on("SOLVER_SECOND_OPINION"),
         # The model's own cases, run with the validator's executor. Live traffic
         # ships no `public_examples` at all, so without these there is nothing to
         # grade and the repair loop never fires. `SOLVER_SELF_TESTS=0` turns the
@@ -148,8 +149,7 @@ def build_solver(browsers: Optional[Sequence[Browser]] = None) -> VerifyingSolve
         # combined prompt requested a second block that this switch then told
         # the grader to ignore, so the model spent output tokens inside the
         # deadline writing something nothing read.
-        self_tests=os.environ.get("SOLVER_SELF_TESTS", "true").strip().lower()
-        not in ("0", "false", "no"),
+        self_tests=_env_on("SOLVER_SELF_TESTS"),
     )
 
 
