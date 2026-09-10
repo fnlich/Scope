@@ -355,6 +355,17 @@ def _verdict(
             # "could not be run here" is all an operator would learn from a
             # Rust rehearsal, and "it builds" is most of what they wanted.
             builds = "it compiles locally; "
+    elif request.language == "python":
+        absent = _python_sandbox_missing()
+        if absent is not None:
+            return UNKNOWN, (
+                f"the Python grading image has not been pulled on this machine, "
+                f"so the cases were not run.\n           Fix:\n"
+                f"               docker pull {absent}\n"
+                f"           Do NOT let the grader pull it: that happens inside "
+                f"its own bounded run, and over budget it fails every case and "
+                f"reads as a WRONG ANSWER."
+            )
     if not tests:
         return UNKNOWN, "no tests came with this problem to check it against"
     try:
@@ -404,7 +415,32 @@ def _executor_hint(exc: Exception) -> str:
 
 
 def _rust_sandbox_missing() -> Optional[str]:
-    """The pinned sandbox image, if this machine has not pulled it yet.
+    """The pinned Rust sandbox image, if this machine has not pulled it yet."""
+    from rlvr.policy import RELEASE_POLICY
+
+    return _image_missing(RELEASE_POLICY.rust_image)
+
+
+def _python_sandbox_missing() -> Optional[str]:
+    """The Python grading image, if Docker is the Python backend and this
+    machine has not pulled it yet.
+
+    Docker became the default Python backend (256 MiB parity), so the hazard
+    the Rust check exists for is now Python's too: a first `docker run` of an
+    absent image pulls it INSIDE the executor's bounded subprocess, and over
+    that budget every case comes back timed out -- a correct program read as
+    a wrong one.
+    """
+    from solvers.verify import _Grader
+
+    settings = _Grader._build_settings()
+    if settings.executor != "docker":
+        return None
+    return _image_missing(settings.docker_image)
+
+
+def _image_missing(image: str) -> Optional[str]:
+    """`image`, if this machine has not pulled it yet.
 
     Returns None when it is present, when Docker cannot be asked at all, and on
     any answer other than a clear "no such image" -- claiming an absent image on
@@ -426,12 +462,9 @@ def _rust_sandbox_missing() -> Optional[str]:
     import shutil
     import subprocess
 
-    from rlvr.policy import RELEASE_POLICY
-
     docker = shutil.which("docker")
     if docker is None:
         return None  # a missing Docker is the executor's story to tell
-    image = RELEASE_POLICY.rust_image
     try:
         done = subprocess.run(
             [docker, "image", "inspect", image],

@@ -203,10 +203,10 @@ The public examples are the friendly ones, and on live traffic there are usually
 none at all. Grading is on the **complete hidden suite**, written to break a
 solution that only handles the shape it was shown — so the cases the program
 will be checked against are asked for *first, in their own turn*, before the
-program exists to back-fill them from. Turn 1 names five classes and their
+program exists to back-fill them from. Turn 1 names six classes and their
 order is the instruction:
 
-    THREE ORDINARY   typical inputs — the common path an all-boundary suite
+    ONE ORDINARY     a typical input — the common path an all-boundary suite
                      never checks, and where a program wrong down the middle
                      passes every other case
     EMPTY OR ZERO    empty list, empty string, 0, an empty payload
@@ -216,6 +216,17 @@ order is the instruction:
     LIKELY WRONG     what this particular problem makes easy to get wrong —
                      ties, duplicates, all-equal, sorted, reversed, a rule
                      that fires beside an input that NEARLY makes it fire
+    EVERY RESULT     one case per distinct result the statement names — each
+                     refusal, sentinel, empty answer, or differently-shaped
+                     return, including the ones no example ever shows
+
+The last class is about the SHAPE of the answer rather than the size of the
+input, and it is the one a statement can hide in a single sentence. Every
+sample problem in this repository names a result — `{"status": "cycles"}`, an
+`"invalid"` recovery, a `("rejected",)`, a `-1`, an empty `K = 0` — that none
+of its public examples demonstrates. A model that never wrote a case for that
+result usually never wrote the branch either, and the hidden suite always
+tests it.
 
 That list used to be nine classes with a per-class count, and it was restated
 almost verbatim in turn 2 as an `<edge_cases>` checklist the model was asked to
@@ -1214,11 +1225,20 @@ re-serves a wrong answer for every later task with the same statement.
 
 So `self_passed` is kept in its own field. It never touches `passed`/`total`,
 `verified` is earned by the validator's examples alone — with none shipped it
-stays False however many of its own cases a program passes. The answer cache is
-gated on `verified` **and** on having no outstanding failures, so an answer that
-cleared the examples and still disagrees with its own cases is not cached
-either: one wrong answer must not be re-served for every later task with the
-same statement.
+stays False however many of its own cases a program passes. The in-memory answer
+cache is gated on `verified` **and** on having no outstanding failures, so an
+answer that cleared the examples and still disagrees with its own cases is not
+cached either: one wrong answer must not be re-served for every later task with
+the same statement.
+
+There is a second, on-disk cache for live traffic, which ships no public
+examples and so never fills the first: `solvers/solution_cache.py` keeps an
+answer under `solutions/cache/<problem hash>.json` when it passed every case its
+readers wrote, nothing was left contested, the size probe timed it at scale and
+finished (`probe=passed`), and grading was not degraded to the subprocess
+fallback. A request with the same statement, language and entrypoint is answered
+from that file in about a second, before any conversation opens (`cache=hit` on
+the summary line). `SOLVER_SOLUTION_CACHE=0` turns it off.
 
 Two rules keep the bar honest, and they are the same rule at two moments:
 
@@ -1450,9 +1470,13 @@ Four rules keep the split from becoming a second way to lose:
   else: the program was written somewhere this never touched, and it ships. The
   ceiling and the still-writing reopen that the sequential shape needed exist
   because a slow cases turn used to take the program's budget with it.
-- **The bar is waited for with one correction round held back.** A
-  disagreement arriving with no time to act on it grades an answer that ships
-  unchanged either way, so the wait stops at `ROUND_TRIP_FLOOR_S`.
+- **The bar is waited for, bounded by the deadline and nothing else.** There
+  is no round held back and no floor under the wait: a disagreement that
+  arrives late still turns an answer shipped unchecked into one that was
+  graded, and `disagreed=` on the summary line is worth more than a round
+  nobody may need. The second bar is never waited for at all -- it is joined
+  whenever it has landed, before every grade, and reported `late` if it never
+  does.
 - **A repair still quotes the bar.** Independence is about how the program is
   *written*, not about what it is shown afterwards. Turn 3 onward names the
   failing case, because a repair that cannot see what it failed is a guess.
@@ -1467,12 +1491,18 @@ Each phase may name its own model and effort:
 SOLVER_CLI_PHASE_PROFILES=cases=sonnet:low,program=opus:low
 ```
 
-Phases are `cases`, `program` and `repair`. It is **unset by default**, and
-that is deliberate rather than cautious: every one of the 102 solves in the
-archived runs opened on the same model, so those logs say nothing whatever
-about how another model answers a cases turn or a program turn here. A default
-naming one would be a guess with a measurement's authority. Measure it on your
-own traffic, then set it.
+Phases are `cases`, `program`, `repair`, `judge` and `cases2`. The first three
+are **unset by default**, and that is deliberate rather than cautious: every one
+of the 102 solves in the archived runs opened on the same model, so those logs
+say nothing whatever about how another model answers a cases turn or a program
+turn here. A default naming one would be a guess with a measurement's authority.
+Measure it on your own traffic, then set it. `judge` and `cases2` DO default,
+to `sonnet:low`: both exist to be a reading of the statement the program's
+author did not make, so their default is "a different model from the one that
+writes programs", and sonnet in low-thinking mode is the measured choice (see
+`.env.example`). Correction rounds rotate through `SOLVER_REPAIR_ROTATION`
+(`opus:low,sonnet:low,fable:low`) until the program passes or the deadline
+stops it -- around again when every model has had it once.
 
 What a phase names is a **preference, never a pin**, and the two escapes are
 what make it safe to use at all:
@@ -1524,9 +1554,19 @@ So the summary line carries both:
   unlike `exit=`, which describes how the solve ended and so reports the last.
 - **`exit=`** — which condition ended the loop: `converged`, `verified`,
   `budget`, `stalled`, `cutoff`, `empty`, `maxattempts`, plus `cases` (the cases
-  turn never answered, so no program was asked for) and `failed` (the backend
-  raised). Every way out of a pass records one, so the line never carries an
-  earlier pass's reason for this one, or nothing.
+  turn never answered, so no program was asked for), `exhausted` (the repair
+  could not be carried on: no model but the one answering, or nothing left to
+  carry) and `failed` (the backend raised). Every way out of a pass records one,
+  so the line never carries an earlier pass's reason for this one, or nothing.
+- **`probe=`** — what the size probe said about the program that shipped:
+  `passed` (finished at the statement's own scale inside 5s), `too_slow`,
+  `oom`, `crashed`, `skipped` (the clock ran out first) or `none` (no
+  generator, no valid large input). Only `passed` lets an answer into the
+  on-disk solution cache.
+- **`bar2=`, `union=`, `split=`, `adjudicated=`, `contested=`, `repair=`** —
+  the second bar's model (or `late`/`none`), what the two bars union to, how
+  many calls they read two ways, how the judge settled disputed cases, how many
+  were dropped as ambiguous, and which models the correction rounds ran on.
 
 Read them together. `rounds=1 disagreed=0/18 exit=converged` is a program
 nothing could fault. `rounds=1 disagreed=none exit=converged` is a program
@@ -1969,8 +2009,8 @@ backend that does not report one keeps the historic behaviour.
 
 Together those left the two failed tasks with 5 seconds against a 20-second
 second-opinion guard, while five healthy tabs sat idle. The pass loop now keeps
-asking while it is holding **nothing** and the clock allows one more round trip
-(`EMPTY_HANDED_FLOOR_S`, capped at `MAX_PASSES`). Holding an answer, the old
+asking while it is holding **nothing** and any deadline remains (capped at
+`MAX_PASSES`; there is no time floor -- the deadline is the only clock). Holding an answer, the old
 policy stands: one second opinion, because there is then something worth
 submitting and each further ask spends a real account's quota.
 
@@ -2005,7 +2045,7 @@ fresh conversation.
 |---|---|---|
 | `SOLVER_MAX_ATTEMPTS` | `0` | Rounds per solve, `0` meaning **unlimited** — correct until it passes or the request's deadline stops it. A count here is a second, private deadline under the only real one, and there is no partial credit for stopping early. Set a number to cap it anyway |
 | `SOLVER_MAX_BUDGET_S` | `3600` | The protocol's own maximum for `deadline_s`, so it cannot bind on a spec-compliant request. Lowering it below the advertised deadline throws away answers the validator would still pay for |
-| `SOLVER_VERIFY_EXECUTOR` | `subprocess` | Python grading backend; Rust always uses Docker |
+| `SOLVER_VERIFY_EXECUTOR` | `docker` | Python grading backend, matching the validator's 256 MiB / no-swap container; Rust always uses Docker. When no daemon answers, Python falls back to `subprocess` (1 GiB) with a once-per-run warning, tries Docker again every `SOLVER_EXECUTOR_RETRY_S`, and answers graded that way are kept out of the on-disk cache |
 | `SOLVER_EXECUTOR_RETRY_S` | `300` | How long an executor that could not be BUILT stays unavailable before a solve tries again. Without a daemon, building the Rust executor runs `docker info` — 60ms against a missing socket, up to 20s against a hung one — and it used to run once per Rust task, inside the solve's budget. A hold rather than a verdict: a daemon started after the miner is picked up on its own |
 | `MINER_RESPONSE_GRACE_S` | `5` | How far past `deadline_s` the solve may run. The validator reads until `deadline_s + 10` (`_MINER_RESPONSE_GRACE_S`, `rlvr/neurons/decentralized.py`), and the reference handler stopped at `deadline_s` flat. Not all ten: the rest is the response's own trip across the wire. `0` restores the reference behaviour |
 | `GLM_REQUEST_TIMEOUT_S` | `3600` | The deadline `handle_request` answers **504** at, `min()`-ed with the validator's own. Named for the reference miner's GLM client but applied to whatever solver is plugged in. `docs/DEMO_MINER.md` documents `280` for that miner; leaving `280` in your `.env` costs the browser solver 20 seconds of every solve |
@@ -2432,6 +2472,9 @@ Then **pull** the sandbox image. Do not build it:
 ```bash
 cd /path/to/Scope
 docker pull "$(python -c 'from rlvr.policy import RELEASE_POLICY; print(RELEASE_POLICY.rust_image)')"
+# ...and the Python grading image, now that Docker is the default Python
+# backend too (the same first-pull hazard applies):
+docker pull "$(python -c 'from rlvr.config import Settings; print(Settings(_env_file=None).docker_image)')"
 ```
 
 `scripts/build_rust_sandbox.sh` builds a LOCAL tag, `hone-rust-sandbox:rustc-1.89.0`,

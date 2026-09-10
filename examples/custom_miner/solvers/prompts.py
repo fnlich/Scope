@@ -324,6 +324,10 @@ Write, in this order:
    duplicates, every element equal, already sorted, exactly reversed, a rule the
    statement states given one input that makes it fire and one that NEARLY does,
    and whatever else this particular problem makes easy to get wrong.
+6. ONE CASE FOR EVERY DISTINCT RESULT THE STATEMENT NAMES: each refusal, each
+   sentinel, each empty answer, each result shaped differently from the
+   ordinary one. A result the statement mentions once and no example shows is
+   still a result the program has to produce.
 
 Skip a class only when the statement makes it impossible. At most {limit} cases
 in total. Derive every `expected` from the STATEMENT by reasoning it out.
@@ -361,6 +365,10 @@ Write, in this order:
    duplicates, every element equal, already sorted, exactly reversed, a rule the
    statement states given one input that makes it fire and one that NEARLY does,
    and whatever else this particular problem makes easy to get wrong.
+6. ONE CASE FOR EVERY DISTINCT RESULT THE STATEMENT NAMES: each refusal, each
+   sentinel, each empty answer, each result shaped differently from the
+   ordinary one. A result the statement mentions once and no example shows is
+   still a result the program has to write.
 
 Skip a class only when the statement makes it impossible. At most {limit} cases
 in total. Derive every `expected` from the STATEMENT by reasoning it out.
@@ -428,11 +436,35 @@ def extract_generator(reply: str) -> str:
     return ""
 
 
+# What the cases prompt says about the program turn, and what it says instead
+# when there is not going to be one. Under the independent bar (the default)
+# and for the second bar, the conversation is closed after the cases and never
+# asked for a program -- so "you will be asked for it next" was a false
+# premise about the task the reader was doing.
+_PROGRAM_NEXT = (
+    "You will be\nasked for the program in my next message, and these cases "
+    "are what it will be\nRUN against before it is submitted"
+)
+_PROGRAM_ELSEWHERE = (
+    "The program is being\nwritten elsewhere, from this same statement, by "
+    "someone who will not see these\ncases; they are what it will be RUN "
+    "against before it is submitted"
+)
+_NOT_YET = ("Do NOT write the program yet —\nyou will be asked for it next.",
+            "Do NOT write the program yet — you will be asked for it next.")
+_NOT_AT_ALL = ("Do NOT write the program — it is being written elsewhere, and "
+               "you will not be\nasked for it.")
+
+
 def build_tests_prompt(
     language: str, statement: str, entrypoint: str, examples: list[dict[str, Any]],
-    want_probe: bool = False,
+    want_probe: bool = False, independent: bool = False,
 ) -> str:
     """Turn 1: ask for the cases, and optionally the size probe beside them.
+
+    `independent` says this conversation will NOT be asked for the program:
+    the bar is being written beside a program conversation it never sees.
+    What changes is only the truth of two sentences -- see `_PROGRAM_NEXT`.
 
     `want_probe` adds one more fenced block to the SAME turn rather than
     another turn, and that is the entire cost argument: a third model turn is
@@ -465,6 +497,12 @@ def build_tests_prompt(
     task = (TESTS_TASK_RUST if is_rust else TESTS_TASK_PYTHON).format(
         entrypoint=entrypoint, limit=MAX_SELF_TESTS
     )
+    if independent:
+        assert _PROGRAM_NEXT in task, "the cases template moved"
+        task = task.replace(_PROGRAM_NEXT, _PROGRAM_ELSEWHERE)
+        for stale in _NOT_YET:
+            parts[1] = parts[1].replace(stale, _NOT_AT_ALL)
+        assert _NOT_AT_ALL in parts[1], "the cases contract moved"
     if want_probe:
         task += "\n\n" + GENERATOR_TASK.format(
             shape=(_PROBE_SHAPE_RUST if is_rust else _PROBE_SHAPE_PYTHON).format(
@@ -495,6 +533,166 @@ def _render_cases(cases: list[dict[str, Any]], language: str, entrypoint: str) -
                 f"{label}{entrypoint}({args}{kwargs}) -> {json.dumps(case.get('expected'))}"
             )
     return "\n".join(lines)
+
+
+def _render_calls(
+    cases: Sequence[dict[str, Any]], language: str, entrypoint: str
+) -> str:
+    """The calls alone, with no expected value beside them.
+
+    `_render_cases` renders `call -> expected`, which is exactly what must NOT
+    reach a reader being asked what the call returns. This is the same
+    rendering with the answer removed.
+    """
+    lines = []
+    for index, case in enumerate(cases):
+        if language == "rust":
+            lines.append(f"{index}. stdin {json.dumps((case.get('args') or [''])[0])}")
+        else:
+            args = ", ".join(json.dumps(a) for a in case.get("args", []))
+            kwargs = "".join(
+                f", {k}={json.dumps(v)}" for k, v in (case.get("kwargs") or {}).items()
+            )
+            lines.append(f"{index}. {entrypoint}({args}{kwargs})")
+    return "\n".join(lines)
+
+
+# What a THIRD reader is asked when the bar and the program disagree about a
+# case: not who is right, but what the call returns, from the statement alone.
+#
+# The question is narrowed on purpose, and the narrowing is what the evidence
+# supports. `calibration/two_bar_overlap.py` measured two models asked to
+# choose their own test inputs: they shared five of 233, so nothing can be
+# built on them agreeing about WHAT to test. `calibration/fixed_inputs.py`
+# then held the inputs fixed and asked only for the expected values: 91 of 97
+# agreed. Two readings of a statement converge on what a given call must
+# return and diverge completely on which calls are worth making, so this asks
+# the question they agree about.
+#
+# No program is shown, and that is the whole value of the answer. A reader who
+# has seen the code is not an independent reading of the statement any more,
+# it is a review of the code -- and the failure being adjudicated is precisely
+# the one where the program and the case that should have caught it came from
+# the same misreading.
+EXPECTED_ONLY = """\
+<output>
+Reply with ONE fenced ```json block and nothing else: an array of objects
+{{"i": <the number of the call>, "expected": <what it must return>}}, one for
+every call the statement DETERMINES. Where the statement does not determine a
+call's answer, leave that call out rather than guess. No prose, no code, no
+program.
+</output>
+
+<problem language="{language}" entrypoint="{entrypoint}">
+{statement}
+</problem>
+{examples}
+<calls note="Work out from the statement alone what each of these must return.
+You have not been shown any program and there is no reference answer to check
+against{beyond}. {value_rule}">
+{calls}
+</calls>
+
+One fenced ```json block, one object per call you can determine, nothing else."""
+
+# What `expected` IS, by language. A Rust case's expected is the program's
+# complete stdout, a string, and the grader compares strings: a reader that
+# answered a numeric problem with the number matched neither the bar nor the
+# program, and the case was dropped as contested.
+_EXPECTED_VALUE_RULE = {
+    "rust": "`expected` is the complete stdout the program must write, as ONE "
+            "JSON string.",
+    "python": "`expected` is the exact value the call must return, written as "
+              "JSON.",
+}
+
+
+def build_expected_prompt(
+    language: str,
+    statement: str,
+    entrypoint: str,
+    cases: Sequence[dict[str, Any]],
+    examples: Optional[list[dict[str, Any]]] = None,
+) -> str:
+    """Ask a reader what these exact calls must return, from the statement.
+
+    The public examples go in when there are any: they are ground truth from
+    neither party, and they settle exactly the tie-break and ordering
+    ambiguities a statement leaves open. Live traffic ships none, so on live
+    traffic this is the statement alone, as before.
+    """
+    is_rust = language == "rust"
+    rendered = _render_examples(language, examples or [])
+    return EXPECTED_ONLY.format(
+        language="rust" if is_rust else "python",
+        entrypoint=entrypoint,
+        statement=statement.strip(),
+        examples=(
+            "\n<examples note=\"PUBLIC EXAMPLES — already known to be right; "
+            "where the statement is ambiguous, they decide.\">\n"
+            f"{rendered}\n</examples>\n"
+            if rendered else ""
+        ),
+        beyond=" beyond the public examples above" if rendered else "",
+        value_rule=_EXPECTED_VALUE_RULE["rust" if is_rust else "python"],
+        calls=_render_calls(cases, language, entrypoint),
+    )
+
+
+def extract_expected(reply: str, count: int) -> dict[int, Any]:
+    """`{index: expected}` from a reader's reply, or `{}`.
+
+    Tolerant the way `extract_self_tests` is: thinking blocks and stray
+    control characters are stripped first, and the LAST parseable block wins,
+    because a reader that writes an array, re-reads the statement and writes a
+    corrected one has answered with the second. Anything that is not an
+    object carrying `i` and `expected` is dropped rather than argued with, and
+    an index outside the calls asked about is dropped too -- a reader that
+    invents a seventh call when six were listed has answered a different
+    question.
+
+    Two shapes of reply are read as what they meant rather than as what they
+    said. A reader that numbered the calls from 1 -- every index in 1..count
+    and none at 0 -- is shifted back, because read literally its answer for
+    call 0 would be compared against call 1. And an index that appears twice
+    with different values is dropped: a reply that contradicts itself about a
+    call has not given a verdict on it.
+    """
+    reply = _OPEN_THINK_RE.sub("", _THINK_RE.sub("", sanitize_code(reply)))
+    blocks = fenced_blocks(reply)
+    for body in [*reversed(blocks), reply]:
+        try:
+            rows = json.loads(_scrub_json(body))
+        except Exception:  # noqa: BLE001 - try the next block, then the prose
+            continue
+        if not isinstance(rows, list):
+            continue
+        raw: list[tuple[int, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict) or "i" not in row or "expected" not in row:
+                continue
+            try:
+                raw.append((int(row["i"]), row["expected"]))
+            except (TypeError, ValueError):
+                continue
+        if not raw:
+            continue
+        indices = {i for i, _ in raw}
+        if indices and 0 not in indices and count in indices and indices <= set(range(1, count + 1)):
+            raw = [(i - 1, value) for i, value in raw]
+        found: dict[int, Any] = {}
+        contradicted: set[int] = set()
+        for index, value in raw:
+            if not 0 <= index < count:
+                continue
+            if index in found and found[index] != value:
+                contradicted.add(index)
+            found[index] = value
+        for index in contradicted:
+            found.pop(index, None)
+        if found:
+            return found
+    return {}
 
 
 # Two of these are facts about THIS grader, not general advice, and both cost a
@@ -573,6 +771,17 @@ INDEPENDENT_CASES_NOTE = (
     "is submitted."
 )
 
+# ...and the same bar described to a reader who did not write the program
+# either. Both notes above say "your program"; to a model handed someone
+# else's program that is the false premise `build_resume_prompt` exists to
+# remove, and a message that says "not yours" two lines below "YOUR OWN cases"
+# is contradicting itself about the one fact the round turns on.
+FOREIGN_CASES_NOTE = (
+    "Test cases written from this same statement by a reader who has seen "
+    "neither the program below nor whoever wrote it. Every one of these is "
+    "RUN against the program before it is submitted."
+)
+
 
 def build_code_prompt(
     language: str,
@@ -598,8 +807,9 @@ def build_code_prompt(
 
     Laid out in delimited sections, and the order is the argument. The output
     contract goes FIRST because it is the only instruction whose failure costs
-    the entire answer rather than degrading it; the site's nudge repeats it last,
-    so it holds both the primacy and the recency slot. The problem and its
+    the entire answer rather than degrading it; on the browser backends the
+    site's nudge repeats it last, so there it holds both the primacy and the
+    recency slot (the CLI backend appends nothing). The problem and its
     examples come next, because instructions about how to solve something are
     unreadable before you know what it is. Everything that shapes HOW to answer
     comes last, closest to where generation begins.
@@ -667,8 +877,17 @@ def build_resume_prompt(
     from_self_tests: bool = False,
     bar_is_independent: bool = False,
     failed_cases: Optional[Sequence[dict[str, Any]]] = None,
+    foreign: bool = False,
+    case_confirmed: bool = False,
+    too_slow: Optional[str] = None,
 ) -> str:
     """A repair round for a conversation that no longer exists.
+
+    `too_slow` is the size probe's sentence when the program in hand passes
+    every case and is merely too slow at scale. Without it a carried too_slow
+    repair reported an empty failure list and offered a case correction for
+    cases that did not exist; the receiving model was never told the problem
+    was speed.
 
     Repairs normally stay inside one conversation, because the model can see
     its own previous attempt there and the prompt need only carry what went
@@ -681,14 +900,27 @@ def build_resume_prompt(
     So the whole conversation is reconstituted in one message: the problem as
     turn 2 states it, the program that was produced, and what happened when it
     ran. A fresh tab has no history, so nothing here may assume any.
+
+    `foreign` says the model being asked is not the one that wrote the
+    program. That is now the ordinary case rather than the emergency one: a
+    correction round hands the repair to the next model on the rotation
+    precisely so that the reading which produced the bug is not the reading
+    asked to find it. What it changes is only the truth of the sentences --
+    "YOUR program" is false to a model seeing this code for the first time,
+    and a false premise gets argued with instead of acted on.
     """
     base = build_code_prompt(
         language, statement, entrypoint, examples, cases=cases,
-        cases_note=INDEPENDENT_CASES_NOTE if bar_is_independent else None,
+        cases_note=(
+            FOREIGN_CASES_NOTE if foreign
+            else INDEPENDENT_CASES_NOTE if bar_is_independent
+            else None
+        ),
     )
     report = build_repair_prompt(
         failures, language, entrypoint, defect=defect,
         from_self_tests=from_self_tests, bar_is_independent=bar_is_independent,
+        foreign=foreign, case_confirmed=case_confirmed, too_slow=too_slow,
         # The ones that FAILED, rendered in full beside the whole bar above.
         # `build_repair_prompt` only renders them when it is given them, and
         # this caller never was -- so the one prompt that reaches a second
@@ -697,11 +929,18 @@ def build_resume_prompt(
         # enough to reproduce the failure and not enough to correct the case.
         failed_cases=failed_cases,
     )
+    attempt_note = (
+        "A program written by someone else from this same statement. It is "
+        "not yours and you are not being asked to defend it. This is what "
+        "happened when I ran it."
+        if foreign else
+        "YOUR program, from a conversation that ended before it could be "
+        "corrected. This is what happened when I ran it."
+    )
     return "\n".join([
         base,
         "",
-        '<previous_attempt note="YOUR program, from a conversation that ended '
-        'before it could be corrected. This is what happened when I ran it.">',
+        f'<previous_attempt note="{attempt_note}">',
         f"```{'rust' if language == 'rust' else 'python'}",
         code.strip(),
         "```",
@@ -711,7 +950,9 @@ def build_resume_prompt(
     ])
 
 
-def _ran_against(target: str, independent: bool) -> str:
+def _ran_against(
+    target: str, independent: bool, foreign: bool = False
+) -> str:
     """How to describe the bar to the conversation being asked to repair.
 
     It has to be TRUE, and which sentence is true depends on where the cases
@@ -723,7 +964,19 @@ def _ran_against(target: str, independent: bool) -> str:
     answers is wrong" versus "someone else read this statement differently" --
     and the second is the true one when the bar is independent, which is the
     whole reason the bar is written elsewhere.
+
+    `foreign` is the third case and it is about the PROGRAM rather than the
+    bar: the repair has been handed to a model that did not write the code it
+    is being shown. "The test cases you sent" and "your program" are both
+    false there, and a model told it wrote something it did not spends the
+    round reconciling the claim instead of the failure.
     """
+    if foreign:
+        return (
+            f"Someone else wrote this program from the same statement, and "
+            f"someone else again wrote test cases from it. I ran {target} "
+            f"against those cases and got:"
+        )
     if independent:
         return (
             f"Someone else read the same statement and wrote test cases from "
@@ -769,6 +1022,8 @@ def build_repair_prompt(
     bar_is_independent: bool = False,
     failed_cases: Optional[Sequence[dict[str, Any]]] = None,
     too_slow: Optional[str] = None,
+    case_confirmed: bool = False,
+    foreign: bool = False,
 ) -> str:
     """Ask for a fix, quoting the concrete failures the local grader found.
 
@@ -867,6 +1122,32 @@ def build_repair_prompt(
             f"Send back ONE fenced code block, with nothing outside it: "
             f"{WHOLE_PROGRAM}."
         )
+    elif from_self_tests and case_confirmed:
+        # The escape hatch, closed by EVIDENCE rather than by exhaustion.
+        #
+        # The branch below closes it after several rounds in which the program
+        # did not change, which is a statement about the loop rather than
+        # about the case. This one closes it because a third model, shown the
+        # same statement and these inputs and no program at all, worked out
+        # the same expected value the case carries. Two independent readings
+        # agreeing is the strongest evidence available here that the case is
+        # right, and it is worth having: measured over 54 live solves, nine of
+        # ten single-case disagreements ended with the program's own author
+        # ruling its own case wrong and keeping the program.
+        #
+        # It says what was done rather than asserting the program is broken.
+        # The program may still be right in every other respect; what is
+        # settled is that this case is not the thing to change.
+        target = "the program" if language == "rust" else f"`{entrypoint}`"
+        body = (
+            f"{_ran_against(target, bar_is_independent, foreign)}\n"
+            f"{detail}\n\n"
+            f"I asked someone else to read the statement and work out what "
+            f"that call must return, without showing them any program. They "
+            f"arrived at the same value the case expects, so the case stands "
+            f"and it is the program that has to change. Send back ONE fenced "
+            f"block, with nothing outside it: {WHOLE_PROGRAM}."
+        )
     elif from_self_tests and insist_on_program:
         # The case escape hatch, withdrawn. It exists because the model's own
         # cases may be wrong -- turn 1 reasons its `expected` values out before
@@ -885,7 +1166,7 @@ def build_repair_prompt(
         # is answered by arguing with it.
         target = "the program" if language == "rust" else f"`{entrypoint}`"
         body = (
-            f"{_ran_against(target, bar_is_independent)}\n"
+            f"{_ran_against(target, bar_is_independent, foreign)}\n"
             f"{detail}\n\n"
             f"The program has not changed for several rounds now, so this time "
             f"it is the program that has to. Send back ONE fenced block, with "
@@ -902,7 +1183,7 @@ def build_repair_prompt(
         # output rule names both ways out and lets the model pick.
         target = "the program" if language == "rust" else f"`{entrypoint}`"
         body = (
-            f"{_ran_against(target, bar_is_independent)}\n"
+            f"{_ran_against(target, bar_is_independent, foreign)}\n"
             f"{detail}\n\n"
             f"Send back ONE fenced block: {WHOLE_PROGRAM} — or, if the case "
             f"was wrong rather than the program, a `json` array holding just "

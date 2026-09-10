@@ -54,6 +54,7 @@ import os
 
 from .browser_pool import Site
 from .config import selectors
+from .config import env_on
 
 # Claude answers in the chat by default, but long code can be moved to the
 # artifacts panel, which lives outside the message the reader scrapes. One
@@ -134,8 +135,8 @@ def claude_site() -> Site:
         # The answer as it came off the wire, ahead of every render.
         # `CLAUDE_STREAM=0` turns the capture off entirely;
         # `CLAUDE_STREAM_FIRST=1` promotes it over what the page shows.
-        stream=os.environ.get("CLAUDE_STREAM", "1") != "0",
-        stream_first=os.environ.get("CLAUDE_STREAM_FIRST", "0") == "1",
+        stream=env_on("CLAUDE_STREAM"),
+        stream_first=env_on("CLAUDE_STREAM_FIRST", default=False),
         message_id_attr=None,
         nudge=os.environ.get("CLAUDE_NUDGE", NUDGE),
         poll_s=float(os.environ.get("CLAUDE_POLL_S", "2")),

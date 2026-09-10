@@ -116,12 +116,18 @@ _MODEL_WINDOWS = {"seven_day_opus": "opus", "seven_day_sonnet": "sonnet"}
 # stale, and one turn every half hour is a cheap way to notice.
 LIMIT_RECHECK_S = 1800.0
 
-# The share of a seat's window past which FRESH solves go to another seat
-# while one is free, and the reading and judge turns go to the lightest seat
-# at all times. Measured: the limit landed at 91%+ in the middle of a repair
-# round, and the repair had to be carried to a fresh conversation on the
-# other seat with its context re-sent. A seat that is nearly spent is left
-# for the conversations already on it. SOLVER_CLI_SWITCH_AT.
+# The share of a seat's window past which FRESH conversations -- solves, and
+# the named-model turns of the second reading and the judge alike -- go to
+# another seat while one is free. Below it the first seat is drained first:
+# spreading turns across seats does not create capacity, and it spends the
+# backup while the primary is healthy, which is the one thing the backup is
+# not for. Measured: the limit landed at 91%+ in the middle of a repair round,
+# and the repair had to be carried to a fresh conversation on the other seat
+# with its context re-sent. A seat that is nearly spent is left for the
+# conversations already on it -- except when the alternative is to WAIT: a
+# full seat with a near-spent one idle beside it moves the turn there rather
+# than queue, because the operator's rule is that a limited seat is switched
+# away from, never waited on. SOLVER_CLI_SWITCH_AT.
 SWITCH_AT = 0.95
 
 # How long a turn may stream events without one character of the answer
@@ -156,6 +162,19 @@ SILENT_FLOOR_S = 20.0
 # One silent hop per conversation. Two rungs that both go quiet would
 # otherwise spend the budget discovering it, at `FIRST_TEXT_S` each.
 MAX_SILENT_HOPS = 1
+
+# ...and the same bound on hopping past a seat that is merely RETRYING.
+#
+# `_Busy` deliberately benches nothing -- one retry is not evidence a model is
+# out -- and that is exactly why this has to exist. A verdict that records an
+# outage stops the turn coming back: the pair is unhealthy and `next_pair`
+# skips it. A verdict that records nothing leaves every pair healthy, so a
+# turn whose rungs are all retrying can walk the ladder in a circle, spending
+# a real subprocess call at each stop, until the deadline takes it.
+#
+# One hop, then the wait is paid where it stands. If the seats really are all
+# retrying, waiting is what was left anyway.
+MAX_BUSY_HOPS = 1
 
 # How long a MODEL is left alone after the service refused it -- an overload,
 # a 5xx, a connection that never completed. The operator's number, and the
@@ -208,8 +227,12 @@ API_RETRIES_TOLERATED = 2
 # whatever the attempt number.
 LONG_RETRY_MS = 15000
 
-# The least of a slice worth starting another attempt in.
-HOP_FLOOR_S = 5.0
+# There is deliberately no hop floor. There was one (5s): a turn that met a
+# limit with less than that of its slice left gave up rather than hop to a
+# seat that could serve, and a retrying turn would not move for want of the
+# same 5s. Both were a second clock under the deadline. A hop with a second
+# left fails on the slice like any other read, and costs nothing that was not
+# already lost.
 
 # Consecutive unexplained failures on one pair before it is set aside.
 FAILURES_BEFORE_HOLD = 2
@@ -302,6 +325,22 @@ class _Limited(Exception):
     """The subscription's usage limit was reported before any answer."""
 
 
+class _Busy(Exception):
+    """This seat is retrying and somebody else is free. Move, do not bench it.
+
+    Distinct from `_Degraded`, and the difference is the whole point. A
+    degraded model is one the service is failing, and the answer to that is to
+    stop asking it for ten minutes on every account. A model on its FIRST
+    retry is not that: the CLI has said it is trying again, and it usually
+    succeeds. Benching it to avoid a one-second wait would cost the next
+    twenty solves their default model -- far more than the wait was worth.
+
+    So this hops and records nothing. If the seat really is failing, its
+    retries run out and `_Degraded` follows a few seconds later on evidence
+    rather than on a guess.
+    """
+
+
 class _Degraded(Exception):
     """The service is failing this model: overloaded, erroring, unreachable."""
 
@@ -372,17 +411,24 @@ class Profile:
 def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profile, ...]:
     """What answers when the default model will not, in order.
 
-    `SOLVER_CLI_EMERGENCY_PROFILES=fable:low,sonnet:low` -- each entry a model
-    alias the CLI accepts, optionally with an effort after a colon. Those are
-    the defaults, and the order is measured rather than ranked: on a real
-    production problem the program turn took fable 38s at low effort, opus
-    86s, sonnet 161s -- and sonnet at high effort, or either model at high,
-    did not finish inside 200s. A rung that cannot answer inside the deadline
-    is not a rung. Effort above low on the ladder is for problems that
-    justify it, set by the operator who measured it.
+    `SOLVER_CLI_EMERGENCY_PROFILES=sonnet:low,fable:low` -- each entry a model
+    alias the CLI accepts, optionally with an effort after a colon.
+
+    Sonnet first, and the order is a correctness judgement rather than a speed
+    one. Latency says the opposite: on a real production problem the program
+    turn took fable 38s at low effort, opus 86s, sonnet 161s, and either model
+    at high effort did not finish inside 200s -- which is why the ladder is
+    still all `low`, and why nothing above it belongs here unless an operator
+    measures a problem that justifies it. But an emergency rung answers a
+    whole solve, not a phase, and the subnet pays only for a complete pass of
+    the hidden suite: 161s inside a 290s deadline is affordable, and a wrong
+    answer at 38s earns exactly what no answer earns. Sonnet is also the model
+    `fixed_inputs.py` measured against opus -- 94% agreement on expected
+    values with the inputs held fixed -- so it is the one rung with evidence
+    that it reads these statements the way the default model does.
     """
     default_effort = default_effort or cli_effort()
-    raw = _flag("SOLVER_CLI_EMERGENCY_PROFILES", "fable:low,sonnet:low")
+    raw = _flag("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:low,fable:low")
     profiles: list[Profile] = []
     for entry in raw.split(","):
         entry = entry.strip()
@@ -404,25 +450,49 @@ def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profil
     return tuple(profiles)
 
 
-PHASES = ("cases", "program", "repair")
+PHASES = ("cases", "program", "repair", "judge", "cases2")
+
+# The phases whose model is named here rather than left to the ladder, and the
+# reason each is: both want a reader that is NOT the one writing the program.
+#
+# `cases2` is the second bar and `judge` settles a case the first bar and the
+# program disagree about. Neither is a preference about speed or skill; both
+# exist to break the correlation that makes a self-written bar agree with the
+# bug it was supposed to catch. `avoid=` cannot express that here -- it is
+# resolved against the ladder, whose first alternative rung is whatever the
+# operator ordered, and the program's own provider is not even known at the
+# moment `cases2` is launched (the two turns start together). So the model is
+# named, and `open_for` still falls through to the ladder when it is out
+# everywhere, which keeps the preference from ever deciding whether anyone
+# answers at all.
+#
+# Sonnet is the name because it is the only one with a measurement behind it:
+# `calibration/fixed_inputs.py`, opus and sonnet each deriving `expected` for
+# the same fixed inputs, agreed on 91 of 97 -- close enough to trust a case it
+# writes, far enough apart that the 6 it split on are the statement's real
+# ambiguities rather than one model's noise.
+_INDEPENDENT_READER = "sonnet"
 
 
 def cli_phase_profiles(
     default_effort: Optional[str] = None,
 ) -> dict[str, Profile]:
-    """Which model answers which phase, when the operator has measured one.
+    """Which model answers which phase.
 
     `SOLVER_CLI_PHASE_PROFILES=cases=sonnet:low,program=opus:low` -- one entry
     per phase named in `PHASES`, each a model alias with an optional effort
     after a colon, exactly as `SOLVER_CLI_EMERGENCY_PROFILES` spells them.
 
-    EMPTY by default, and deliberately so. Every solve in the two archived
-    production runs -- 102 of them -- opened on the same model, so the logs
-    say nothing about how any other model answers a cases turn or a program
-    turn here. A default naming one would be a guess wearing a measurement's
-    clothes. What the phase split buys is independence and concurrency, and
-    those hold whatever answers each phase; which model belongs where is a
-    number to be measured on this corpus and then written down.
+    `cases` and `program` are UNSET by default, and deliberately so. Every
+    solve in the two archived production runs -- 102 of them -- opened on the
+    same model, so the logs say nothing about how any other model answers a
+    cases turn or a program turn here. A default naming one would be a guess
+    wearing a measurement's clothes; which model belongs where is a number to
+    be measured on this corpus and then written down.
+
+    `judge` and `cases2` are SET, and for a reason that is not about which
+    model is better: see `_INDEPENDENT_READER`. An operator may still name
+    something else for them, and does so the same way.
 
     A phase named here is a PREFERENCE, never a pin: `open_for` falls through
     to the ordinary ladder when that model is out on every account, so an
@@ -430,7 +500,10 @@ def cli_phase_profiles(
     """
     default_effort = default_effort or cli_effort()
     raw = _flag("SOLVER_CLI_PHASE_PROFILES", "")
-    chosen: dict[str, Profile] = {}
+    chosen: dict[str, Profile] = {
+        "judge": Profile(_INDEPENDENT_READER, "low"),
+        "cases2": Profile(_INDEPENDENT_READER, "low"),
+    }
     for entry in raw.split(","):
         entry = entry.strip()
         if not entry:
@@ -457,6 +530,50 @@ def cli_phase_profiles(
             )
         chosen[phase] = Profile(model, effort)
     return chosen
+
+
+def cli_repair_rotation(
+    default_effort: Optional[str] = None,
+) -> tuple[Profile, ...]:
+    """The models a correction round moves through, in order.
+
+    `SOLVER_REPAIR_ROTATION=opus:low,sonnet:low,fable:low`, spelled exactly as
+    the emergency ladder is.
+
+    A repair that stays where the program was written is a model being asked
+    to find a bug in its own reading of the statement, and measured over 54
+    live solves it mostly does not: of ten single-case disagreements, nine
+    ended with the model editing its own test case and keeping the program.
+    Rotating hands the same failure to a reader who has no stake in the
+    original answer.
+
+    The rotation is not the emergency ladder. That one answers "who can serve
+    at all" and is ordered by which rung still has quota; this one answers
+    "who has not already been wrong about this problem" and is ordered by
+    which model is likeliest to be right. Opus leads because it writes the
+    program; the two behind it are the readers that did not.
+    """
+    default_effort = default_effort or cli_effort()
+    raw = _flag("SOLVER_REPAIR_ROTATION", "opus:low,sonnet:low,fable:low")
+    profiles: list[Profile] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        model, _, effort = entry.partition(":")
+        model, effort = model.strip(), effort.strip() or default_effort
+        if not model or any(ch.isspace() for ch in model):
+            raise SystemExit(
+                f"SOLVER_REPAIR_ROTATION entry {entry!r}: expected "
+                f"model or model:effort"
+            )
+        if effort not in EFFORTS:
+            raise SystemExit(
+                f"SOLVER_REPAIR_ROTATION entry {entry!r}: effort must be "
+                f"one of {', '.join(EFFORTS)}"
+            )
+        profiles.append(Profile(model, effort))
+    return tuple(profiles)
 
 
 def cli_backup_dirs() -> tuple[str, ...]:
@@ -660,17 +777,17 @@ class CliConversation:
         # leaves room to re-ask from one that does not.
         self._slice_s = 0.0
         self._silent_hops = 0
+        self._busy_hops = 0
+        # This turn's hard deadline, so the stream parser can ask whether
+        # there is room to act on what it is seeing. `send` owns it; `_retry`
+        # reads it. 0.0 means no turn is running.
+        self._turn_deadline = 0.0
         try:
             self._first_text_after = float(
                 _flag("SOLVER_CLI_FIRST_TEXT_S", "") or FIRST_TEXT_S
             )
         except ValueError:
             self._first_text_after = FIRST_TEXT_S
-
-    # A round trip on this backend starts a process and re-reads the session
-    # before the model says a word; `VerifyingSolver` will not start a
-    # correction round with less than this left.
-    round_trip_floor_s = 20.0
 
     @property
     def model(self) -> str:
@@ -736,15 +853,24 @@ class CliConversation:
         """
         budget = max(1.0, float(timeout_s))
         deadline = time.monotonic() + max(budget, float(extend_to_s or 0.0))
+        self._turn_deadline = deadline
         self.still_writing = False
         self.empty_reason = None
+        # Per TURN. Both bounds are about one turn walking the ladder in a
+        # circle, and left uncleared a hop on an earlier turn disabled the
+        # move for every later turn of a not-yet-started conversation -- the
+        # busy one then waited out a retry with an idle account beside it.
+        self._busy_hops = 0
+        self._silent_hops = 0
         while True:
             # Known to be out already: hop in a millisecond rather than spend
             # a slice finding out again. One solve discovers it; every solve
-            # after that until the reset is told at once.
+            # after that until the reset is told at once. The SAME model on
+            # another account first -- an outage is nearly always the
+            # account's -- and the ladder only when no account can take it.
             wait, why = self._backend.outage_for(self.account, self.model)
             if wait > 0:
-                if self._hop(why):
+                if self._hop_account(why) or self._hop(why):
                     continue
                 print(f"[cli] {self.provider}: turned away ({why}; "
                       f"{_minutes(wait)} to go) and nobody else on the ladder "
@@ -755,11 +881,27 @@ class CliConversation:
             # The slot is acquired INSIDE the slice. Acquired outside it, a
             # solve queued behind four others waited with no bound at all, and
             # the wait was invisible to every clock in `verify.py`.
+            slot = self._backend.slot_for(self.account)
+            if slot.locked() and self._hop_account(
+                f"{self.account.name} has no free process slot"
+            ):
+                # Full right now, and another ACCOUNT is free. Move rather
+                # than queue: a second subscription is not a longer line, it
+                # is a different set of processes. Checked before waiting
+                # rather than after, so the turn does not spend its slice
+                # discovering what `locked()` already said.
+                continue
             try:
-                await _acquire_within(self._backend.slot, max(0.0, left))
+                await _acquire_within(slot, max(0.0, left))
             except asyncio.TimeoutError:
+                # Nobody else was free either, or this session is pinned to
+                # its account. Then the wait was the only thing to do and it
+                # ran out -- and the line says which of the two it was.
                 print(f"[cli] {self.provider}: no free slot inside {budget:.0f}s "
-                      f"({self._backend.concurrency} allowed at once)")
+                      f"({self._backend.concurrency} allowed at once on "
+                      f"{self.account.name}) and "
+                      + ("this session is pinned to its account"
+                         if self._started else "no other account is free"))
                 self.empty_reason = "unreadable"
                 return ""
             try:
@@ -773,7 +915,7 @@ class CliConversation:
                     text, max(1.0, deadline - time.monotonic())
                 )
             finally:
-                self._backend.slot.release()
+                slot.release()
             if verdict == "silent":
                 # Worth exactly one hop. A second rung that also goes quiet
                 # would cost another `FIRST_TEXT_S` to find out, and the
@@ -782,7 +924,7 @@ class CliConversation:
                 self._silent_hops += 1
                 if self._silent_hops > MAX_SILENT_HOPS:
                     return body
-            elif verdict not in ("limited", "stalled", "degraded", "auth"):
+            elif verdict not in ("limited", "stalled", "degraded", "auth", "busy"):
                 # An answer, a partial one, a model that chose to say nothing
                 # -- or a failure with no stated cause. That last one is NOT
                 # hopped on: nothing says another rung would do better, and
@@ -793,11 +935,113 @@ class CliConversation:
                 return body
             # A failure the ladder has an answer to. `_send` has already
             # recorded it; what remains is whether anyone else can take the
-            # turn, and whether there is slice enough left to ask.
-            if deadline - time.monotonic() < HOP_FLOOR_S:
+            # turn. The slice bounds the next attempt as it bounded this one,
+            # and nothing else does.
+            if deadline - time.monotonic() <= 0:
                 return ""
-            if not self._hop(self._backend.last_error or verdict):
+            why = self._backend.last_error or verdict
+            # The SAME MODEL on another account first, whatever the verdict.
+            # A limit and a sign-out are the account's; a model benched
+            # everywhere is refused there too and falls through to the
+            # ladder. Walking the ladder first re-sent a `judge` or `cases2`
+            # conversation pinned to sonnet as the other account's DEFAULT --
+            # the program's own model, which removed the independence while
+            # leaving the line that claims it. `busy` decided on the other
+            # account's freedom a moment ago; if that moment has passed, the
+            # ladder is still better than returning nothing for a turn that
+            # was killed in order to move.
+            moved = self._hop_account(why) or self._hop(why)
+            if not moved:
                 return ""
+
+    def _another_account_is_free(self) -> bool:
+        """Whether a DIFFERENT sign-in could take this turn right now.
+
+        Deliberately narrower than "the ladder has another rung". The ladder
+        is mostly other models on this same account, which share its
+        processes and its quota -- moving there is not escaping a busy seat,
+        it is answering on a weaker model to avoid a wait. Only another
+        account is a genuinely separate place for the turn to go.
+
+        A session pins its account, so once a turn has produced text there is
+        nowhere to go and the answer is no.
+        """
+        if getattr(self, "_started", False):
+            return False
+        # Every lookup guarded, because this is reached from inside the stream
+        # parser and a backend written outside this module -- or a test's --
+        # need not have a ladder, accounts, or slots at all. Nothing here is
+        # an error: a backend with nowhere else to go is precisely the case
+        # where the wait is the right answer.
+        backend = self._backend
+        for account in getattr(backend, "accounts", ()) or ():
+            if account == self.account:
+                continue
+            try:
+                if backend.outage_for(account, self.model)[0] > 0:
+                    continue
+                if backend.slot_for(account).locked():
+                    continue
+            except Exception:  # noqa: BLE001 - a backend without a ladder
+                return False
+            # Not filtered on `switch_at`: a seat past it can still serve, and
+            # the alternative here is a WAIT on one that cannot.
+            return True
+        return False
+
+    def _hop_account(self, why: str) -> bool:
+        """Move to another ACCOUNT, keeping the model. True if it moved.
+
+        Deliberately not `_hop`. That one walks the ladder, and the ladder is
+        mostly other MODELS on the same account -- which shares this account's
+        processes and its quota, so moving there escapes neither a full slot
+        nor a retrying service, and the turn ricochets between two models on
+        one sign-in until the deadline. Only a different sign-in is a
+        different place to be.
+
+        The MODEL is kept, and that is the other half. This is a move about
+        seats, and the conversations that reach it most are the ones pinned to
+        a model for a reason: `judge` and `cases2` exist to be a reading the
+        program's author did not make, and answering them on whatever the next
+        account defaults to would remove the independence while leaving the
+        line that claims it.
+
+        Nothing doing once the session has started: a session lives in its
+        account's config directory, so it cannot move. There the wait is the
+        only option, and it is bounded by the slice like every other wait.
+        """
+        if self._started:
+            return False
+        for account in self._backend.accounts:
+            if account == self.account:
+                continue
+            # THE SAME MODEL on another account, not that account's default.
+            # This is a move about processes, and the profile is nothing to do
+            # with it -- while the conversations that most often reach here are
+            # exactly the ones pinned to a model for a reason: `cases2` and
+            # `judge` exist to be a reading the program's author did not make,
+            # and quietly answering them on the default model would remove the
+            # independence without removing the line that claims it.
+            if self._backend.outage_for(account, self.model)[0] > 0:
+                continue
+            if self._backend.slot_for(account).locked():
+                continue
+            # A seat at or past `switch_at` is NOT skipped here. `pick` and
+            # `open_profile` demote such a seat, and rightly: they choose
+            # where a fresh conversation starts, and the tail of a backup's
+            # window is for the conversations already on it. This is a
+            # different question. The current seat cannot take the turn --
+            # full, limited, signed out -- so the choice is between the tail
+            # of a window and a wait, and the operator's rule is that a seat
+            # that cannot serve is switched away from, never waited on.
+            was = self.provider
+            self._session = str(uuid.uuid4())
+            self.account = account
+            self.hops += 1
+            self._backend.note_hop()
+            print(f"[cli] hop: {was} -> {self.provider} ({why})")
+            return True
+        return False
 
     def _hop(self, why: str) -> bool:
         """Move this conversation to the next pair that can answer, if any.
@@ -914,6 +1158,14 @@ class CliConversation:
             print(f"[cli] {self.provider} turn refused: "
                   f"{self._backend.last_error or 'limit reached'}")
             return self._verdict("", "limited")
+        except _Busy as exc:
+            # No `note_*` of any kind: the seat is not being judged, it is
+            # being passed over while it retries.
+            await self._kill(proc)
+            errfile.close()
+            self._backend.last_error = f"{self.model} is retrying: {exc}"
+            self._busy_hops += 1
+            return self._verdict("", "busy")
         except _Degraded as exc:
             await self._kill(proc)
             errfile.close()
@@ -1231,12 +1483,58 @@ class CliConversation:
         # at `_failed_result` or a non-zero exit, which hop just the same, a
         # few seconds later. What is NOT recoverable is a wait this turn
         # cannot afford, and that is what the two tests below are for.
+        # A wait is only worth paying when there is nothing better to do with
+        # the time. `API_RETRIES_TOLERATED` assumed there never was: it paid
+        # the first retry's wait unconditionally, on the theory that one
+        # failure is ordinary weather. It is -- but so is a second account
+        # sitting idle, and against one of those the wait buys nothing at all.
+        # So the question asked here is no longer "how bad is this failure"
+        # but "is anyone else free", and only when nobody is does the old
+        # patience apply.
+        #
+        # The exception is the one measured regression this must not undo:
+        # `retry 1/10: authentication_failed, next wait 1s` is two miners
+        # racing to refresh one login's token, transient by the CLI's own
+        # account of it and over in about a second. Hopping on that spent the
+        # backup account's quota to avoid a one-second wait. A short wait on a
+        # named auth race is still paid, whoever else is free.
+        racing = (
+            any(mark in error.lower() for mark in _AUTH_RACE_MARKS)
+            and delay_ms < 2000
+        )
+        # Is anyone ACTUALLY free? Not "does the ladder have another rung":
+        # `next_pair` walks account-major and its first answer for a fresh
+        # turn on the primary is another MODEL on the primary, which shares
+        # this account's processes and its quota. Hopping there abandons a
+        # healthy seat and re-sends the whole prompt to a weaker model to
+        # avoid a one-second wait -- the measured regression above, arrived
+        # at from the other direction.
+        #
+        # A free seat is a different ACCOUNT: its own subscription, its own
+        # processes, genuinely able to take this turn now. That is also the
+        # only thing the instruction behind this asks for -- never wait on a
+        # seat that cannot serve, switch to one that can.
+        others = self._another_account_is_free()
+        what = error or (f"HTTP {code}" if code else "connection error")
         if attempt >= API_RETRIES_TOLERATED or delay_ms >= LONG_RETRY_MS:
-            what = error or (f"HTTP {code}" if code else "connection error")
+            # Failed often enough to be believed about it now, so the pair is
+            # set aside exactly as it always was.
             if code in (401, 403) or classify(error) == "auth":
                 raise _Unauthorised(what)
             raise _Degraded(f"{what}, {attempt} retr{'y' if attempt == 1 else 'ies'} "
                             f"in, next wait {delay_ms / 1000:.0f}s")
+        # And there has to be time left to act on it -- any at all. `send`
+        # declines a hop only once the slice is gone, so this is the same
+        # check made a moment early, and it keeps a turn from being killed for
+        # a move that is then refused.
+        room = getattr(self, "_turn_deadline", 0.0) - time.monotonic() > 0
+        if others and room and not racing and self._busy_hops < MAX_BUSY_HOPS:
+            # Moving on from ONE retry, and moving on is all it is: `_Busy`
+            # records no outage. A first retry is not evidence that a model is
+            # out, and `_Degraded` would bench it on every account for ten
+            # minutes -- spending every later solve's default model to save
+            # this one a second.
+            raise _Busy(f"{what}, retrying in {delay_ms / 1000:.0f}s")
 
     def _failed_result(self, event: dict) -> None:
         """A `result` with `is_error`: the CLI gave up, and says why."""
@@ -1314,18 +1612,31 @@ class CliBackend:
             if profile not in profiles:
                 profiles.append(profile)
         self.profiles = tuple(profiles)
-        # One process per solve in flight, and no more. Measured, four at once:
-        # 3.1 seconds wall clock for four answers, no contention; and eight
-        # conversations across two miner processes on one login, all eight
-        # correct. The bound is here so a fleet of queued solves cannot become
-        # a fleet of processes -- and it has to fit a solve that holds TWO
-        # conversations open at once (the bar and the program, written side by
-        # side) with a second miner doing the same on the same login.
+        # How many `claude` processes one sign-in may have in flight. Measured,
+        # four at once: 3.1 seconds wall clock for four answers, no contention;
+        # and eight conversations across two miner processes on one login, all
+        # eight correct. The bound is here so a fleet of queued solves cannot
+        # become a fleet of processes -- and it has to fit what a solve
+        # actually holds open at once, which is THREE conversations now (the
+        # program, the bar and the second bar, written side by side), times
+        # the four solves `miner_max_concurrent_requests` lets a miner serve
+        # together. Twelve. At eight, the fourth solve's PROGRAM turn queued
+        # behind other solves' second bars -- phase 1 losing capacity to the
+        # mechanism that was meant to cost it nothing.
         self._limit = concurrency or max(
-            1, int(_flag("SOLVER_CLI_CONCURRENCY", "8") or "8")
+            1, int(_flag("SOLVER_CLI_CONCURRENCY", "12") or "12")
         )
         self.concurrency = self._limit
-        self.slot = asyncio.Semaphore(self._limit)
+        # PER ACCOUNT, not one gate across all of them. The limit is about how
+        # many `claude` processes one sign-in should have in flight; shared, it
+        # also made a busy account block a free one, and a solve queued behind
+        # four others waited for a seat while another seat sat idle. `slot`
+        # stays as the primary account's for any caller that still reads it.
+        self._slots = {
+            account.name: asyncio.Semaphore(self._limit)
+            for account in self.accounts
+        }
+        self.slot = self._slots[self.accounts[0].name]
         # One fixed, empty directory for every child, and not a temporary one
         # per conversation. The CLI keys its per-project state on the working
         # directory -- a fresh temp dir per conversation left a new entry under
@@ -1486,13 +1797,40 @@ class CliBackend:
             return 0.0
         return used
 
+    def slot_for(self, account: Account) -> asyncio.Semaphore:
+        """This account's process gate. One per sign-in; see `__init__`."""
+        return self._slots.setdefault(account.name, asyncio.Semaphore(self._limit))
+
+    def _busy(self, account: Account) -> bool:
+        """Whether this account has no free process slot right now.
+
+        Read without taking one, and used only for ORDER: a busy account is
+        tried after a free one rather than skipped, because "busy" is a
+        millisecond-old fact and the seat may well be free by the time the
+        turn asks for it.
+        """
+        slot = self._slots.get(account.name)
+        return slot is not None and slot.locked()
+
     def _with_room_first(
         self, pairs: list[tuple[Account, Profile]]
     ) -> list[tuple[Account, Profile]]:
-        """The ladder's order, except that a seat at or past `switch_at`
-        comes after every seat under it. A stable sort: among seats with
-        room the ladder decides, as it always did."""
-        return sorted(pairs, key=lambda ap: self.usage_of(ap[0]) >= self.switch_at)
+        """The ladder's order, except that a seat with no room comes last.
+
+        Two kinds of "no room", ordered the same way and for the same reason:
+        a seat at or past `switch_at` has nearly spent its window, and a seat
+        whose processes are all in flight would make this turn queue. Neither
+        is an outage -- both can serve -- so both are demoted rather than
+        skipped, and a stable sort leaves the ladder deciding among equals as
+        it always did.
+        """
+        return sorted(
+            pairs,
+            key=lambda ap: (
+                self.usage_of(ap[0]) >= self.switch_at,
+                self._busy(ap[0]),
+            ),
+        )
 
     def next_pair(
         self, account: Account, model: str, same_account: bool
@@ -1664,14 +2002,18 @@ class CliBackend:
         what this docstring said all along, before the sort disagreed with
         it.
 
-        `_with_room_first` still applies, so this and `pick` answer "which
-        seat" the same way: the ladder's order, except that a seat at or past
-        `switch_at` goes last. One rule, whether the caller wanted a
-        particular model or the best available one.
+        `_with_room_first` applies, so this and `pick` answer "which seat"
+        the same way: the ladder's order, except that a seat at or past
+        `switch_at` goes last, and a seat with no free process slot goes
+        after one that has room. One rule, whether the caller wanted a
+        particular model or the best available one. It sorted on usage
+        alone once, and a pinned conversation opened on a full primary with
+        the backup idle -- then paid a slot hop, and a hop line, at `send`
+        for a decision this could have made silently.
         """
         wanted = Profile(model, effort if effort in EFFORTS else self.effort)
-        for account in sorted(
-            self.accounts, key=lambda a: self.usage_of(a) >= self.switch_at
+        for account, _ in self._with_room_first(
+            [(a, wanted) for a in self.accounts]
         ):
             if self.outage_for(account, wanted.model)[0] <= 0:
                 self._opened += 1

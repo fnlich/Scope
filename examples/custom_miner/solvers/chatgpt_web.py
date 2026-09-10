@@ -28,6 +28,7 @@ import os
 
 from .browser_pool import Site, _Tab  # noqa: F401  (_Tab re-exported for tests)
 from .config import selectors
+from .config import env_on
 
 # Selectors, unchanged from the automation script, but each is now the first
 # candidate in an overridable list — see browser_pool's module docstring.
@@ -117,8 +118,8 @@ def chatgpt_site() -> Site:
         # The answer as it came off the wire, ahead of every render.
         # `CHATGPT_STREAM=0` turns the capture off entirely;
         # `CHATGPT_STREAM_FIRST=1` promotes it over what the page shows.
-        stream=os.environ.get("CHATGPT_STREAM", "1") != "0",
-        stream_first=os.environ.get("CHATGPT_STREAM_FIRST", "0") == "1",
+        stream=env_on("CHATGPT_STREAM"),
+        stream_first=env_on("CHATGPT_STREAM_FIRST", default=False),
         message_id_attr="data-message-id",
         nudge=os.environ.get("CHATGPT_NUDGE", NUDGE),
         poll_s=float(os.environ.get("CHATGPT_POLL_S", "2")),

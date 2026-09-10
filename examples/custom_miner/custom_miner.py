@@ -270,9 +270,14 @@ class CustomMiner(DemoMiner):
             public_examples=[c.model_dump(mode="json") for c in request.public_examples],
             deadline_s=request.deadline_s,
         )
+        diagnostics = None
         try:
             result = await self._solver.solve_task(task, timeout_s)
             code, raw = result.code, result.raw_response
+            # Optional, and read with `getattr` because `SolveResult` is a
+            # two-field protocol: a solver written outside this package
+            # satisfies it without ever having heard of diagnostics.
+            diagnostics = getattr(result, "diagnostics", None)
         except Exception as exc:  # noqa: BLE001 - a failed solve scores zero, never crashes
             print(f"[custom-miner] solve failed: {type(exc).__name__}: {exc}")
             code, raw = "", "<solver failed>"
@@ -294,6 +299,7 @@ class CustomMiner(DemoMiner):
             request.problem_id,
             request.model_dump(mode="json"),
             payload.model_dump(mode="json"),
+            solve=diagnostics if isinstance(diagnostics, dict) else None,
         )
         return payload
 
