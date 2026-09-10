@@ -116,12 +116,18 @@ _MODEL_WINDOWS = {"seven_day_opus": "opus", "seven_day_sonnet": "sonnet"}
 # stale, and one turn every half hour is a cheap way to notice.
 LIMIT_RECHECK_S = 1800.0
 
-# The share of a seat's window past which FRESH solves go to another seat
-# while one is free, and the reading and judge turns go to the lightest seat
-# at all times. Measured: the limit landed at 91%+ in the middle of a repair
-# round, and the repair had to be carried to a fresh conversation on the
-# other seat with its context re-sent. A seat that is nearly spent is left
-# for the conversations already on it. SOLVER_CLI_SWITCH_AT.
+# The share of a seat's window past which FRESH conversations -- solves, and
+# the named-model turns of the second reading and the judge alike -- go to
+# another seat while one is free. Below it the first seat is drained first:
+# spreading turns across seats does not create capacity, and it spends the
+# backup while the primary is healthy, which is the one thing the backup is
+# not for. Measured: the limit landed at 91%+ in the middle of a repair round,
+# and the repair had to be carried to a fresh conversation on the other seat
+# with its context re-sent. A seat that is nearly spent is left for the
+# conversations already on it -- except when the alternative is to WAIT: a
+# full seat with a near-spent one idle beside it moves the turn there rather
+# than queue, because the operator's rule is that a limited seat is switched
+# away from, never waited on. SOLVER_CLI_SWITCH_AT.
 SWITCH_AT = 0.95
 
 # How long a turn may stream events without one character of the answer
@@ -221,8 +227,12 @@ API_RETRIES_TOLERATED = 2
 # whatever the attempt number.
 LONG_RETRY_MS = 15000
 
-# The least of a slice worth starting another attempt in.
-HOP_FLOOR_S = 5.0
+# There is deliberately no hop floor. There was one (5s): a turn that met a
+# limit with less than that of its slice left gave up rather than hop to a
+# seat that could serve, and a retrying turn would not move for want of the
+# same 5s. Both were a second clock under the deadline. A hop with a second
+# left fails on the slice like any other read, and costs nothing that was not
+# already lost.
 
 # Consecutive unexplained failures on one pair before it is set aside.
 FAILURES_BEFORE_HOLD = 2
@@ -779,11 +789,6 @@ class CliConversation:
         except ValueError:
             self._first_text_after = FIRST_TEXT_S
 
-    # A round trip on this backend starts a process and re-reads the session
-    # before the model says a word; `VerifyingSolver` will not start a
-    # correction round with less than this left.
-    round_trip_floor_s = 20.0
-
     @property
     def model(self) -> str:
         return self.profile.model
@@ -851,13 +856,21 @@ class CliConversation:
         self._turn_deadline = deadline
         self.still_writing = False
         self.empty_reason = None
+        # Per TURN. Both bounds are about one turn walking the ladder in a
+        # circle, and left uncleared a hop on an earlier turn disabled the
+        # move for every later turn of a not-yet-started conversation -- the
+        # busy one then waited out a retry with an idle account beside it.
+        self._busy_hops = 0
+        self._silent_hops = 0
         while True:
             # Known to be out already: hop in a millisecond rather than spend
             # a slice finding out again. One solve discovers it; every solve
-            # after that until the reset is told at once.
+            # after that until the reset is told at once. The SAME model on
+            # another account first -- an outage is nearly always the
+            # account's -- and the ladder only when no account can take it.
             wait, why = self._backend.outage_for(self.account, self.model)
             if wait > 0:
-                if self._hop(why):
+                if self._hop_account(why) or self._hop(why):
                     continue
                 print(f"[cli] {self.provider}: turned away ({why}; "
                       f"{_minutes(wait)} to go) and nobody else on the ladder "
@@ -883,10 +896,12 @@ class CliConversation:
             except asyncio.TimeoutError:
                 # Nobody else was free either, or this session is pinned to
                 # its account. Then the wait was the only thing to do and it
-                # ran out.
+                # ran out -- and the line says which of the two it was.
                 print(f"[cli] {self.provider}: no free slot inside {budget:.0f}s "
                       f"({self._backend.concurrency} allowed at once on "
-                      f"{self.account.name}) and no other account is free")
+                      f"{self.account.name}) and "
+                      + ("this session is pinned to its account"
+                         if self._started else "no other account is free"))
                 self.empty_reason = "unreadable"
                 return ""
             try:
@@ -920,18 +935,22 @@ class CliConversation:
                 return body
             # A failure the ladder has an answer to. `_send` has already
             # recorded it; what remains is whether anyone else can take the
-            # turn, and whether there is slice enough left to ask.
-            if deadline - time.monotonic() < HOP_FLOOR_S:
+            # turn. The slice bounds the next attempt as it bounded this one,
+            # and nothing else does.
+            if deadline - time.monotonic() <= 0:
                 return ""
             why = self._backend.last_error or verdict
-            # `busy` is the one verdict that already named where to go: it is
-            # raised only when another ACCOUNT is free, so the ladder's answer
-            # -- another model on this same account -- would not be the seat
-            # the decision was made about.
-            moved = (
-                self._hop_account(why) if verdict == "busy"
-                else self._hop(why)
-            )
+            # The SAME MODEL on another account first, whatever the verdict.
+            # A limit and a sign-out are the account's; a model benched
+            # everywhere is refused there too and falls through to the
+            # ladder. Walking the ladder first re-sent a `judge` or `cases2`
+            # conversation pinned to sonnet as the other account's DEFAULT --
+            # the program's own model, which removed the independence while
+            # leaving the line that claims it. `busy` decided on the other
+            # account's freedom a moment ago; if that moment has passed, the
+            # ladder is still better than returning nothing for a turn that
+            # was killed in order to move.
+            moved = self._hop_account(why) or self._hop(why)
             if not moved:
                 return ""
 
@@ -963,10 +982,10 @@ class CliConversation:
                     continue
                 if backend.slot_for(account).locked():
                     continue
-                if backend.usage_of(account) >= backend.switch_at:
-                    continue
             except Exception:  # noqa: BLE001 - a backend without a ladder
                 return False
+            # Not filtered on `switch_at`: a seat past it can still serve, and
+            # the alternative here is a WAIT on one that cannot.
             return True
         return False
 
@@ -1007,12 +1026,14 @@ class CliConversation:
                 continue
             if self._backend.slot_for(account).locked():
                 continue
-            # ...and not onto a seat that has nearly spent its window. Every
-            # other path that picks one demotes those (`_with_room_first`,
-            # `_healthy_accounts`); without it a momentary queue on a primary
-            # with plenty of window left would burn the tail of a backup's.
-            if self._backend.usage_of(account) >= self._backend.switch_at:
-                continue
+            # A seat at or past `switch_at` is NOT skipped here. `pick` and
+            # `open_profile` demote such a seat, and rightly: they choose
+            # where a fresh conversation starts, and the tail of a backup's
+            # window is for the conversations already on it. This is a
+            # different question. The current seat cannot take the turn --
+            # full, limited, signed out -- so the choice is between the tail
+            # of a window and a wait, and the operator's rule is that a seat
+            # that cannot serve is switched away from, never waited on.
             was = self.provider
             self._session = str(uuid.uuid4())
             self.account = account
@@ -1502,16 +1523,11 @@ class CliConversation:
                 raise _Unauthorised(what)
             raise _Degraded(f"{what}, {attempt} retr{'y' if attempt == 1 else 'ies'} "
                             f"in, next wait {delay_ms / 1000:.0f}s")
-        # And there has to be room to act on it. `_retry`'s other two tests
-        # are proxies for "a wait this turn cannot afford" and never read the
-        # clock; this one has to, because `send` refuses to hop below
-        # `HOP_FLOOR_S` -- so without it a turn could be killed for a hop that
-        # is then declined, ending with neither the wait nor the move. The
-        # CLI's own one-second retry would very likely have delivered.
-        room = (
-            getattr(self, "_turn_deadline", 0.0) - time.monotonic()
-            >= HOP_FLOOR_S
-        )
+        # And there has to be time left to act on it -- any at all. `send`
+        # declines a hop only once the slice is gone, so this is the same
+        # check made a moment early, and it keeps a turn from being killed for
+        # a move that is then refused.
+        room = getattr(self, "_turn_deadline", 0.0) - time.monotonic() > 0
         if others and room and not racing and self._busy_hops < MAX_BUSY_HOPS:
             # Moving on from ONE retry, and moving on is all it is: `_Busy`
             # records no outage. A first retry is not evidence that a model is
@@ -1596,15 +1612,19 @@ class CliBackend:
             if profile not in profiles:
                 profiles.append(profile)
         self.profiles = tuple(profiles)
-        # One process per solve in flight, and no more. Measured, four at once:
-        # 3.1 seconds wall clock for four answers, no contention; and eight
-        # conversations across two miner processes on one login, all eight
-        # correct. The bound is here so a fleet of queued solves cannot become
-        # a fleet of processes -- and it has to fit a solve that holds TWO
-        # conversations open at once (the bar and the program, written side by
-        # side) with a second miner doing the same on the same login.
+        # How many `claude` processes one sign-in may have in flight. Measured,
+        # four at once: 3.1 seconds wall clock for four answers, no contention;
+        # and eight conversations across two miner processes on one login, all
+        # eight correct. The bound is here so a fleet of queued solves cannot
+        # become a fleet of processes -- and it has to fit what a solve
+        # actually holds open at once, which is THREE conversations now (the
+        # program, the bar and the second bar, written side by side), times
+        # the four solves `miner_max_concurrent_requests` lets a miner serve
+        # together. Twelve. At eight, the fourth solve's PROGRAM turn queued
+        # behind other solves' second bars -- phase 1 losing capacity to the
+        # mechanism that was meant to cost it nothing.
         self._limit = concurrency or max(
-            1, int(_flag("SOLVER_CLI_CONCURRENCY", "8") or "8")
+            1, int(_flag("SOLVER_CLI_CONCURRENCY", "12") or "12")
         )
         self.concurrency = self._limit
         # PER ACCOUNT, not one gate across all of them. The limit is about how
@@ -1982,14 +2002,18 @@ class CliBackend:
         what this docstring said all along, before the sort disagreed with
         it.
 
-        `_with_room_first` still applies, so this and `pick` answer "which
-        seat" the same way: the ladder's order, except that a seat at or past
-        `switch_at` goes last. One rule, whether the caller wanted a
-        particular model or the best available one.
+        `_with_room_first` applies, so this and `pick` answer "which seat"
+        the same way: the ladder's order, except that a seat at or past
+        `switch_at` goes last, and a seat with no free process slot goes
+        after one that has room. One rule, whether the caller wanted a
+        particular model or the best available one. It sorted on usage
+        alone once, and a pinned conversation opened on a full primary with
+        the backup idle -- then paid a slot hop, and a hop line, at `send`
+        for a decision this could have made silently.
         """
         wanted = Profile(model, effort if effort in EFFORTS else self.effort)
-        for account in sorted(
-            self.accounts, key=lambda a: self.usage_of(a) >= self.switch_at
+        for account, _ in self._with_room_first(
+            [(a, wanted) for a in self.accounts]
         ):
             if self.outage_for(account, wanted.model)[0] <= 0:
                 self._opened += 1

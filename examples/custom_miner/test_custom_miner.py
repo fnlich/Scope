@@ -58,9 +58,7 @@ from solvers.prompts import (  # noqa: E402
     python_defect,
 )
 from solvers.verify import (  # noqa: E402
-    EMPTY_HANDED_FLOOR_S,
     MAX_PASSES,
-    SECOND_OPINION_FLOOR_S,
     SECOND_OPINION_PASSES,
     Answer,
     VerifyingSolver,
@@ -447,7 +445,9 @@ class _SlowBackend:
     async def open(self, avoid=None):
         class Slow:
             async def send(self, text, timeout_s):
-                await asyncio.sleep(4)
+                # A slow model that honours the slice, as every real backend
+                # does: the slice is a ceiling on the read.
+                await asyncio.sleep(min(4.0, timeout_s))
                 return WRONG
             async def close(self): pass
         return Slow()
@@ -456,7 +456,9 @@ class _SlowBackend:
 
 
 def test_a_solve_never_outruns_its_advertised_deadline():
-    solver = VerifyingSolver(_SlowBackend(), max_attempts=9, reserve_s=0, max_budget_s=30)
+    # One second of reserve: with none at all the loop is allowed to run to the
+    # very last instant of the budget, which is the point of having no floor.
+    solver = VerifyingSolver(_SlowBackend(), max_attempts=9, reserve_s=1, max_budget_s=30)
     started = time.monotonic()
     result = asyncio.run(solver.solve_task(DIGITS, timeout_s=30))
     assert time.monotonic() - started < 30
@@ -5929,7 +5931,7 @@ def test_grading_is_not_started_when_it_cannot_finish():
     is no time for a repair round and `verified` never reaches the validator."""
     from types import SimpleNamespace
 
-    from solvers.verify import ROUND_TRIP_FLOOR_S, VERIFY_TIMEOUT_S
+    from solvers.verify import VERIFY_TIMEOUT_S
 
     solver, _ = _solver_seeing([])
     ran = []
@@ -5961,13 +5963,11 @@ def test_grading_is_not_started_when_it_cannot_finish():
     # model round trip is not. A band where the loop would spend twelve seconds
     # on a prompt while refusing a check that measures under a second is not a
     # trade anything would choose; it existed for two years because the two
-    # floors were never reasoned about together.
+    # floors were never reasoned about together. (The loop's own floor is gone
+    # now; the grade's demand is still one case.)
     ran.clear()
-    solver._grade(reply, task, ROUND_TRIP_FLOOR_S + 0.1, cases)
-    assert ran, (
-        f"refused to grade with {ROUND_TRIP_FLOOR_S + 0.1:.1f}s left, which is "
-        f"more than the loop demands before sending a whole new prompt"
-    )
+    solver._grade(reply, task, 12.1, cases)
+    assert ran, "refused to grade with 12.1s left"
 
 
 def test_nothing_anywhere_still_submits_nothing(capsys):
@@ -7342,7 +7342,7 @@ def test_a_solve_that_used_its_whole_budget_does_not_promise_another_model(capsy
                  no usable cases of its own either, so nothing can be graded
                  locally...
         [verify] claude returned nothing; asking another model
-        [verify] -0s left; not enough to ask anyone else, submitting empty
+        [verify] -0s left; the deadline is gone, submitting empty
 
     Two of those four lines are false, and both point the reader away from what
     actually went wrong -- a program turn that spent the entire 285s budget with
@@ -7399,7 +7399,7 @@ def test_a_solve_that_used_its_whole_budget_does_not_promise_another_model(capsy
     assert "asking another model" not in out, (
         "promised a second model with the budget already spent:\n" + out
     )
-    assert "not enough to ask anyone else" in out, out
+    assert "the deadline is gone, submitting empty" in out, out
     # 2. Turn 1 delivered cases. The failure was turn 2's.
     assert "no usable cases of its own" not in out, (
         "blamed the cases turn for the program turn's failure:\n" + out
@@ -8077,30 +8077,27 @@ def test_a_self_check_that_failed_a_case_is_not_reported_as_verified():
     assert with_examples.verified and not with_examples.self_verified
 
 
-def test_the_deadline_ending_the_loop_ships_the_last_version_and_says_so(monkeypatch):
-    """The ordinary way a correction loop ends, and it used to end in silence.
+def test_a_correction_round_is_sent_while_any_deadline_remains(monkeypatch):
+    """The deadline is the only clock (operator's rule).
 
-    `max_attempts` defaults to 0 -- unlimited -- so the clock is what stops the
-    loop on nearly every real solve. `attempt > 1 and left < ROUND_TRIP_FLOOR_S`
-    was a bare `break`: the last version went out, correctly, with nothing in
-    the log to say the deadline was why or that it was going out ungraded. An
-    operator reading that saw a solve stop mid-correction for no stated reason.
-
-    What must be true, and all three are asserted: the repair prompt is NOT sent
-    (there is no time for the round trip), the last version in hand IS submitted
-    rather than nothing, and the line says both -- deadline, and unverified."""
+    The loop used to refuse a correction round below `ROUND_TRIP_FLOOR_S`
+    (12s; 20s on the CLI backend) and ship a program it knew to be wrong with
+    time still on the validator's clock. Now a round goes out whenever any
+    deadline remains: the send is bounded by what is left, and `_supersedes`
+    keeps a fragment from displacing the answer in hand if the clock cuts it.
+    """
     from solvers import verify
 
-    monkeypatch.setattr(verify, "ROUND_TRIP_FLOOR_S", 8.0)
+    assert not hasattr(verify, "ROUND_TRIP_FLOOR_S")
     prompts: list[str] = []
     one_case = '```json\n[{"name": "carry", "args": [12345], "expected": 15}]\n```'
     draft = "```python\ndef g(n):\n    return 0\n```"
-    never_sent = "```python\ndef g(n):\n    return 15\n```"
+    fixed = "```python\ndef g(n):\n    return 15\n```"
 
     class _Slow(_Chat):
         async def send(self, text, timeout_s):
             prompts.append(text)
-            if len(prompts) == 2:       # the program turn eats the budget
+            if len(prompts) == 2:       # the program turn eats most of the budget
                 await asyncio.sleep(2.0)
             return await super().send(text, timeout_s)
 
@@ -8108,28 +8105,67 @@ def test_the_deadline_ending_the_loop_ships_the_last_version_and_says_so(monkeyp
         async def open(self, avoid=None):
             return _Slow(self._replies, self._provider)
 
-    # 8s budget, 2s spent on the program turn: 6s left is enough to GRADE the
-    # draft (one case, `VERIFY_TIMEOUT_S` each) and not enough for another round
-    # trip. Both halves matter -- an ungraded draft would leave the loop by a
-    # different door, and this test is about the door the clock closes.
+    # 8s budget, 2s spent on the program turn, ~6s left after grading the
+    # draft: under the old floor the repair was refused here. It is asked.
     task = SolveTask(problem_id="clock", language="python",
                      statement="Return the sum of the decimal digits of n.",
                      entrypoint="g", public_examples=[], deadline_s=8.0)
-    solver = verify.VerifyingSolver(_SlowBackend([one_case, draft, never_sent]),
+    solver = verify.VerifyingSolver(_SlowBackend([one_case, draft, fixed]),
                                     reserve_s=0, max_budget_s=8,
                                     second_opinion=False)
     with contextlib.redirect_stdout(io.StringIO()) as log:
         answer = asyncio.run(solver.solve_task(task, timeout_s=8.0))
     out = log.getvalue()
 
+    assert len(prompts) == 3, f"the repair was not asked with time left: {len(prompts)}"
+    assert "not enough for another correction round" not in out, out
+    assert answer.code.strip() == "def g(n):\n    return 15", answer.code
+
+
+def test_the_deadline_ending_the_loop_ships_the_last_version_and_says_so():
+    """The ordinary way a correction loop ends, and it used to end in silence.
+
+    The last version goes out, correctly, and the line says both: that the
+    deadline was why, and that it is going out unverified. Reached here by a
+    draft that TIMES OUT on its cases, so that grading it spends what the
+    program turn left and the loop finds the clock gone.
+    """
+    from solvers import verify
+
+    prompts: list[str] = []
+    cases = ('```json\n[{"name": "a", "args": [1], "expected": 1},\n'
+             ' {"name": "b", "args": [2], "expected": 2}]\n```')
+    hangs = "```python\ndef g(n):\n    while True:\n        pass\n```"
+    never_sent = "```python\ndef g(n):\n    return n\n```"
+
+    class _Slow(_Chat):
+        async def send(self, text, timeout_s):
+            prompts.append(text)
+            if len(prompts) == 2:
+                await asyncio.sleep(0.5)
+            return await super().send(text, timeout_s)
+
+    class _SlowBackend(_Backend):
+        async def open(self, avoid=None):
+            return _Slow(self._replies, self._provider)
+
+    # 6s budget: 0.5s on the program turn, and grading two cases that never
+    # finish spends the rest (each is given what fits, and times out).
+    task = SolveTask(problem_id="clock", language="python",
+                     statement="Return n.", entrypoint="g",
+                     public_examples=[], deadline_s=6.0)
+    solver = verify.VerifyingSolver(_SlowBackend([cases, hangs, never_sent]),
+                                    reserve_s=0, max_budget_s=6,
+                                    second_opinion=False)
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        answer = asyncio.run(solver.solve_task(task, timeout_s=6.0))
+    out = log.getvalue()
+
     assert len(prompts) == 2, f"a repair went out with no time for it: {len(prompts)}"
-    assert "not enough for another correction round" in out, out
-    assert "submitting the last version unverified" in out, out
+    assert "the deadline is gone; submitting the last version unverified" in out, out
     # The answer still goes out. An unverified answer can still be right; an
     # answer never sent is a certain zero.
-    assert answer.code.strip() == "def g(n):\n    return 0", answer.code
-    assert answer.verified is False
-
+    assert "while True" in answer.code, answer.code
 
 def test_running_out_before_the_models_own_cases_could_run_says_which(monkeypatch):
     """`_grade` explains an ungraded answer -- and gated that explanation on
@@ -8683,17 +8719,26 @@ def test_the_run_of_asks_is_capped_so_a_dead_fleet_cannot_spin():
     assert len(seen) == MAX_PASSES, f"asked {len(seen)} times, cap is {MAX_PASSES}"
 
 
-def test_holding_nothing_lowers_the_bar_for_one_more_ask():
-    """The two floors encode what each state has to lose. Holding an unverified
-    answer, spending the tail of the budget on another model risks the time.
-    Holding nothing, there is nothing to risk -- what is in hand pays zero."""
-    assert EMPTY_HANDED_FLOOR_S <= SECOND_OPINION_FLOOR_S, (
-        f"empty-handed needs {EMPTY_HANDED_FLOOR_S}s to justify one more ask "
-        f"but holding an answer needs only {SECOND_OPINION_FLOOR_S}s. That is "
-        f"backwards: the state with nothing to lose is being made the harder "
-        f"one to act on."
-    )
-    assert EMPTY_HANDED_FLOOR_S > 0, "an ask still has to be able to happen"
+def test_no_time_floor_gates_a_further_pass():
+    """The operator's rule: the deadline is the only clock. Whether another
+    model is asked is a question about how many have been asked and about the
+    deadline -- an ask with any time left is allowed to happen, and one with
+    none is not, whatever is in hand."""
+    from solvers import verify
+
+    assert not hasattr(verify, "EMPTY_HANDED_FLOOR_S")
+    assert not hasattr(verify, "SECOND_OPINION_FLOOR_S")
+    assert not hasattr(verify, "RESUME_FLOOR_S")
+    assert not hasattr(verify, "ROUND_TRIP_FLOOR_S")
+    solver = verify.VerifyingSolver.__new__(verify.VerifyingSolver)
+    empty = verify.Candidate(code="", raw="")
+    held = verify.Candidate(code="def g(n): return 0", raw="")
+    assert solver._next_pass_blocked_by(empty, 1, 1.5) is None
+    assert solver._next_pass_blocked_by(held, 1, 1.5) is None
+    # Under the send's own minimum slice a pass could only be padded past the
+    # deadline; that is the one thing besides the deadline that decides.
+    assert "deadline" in solver._next_pass_blocked_by(empty, 1, 0.5)
+    assert "deadline" in solver._next_pass_blocked_by(held, 1, -1.0)
 
 
 def test_the_first_read_gets_the_deadline_the_validator_actually_advertised():
@@ -11239,19 +11284,12 @@ def test_a_phase_that_runs_the_deadline_out_stops_instead_of_handing_on():
     Real sleeps, because a fake that fails instantly cannot tell the two
     apart — the budget would be intact in both.
 
-    Nothing new enforces this: `solve_task` has always refused to open a pass
-    with less than `EMPTY_HANDED_FLOOR_S` left. What changed is that the rule
-    now BINDS, because turn 1 reads against the real budget — while it was
+    `solve_task` refuses to open a pass once the deadline is gone -- and only
+    then, because the deadline is the only clock (operator's rule). What makes
+    the rule bind is that turn 1 reads against the real budget: while it was
     capped at 60s the budget survived it and four tabs were spent in a row.
-    This test is what stops that floor being loosened back out from under it."""
-    # The floor has to be a real reserve. At zero the guarantee below still
-    # happens to hold, but only because `remaining` lands a hair NEGATIVE —
-    # which is luck, not a rule, and a lease that arrives a millisecond earlier
-    # would spend a tab on a solve with no time to use it.
-    assert EMPTY_HANDED_FLOOR_S >= 5.0, (
-        f"EMPTY_HANDED_FLOOR_S is {EMPTY_HANDED_FLOOR_S}; it is the only thing "
-        f"stopping a spent deadline being handed to another tab"
-    )
+    A read cut at the budget leaves `remaining` at or under zero by the time
+    it is measured, which is what the first half below relies on."""
 
     # 40s deadline -> 20s budget. Turn 1 burns all of it.
     log, answer = _burning_backend(40.0, 999.0)
@@ -11742,16 +11780,14 @@ def test_a_cases_only_reply_cannot_launder_a_fragment(monkeypatch):
     assert (relaundered.self_passed, relaundered.self_total) == (1, 1)
 
 
-def test_grading_leaves_room_for_the_round_the_evidence_is_for(monkeypatch):
-    """One grading pass could spend every second that was left.
+def test_grading_is_handed_the_whole_remainder(monkeypatch):
+    """No round trip is held back from the grade any more.
 
-    A list of failures nobody has time to report is not worth the run that
-    produced it, so `_grade` holds a round trip back — and that reserve was
-    tried once before and reverted, because `check` sized its run by the worst
-    case and a shortened budget meant only the first case or two ran. Sizing by
-    iteration rather than by the worst case is what makes it safe: an ordinary
-    suite finishes well inside the shortened budget, so the reserve costs no
-    evidence at all and buys the correction round.
+    The reserve was a budget inside the deadline: with twenty cases and twenty
+    seconds left it graded eight of them and shipped a right answer not
+    `self_verified` for want of the twelve seconds it was saving for a round
+    the loop then did not start. Whether another round fits is the loop's
+    question, asked against the deadline; the grade's job is to grade.
     """
     from solvers import verify
 
@@ -11772,11 +11808,9 @@ def test_grading_leaves_room_for_the_round_the_evidence_is_for(monkeypatch):
         answer = asyncio.run(solver.solve_task(_NO_EXAMPLES, timeout_s=60.0))
 
     assert seen, "nothing was graded at all"
-    assert all(b <= 60.0 - verify.ROUND_TRIP_FLOOR_S for b in seen), (
-        f"a grading pass was handed the whole remainder: {seen}"
-    )
-    # And the reserve cost no evidence: three cases, all three run, the repair
-    # round sent and the corrected program submitted.
+    assert all(b <= 60.0 for b in seen), f"graded past the deadline: {seen}"
+    # Three cases, all three run, the repair round sent and the corrected
+    # program submitted.
     assert "while n > 0" in answer.code, f"lost the correction: {answer.code!r}"
     assert answer.self_total == 3 and answer.self_passed == 3, (
         f"the reserve truncated the run: {answer.self_passed}/{answer.self_total}"
@@ -11824,13 +11858,12 @@ def test_the_solve_always_finishes_before_the_miner_answers_504():
         short clock shortens the per-case timeout instead of spending the full
         one on the last case.
 
-    The loop will not START a round below `ROUND_TRIP_FLOOR_S`, so that is the
-    largest slice the last read can be given.
+    The loop starts a round with whatever is left, so the last read may be
+    given anything up to the whole budget; `tail_budget` is capped, which is
+    what keeps the arithmetic closed.
     """
     from solvers.browser_pool import tail_budget
-    from solvers.verify import (
-        DELIVERY_RESERVE_S, MIN_CASE_TIMEOUT_S, ROUND_TRIP_FLOOR_S,
-    )
+    from solvers.verify import DELIVERY_RESERVE_S, MIN_CASE_TIMEOUT_S
     from custom_miner import RESPONSE_GRACE_S
 
     for deadline in (30.0, 60.0, 300.0, 600.0):
@@ -11838,7 +11871,7 @@ def test_the_solve_always_finishes_before_the_miner_answers_504():
         budget = cutoff - DELIVERY_RESERVE_S            # what solve_task may spend
         if budget <= 5.0:                               # solve_task's own fallback
             budget = max(1.0, cutoff * 0.5)
-        worst = budget + tail_budget(ROUND_TRIP_FLOOR_S) + MIN_CASE_TIMEOUT_S
+        worst = budget + tail_budget(budget) + MIN_CASE_TIMEOUT_S
         assert worst < cutoff, (
             f"deadline={deadline:g}: the worst-case solve ends at {worst:.1f}s "
             f"but the miner cancels itself at {cutoff:.1f}s — that is a 504, "
@@ -12933,9 +12966,11 @@ def _fake_cli(tmp_path, monkeypatch, mode="ok", backups=0):
         monkeypatch.setenv("SOLVER_CLI_BACKUP_ACCOUNTS", ",".join(map(str, dirs)))
     else:
         monkeypatch.delenv("SOLVER_CLI_BACKUP_ACCOUNTS", raising=False)
-    # The ladder these tests were written against. The shipped default is
-    # measured separately, in `test_the_default_ladder_is_the_measured_one`.
-    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:high,fable:low")
+    # The SHIPPED ladder, pinned explicitly so a test that hops runs onto the
+    # rung production runs onto: sonnet in low-thinking mode (operator's rule),
+    # then fable. It used to pin `sonnet:high`, so every behavioural hop test
+    # asserted an effort the miner never uses.
+    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:low,fable:low")
     monkeypatch.delenv("SOLVER_CLI_MODELS", raising=False)
     monkeypatch.delenv("SOLVER_CLI_RECOVERY_S", raising=False)
     return log
@@ -13537,7 +13572,7 @@ def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session
     first, second, spent, conversation, after = asyncio.run(go())
     assert extract_code(first, "g") and extract_code(second, "g"), (first, second)
     assert conversation.provider == "cli:sonnet" and conversation.hops == 1
-    assert conversation.effort == "high"
+    assert conversation.effort == "low"
     # ONE account, so there is nowhere for the turn to go and the wait is the
     # right answer: the first retry is sat through, the second is the signal,
     # and the 4s and 16s behind it are never paid. Moving on is only better
@@ -13548,7 +13583,7 @@ def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session
     assert 0.9 < spent < 5.0, spent
     calls = _cli_calls(log)
     assert [(c["model"], c["effort"], c["resumed"]) for c in calls] == [
-        ("opus", "low", False), ("opus", "low", True), ("sonnet", "high", True),
+        ("opus", "low", False), ("opus", "low", True), ("sonnet", "low", True),
     ], calls
     assert len({c["session"] for c in calls}) == 1, "the session was lost in the hop"
     # Every account, ten minutes: the service's problem, not a seat's -- and
@@ -13559,10 +13594,10 @@ def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session
     assert "*/opus" in out_table and 500 < out_table["*/opus"]["seconds"] <= 600, out_table
     assert "refused" in out_table["*/opus"]["why"] and "529" in out_table["*/opus"]["why"]
     # The next fresh solve goes straight to the emergency profile.
-    assert after.provider == "cli:sonnet" and after.effort == "high"
+    assert after.provider == "cli:sonnet" and after.effort == "low"
     out = capsys.readouterr().out
     assert "hop: cli:opus -> cli:sonnet" in out, out
-    assert "EMERGENCY MODE: cli:sonnet (effort high)" in out, out
+    assert "EMERGENCY MODE: cli:sonnet (effort low)" in out, out
 
 
 def test_a_server_error_result_is_read_the_same_way(tmp_path, monkeypatch):
@@ -13769,7 +13804,7 @@ def test_the_status_command_names_each_account(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "primary" in out and "signed in (subscription)" in out, out
     assert "claude-2" in out and "NOT signed in" in out, out
-    assert "ladder: opus/low, sonnet/high, fable/low" in out, out
+    assert "ladder: opus/low, sonnet/low, fable/low" in out, out
 
     _cli_modes(log, {"*": "ok"})
     assert claude_cli.main(["status"]) == 0
@@ -13851,7 +13886,7 @@ def test_a_drill_lets_the_operator_watch_the_ladder_move(
 
     monkeypatch.setenv("SOLVER_CLI_DRILL", "refuse:opus")
     backend = CliBackend()
-    assert backend.pick()[1].label == "sonnet/high"
+    assert backend.pick()[1].label == "sonnet/low"
 
     monkeypatch.setenv("SOLVER_CLI_DRILL", "limit:nobody")
     with pytest.raises(SystemExit):
@@ -13903,7 +13938,7 @@ def test_the_cli_summary_names_the_ladder(tmp_path, monkeypatch):
     _fake_cli(tmp_path, monkeypatch, backups=1)
     monkeypatch.setenv("SOLVER_BACKEND", "cli")
     assert roster_module.describe([]) == (
-        "claude CLI (opus/low > sonnet/high > fable/low; 2 accounts)"
+        "claude CLI (opus/low > sonnet/low > fable/low; 2 accounts)"
     )
 
 
@@ -15441,13 +15476,15 @@ def test_a_quadratic_program_that_passes_every_case_is_caught_at_size():
     slow = asyncio.run(
         solver._timed_out_at_scale(quadratic, generator, _Task(), 60.0)
     )
-    assert slow is not None, "a quadratic program ran to size without complaint"
-    assert "did not finish" in slow and "bytes" in slow, slow
+    assert slow.sentence is not None, "a quadratic program ran to size without complaint"
+    assert "did not finish" in slow.sentence and "bytes" in slow.sentence, slow
+    assert slow.state == "too_slow", slow
 
     fast = asyncio.run(
         solver._timed_out_at_scale(linear, generator, _Task(), 60.0)
     )
-    assert fast is None, f"a linear program was reported too slow: {fast}"
+    assert fast.sentence is None, f"a linear program was reported too slow: {fast}"
+    assert fast.state == "passed", fast
 
     # And the same suite the validator uses agrees the small cases are silent:
     # both programs pass a hand-sized case, which is what makes the probe the
@@ -15479,17 +15516,19 @@ def test_the_probe_never_costs_the_answer(tmp_path, monkeypatch):
         solver._timed_out_at_scale(code, gen, _Task(), left)
     )
 
-    assert run("") is None, "no generator must not be a verdict"
-    assert run("def generate(seed, scale):\n    raise ValueError('x')\n") is None
-    assert run("def generate(seed, scale):\n    return 'not a case'\n") is None
-    assert run("def generate(seed, scale):\n    return {'args': 5}\n") is None
+    assert run("") == (None, "none"), "no generator must not be a verdict"
+    assert run("def generate(seed, scale):\n    raise ValueError('x')\n") == (None, "none")
+    assert run("def generate(seed, scale):\n    return 'not a case'\n") == (None, "none")
+    assert run("def generate(seed, scale):\n    return {'args': 5}\n") == (None, "none")
     # A generator that ignores the byte budget: its output cannot come back
     # through the sandbox at all, and that is a skip, never a crash report.
     assert run(
         "def generate(seed, scale):\n    return {'args': ['x' * 900000]}\n"
-    ) is None
-    # No time to run it and act on it.
-    assert run("def generate(seed, scale):\n    return {'args': [[1]]}\n", 1.0) is None
+    ) == (None, "none")
+    # One second left: the run goes ahead with what there is (there is no
+    # floor), and either finishes -- evidence -- or is cut, which is not.
+    verdict = run("def generate(seed, scale):\n    return {'args': [[1]]}\n", 1.0)
+    assert verdict.sentence is None and verdict.state in ("passed", "skipped"), verdict
 
     # The ceiling is the measured transport limit, not a guess: the sandbox
     # keeps only the last 256 KiB of stdout, so a framed reply above that
@@ -15799,6 +15838,10 @@ def test_a_judge_that_backs_neither_drops_the_case_as_ambiguous():
 
     assert "contested=1" in log, log
     assert answer.code.strip(), "an ambiguous case cost the answer"
+    # DROPPED, not merely counted: the case is off the bar the answer shipped
+    # against, and nothing is outstanding against the program.
+    assert answer.self_total == 0, answer.diagnostics
+    assert not answer.diagnostics["failures"], answer.diagnostics
 
 
 def test_a_judge_that_does_not_answer_leaves_the_round_exactly_as_it_was():
@@ -15820,7 +15863,7 @@ def test_a_judge_that_does_not_answer_leaves_the_round_exactly_as_it_was():
     assert "adjudicated=" not in log, log
     assert answer.code.strip(), "a silent judge cost the answer"
     repair = backend.sent.get("program", [])[-1]
-    assert "corrected" in repair, "the ordinary offer was withdrawn anyway"
+    assert "holding just the case" in repair, "the ordinary offer was withdrawn anyway"
 
 
 def test_the_judge_is_never_shown_a_program_or_an_expected_value():
@@ -15865,14 +15908,16 @@ def test_the_probe_runs_again_on_a_program_it_asked_to_be_rewritten():
     produce -- shipped having never been timed."""
     from solvers.verify import VerifyingSolver
 
+    from solvers.verify import _Probe
+
     solver = VerifyingSolver.__new__(VerifyingSolver)
     solver._size_probe = True
-    solver._probe_ran = False
     timed: list[str] = []
 
     async def fake(code, generator, task, left):
         timed.append(code)
-        return "too slow" if "quadratic" in code else None
+        return (_Probe("too slow", "too_slow") if "quadratic" in code
+                else _Probe(None, "passed"))
 
     solver._timed_out_at_scale = fake
     probed: dict = {}
@@ -15906,12 +15951,11 @@ def test_the_probe_has_no_budget_floor_under_it():
 
     solver = verify.VerifyingSolver.__new__(verify.VerifyingSolver)
     solver._size_probe = True
-    solver._probe_ran = False
     offered: list[float] = []
 
     async def fake(code, generator, task, left):
         offered.append(left)
-        return None
+        return verify._Probe(None, "passed")
 
     solver._timed_out_at_scale = fake
     task = SimpleNamespace(language="python", entrypoint="g")
@@ -15986,6 +16030,15 @@ def test_an_out_of_memory_at_scale_is_reported_like_a_timeout():
     )
     # An ordinary crash is left alone.
     assert not _looks_out_of_memory(_Run(ok=False, error="IndexError: list index"))
+    # ...including one whose traceback merely CONTAINS the letters. `oom` was a
+    # substring match, and a program with a function called `count_rooms` had
+    # every crash at scale reported as a memory kill.
+    assert not _looks_out_of_memory(_Run(
+        ok=False,
+        error='RecursionError: maximum recursion depth\n  File "<c>", line 12, in count_rooms',
+    ))
+    assert not _looks_out_of_memory(_Run(ok=False, error="KeyError: 'bedroom'"))
+    assert _looks_out_of_memory(_Run(ok=False, error="Rust container exceeded its memory limit"))
 
 
 # --------------------------------------------------------------------------- #
@@ -16033,6 +16086,14 @@ def test_a_rotated_repair_is_not_told_it_wrote_the_program():
     assert "YOUR program" not in theirs, theirs
     assert "someone else" in theirs.lower()
     assert "not yours" in theirs
+    # The <must_pass> note used to be chosen from `bar_is_independent` alone,
+    # so a rotated repair was headed "YOUR OWN cases from the previous
+    # message" two lines above "It is not yours".
+    assert "your program" not in theirs.lower(), theirs
+    assert "YOUR OWN" not in theirs, theirs
+    assert "previous message" not in theirs, theirs
+    independent = build_resume_prompt(**kwargs, foreign=True, bar_is_independent=True)
+    assert "your program" not in independent.lower(), independent
 
 
 # --------------------------------------------------------------------------- #
@@ -16194,7 +16255,8 @@ def test_a_cache_hit_answers_without_opening_a_conversation(monkeypatch, tmp_pat
     task = _two_seat_task()
     solution_cache.save(_cache_key(task), solution_cache.record(
         code="def g(n):\n    return sum(int(c) for c in str(n))\n",
-        raw="raw", task=task, bar=[], probe="passed", providers=["cli:opus"],
+        raw="raw", task=task, bar=[{"args": [12345], "expected": 15}],
+        probe="passed", providers=["cli:opus"],
     ))
 
     class _NeverAsked:
@@ -16224,7 +16286,8 @@ def test_a_cached_answer_that_no_longer_parses_is_solved_again(
     task = _two_seat_task()
     solution_cache.save(_cache_key(task), solution_cache.record(
         code="def g(n:\n    return  # truncated mid-signature",
-        raw="raw", task=task, bar=[], probe="passed", providers=[],
+        raw="raw", task=task, bar=[{"args": [1], "expected": 1}],
+        probe="passed", providers=[],
     ))
 
     backend = _TwoSeats({
@@ -16343,29 +16406,34 @@ def test_a_slot_hop_keeps_the_model_it_was_pinned_to(tmp_path, monkeypatch):
 
 
 def test_a_probe_that_never_ran_is_not_reported_as_a_pass():
-    """`passed` is evidence and gates the on-disk cache; the other three ways
-    of returning None know nothing about the program.
+    """`passed` is evidence and gates the on-disk cache; the other ways of
+    returning no sentence know nothing about the program.
 
     Recorded as `passed`, an answer the clock ran out on would be written to
     a permanent cache and served again unexamined -- the one thing the cache
-    gate exists to prevent."""
+    gate exists to prevent. The state comes back FROM the run rather than
+    being latched on the solver, because the solver serves several solves at
+    once and a flag on `self` was read by whichever finished last."""
     import solvers.verify as verify
+    from solvers.verify import _Probe
 
     solver = verify.VerifyingSolver.__new__(verify.VerifyingSolver)
     solver._size_probe = True
-    solver._probe_ran = False
+    assert not hasattr(solver, "_probe_ran")
     task = SimpleNamespace(language="python", entrypoint="g")
     candidate = SimpleNamespace(code="def g(n): return n")
 
     async def never_runs(code, generator, task, left):
-        return None                      # no valid input could be built
+        return _Probe(None, "none")          # no valid input could be built
 
     async def finishes(code, generator, task, left):
-        solver._probe_ran = True
-        return None
+        return _Probe(None, "passed")
 
     async def too_slow(code, generator, task, left):
-        return "did not finish"
+        return _Probe("did not finish", "too_slow")
+
+    async def crashes(code, generator, task, left):
+        return _Probe(None, "crashed")
 
     now = time.monotonic()
 
@@ -16382,6 +16450,11 @@ def test_a_probe_that_never_ran_is_not_reported_as_a_pass():
         solver._probe_now(candidate, ["gen"], {}, task, 300.0, now))
     assert verdict == "did not finish" and state == "too_slow"
 
+    # A crash at scale is not a pass either, whatever caused it.
+    solver._timed_out_at_scale = crashes
+    assert asyncio.run(solver._probe_now(
+        candidate, ["gen"], {}, task, 300.0, now)) == (None, "crashed")
+
     # Out of time: never asked, so nothing is known.
     solver._timed_out_at_scale = finishes
     assert asyncio.run(solver._probe_now(
@@ -16390,6 +16463,77 @@ def test_a_probe_that_never_ran_is_not_reported_as_a_pass():
     # And no generator at all is not a pass either.
     assert asyncio.run(solver._probe_now(
         candidate, [], {}, task, 300.0, now)) == (None, "none")
+
+    # Only VERDICTS are remembered. A `none` is not: a later call with a
+    # generator the first bar did not have must be free to find out.
+    probed: dict = {}
+    solver._timed_out_at_scale = never_runs
+    asyncio.run(solver._probe_now(candidate, ["gen"], probed, task, 300.0, now))
+    assert probed == {}
+    solver._timed_out_at_scale = finishes
+    asyncio.run(solver._probe_now(candidate, ["gen"], probed, task, 300.0, now))
+    assert probed[candidate.code.strip()].state == "passed"
+
+
+def test_the_probe_tries_every_generator_it_was_given():
+    """Both bars are asked for one, and the second exists precisely so that a
+    first generator returning the wrong shape at every scale is not the end
+    of the probe."""
+    import solvers.verify as verify
+    from solvers.verify import _Probe
+
+    solver = verify.VerifyingSolver.__new__(verify.VerifyingSolver)
+    solver._size_probe = True
+    task = SimpleNamespace(language="python", entrypoint="g")
+    used: list[str] = []
+
+    async def fake(code, generator, task, left):
+        used.append(generator)
+        return _Probe(None, "none") if generator == "broken" else _Probe(None, "passed")
+
+    solver._timed_out_at_scale = fake
+    verdict = asyncio.run(solver._probe_now(
+        SimpleNamespace(code="x"), ["broken", "works"], {}, task, 300.0,
+        time.monotonic(),
+    ))
+    assert verdict == (None, "passed") and used == ["broken", "works"], used
+
+
+def test_a_probe_verdict_belongs_to_one_solve():
+    """Two solves probing at once on the one solver must not read each other's
+    result. Reproduced with the flag this replaced: solve B, whose generator
+    built nothing, reported `passed` because solve A's run finished while B
+    was waiting -- and B's never-timed program went into the permanent
+    cache."""
+    import solvers.verify as verify
+    from solvers.verify import _Probe
+
+    solver = verify.VerifyingSolver.__new__(verify.VerifyingSolver)
+    solver._size_probe = True
+    task = SimpleNamespace(language="python", entrypoint="g")
+    gate = asyncio.Event()
+
+    async def fake(code, generator, task, left):
+        if code == "A":
+            await gate.wait()             # A finishes at size, later
+            return _Probe(None, "passed")
+        gate.set()                        # B built nothing, and says so first
+        await asyncio.sleep(0.01)
+        return _Probe(None, "none")
+
+    solver._timed_out_at_scale = fake
+
+    async def go():
+        now = time.monotonic()
+        a = asyncio.create_task(solver._probe_now(
+            SimpleNamespace(code="A"), ["gen"], {}, task, 300.0, now))
+        b = asyncio.create_task(solver._probe_now(
+            SimpleNamespace(code="B"), ["gen"], {}, task, 300.0, now))
+        return await asyncio.gather(a, b)
+
+    a, b = asyncio.run(go())
+    assert a == (None, "passed"), a
+    assert b == (None, "none"), "solve B was credited with solve A's run"
 
 
 def test_two_bars_that_spell_rust_output_differently_have_not_disagreed():
@@ -16499,39 +16643,70 @@ def test_a_judged_case_is_not_restored_by_the_round_that_corrected_another():
     guard refuses to ask twice, and the solve re-reported a disagreement an
     independent reader had said the statement does not decide, every round
     until the deadline.
+
+    Driven through the loop: two failing cases, the judge rules one ambiguous
+    and says nothing about the other, and the next reply corrects the other
+    beside its program.
     """
-    from solvers.verify import _case_key, _merge_cases
+    program = "```python\ndef g(n):\n    return 0\n```"
+    corrected = ('```json\n[{"name": "y", "args": [0], "expected": 0}]\n```\n'
+                 + program)
+    backend = _TwoSeats({
+        "cases": ['```json\n[{"name": "x", "args": [12345], "expected": 99},\n'
+                  ' {"name": "y", "args": [0], "expected": 5}]\n```'],
+        "program": [program, corrected, corrected],
+        # Case x: neither 99 nor 0 -- ambiguous, dropped. Nothing about y.
+        "judge": ['```json\n[{"i": 0, "expected": 7}]\n```'],
+        None: [program],
+    })
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             independent_bar=True, judge=True)
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        answer = asyncio.run(solver.solve_task(_two_seat_task(), 120.0))
+    log = out.getvalue()
 
-    # The shape of the round: a bar, a case the program failed, and a merged
-    # bar the model sent back in the same reply.
-    agreed = [
-        {"name": "a", "args": [1], "expected": 1},
-        {"name": "disputed", "args": [2], "expected": 99},
-    ]
-    failed = [agreed[1]]
-    revised, _ = _merge_cases(
-        agreed, [{"name": "disputed", "args": [2], "expected": 7}], failed
-    )
-    # The order the loop now runs in: the model's own correction lands FIRST,
-    # then the judge acts on the bar that results.
-    agreed = revised
-    dropped = {_case_key({"args": [2]})}
-    agreed = [c for c in agreed if _case_key(c) not in dropped]
+    assert "contested=1" in log, log
+    bar = answer.diagnostics["bar"]
+    assert [c["args"] for c in bar] == [[0]], bar          # x is gone, y stays
+    assert bar[0]["expected"] == 0, bar                     # ...corrected
+    assert answer.self_verified and not answer.diagnostics["failures"], log
+    assert "corrected=1" in log, log
 
-    assert [c["args"] for c in agreed] == [[1]], agreed
-    # Nothing left pending that could put it back.
-    assert all(_case_key(c) not in dropped for c in agreed)
+
+def test_a_handoff_landing_on_the_authors_model_is_not_called_foreign_in_the_loop():
+    """The comparison the handoff makes, made by the handoff. A browser fleet
+    has no models to change, so a carried repair can land on the very model
+    that wrote the program; telling it the program is someone else's is the
+    same false premise the flag exists to remove, pointed the other way."""
+    wrong = "```python\ndef g(n):\n    return 0\n```"
+
+    class _OneModel(_TwoSeats):
+        def _seat(self, phase):
+            seat = super()._seat(phase)
+            seat.provider = "cli:opus@primary"       # every seat, the same model
+            return seat
+
+    backend = _OneModel({"cases": [CASES], "program": [wrong, wrong],
+                         "repair": [wrong], None: [wrong]})
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             independent_bar=True)
+    with contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(solver.solve_task(_two_seat_task(), 120.0))
+    carried = backend.sent["repair"][0]
+    assert "YOUR program" in carried and "not yours" not in carried, carried[-500:]
 
 
 def test_the_second_bar_is_never_waited_for():
     """It is an addition to a bar that already exists, so it is taken if it
-    has landed and abandoned if it has not.
+    has landed and left running if it has not -- and never waited for.
 
     Waiting was the bug. `_collect_bar` bounds itself by everything left of
     the solve -- right for the first bar, since without it there is nothing to
     grade at all, and wrong for this one: bar1 has already landed by then, so
     a hung second model would hold the whole remaining deadline and the answer
-    would ship UNGRADED with a perfectly good bar in hand.
+    would ship UNGRADED with a perfectly good bar in hand. A second bar that
+    never lands is reported as `late` when the pass ends, and its seat is
+    closed with the others.
     """
     async def go():
         started = asyncio.Event()
@@ -16575,7 +16750,8 @@ def test_the_second_bar_is_never_waited_for():
     assert spent < 20.0, f"waited on the second bar: {spent:.0f}s of a 120s budget"
     # The first bar still graded the program, which is the whole point.
     assert answer.self_total == 1 and answer.self_passed == 1, log
-    assert "first bar stands on its own" in log, log
+    assert "never landed before the pass ended" in log, log
+    assert "bar2=late" in log, log
 
 
 # --------------------------------------------------------------------------- #
@@ -16591,14 +16767,19 @@ class _Fleet:
     solve together needs a fleet that can be asked for a model by name.
     """
 
-    def __init__(self, per_phase, per_model=None):
+    def __init__(self, per_phase, per_model=None, provider_of=None):
         self.per_phase = per_phase
         self.per_model = per_model or {}
+        # Which provider label a phase's seat reports. Production's program
+        # seat is `cli:opus@...`, and the rotation skips the model named in
+        # the incumbent's label -- a seat labelled `cli:program` never
+        # exercises that skip.
+        self.provider_of = provider_of or {}
         self.opened: list[str] = []
         self.sent: dict[str, list[str]] = {}
 
     def _seat(self, label, replies):
-        seat = _Chat(replies, provider=f"cli:{label}")
+        seat = _Chat(replies, provider=self.provider_of.get(label, f"cli:{label}"))
         sent = self.sent.setdefault(label, [])
         send = seat.send
 
@@ -16648,10 +16829,19 @@ def test_one_solve_uses_every_mechanism_and_the_next_one_is_free(
     from solvers import solution_cache
     from solvers.verify import _cache_key
 
+    from solvers import verify
+
     monkeypatch.setenv("SOLVER_SOLUTION_CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.setenv("SOLVER_REPAIR_ROTATE_FROM", "1")
+    # The constant is read at import, so the environment variable would be
+    # inert here; the attribute is what the loop reads.
+    monkeypatch.setattr(verify, "ROTATE_AFTER_ROUNDS", 1)
 
     wrong = "```python\ndef g(n):\n    return 0\n```"
+    # A DIFFERENT wrong program on the second try, so the rotation is reached
+    # by the round count -- the mechanism under test -- and not by the
+    # duplicate guard. Still right on the second bar's `g(0)`, so the one
+    # scripted judge reply is only ever asked about the one disputed call.
+    wrong2 = "```python\ndef g(n):\n    return n\n```"
     right = "```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"
     # A generator the probe can use: one large valid input.
     gen = (
@@ -16671,13 +16861,15 @@ def test_one_solve_uses_every_mechanism_and_the_next_one_is_free(
             "cases2": ['```json\n[{"name": "b", "args": [0], "expected": 0}]\n```'],
             # The program's own conversation answers wrong, twice: the repair
             # has to leave it to be fixed.
-            "program": [wrong, wrong],
+            "program": [wrong, wrong2],
             # The third reader agrees with the bar, so the case stands.
             "judge": ['```json\n[{"i": 0, "expected": 15}]\n```'],
             None: [wrong],
         },
         # ...and the rotation lands somewhere that gets it right.
         per_model={"sonnet": [right], "fable": [right]},
+        # The author is opus, as in production, so the first hop must skip it.
+        provider_of={"program": "cli:opus@primary"},
     )
     solver = VerifyingSolver(
         fleet, reserve_s=0, max_budget_s=120,
@@ -16698,8 +16890,11 @@ def test_one_solve_uses_every_mechanism_and_the_next_one_is_free(
     # ...so the repair asked for the program and did NOT offer the case.
     repair = fleet.sent["program"][-1]
     assert "arrived at the same value the case expects" in repair, repair[-300:]
-    # The repair left the model that wrote the program.
-    assert any(o.startswith("profile:") for o in fleet.opened), fleet.opened
+    # The repair left the model that wrote the program -- for the NEXT model
+    # on the rotation, not back to the author.
+    hops = [o for o in fleet.opened if o.startswith("profile:")]
+    assert hops and hops[0] == "profile:sonnet", fleet.opened
+    assert "profile:opus" not in hops, fleet.opened
     assert "repair=" in log, log
     # A model shown someone else's program is told so.
     carried = next(
@@ -16746,3 +16941,493 @@ def test_one_solve_uses_every_mechanism_and_the_next_one_is_free(
     # The archive of that submission still says what it was checked against.
     assert second.diagnostics.get("bar"), second.diagnostics
     assert second.diagnostics.get("probe") == "passed", second.diagnostics
+
+
+# --------------------------------------------------------------------------- #
+# Round three: the correction runs until it passes or the deadline stops it
+# --------------------------------------------------------------------------- #
+def test_the_rotation_goes_round_again_instead_of_stopping(monkeypatch):
+    """Every model having had the repair once is a lap, not the end.
+
+    `_next_profile` returning None used to end the pass `exit=exhausted`
+    with most of the deadline left -- a round cap of 3 x ROTATE_AFTER_ROUNDS
+    hiding in the rotation. The operator's rule is pass or deadline.
+    """
+    from solvers import verify
+
+    monkeypatch.setattr(verify, "ROTATE_AFTER_ROUNDS", 1)
+    # Every seat answers wrong, and differently each time, so the rotation is
+    # reached by the round count rather than the duplicate guard.
+    wrongs = [f"```python\ndef g(n):\n    return {i}\n```" for i in range(1, 40)]
+    fleet = _Fleet(
+        per_phase={"cases": [CASES], "program": list(wrongs), None: list(wrongs)},
+        per_model={"opus": list(wrongs), "sonnet": list(wrongs), "fable": list(wrongs)},
+        provider_of={"program": "cli:opus@primary"},
+    )
+    solver = VerifyingSolver(fleet, reserve_s=0, max_budget_s=120,
+                             independent_bar=True, max_attempts=7)
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        asyncio.run(solver.solve_task(_two_seat_task(), 120.0))
+    log = out.getvalue()
+
+    hops = [o for o in fleet.opened if o.startswith("profile:")]
+    assert hops[:4] == ["profile:sonnet", "profile:fable", "profile:opus",
+                        "profile:sonnet"], hops
+    assert "going round again" in log, log
+    assert "exit=exhausted" not in log, log
+    assert "exit=maxattempts" in log, log
+
+
+def test_a_too_slow_program_is_carried_to_the_next_model(monkeypatch):
+    """The handoff for a slow-but-correct program was dead code.
+
+    `_resume_elsewhere` asked for failures or a defect, and a program that
+    reached the probe has neither -- so the too_slow rounds stayed with the
+    author until the loop printed "nobody else to ask" with two models never
+    asked. The carried prompt now says what is wrong: speed. And a too_slow
+    report re-sent to the author is named as a repeat rather than sent word
+    for word.
+    """
+    from solvers import verify
+    from solvers.verify import _Probe
+
+    monkeypatch.setattr(verify, "ROTATE_AFTER_ROUNDS", 2)
+    slow = "```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"
+    # A second slow program, different in text: two too_slow rounds with the
+    # author, the second report named as a repeat, then the rotation.
+    slow2 = "```python\ndef g(n):\n    total = sum(int(c) for c in str(n))\n    return total\n```"
+    quick = "```python\ndef g(n):\n    return sum(map(int, str(n)))\n```"
+    gen = ("```python\ndef generate(seed, scale):\n"
+           "    return {'args': [int('9' * min(scale, 200))]}\n```")
+    fleet = _Fleet(
+        per_phase={"cases": [CASES + "\n" + gen], "program": [slow, slow2, slow],
+                   None: [slow]},
+        per_model={"sonnet": [quick], "fable": [quick]},
+        provider_of={"program": "cli:opus@primary"},
+    )
+    solver = VerifyingSolver(fleet, reserve_s=0, max_budget_s=120,
+                             independent_bar=True)
+
+    async def fake(code, generator, task, left):
+        if "map(int" in code:
+            return _Probe(None, "passed")
+        return _Probe("I ran the program on one valid input of 200 bytes and "
+                      "it did not finish within 5 seconds.", "too_slow")
+
+    solver._timed_out_at_scale = fake
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        answer = asyncio.run(solver.solve_task(_two_seat_task(), 120.0))
+    log = out.getvalue()
+
+    assert "too_slow report has now gone out 2 times" in log, log
+    assert "profile:sonnet" in fleet.opened, fleet.opened
+    carried = fleet.sent["sonnet"][0]
+    assert "did not finish" in carried, carried[-600:]
+    assert "not yours" in carried, carried[-600:]
+    assert "map(int" in answer.code, answer.code
+    assert "probe=passed" in log and "exit=exhausted" not in log, log
+
+
+def test_a_repeated_slow_program_is_carried_on_with_its_verdict(monkeypatch):
+    """The duplicate guard reaches the handoff first when the author re-sends
+    the same slow program; without the probe's verdict in hand it declined
+    ("no fault to report") and the stale-tab check ended the pass."""
+    from solvers import verify
+    from solvers.verify import _Probe
+
+    monkeypatch.setattr(verify, "ROTATE_AFTER_ROUNDS", 1)
+    slow = "```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"
+    quick = "```python\ndef g(n):\n    return sum(map(int, str(n)))\n```"
+    gen = ("```python\ndef generate(seed, scale):\n"
+           "    return {'args': [int('9' * min(scale, 200))]}\n```")
+    fleet = _Fleet(
+        per_phase={"cases": [CASES + "\n" + gen], "program": [slow, slow],
+                   None: [slow]},
+        per_model={"sonnet": [quick]},
+        provider_of={"program": "cli:opus@primary"},
+    )
+    solver = VerifyingSolver(fleet, reserve_s=0, max_budget_s=120,
+                             independent_bar=True)
+
+    async def fake(code, generator, task, left):
+        return (_Probe(None, "passed") if "map(int" in code
+                else _Probe("it did not finish within 5 seconds.", "too_slow"))
+
+    solver._timed_out_at_scale = fake
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        answer = asyncio.run(solver.solve_task(_two_seat_task(), 120.0))
+    log = out.getvalue()
+    assert "profile:sonnet" in fleet.opened, fleet.opened
+    assert "did not finish" in fleet.sent["sonnet"][0]
+    assert "map(int" in answer.code and "exit=stalled" not in log, log
+
+
+def test_no_resume_floor_gates_the_handoff():
+    """A 40s floor under the handoff was a second clock; it stopped the
+    rotation with time on the validator's clock."""
+    from solvers import verify
+
+    assert not hasattr(verify, "RESUME_FLOOR_S")
+    assert not hasattr(verify, "MAX_JUDGED_CORRECTIONS")
+
+
+def test_a_split_case_is_settled_by_the_program_without_a_judge():
+    """Two bars that read one call two ways already hold the second reading,
+    so the program's own value decides: agreeing with the second bar is two
+    readings against one and the case is corrected; agreeing with neither is
+    the statement being ambiguous there and the case is dropped. Neither
+    spends a judge turn. This routing was designed and then never wired in."""
+    def run(program):
+        backend = _TwoSeats({
+            "cases": ['```json\n[{"name": "a", "args": [12345], "expected": 99}]\n```'],
+            "cases2": ['```json\n[{"name": "a", "args": [12345], "expected": 15}]\n```'],
+            "program": [program, program],
+            "judge": ['```json\n[{"i": 0, "expected": 15}]\n```'],
+            None: [program],
+        })
+        solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                                 independent_bar=True, second_bar=True, judge=True)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            answer = asyncio.run(solver.solve_task(_two_seat_task(), 120.0))
+        return backend, answer, out.getvalue()
+
+    # The program agrees with the second bar: the first bar's case was wrong.
+    backend, answer, log = run("```python\ndef g(n):\n    return 15\n```")
+    assert "split=1" in log, log
+    assert "adjudicated=program:1" in log, log
+    assert "judge" not in backend.opened, backend.opened
+    assert answer.self_verified and not answer.diagnostics["failures"], log
+    assert answer.diagnostics["bar"][0]["expected"] == 15, answer.diagnostics["bar"]
+
+    # The program agrees with neither: the statement is ambiguous there.
+    backend, answer, log = run("```python\ndef g(n):\n    return 7\n```")
+    assert "contested=1" in log, log
+    assert "judge" not in backend.opened, backend.opened
+    assert answer.self_total == 0, answer.diagnostics
+
+
+def test_a_case_the_program_crashed_on_is_not_put_to_the_judge():
+    """A program that produced no value is wrong under both readings; ruled
+    `contested` it would have had the case dropped and shipped crashing on
+    the input."""
+    program = "```python\ndef g(n):\n    raise ValueError('no')\n```"
+    backend = _judge_backend(
+        '```json\n[{"i": 0, "expected": 7}]\n```',   # a judge that disagrees with the bar
+        program,
+        '```json\n[{"name": "a", "args": [12345], "expected": 15}]\n```',
+    )
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                             independent_bar=True, judge=True)
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        answer = asyncio.run(solver.solve_task(_two_seat_task(), 120.0))
+    log = out.getvalue()
+    assert "judge" not in backend.opened, backend.opened
+    assert "contested" not in log, log
+    assert answer.self_total == 1 and answer.diagnostics["failures"], log
+
+
+def test_a_crash_at_scale_is_not_recorded_as_a_pass():
+    """The `finished` branch ran for any result that was neither a timeout
+    nor an OOM, so a recursive solution that blew the stack at n=50000 went
+    into the permanent cache as timed-and-passed."""
+    from solvers import verify
+
+    solver = verify.VerifyingSolver.__new__(verify.VerifyingSolver)
+    solver._grader = verify._Grader()
+
+    class _Task:
+        language, entrypoint = "python", "g"
+
+    recursive = "def g(n):\n    return 0 if n == 0 else 1 + g(n - 1)\n"
+    generator = "def generate(seed, scale):\n    return {'args': [50000]}\n"
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        verdict = asyncio.run(
+            solver._timed_out_at_scale(recursive, generator, _Task(), 60.0)
+        )
+    assert verdict.state == "crashed" and verdict.sentence is None, verdict
+    assert "crashed" in out.getvalue() and "no pass is recorded" in out.getvalue()
+
+
+def test_the_probe_is_bounded_by_the_clock_and_by_no_floor():
+    """`remaining() < 2 x VERIFY_TIMEOUT_S` was a 10s floor: below it the
+    probe was skipped and the log blamed the generator. Now a run goes ahead
+    with whatever is left, and a run the clock cuts is `skipped` -- a
+    timeout inside a shorter window than the validator's is not a verdict."""
+    from solvers import verify
+
+    solver = verify.VerifyingSolver.__new__(verify.VerifyingSolver)
+    solver._grader = verify._Grader()
+
+    class _Task:
+        language, entrypoint = "python", "g"
+
+    generator = "def generate(seed, scale):\n    return {'args': [scale]}\n"
+    quick = "def g(n):\n    return n\n"
+    verdict = asyncio.run(solver._timed_out_at_scale(quick, generator, _Task(), 6.0))
+    assert verdict.state == "passed", verdict
+
+    sleepy = "import time\ndef g(n):\n    time.sleep(3)\n    return n\n"
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        verdict = asyncio.run(
+            solver._timed_out_at_scale(sleepy, generator, _Task(), 1.5)
+        )
+    assert verdict.state == "skipped" and verdict.sentence is None, (verdict, out.getvalue())
+
+
+def test_the_judge_answering_a_rust_number_matches_the_string():
+    """A Rust case's `expected` is stdout, a string. A reader that answered a
+    numeric problem with the number matched neither side and had the case
+    dropped as contested."""
+    from solvers.verify import _Run, _case_key
+
+    backend = _TwoSeats({
+        "judge": ['```json\n[{"i": 0, "expected": 6}]\n```'],
+        None: ["unused"],
+    })
+    solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120, judge=True)
+    task = SimpleNamespace(language="rust", entrypoint="main", statement="Sum.",
+                           public_examples=[])
+    case = {"name": "a", "args": ["3\n1 2 3\n"], "expected": "6"}
+    verdicts = asyncio.run(solver._adjudicate(
+        task, [case], [_Run(ok=True, value="5")], "cli:opus", 120.0,
+        time.monotonic(), {},
+    ))
+    assert verdicts == {_case_key(case): ("case", "6")}, verdicts
+
+
+def test_extract_expected_reads_what_the_reply_meant():
+    from solvers.prompts import extract_expected
+
+    # Numbered from 1: shifted back rather than compared against the wrong call.
+    assert extract_expected(
+        '```json\n[{"i": 1, "expected": 5}, {"i": 2, "expected": 6}]\n```', 2
+    ) == {0: 5, 1: 6}
+    # Numbered from 0: taken as is.
+    assert extract_expected(
+        '```json\n[{"i": 0, "expected": 5}, {"i": 1, "expected": 6}]\n```', 2
+    ) == {0: 5, 1: 6}
+    # Contradicting itself about a call is no verdict on it.
+    assert extract_expected(
+        '```json\n[{"i": 0, "expected": 5}, {"i": 0, "expected": 6}, '
+        '{"i": 1, "expected": 9}]\n```', 2
+    ) == {1: 9}
+    # The LAST block is the answer; the first was a draft.
+    assert extract_expected(
+        '```json\n[{"i": 0, "expected": 5}]\n```\nWait, re-reading:\n'
+        '```json\n[{"i": 0, "expected": 6}]\n```', 1
+    ) == {0: 6}
+    # Thinking is not an answer.
+    assert extract_expected(
+        '<think>[{"i": 0, "expected": 1}]</think>\n```json\n[{"i": 0, "expected": 2}]\n```',
+        1,
+    ) == {0: 2}
+
+
+def test_the_judge_prompt_is_consistent_and_knows_what_expected_is():
+    from solvers.prompts import build_expected_prompt
+
+    rust = build_expected_prompt("rust", "Sum.", "main",
+                                 [{"args": ["3\n1 2 3\n"], "expected": "6"}])
+    assert "ONE JSON string" in rust and "complete stdout" in rust, rust
+    assert "every call listed" not in rust
+    assert "every call the statement DETERMINES" in rust
+    assert rust.rstrip().endswith("nothing else."), rust[-120:]
+    python = build_expected_prompt("python", "Sum.", "g",
+                                   [{"args": [1], "expected": 1}],
+                                   examples=[{"args": [2], "expected": 2}])
+    assert "exact value the call must return" in python, python
+    assert "PUBLIC EXAMPLES" in python and "args=[2]" in python, python
+    assert "beyond the public examples above" in python
+
+
+def test_the_cases_prompt_does_not_promise_a_program_turn_it_will_not_take():
+    """Under the independent bar the conversation is closed after the cases
+    and never asked for a program; the prompt used to say it would be."""
+    from solvers.prompts import build_tests_prompt
+
+    for want_probe in (False, True):
+        alone = build_tests_prompt("python", "Sum.", "g", [], want_probe=want_probe,
+                                   independent=True)
+        assert "you will be asked for it next" not in alone
+        assert "in my next message" not in alone
+        assert "written elsewhere" in alone and "Do NOT write the program" in alone
+        # The sequential shape still promises what it delivers.
+        sequential = build_tests_prompt("python", "Sum.", "g", [], want_probe=want_probe)
+        assert "you will be asked for it next" in sequential
+
+
+def test_off_turns_a_solver_switch_off(monkeypatch):
+    """One boolean grammar for the whole .env: `off` was understood by the
+    CLI settings and silently ignored by the solver's."""
+    from solvers import solution_cache, verify
+
+    class _Unused:
+        async def open(self, avoid=None, timeout_s=None): raise AssertionError
+        async def aclose(self): pass
+        def stats(self): return {}
+
+    monkeypatch.setenv("SOLVER_JUDGE", "off")
+    monkeypatch.setenv("SOLVER_SECOND_BAR", "off")
+    assert verify.VerifyingSolver(_Unused())._judge is False
+    assert verify.VerifyingSolver(_Unused())._second_bar is False
+    monkeypatch.setenv("SOLVER_SOLUTION_CACHE", "off")
+    assert solution_cache.cache_dir() is None
+
+    # And the production defaults, with nothing set: on, on, and docker.
+    for name in ("SOLVER_JUDGE", "SOLVER_SECOND_BAR", "SOLVER_VERIFY_EXECUTOR",
+                 "SOLVER_INDEPENDENT_BAR"):
+        monkeypatch.delenv(name, raising=False)
+    solver = verify.VerifyingSolver(_Unused())
+    assert solver._judge and solver._second_bar
+    assert verify._Grader._build_settings().executor == "docker"
+
+
+def test_a_limit_moves_a_pinned_conversation_to_the_same_model_elsewhere(
+    tmp_path, monkeypatch
+):
+    """A usage limit is the account's. Walking the ladder first re-sent a
+    `judge` or `cases2` conversation pinned to sonnet as the other account's
+    DEFAULT model -- the program's own -- removing the independence while
+    leaving the line that claims it."""
+    from solvers.claude_cli import CliBackend
+
+    log = _fake_cli(tmp_path, monkeypatch, backups=1)
+    _cli_modes(log, {"default": "limited", "*": "ok"})
+    backend = CliBackend()
+
+    async def go():
+        conversation = await backend.open_profile("sonnet", "low")
+        body = await conversation.send("judge this", 60.0)
+        return conversation, body
+
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        conversation, body = asyncio.run(go())
+    assert body, out.getvalue()
+    assert conversation.provider == "cli:sonnet@claude-2", conversation.provider
+    assert "hop: cli:sonnet@primary -> cli:sonnet@claude-2" in out.getvalue()
+
+
+def test_a_full_seat_moves_to_a_nearly_spent_one_rather_than_wait(
+    tmp_path, monkeypatch
+):
+    """`pick` demotes a seat past `switch_at`, rightly; the account hop used
+    to SKIP it, so a full primary with a healthy 96% backup idle beside it
+    queued the whole slice. A seat that cannot serve is switched away from,
+    never waited on."""
+    from solvers import claude_cli
+    from solvers.claude_cli import CliBackend
+
+    assert not hasattr(claude_cli, "HOP_FLOOR_S")
+    _fake_cli(tmp_path, monkeypatch, backups=1)
+    backend = CliBackend()
+    primary, backup = backend.accounts
+    backend.note_rate_limit(
+        {"status": "allowed_warning", "rateLimitType": "five_hour",
+         "unifiedWindows": {"five_hour": {"utilization": 0.96,
+                                          "resetsAt": time.time() + 600}}},
+        "opus", backup,
+    )
+
+    async def go():
+        conversation = await backend.open()
+        assert conversation.account is primary
+        for _ in range(backend.concurrency):
+            await backend.slot_for(primary).acquire()
+        free = conversation._another_account_is_free()
+        moved = conversation._hop_account("primary has no free process slot")
+        return free, moved, conversation
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        free, moved, conversation = asyncio.run(go())
+    assert free and moved, "waited on a full seat with a backup idle"
+    assert conversation.account is backup, conversation.provider
+
+
+def test_a_degraded_grader_keeps_answers_out_of_the_permanent_cache(
+    monkeypatch, tmp_path
+):
+    """Under the subprocess fallback a `passed` probe says the program finished
+    at 1 GiB, which is not what 256 MiB will say; kept, it would be served on
+    every duplicate with no re-run ever."""
+    from solvers import solution_cache
+    from solvers.verify import _Probe, _cache_key
+
+    monkeypatch.setenv("SOLVER_SOLUTION_CACHE_DIR", str(tmp_path / "cache"))
+    right = "```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"
+    gen = ("```python\ndef generate(seed, scale):\n"
+           "    return {'args': [int('9' * min(scale, 200))]}\n```")
+
+    def solve(degraded):
+        backend = _TwoSeats({"cases": [CASES + "\n" + gen], "program": [right],
+                             None: [right]})
+        solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                                 independent_bar=True)
+        solver._grader.degraded = lambda language: degraded
+
+        async def passed(code, generator, task, left):
+            return _Probe(None, "passed")
+
+        solver._timed_out_at_scale = passed
+        with contextlib.redirect_stdout(io.StringIO()):
+            asyncio.run(solver.solve_task(_two_seat_task(), 120.0))
+        return solution_cache.load(_cache_key(_two_seat_task()))
+
+    assert solve(degraded=True) is None, "a degraded grade was kept for ever"
+    assert solve(degraded=False) is not None, "a sound grade was not kept"
+
+
+def test_the_grader_says_when_it_is_degraded_and_tries_docker_again(monkeypatch):
+    """The subprocess fallback used to be cached for the life of the process:
+    a Docker daemon started after the miner was never looked for again, and
+    `state()` said "ready"."""
+    import shutil
+
+    from solvers import verify
+
+    if shutil.which("docker"):
+        pytest.skip("a Docker binary is present; this test needs it absent")
+    monkeypatch.setenv("SOLVER_VERIFY_EXECUTOR", "docker")
+    monkeypatch.setattr(verify, "EXECUTOR_RETRY_S", 0.0)
+    grader = verify._Grader()
+    built = []
+    real = grader._build
+
+    def spy(language):
+        built.append(language)
+        return real(language)
+
+    grader._build = spy
+    with contextlib.redirect_stdout(io.StringIO()):
+        first = grader.executor("python")
+        second = grader.executor("python")
+    assert grader.degraded("python")
+    assert grader.state("python").startswith("degraded"), grader.state("python")
+    # With the retry interval elapsed, Docker was looked for again.
+    assert built == ["python", "python"], built
+    assert type(first).__name__ == type(second).__name__ == "SubprocessExecutor"
+
+
+def test_a_stored_answer_without_its_evidence_is_a_miss(monkeypatch, tmp_path):
+    """The hit line claims the answer passed its own cases and was timed at
+    scale; a file that does not carry both is not what this code writes."""
+    from solvers import solution_cache
+    from solvers.verify import _cache_key
+
+    monkeypatch.setenv("SOLVER_SOLUTION_CACHE_DIR", str(tmp_path))
+    task = _two_seat_task()
+    right = "```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"
+    for record in (
+        dict(bar=[], probe="passed"),
+        dict(bar=[{"args": [1], "expected": 1}], probe="skipped"),
+    ):
+        solution_cache.save(_cache_key(task), solution_cache.record(
+            code="def g(n):\n    return 0\n", raw="raw", task=task,
+            providers=[], **record,
+        ))
+        backend = _TwoSeats({"cases": [CASES], "program": [right], None: [right]})
+        solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=120,
+                                 independent_bar=True)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            answer = asyncio.run(solver.solve_task(task, 120.0))
+        assert "cache=hit" not in out.getvalue(), record
+        assert "sum(int(c)" in answer.code, record

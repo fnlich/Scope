@@ -47,11 +47,11 @@ _MAX_BYTES = 2 * 1024 * 1024
 def cache_dir() -> Optional[Path]:
     """Where answers are kept, or None when the operator turned this off.
 
-    `SOLVER_SOLUTION_CACHE=0` disables it outright;
+    `SOLVER_SOLUTION_CACHE=0` (or `false`, `no`, `off`) disables it outright;
     `SOLVER_SOLUTION_CACHE_DIR=` (empty) does the same by naming nowhere.
     """
     if os.environ.get("SOLVER_SOLUTION_CACHE", "1").strip().lower() in (
-        "0", "false", "no"
+        "0", "false", "no", "off"
     ):
         return None
     raw = os.environ.get("SOLVER_SOLUTION_CACHE_DIR", DEFAULT_DIR).strip()

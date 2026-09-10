@@ -68,9 +68,29 @@ from .prompts import (
 from . import solution_cache
 from .rust_compile import compile_defect, rustc_path
 
-# Per-example wall clock when checking our own candidate. Kept small: this is
-# a smoke test against tiny public examples, not the real grading run.
+# Per-case wall clock for every local run: grading against the bar, the size
+# probe, and the too_slow / OOM verdicts are all calibrated to it. It EQUALS the
+# validator's `per_test_timeout_s` (5.0) and that is not a coincidence to tune
+# away: set lower, the probe calls programs slow that the validator passes and
+# keeps them out of the cache; set higher, a program that times out there
+# passes here. Overridable for experiments only.
 VERIFY_TIMEOUT_S = float(os.environ.get("SOLVER_VERIFY_TIMEOUT_S", "5"))
+
+
+def _env_on(name: str, default: bool = True) -> bool:
+    """A boolean setting, read with the one grammar the whole `.env` uses.
+
+    `0`, `false`, `no` and `off` are off; anything else set is on; unset is
+    the default. The CLI backend's `_on` reads its settings the same way, and
+    this used to differ from it by exactly `off` -- so an operator who had
+    written `SOLVER_CLI_ALLOW_OVERAGE=off` and then `SOLVER_JUDGE=off` turned
+    the first thing off and left the second on, with no word that the value
+    was not understood.
+    """
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
 
 # The least a case may be given when the budget cannot afford the full timeout.
 #
@@ -92,12 +112,6 @@ MIN_CASE_TIMEOUT_S = 1.0
 # stop paying for the probe, short enough that a box the operator has just
 # fixed heals on its own.
 EXECUTOR_RETRY_S = float(os.environ.get("SOLVER_EXECUTOR_RETRY_S", "300"))
-
-# What a repair needs to be worth carrying to a FRESH conversation: a tab, a
-# prompt that restates the whole problem, and a read long enough to answer it.
-# More than the 12s an in-conversation round trip needs, because none of that
-# is warm.
-RESUME_FLOOR_S = 40.0
 
 # What must be left when a read stops, for the answer to reach the validator at
 # all. THE ONLY reserve taken out of the deadline, and the only thing standing
@@ -185,10 +199,20 @@ PROBE_SCALES = (PROBE_MAX_BYTES, PROBE_MAX_BYTES // 4, PROBE_MAX_BYTES // 16)
 # and it falls here.
 MAX_ADJUDICATED = 2
 
-# The least a correction round can be worth starting with: one prompt out, one
-# reply back, and something read from the page at the end of it. Below this the
-# loop stops and the last version in hand goes out as it stands.
-ROUND_TRIP_FLOOR_S = 12.0
+# The least slice a read can be handed: `send(prompt, max(MIN_SLICE_S, left))`
+# pads every slice up to it, so a round or a pass started with less than this
+# left would run PAST the deadline by construction. Not a budget -- the
+# granularity of the clock -- and the only thing besides the deadline itself
+# that decides whether another round, pass or handoff is started.
+MIN_SLICE_S = 1.0
+
+# There is deliberately no round-trip floor here. There was one (12s, 20s on
+# the CLI backend), and it was a second clock under the deadline: below it the
+# loop refused another correction round and shipped a program it knew to be
+# wrong with time still on the validator's clock. A round started with too
+# little left is cut by the deadline like any other read, `_supersedes` keeps
+# the fragment from displacing the answer in hand, and the delivery reserve
+# ships that answer. The deadline is the only clock. (Operator's rule.)
 
 # Under this, a round did not involve the model. `send` blocks on a chat UI
 # until the reply finishes -- tens of seconds, normally -- so a round that came
@@ -255,12 +279,6 @@ HANDOFF_ROUNDS = CASES_ONLY_ROUNDS + 1
 ROTATE_AFTER_ROUNDS = max(
     1, int(os.environ.get("SOLVER_REPAIR_ROTATE_FROM", "2") or 2)
 )
-# How many times per pass a CORRECTED case is put to the judge before the
-# rest are accepted as they arrive. One judge turn decides every case a reply
-# corrected, so this is a cap on turns, not on cases; a pass that keeps
-# correcting its bar after two verdicts has said what it has to say about
-# the cases, and the budget is better spent on the program.
-MAX_JUDGED_CORRECTIONS = 2
 # The most of the bar ONE repair reply may rewrite, as a fraction. A reply
 # that corrects more than this is re-specifying the problem rather than fixing
 # a case, and is refused whole.
@@ -303,8 +321,9 @@ class Backend(Protocol):
 class Answer:
     """What a solver hands back to the miner.
 
-    Structurally compatible with ``custom_miner.SolveResult`` (the miner only
-    reads ``.code`` and ``.raw_response``) and defined here on purpose: importing
+    Structurally compatible with ``custom_miner.SolveResult`` (the miner reads
+    ``.code``, ``.raw_response`` and, when present, ``.diagnostics``, which it
+    archives beside the exchange) and defined here on purpose: importing
     the miner module from inside a request would make a path problem surface as
     a failed solve at serving time rather than at startup.
     """
@@ -923,6 +942,13 @@ class _Grader:
         # inside the solve's budget, for the life of the process.
         self._broken: dict[str, tuple[float, str]] = {}
         self._reported: set[str] = set()
+        # A language being graded under the subprocess FALLBACK, by when it
+        # fell back. The fallback used to go into `_cache` like a real
+        # executor and stay there for the life of the process: a Docker
+        # daemon started after the miner -- the ordinary case, and the one
+        # `EXECUTOR_RETRY_S` exists for -- was never looked for again, Python
+        # was graded at 1 GiB for days, and `state()` said "ready".
+        self._fallback_since: dict[str, float] = {}
 
     @staticmethod
     def _build_settings():
@@ -936,12 +962,28 @@ class _Grader:
         # _env_file=None so the miner's .env cannot accidentally repoint this.
         return Settings(_env_file=None, executor=kind, per_test_timeout_s=VERIFY_TIMEOUT_S)
 
-    def executor(self, language: str):
+    def _current(self, language: str):
+        """The cached executor, unless it is a fallback due for another try."""
         cached = self._cache.get(language)
+        if cached is None:
+            return None
+        since = self._fallback_since.get(language)
+        if since is not None and time.monotonic() - since >= EXECUTOR_RETRY_S:
+            return None
+        return cached
+
+    def degraded(self, language: str) -> bool:
+        """Whether this language is graded under looser limits than the
+        validator's. Read by the solution cache's gate: a size probe that
+        passed at 1 GiB has not shown what 256 MiB would do."""
+        return language in self._fallback_since
+
+    def executor(self, language: str):
+        cached = self._current(language)
         if cached is not None:
             return cached
         with self._lock:
-            cached = self._cache.get(language)
+            cached = self._current(language)
             if cached is not None:
                 return cached
             held = self._broken.get(language)
@@ -951,13 +993,17 @@ class _Grader:
                 # counts those lines, so it must not change shape here.
                 raise RuntimeError(held[1])
             try:
-                executor = self._build(language)
+                executor, degraded = self._build(language)
             except Exception as exc:  # noqa: BLE001 - remembered, then re-raised
                 self._broken[language] = (time.monotonic(), f"{exc}")
                 self._report_unavailable(language, exc)
                 raise
             self._broken.pop(language, None)
             self._cache[language] = executor
+            if degraded:
+                self._fallback_since[language] = time.monotonic()
+            else:
+                self._fallback_since.pop(language, None)
             return executor
 
     def state(self, language: str) -> str:
@@ -968,6 +1014,11 @@ class _Grader:
         operator polls to find out whether the miner is healthy is the last
         place to put that.
         """
+        if language in self._fallback_since:
+            return (
+                f"degraded: subprocess at 1 GiB, Docker unavailable "
+                f"(tried again every {EXECUTOR_RETRY_S:.0f}s)"
+            )
         if language in self._cache:
             return "ready"
         held = self._broken.get(language)
@@ -977,6 +1028,10 @@ class _Grader:
 
     def _build(self, language: str):
         """Construct the executor for ``language``. Assumes the lock is held.
+
+        Returns `(executor, degraded)`: `degraded` is True when Python fell
+        back to the subprocess backend, so the caller can remember to try
+        Docker again later and say so in `state()`.
 
         Python falls back to the subprocess backend when Docker cannot be
         built, and that asymmetry with Rust is the whole point. Rust has no
@@ -1006,7 +1061,7 @@ class _Grader:
                 per_test_timeout_s=VERIFY_TIMEOUT_S,
             )
         try:
-            return get_executor(settings, language=language)
+            return get_executor(settings, language=language), False
         except Exception as exc:  # noqa: BLE001 - Python degrades, Rust cannot
             if language == "rust" or settings.executor != "docker":
                 raise
@@ -1027,9 +1082,10 @@ class _Grader:
                     f"unavailable ({exc}). The validator grades in a container "
                     f"with 256 MiB and no swap, and one OOM there fails every "
                     f"hidden test — an answer that allocates more than that "
-                    f"will pass here and score zero. Once per run."
+                    f"will pass here and score zero. Docker is looked for "
+                    f"again every {EXECUTOR_RETRY_S:.0f}s. Once per run."
                 )
-            return fallback
+            return fallback, True
 
     def _report_unavailable(self, language: str, exc: BaseException) -> None:
         """Say what a missing executor costs, once per language per run.
@@ -1336,6 +1392,41 @@ class _Grader:
         return runs
 
 
+class _NoExecutor(Exception):
+    """The size probe has no executor to run on. Private to it."""
+
+
+class _Probe(NamedTuple):
+    """What the size probe found, and how much it is worth.
+
+    `sentence` is the report a repair prompt carries, and is None unless the
+    program has to change. `state` says what the None means, because four
+    different Nones used to mean four different things to a caller that could
+    only see one:
+
+    * `passed`   -- the program ran at the statement's own scale and finished
+                    inside the per-test limit. EVIDENCE, and the only state
+                    `solution_cache.worth_keeping` accepts.
+    * `too_slow` -- it ran and did not finish; `oom` -- it ran and was killed
+                    for memory. Both carry a sentence and both are verdicts.
+    * `crashed`  -- it ran and died some other way. Far likelier the
+                    generator handing it an input the statement does not
+                    allow than a fault in the program, so no sentence -- but
+                    not a pass either, and never cached as one.
+    * `skipped`  -- the clock ran out before a run could be finished. Nothing
+                    is known.
+    * `none`     -- no generator, no valid large input, or no executor.
+                    Nothing is known.
+
+    Returned rather than latched on the solver, because the solver serves
+    several solves at once and a flag on `self` was read by whichever of them
+    finished last.
+    """
+
+    sentence: Optional[str]
+    state: str
+
+
 @dataclass
 class _Run:
     """One input's outcome from `_Grader.outputs`."""
@@ -1356,19 +1447,26 @@ class _Run:
 # backend's version, where `RLIMIT_AS` makes the allocation fail inside the
 # interpreter rather than killing the process.
 #
-# Matched on TEXT because that is all `_Run` carries, and kept deliberately
-# short: every phrase here has to be one the executor writes for a memory
-# kill and for nothing else. A looser pattern would turn an ordinary crash at
-# scale into a repair round that rewrites a correct program.
-_OOM_MARKS = ("oom", "memory limit", "memoryerror", "out of memory")
+# Matched on TEXT because that is all `_Run` carries, and matched on WHOLE
+# PHRASES because the text is a traceback: it carries the program's own
+# identifiers and messages, and a bare `oom` is inside `rooms`, `bloom` and
+# `zoom`. Every phrase here is one the executors write for a memory kill --
+# `container killed (likely OOM / memory limit)` and `exceeded its memory
+# limit` from the two Docker executors, `MemoryError` from the interpreter
+# under `RLIMIT_AS` -- and for nothing else. A looser pattern turned an
+# ordinary crash at scale into a repair round that rewrote a correct program
+# to fix a memory problem it did not have.
+_OOM_RE = re.compile(
+    r"likely oom|memory limit|\bmemoryerror\b|\bout of memory\b|\boom[- ]?killed\b",
+    re.IGNORECASE,
+)
 
 
 def _looks_out_of_memory(run: "_Run") -> bool:
     """True when this run died for lack of memory rather than of time."""
     if run.timed_out:
         return False
-    text = (run.error or "").lower()
-    return any(mark in text for mark in _OOM_MARKS)
+    return bool(_OOM_RE.search(run.error or ""))
 
 
 # Text that changes between two runs of the SAME failure, and nothing else.
@@ -1463,27 +1561,11 @@ def _clip(value: Any, limit: int = 160) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
-# How much budget must be left to ask ANOTHER model, by what is already in hand.
-#
-# The two numbers differ because what they risk differs, and the payment policy
-# is what sets the price. `all_passed` is a hard gate: an empty answer pays
-# exactly zero, and no amount of hurrying changes that. Above the gate, speed is
-# a multiplier floored at 0.95 -- the slowest correct answer still earns 95% of
-# what the fastest earns. So:
-#
-#   * Empty-handed, ANY time worth a round trip is worth spending. A failed
-#     extra ask costs nothing that was not already lost; a successful one is the
-#     whole payment. So the floor is the mechanical minimum and nothing more:
-#     12s is what `_attempt`'s own loop refuses to start a round below, which
-#     makes this "as long as an ask can happen at all".
-#   * Holding an unverified answer, the ask is speculative rather than free --
-#     it spends a real account's quota to improve on something that may already
-#     be right. That bar stays where it was.
-#
-# The ordering is the invariant, not the values: empty-handed must never be the
-# HARDER case to justify. It is the one with nothing to lose.
-EMPTY_HANDED_FLOOR_S = 12.0
-SECOND_OPINION_FLOOR_S = 20.0
+# No time floor gates a further PASS either. Whether another model is asked
+# is a question about how many have been asked (`MAX_PASSES`,
+# `SECOND_OPINION_PASSES`) and about the deadline, and nothing else: a pass
+# opened with seconds left is cut by the same clock as everything else, and
+# an empty answer pays exactly zero however early it is sent.
 
 # How many models one task may be put to.
 #
@@ -1522,6 +1604,7 @@ class _Shipped(NamedTuple):
     adjudicated: tuple = ()
     contested: int = 0
     repair: tuple = ()
+    split: int = 0
 
     @classmethod
     def of(cls, plan: "_Plan") -> "_Shipped":
@@ -1531,6 +1614,7 @@ class _Shipped(NamedTuple):
             bar2_provider=plan.bar2_provider, union=plan.union,
             adjudicated=tuple(plan.adjudicated.items()),
             contested=plan.contested, repair=tuple(plan.repair),
+            split=plan.split,
         )
 
 
@@ -1608,10 +1692,19 @@ class _Plan:
         # the bar carries a hand-derived `expected`, so none of them is ever the
         # size the validator runs -- and until this field existed the log could
         # not tell an answer timed at scale from one that was never timed. The
-        # states are worth keeping apart: `passed` is evidence, `none` is a
-        # solve whose cases turn returned no generator, `too_slow` is an answer
-        # that shipped known-slow because the clock ran out mid-repair.
+        # states are worth keeping apart -- see `_Probe`: `passed` is
+        # evidence; `too_slow` and `oom` are answers that shipped known-bad at
+        # scale because the clock ran out mid-repair; `crashed` died at scale
+        # some other way; `skipped` and `none` were never timed. Describes the
+        # program that SHIPPED: cleared whenever a different program becomes
+        # the one in hand, so a verdict never outlives the program it was
+        # about.
         self.probe = ""
+        # Calls the two bars both wrote and disagreed about. Neither a failure
+        # nor a verdict on its own -- see `_union_bars` and the split routing
+        # in `_attempt` -- but the one number that says how ambiguous the
+        # statement was, so it is recorded.
+        self.split = 0
         # The SECOND bar: which model wrote it, and what the union came to.
         # `union` is (bar1, bar2, union) case counts, so a line can say whether
         # the second reader contributed anything the first had not thought of
@@ -1751,8 +1844,7 @@ class VerifyingSolver:
         # many conversations a solve holds open and a scripted backend that
         # hands every conversation the same replies cannot serve two.
         self._independent_bar = (
-            os.environ.get("SOLVER_INDEPENDENT_BAR", "true").strip().lower()
-            not in ("0", "false", "no")
+            _env_on("SOLVER_INDEPENDENT_BAR")
             if independent_bar is None
             else bool(independent_bar)
         )
@@ -1764,8 +1856,7 @@ class VerifyingSolver:
         # and it is the only thing here that reaches a solve where the bar and
         # the program agreed with each other and were both wrong.
         self._second_bar = self._independent_bar and (
-            os.environ.get("SOLVER_SECOND_BAR", "true").strip().lower()
-            not in ("0", "false", "no")
+            _env_on("SOLVER_SECOND_BAR")
             if second_bar is None
             else bool(second_bar)
         )
@@ -1773,8 +1864,7 @@ class VerifyingSolver:
         # Costs a short turn and only on the rounds that have a disagreement
         # to settle -- about a quarter of solves. See `_adjudicate`.
         self._judge = (
-            os.environ.get("SOLVER_JUDGE", "true").strip().lower()
-            not in ("0", "false", "no")
+            _env_on("SOLVER_JUDGE")
             if judge is None
             else bool(judge)
         )
@@ -1798,13 +1888,8 @@ class VerifyingSolver:
         # local run of the finished program on a large valid input. No extra
         # model turn, and no oracle -- see `_timed_out_at_scale`.
         self._size_probe = (
-            os.environ.get("SOLVER_SIZE_PROBE", "true").strip().lower()
-            not in ("0", "false", "no")
+            _env_on("SOLVER_SIZE_PROBE")
         )
-        # Whether the last `_timed_out_at_scale` actually ran the program at
-        # size. See it, and `_probe_now`, which turns this into the difference
-        # between `passed` and `none`.
-        self._probe_ran = False
         self._grader = _Grader()
         self._cache: dict[str, tuple[str, str]] = {}
         self._cache_size = max(0, int(cache_size))
@@ -1845,12 +1930,11 @@ class VerifyingSolver:
             # real account's quota, to improve on something already worth
             # submitting.
             return "the answer in hand has already had its second opinion"
-        floor_s = EMPTY_HANDED_FLOOR_S if empty_handed else SECOND_OPINION_FLOOR_S
-        if remaining < floor_s:
+        if remaining < MIN_SLICE_S:
             return (
-                "not enough to ask anyone else, submitting empty"
+                "the deadline is gone, submitting empty"
                 if empty_handed
-                else "no time for a second opinion"
+                else "the deadline is gone"
             )
         return None
 
@@ -1917,7 +2001,20 @@ class VerifyingSolver:
         if key in self._cache:
             self._counts["cache_hits"] += 1
             code, raw = self._cache[key]
-            return Answer(code=code, raw_response=raw, verified=True)
+            # Said and archived, like the disk hit below: a submission served
+            # without being re-run is the one whose provenance a wrong result
+            # asks about, and it used to leave no line and no `solve` record.
+            print(
+                f"[verify] {task.language} entrypoint={task.entrypoint} "
+                f"cache=hit(memory) {key[:12]} (it reproduced the public "
+                f"examples earlier in this process)"
+                + (f" id={_ident(task)}" if _ident(task) else "")
+            )
+            return Answer(
+                code=code, raw_response=raw, verified=True,
+                diagnostics={"cache": "memory-hit", "cache_key": key,
+                             "exit": "cache"},
+            )
         # ...and the same question asked of the disk, which outlives the
         # process. Before any conversation is opened, because the whole value
         # of a hit is that it costs a second and no quota.
@@ -1934,7 +2031,20 @@ class VerifyingSolver:
         # request; serving a cached answer past them would skip the better
         # evidence for the worse. Live traffic ships none, so this costs
         # nothing there and keeps a replay honest.
-        stored = None if task.public_examples else solution_cache.load(key)
+        # Off the loop: a read of up to 2 MiB and a JSON parse, on the loop
+        # every other in-flight solve's deadline timer runs on.
+        stored = (
+            None if task.public_examples
+            else await asyncio.to_thread(solution_cache.load, key)
+        )
+        if stored is not None and (
+            stored.get("probe") != "passed" or not stored.get("bar")
+        ):
+            # Not what this code writes. The line below claims the answer
+            # passed its own cases and was timed at scale, so a file that does
+            # not carry both -- hand-edited, or from another build -- is a
+            # miss rather than a claim.
+            stored = None
         if stored is not None:
             code = str(stored.get("code") or "")
             defect = (
@@ -1963,6 +2073,10 @@ class VerifyingSolver:
                     diagnostics={
                         "cache": "hit",
                         "cache_key": key,
+                        # The same shape a solved answer archives, so a reader
+                        # joining on `provider` or `exit` finds the hits too.
+                        "provider": (stored.get("providers") or [None])[0],
+                        "exit": "cache",
                         "saved_at": stored.get("saved_at"),
                         "bar": stored.get("bar") or [],
                         "probe": stored.get("probe") or "",
@@ -2147,17 +2261,31 @@ class VerifyingSolver:
         # actually establish about itself: it passed every case its readers
         # wrote, nothing was left contested, and it was timed at the
         # statement's own scale. See `solution_cache.worth_keeping`.
+        # ...and not while grading is DEGRADED. Under the subprocess fallback
+        # a `passed` probe says the program finished in time at 1 GiB, which
+        # is not what the validator's 256 MiB will say; kept, it would be
+        # served on every duplicate with no re-run ever.
         if best.code.strip() and solution_cache.worth_keeping(
             self_verified=best.self_verified,
             failures=bool(best.failures),
             contested=shipped.contested,
             probe=shipped.probe,
-        ):
-            solution_cache.save(key, solution_cache.record(
+        ) and not self._grader.degraded(task.language):
+            record = solution_cache.record(
                 code=best.code, raw=best.raw, task=task, bar=best.self_bar,
                 probe=shipped.probe,
-                providers=[p for p in (won_with, *shipped.repair) if p],
-            ))
+                # Every model that touched what a hit is served on, in the
+                # order they touched it, once each: the bars it cleared, the
+                # program's author, the models the repair went through.
+                providers=list(dict.fromkeys(
+                    p for p in (
+                        shipped.bar_provider, shipped.bar2_provider,
+                        won_with, *shipped.repair,
+                    )
+                    if p and p != "late"
+                )),
+            )
+            await asyncio.to_thread(solution_cache.save, key, record)
         elapsed = time.monotonic() - started
         print(
             f"[verify] {task.language} entrypoint={task.entrypoint} "
@@ -2168,6 +2296,7 @@ class VerifyingSolver:
                 f"union={shipped.union[2]}({shipped.union[0]}+{shipped.union[1]}) "
                 if shipped.union else ""
             )
+            + (f"split={shipped.split} " if shipped.split else "")
             + f"examples={best.passed}/{best.total} "
             + (
                 f"self={best.self_passed}/{best.self_total} "
@@ -2227,6 +2356,7 @@ class VerifyingSolver:
                 "bar_provider": shipped.bar_provider,
                 "bar2_provider": shipped.bar2_provider,
                 "union": list(shipped.union) if shipped.union else None,
+                "split": shipped.split,
                 "bar": best.self_bar,
                 "self_passed": best.self_passed,
                 "self_total": best.self_total,
@@ -2250,7 +2380,9 @@ class VerifyingSolver:
             },
         )
 
-    async def _ask_for_cases(self, conversation, task, left: float, probe=None):
+    async def _ask_for_cases(
+        self, conversation, task, left: float, probe=None, independent: bool = False,
+    ):
         """Turn 1: the model's cases, before it has written the program.
 
         Returns the cases, or ``[]`` when the reply carried none usable, or
@@ -2273,6 +2405,10 @@ class VerifyingSolver:
         prompt = build_tests_prompt(
             task.language, task.statement, task.entrypoint, task.public_examples,
             want_probe=want_probe,
+            # Whether this conversation will be asked for the program. The
+            # bar's own conversation never is, and the prompt used to promise
+            # it would be.
+            independent=independent,
         )
         # The slice IS everything left, and everything left runs to the point
         # the answer stops being deliverable. Nothing is held back to extend to.
@@ -2364,7 +2500,7 @@ class VerifyingSolver:
         # in its turn rather than shipping on the strength of its predecessor's
         # verdict.
         probe: list = []
-        probed: dict[str, Optional[str]] = {}
+        probed: dict[str, _Probe] = {}
         # Correction rounds sent into the conversation now in hand. Reset when
         # the repair is carried elsewhere, so each conversation is judged on
         # what it did rather than on what the pass has spent.
@@ -2401,6 +2537,7 @@ class VerifyingSolver:
                 plan.contested = 0
                 plan.repair = []
                 plan.union = None
+                plan.split = 0
                 plan.bar_provider = None
                 plan.bar2_provider = None
             conversation = await self._open_within(
@@ -2520,8 +2657,8 @@ class VerifyingSolver:
                     # and the clock decides it.
                     #
                     # Whether anything ELSE happens is already decided, by the
-                    # clock, in `solve_task`: it will not open another pass with
-                    # less than `EMPTY_HANDED_FLOOR_S` left. That is the whole
+                    # clock, in `solve_task`: it will not open another pass
+                    # once the deadline is gone. That is the whole
                     # guarantee "a turn that ran the deadline out is never
                     # retried on another tab" rests on, and it holds only
                     # because turn 1 now reads against the real budget -- when
@@ -2561,7 +2698,7 @@ class VerifyingSolver:
                         # the task, and `BLIND_TAB_GRACE_S` bounds what finding
                         # that out costs.
                         plan.two_phase = False
-                    if left_after < EMPTY_HANDED_FLOOR_S:
+                    if left_after <= 0:
                         print(
                             f"[verify] the cases turn used the whole "
                             f"{budget:.0f}s budget; nothing left to ask anyone "
@@ -2644,8 +2781,23 @@ class VerifyingSolver:
             # Whether the prompt just sent WITHDREW the offer to correct a
             # case. A withdrawal the reply can ignore is not one.
             program_only = False
-            async def _resume_elsewhere(why: str, avoid: Optional[str] = None):
+            async def _resume_elsewhere(
+                why: str, avoid: Optional[str] = None, slow: Optional[str] = None,
+            ):
                 """Carry the repair to a FRESH conversation, or None.
+
+                `slow` is the size probe's sentence when the program in hand
+                is correct on every case and merely too slow at scale. That is
+                a fault worth carrying -- the validator fails every large
+                hidden test on it -- and it used to be refused here, because
+                the guard below asked for failures or a defect and a slow
+                program has neither. So the too_slow handoff was dead code:
+                the loop printed "nobody else to ask" with two models on the
+                rotation never asked, and shipped a program known to time out.
+
+                Declines say why. Every caller used to word its exit line from
+                its own guess -- "every model has had it", "nobody else to
+                ask" -- and each guess was wrong on some path.
 
                 The one move available when a conversation will not produce a
                 new answer -- because it is unreadable, or because it just
@@ -2675,12 +2827,25 @@ class VerifyingSolver:
                 nonlocal rotated, program_only, program_unchanged, reported_failed
                 nonlocal rounds_here
                 left_now = budget - (time.monotonic() - started)
-                if (
-                    best is None
-                    or not best.code.strip()
-                    or not (best.failures or best.defect)
-                    or left_now < RESUME_FLOOR_S
-                ):
+                if best is None or not best.code.strip():
+                    print("[verify] the repair is not carried on: no program "
+                          "in hand to carry")
+                    return None
+                if not (best.failures or best.defect or slow):
+                    print("[verify] the repair is not carried on: the program "
+                          "in hand has no fault to report")
+                    return None
+                if left_now < MIN_SLICE_S:
+                    # The only clock. There was a 40s floor here on the theory
+                    # that a fresh conversation needs that long to be worth
+                    # opening; it stopped the rotation with time on the
+                    # validator's clock, which is the one thing the rotation
+                    # must not do. A handoff opened with seconds left is cut by
+                    # the deadline like any other read; one that could not be
+                    # handed the minimum slice without padding past the
+                    # deadline is not opened.
+                    print("[verify] the repair is not carried on: the deadline "
+                          "is gone")
                     return None
                 # ONCE per model, not once per pass. The old rule stopped after
                 # a single handoff on the theory that a second tab failing is a
@@ -2709,9 +2874,24 @@ class VerifyingSolver:
                         rotated.append(leaving)
                     nxt = _next_profile(rotation, rotated, provider)
                     if nxt is None:
-                        # Every model has had it. The answer in hand is the
-                        # best this pass is going to hold.
-                        return None
+                        # Every model has had it once. That is a lap, not the
+                        # end: the correction runs until the program passes or
+                        # the deadline stops it (operator's rule), and a model
+                        # is stochastic -- its second look at a program another
+                        # model has since rewritten is a real chance. Stopping
+                        # here was a round cap of 3 x ROTATE_AFTER_ROUNDS that
+                        # shipped wrong programs with minutes left.
+                        rotated.clear()
+                        if leaving is not None:
+                            rotated.append(leaving)
+                        nxt = _next_profile(rotation, rotated, provider)
+                        if nxt is None:
+                            print("[verify] the repair is not carried on: the "
+                                  "rotation has no model but the one answering")
+                            return None
+                        print(f"[verify] every model on the rotation has had "
+                              f"the repair once; going round again with "
+                              f"{left_now:.0f}s left")
                     rotated.append(nxt)
                 else:
                     # No models to rotate through -- a browser fleet, where
@@ -2720,6 +2900,9 @@ class VerifyingSolver:
                     # still holds: a second tab that also fails is a fleet
                     # problem rather than something to keep paying for.
                     if rotated:
+                        print("[verify] the repair is not carried on: it has "
+                              "already been carried once and there is no "
+                              "other model to carry it to")
                         return None
                     nxt = None
                     rotated.append(None)
@@ -2786,43 +2969,115 @@ class VerifyingSolver:
                         # one thing the round turns on, and a false premise
                         # gets argued with rather than acted on.
                         foreign=elsewhere,
-                        case_confirmed=any(
+                        # ALL of them, not any: the prompt's confirmation
+                        # withdraws the case offer for every failure it lists,
+                        # so it may only be made when every listed case was
+                        # confirmed. One confirmed and one merely failing used
+                        # to lock the model out of correcting the second.
+                        case_confirmed=bool(best.failed_cases) and all(
                             adjudicated.get(_case_key(case), ("", None))[0]
                             == "case"
                             for case in best.failed_cases
                         ),
+                        too_slow=slow,
                     ),
                 )
 
+            bar2_joined = False
+
+            async def join_bar2() -> bool:
+                """The second bar, joined to the first IF it has landed.
+
+                Never waits, and is asked often: when the first bar is
+                collected, before every grade, and once more before a program
+                is called converged. That is what makes it incremental. The
+                second bar is an addition to a bar that already exists, so
+                nothing is ever held for it -- but it was once CANCELLED the
+                first time it was not ready, at the first join, and that cut
+                the stage on the program turn's clock rather than the
+                deadline: whenever sonnet's cases turn ran longer than opus's
+                program turn, the one mechanism aimed at the solves where bar
+                and program agree was thrown away with most of the budget
+                left. Now a bar that lands during round three is graded
+                against from round three.
+
+                True when cases were added, so a caller about to ship can
+                re-grade against them first.
+                """
+                nonlocal agreed, split_keys, bar2_task, bar2, bar2_joined
+                if bar2_task is None or not bar2_task.done():
+                    return False
+                extra = await self._collect_bar(
+                    bar2_task, bar2, phases, budget, started, bar2_started,
+                    label="1 bar2", who="the second bar", quiet=True,
+                )
+                bar2_task, bar2 = None, []
+                bar2_joined = True
+                if not extra:
+                    return False
+                before = len(agreed)
+                agreed, split_keys = _union_bars(agreed, extra, task.language)
+                if plan is not None:
+                    plan.union = (before, len(extra), len(agreed))
+                    plan.split = len(split_keys)
+                print(
+                    f"[verify] the two bars union to {len(agreed)} case(s) "
+                    f"({before} + {len(extra)}, {len(split_keys)} of them the "
+                    f"same call read two ways)"
+                )
+                return len(agreed) > before
+
+            def _too_slow_report(slow: str) -> str:
+                """The too_slow repair prompt, with a repeat named as one.
+
+                Through the same `reports_sent` bookkeeping as every other
+                report. With the verdict cached per program, a model that
+                re-sends the same slow program used to receive the identical
+                prompt word for word every round -- the exact pattern the
+                stalled mechanism exists to break.
+                """
+                report = build_repair_prompt(
+                    [], task.language, task.entrypoint, too_slow=slow
+                )
+                stalled = reports_sent.get(report, 0)
+                reports_sent[report] = stalled + 1
+                if stalled:
+                    print(
+                        f"[verify] this same too_slow report has now gone out "
+                        f"{stalled + 1} times; naming the repetition in it"
+                    )
+                    report = build_repair_prompt(
+                        [], task.language, task.entrypoint, too_slow=slow,
+                        stalled=stalled,
+                    )
+                return report
+
             attempt = 0
-            # A backend may know its own round trip is longer than the floor
-            # here: the CLI starts a process and re-reads the session before
-            # the model says a word. Measured, a correction round started with
-            # 15s on the CLI backend produced nothing.
-            round_trip_floor = max(
-                ROUND_TRIP_FLOOR_S,
-                float(getattr(conversation, "round_trip_floor_s", 0.0) or 0.0),
-            )
             while True:
                 attempt += 1
                 left = budget - (time.monotonic() - started)
-                if attempt > 1 and left < round_trip_floor:
-                    # Not enough left to be worth another ROUND TRIP -- which is
-                    # what this has always been about, and it never should have
-                    # gated the first one. It did: below a 32-second deadline
-                    # the budget lands under twelve seconds and the model was
-                    # never asked at all, so the miner returned an empty answer
-                    # without a single line of log to say why. The first attempt
-                    # always runs, however little there is, exactly as the first
-                    # pass does in `solve_task`.
+                if attempt > 1 and left < MIN_SLICE_S:
+                    # The deadline, and only the deadline. This used to be a
+                    # round-trip floor (12s; 20s on the CLI backend) on the
+                    # theory that a round started under it cannot finish --
+                    # and it stopped the loop with a wrong program in hand and
+                    # time on the validator's clock, which is the one thing the
+                    # correction must not do (operator's rule). A round started
+                    # with seconds left is cut by the same deadline as every
+                    # other read, and `_supersedes` keeps a fragment from
+                    # displacing the answer in hand. `MIN_SLICE_S` is not a
+                    # budget: it is the least slice `send` can be handed, and
+                    # a round that would have to be padded past the deadline
+                    # to be sent at all is one the deadline has ended. The
+                    # first attempt always runs, however little there is,
+                    # exactly as the first pass does in `solve_task`.
                     #
                     # And this branch itself used to be the silent one. The
                     # deadline is the ordinary way a correction loop ends -- it
                     # runs until the answer passes or the clock stops it -- so
                     # it is the last thing that should happen without a word.
                     print(
-                        f"[verify] {max(0.0, left):.0f}s left, not enough for "
-                        f"another correction round; submitting the last version"
+                        f"[verify] the deadline is gone; submitting the last version"
                         + (
                             " unverified"
                             if best is None or not best.verified
@@ -2917,54 +3172,13 @@ class VerifyingSolver:
                         bar_task, bar, phases, budget, started, bar_started
                     )
                     bar_task, bar = None, []
-                    if bar2_task is not None:
-                        # The second reader, joined to the first -- but only if
-                        # it has ALREADY finished. It is not waited for, and
-                        # that is not a budget, it is what the second bar is:
-                        # an addition to a bar that already exists.
-                        #
-                        # Waiting was the mistake. `_collect_bar` bounds itself
-                        # by everything left of the solve, which is right for
-                        # the first bar -- without it there is nothing to grade
-                        # at all -- and wrong for this one. Bar1 has landed by
-                        # the time this runs, so a hung second model would hold
-                        # the whole remaining deadline and the answer would
-                        # ship UNGRADED, having had a perfectly good bar in
-                        # hand the entire time. Both bars were started
-                        # together and have had the same wall-clock, so one
-                        # that is not done when the other is has already spent
-                        # longer than the program turn took.
-                        if bar2_task.done():
-                            extra = await self._collect_bar(
-                                bar2_task, bar2, phases, budget, started,
-                                bar2_started, label="1 bar2",
-                                who="the second bar", quiet=True,
-                            )
-                        else:
-                            extra = []
-                            bar2_task.cancel()
-                            print(
-                                "[verify] the second bar was still being "
-                                "written when the program was graded; the "
-                                "first bar stands on its own"
-                            )
-                            if plan is not None:
-                                plan.bar2_provider = "late"
-                        bar2_task, bar2 = None, []
-                        if extra:
-                            before = len(agreed)
-                            agreed, split_keys = _union_bars(
-                                agreed, extra, task.language
-                            )
-                            if plan is not None:
-                                plan.union = (before, len(extra), len(agreed))
-                            print(
-                                f"[verify] the two bars union to "
-                                f"{len(agreed)} case(s) "
-                                f"({before} + {len(extra)}, "
-                                f"{len(split_keys)} of them the same call "
-                                f"read two ways)"
-                            )
+                    # The second reader, joined to the first if it has ALREADY
+                    # finished -- and asked again before every grade if it has
+                    # not. It is never waited for: bar1 has landed by now, so a
+                    # hung second model would otherwise hold the whole
+                    # remaining deadline and the answer would ship UNGRADED
+                    # with a perfectly good bar in hand.
+                    await join_bar2()
                     if not agreed and not bar_retried:
                         # A bar that came back with nothing leaves the solve
                         # with NOTHING TO GRADE: `self_total` is 0, there are
@@ -2986,7 +3200,7 @@ class VerifyingSolver:
                         if (
                             self._self_tests
                             and (plan is None or plan.two_phase)
-                            and left_now > round_trip_floor
+                            and left_now >= MIN_SLICE_S
                         ):
                             # The program's turn is already over, and the
                             # retry is about to run AFTER it. Mark the turn
@@ -3206,6 +3420,9 @@ class VerifyingSolver:
                         # is re-graded, not assumed to pass.
                         agreed, revised = revised, None
                         graded = last_program_reply or reply
+                # A second bar that landed during this round's turn is graded
+                # against from this round on.
+                await join_bar2()
                 graded_at = time.monotonic()
                 candidate = await self._graded(
                     graded, task, budget - (time.monotonic() - started), agreed,
@@ -3291,17 +3508,49 @@ class VerifyingSolver:
                     # `note_adjudicated` would count it twice -- the archived
                     # breakdown of how disputes were settled is the whole
                     # reason the counters exist.
+                    # ...and only the ones the program ANSWERED. A case the
+                    # program crashed or timed out on is not a disagreement
+                    # between two readings, it is a program that produced no
+                    # value, and it is wrong under both. Put to the judge it
+                    # could be ruled `contested` and dropped, shipping a
+                    # program that crashes on the input.
                     fresh = [
                         (case, actual)
                         for case, actual in zip(
                             candidate.failed_cases, candidate.failed_actuals
                         )
-                        if _case_key(case) not in adjudicated
+                        if _case_key(case) not in adjudicated and actual.ok
                     ]
-                    verdicts = await self._adjudicate(
-                        task, [c for c, _ in fresh], [a for _, a in fresh],
-                        provider, budget, started, split_keys,
-                    ) if fresh else {}
+                    # A call the two BARS split on already has its second
+                    # reading, and the judge -- pinned to the second bar's
+                    # model -- would not be a third. The program's value
+                    # decides: agreeing with the second bar is two readings
+                    # against one, so the case was wrong; agreeing with
+                    # neither is the statement being ambiguous there, and the
+                    # case is dropped. This routing was designed and then
+                    # never wired in: `split_keys` only kept the case away
+                    # from the judge, and the case fell to the ordinary repair
+                    # prompt -- the program's own author, with the case-edit
+                    # offer, deciding a call two other readers disagreed on.
+                    verdicts: dict[tuple, tuple[str, Any]] = {}
+                    for case, actual in fresh:
+                        key = _case_key(case)
+                        if key in split_keys:
+                            other = split_keys[key]
+                            verdicts[key] = (
+                                ("program", other)
+                                if _same_expected(actual.value, other, task.language)
+                                else ("contested", other)
+                            )
+                    unsettled = [
+                        (c, a) for c, a in fresh if _case_key(c) not in verdicts
+                    ]
+                    if unsettled:
+                        verdicts.update(await self._adjudicate(
+                            task, [c for c, _ in unsettled],
+                            [a for _, a in unsettled],
+                            provider, budget, started, split_keys,
+                        ))
                     adjudicated.update(verdicts)
                     corrections = [
                         dict(case, expected=verdicts[_case_key(case)][1])
@@ -3411,8 +3660,37 @@ class VerifyingSolver:
                     candidate, best,
                     getattr(conversation, "still_writing", False),
                 ):
+                    if plan is not None and (
+                        best is None
+                        or best.code.strip() != candidate.code.strip()
+                    ):
+                        # A different program is now the one in hand, and the
+                        # probe verdict describes the one that shipped: the
+                        # predecessor's `too_slow` must not be reported for a
+                        # program that was never timed. What is known about
+                        # THIS program, if it was timed before, is in `probed`.
+                        known = probed.get(candidate.code.strip())
+                        plan.note_probe(known.state if known is not None else "")
                     best, best_provider = candidate, provider
-                if candidate.verified and not candidate.failures:
+                # A second bar that landed since the grade above: joined, and
+                # the program re-graded against the union before anything is
+                # called converged. `graded` is the reply the program came
+                # from; `_graded` is off the loop, as every grade is.
+                if (
+                    not candidate.defect and not candidate.failures
+                    and best is candidate and await join_bar2()
+                ):
+                    candidate = await self._graded(
+                        graded, task, budget - (time.monotonic() - started),
+                        agreed, previous=last_code or "",
+                    )
+                    judged[candidate.code.strip()] = candidate
+                    best, best_provider = candidate, provider
+                # `best is candidate`: a fragment the model was still writing
+                # that happens to pass is not the answer -- `_supersedes` just
+                # refused it -- and probing it, then recording `exit=verified`
+                # for it, described a program that did not ship.
+                if candidate.verified and not candidate.failures and best is candidate:
                     slow, probe_state = await self._probe_now(
                         candidate, probe, probed, task, budget, started
                     )
@@ -3441,24 +3719,23 @@ class VerifyingSolver:
                                 f"{rounds_here} round(s) with "
                                 f"{provider or 'this model'} did not make it "
                                 f"fast enough",
-                                avoid=provider,
+                                avoid=provider, slow=slow,
                             )
                             if carried is not None:
                                 conversation, provider, prompt = carried
                                 continue
-                            # Nowhere left to take it. The answer in hand is
-                            # correct and slow, which still beats nothing.
+                            # Nowhere left to take it -- `_resume_elsewhere`
+                            # said why. The answer in hand is correct and slow,
+                            # which still beats nothing.
                             print(
                                 f"[verify] the program is still too slow after "
-                                f"{rounds_here} round(s) and there is nobody "
-                                f"else to ask; submitting it as it stands"
+                                f"{rounds_here} round(s) and the repair cannot "
+                                f"be carried on; submitting it as it stands"
                             )
                             if plan is not None:
                                 plan.note_exit("exhausted")
                             break
-                        prompt = build_repair_prompt(
-                            [], task.language, task.entrypoint, too_slow=slow
-                        )
+                        prompt = _too_slow_report(slow)
                         continue
                     if plan is not None:
                         plan.note_exit("verified")
@@ -3558,10 +3835,18 @@ class VerifyingSolver:
                     # Change something rather than re-ask -- a FRESH
                     # conversation is a real change where a re-ask is not, and
                     # `_resume_elsewhere` is that move.
+                    #
+                    # With what is KNOWN about this program: a repeat of a
+                    # program the probe already called too slow has a fault to
+                    # carry even though its failure list is empty, and without
+                    # it the handoff declined ("no fault to report") and the
+                    # stale-tab check below ended the pass.
+                    known = probed.get(candidate.code.strip())
                     carried = await _resume_elsewhere(
                         f"{provider or 'this model'} sent back the same program "
                         f"and the same failures after being shown them",
                         avoid=provider,
+                        slow=known.sentence if known is not None else None,
                     )
                     if carried is not None:
                         conversation, provider, prompt = carried
@@ -3596,7 +3881,7 @@ class VerifyingSolver:
                         if plan is not None:
                             plan.note_exit("stalled")
                         break
-                if not candidate.defect and not candidate.failures:
+                if not candidate.defect and not candidate.failures and best is candidate:
                     # Nothing the program's cases can say against it -- and the
                     # cases are all small, by a rule this file cannot relax: an
                     # `expected` is derived by hand, so no case on the bar is
@@ -3631,24 +3916,23 @@ class VerifyingSolver:
                                 f"{rounds_here} round(s) with "
                                 f"{provider or 'this model'} did not make it "
                                 f"fast enough",
-                                avoid=provider,
+                                avoid=provider, slow=slow,
                             )
                             if carried is not None:
                                 conversation, provider, prompt = carried
                                 continue
-                            # Nowhere left to take it. The answer in hand is
-                            # correct and slow, which still beats nothing.
+                            # Nowhere left to take it -- `_resume_elsewhere`
+                            # said why. The answer in hand is correct and slow,
+                            # which still beats nothing.
                             print(
                                 f"[verify] the program is still too slow after "
-                                f"{rounds_here} round(s) and there is nobody "
-                                f"else to ask; submitting it as it stands"
+                                f"{rounds_here} round(s) and the repair cannot "
+                                f"be carried on; submitting it as it stands"
                             )
                             if plan is not None:
                                 plan.note_exit("exhausted")
                             break
-                        prompt = build_repair_prompt(
-                            [], task.language, task.entrypoint, too_slow=slow
-                        )
+                        prompt = _too_slow_report(slow)
                         continue
                     # Reported as `converged`, and the summary line says beside
                     # it how many cases DISAGREED to begin with -- because
@@ -3685,18 +3969,13 @@ class VerifyingSolver:
                         # the model being fled.
                         conversation, provider, prompt = carried
                         continue
-                    # Already carried once, or nowhere to carry it to. A second
-                    # model that has not moved it in `HANDOFF_ROUNDS` is not a
-                    # model that moves it in five, and the answer in hand is
+                    # Nowhere to carry it to -- `_resume_elsewhere` said why,
+                    # and this line no longer guesses. The answer in hand is
                     # the best this pass is going to hold.
                     print(
                         f"[verify] {rounds_here} correction round(s) here and "
-                        + (
-                            "every model on the rotation has had it"
-                            if rotated else
-                            "no other model to carry it to"
-                        )
-                        + "; submitting the best version in hand"
+                        f"the repair cannot be carried on; submitting the best "
+                        f"version in hand"
                     )
                     if plan is not None:
                         plan.note_exit("exhausted")
@@ -3706,7 +3985,12 @@ class VerifyingSolver:
                 # establishes, so the case stands and the offer to rewrite it
                 # is withdrawn for THIS round -- by evidence rather than by the
                 # exhaustion the two conditions below describe.
-                case_confirmed = any(
+                # ALL of the failing cases, not any of them: the confirmation
+                # withdraws the case offer for every failure the prompt lists,
+                # and one confirmed case beside one that was merely failing
+                # used to lock the model out of correcting the second -- which
+                # may be the very call the two bars split on.
+                case_confirmed = bool(candidate.failed_cases) and all(
                     adjudicated.get(_case_key(case), ("", None))[0] == "case"
                     for case in candidate.failed_cases
                 )
@@ -3819,6 +4103,23 @@ class VerifyingSolver:
                 finally:
                     if not pending.done():
                         pending.cancel()
+            # A bar task that finished with an exception before the pass
+            # ended -- its open raised, its send raised -- is done, so it was
+            # neither cancelled nor awaited above, and asyncio logs "Task
+            # exception was never retrieved" at collection, reading as a crash
+            # in the miner log. Retrieved here, and that is all.
+            for finished in (bar_task, bar2_task):
+                if finished is not None and finished.done() and not finished.cancelled():
+                    finished.exception()
+            # The second bar never landed while this pass ran. Its conversation
+            # was closed above like the others; what remains is to say so on
+            # the summary line, where `bar2=late` is the instrument for
+            # deciding whether the second reader is fast enough to be worth
+            # its turn.
+            if bar2_task is not None and not bar2_joined and plan is not None:
+                plan.bar2_provider = "late"
+                print("[verify] the second bar never landed before the pass "
+                      "ended; the first bar stood on its own")
         return best, best_provider
 
     async def _write_the_bar(
@@ -3857,13 +4158,13 @@ class VerifyingSolver:
         # comparison the split exists to let an operator make.
         began = time.monotonic()
         cases = await self._ask_for_cases(
-            conversation, task, max(1.0, left), probe=probe
+            conversation, task, max(1.0, left), probe=probe, independent=True,
         )
         # Read AFTER the turn, not at open: the ladder may hop the
         # conversation to another model inside the turn, and `bar=` on the
         # summary line is the instrument for deciding which model should
         # write the bar -- bound at open it credited the one that refused.
-        if plan is not None:
+        if plan is not None and getattr(plan, provider_slot, None) != "late":
             setattr(plan, provider_slot, getattr(conversation, "provider", None))
         return cases, time.monotonic() - began
 
@@ -4048,7 +4349,8 @@ class VerifyingSolver:
             reply = await self._send_within(
                 conversation,
                 build_expected_prompt(
-                    task.language, task.statement, task.entrypoint, asked
+                    task.language, task.statement, task.entrypoint, asked,
+                    examples=task.public_examples,
                 ),
                 max(1.0, budget - (time.monotonic() - started)),
             )
@@ -4077,6 +4379,13 @@ class VerifyingSolver:
                 # ambiguity, but a weak one, so it decides nothing.
                 continue
             judged = said[index]
+            if task.language == "rust" and isinstance(judged, (int, float, bool)):
+                # A Rust case's `expected` is stdout, a string, and the grader
+                # compares strings; a reader that answered a numeric problem
+                # with the number -- `6` for `"6"` -- matched neither side
+                # and had the case DROPPED as contested. JSON's spelling of
+                # the scalar is what the program would have printed.
+                judged = json.dumps(judged)
             # The GRADER's comparison, both times. Two earlier passes at this
             # measurement compared with `json.dumps` and reported agreement of
             # 0% and 48%, every point of the difference whitespace: for Rust a
@@ -4103,20 +4412,12 @@ class VerifyingSolver:
     ) -> tuple[Optional[str], str]:
         """The size probe's verdict at a success exit, and what it amounts to.
 
-        Returns `(sentence, state)`. The sentence is None unless the program
-        must be repaired; the state is one of `passed`, `too_slow`, `skipped`
-        or `none`, and it exists because four different Nones used to mean
-        four different things to a caller that could only see one. "Finished
-        inside five seconds at the statement's own scale" is evidence and is
-        worth keeping an answer over; "there was no time to ask" and "no large
-        input could be built" are not, and recording either as `passed` put a
-        never-timed answer into the permanent cache.
-
-
-        None means SHIP -- and it means that for every reason: the probe is
-        off, no generator came back, no time is left, or the program finished
-        in time. Only a program that actually ran out of clock on a large
-        valid input returns a sentence, and only then does the loop keep going.
+        Returns `(sentence, state)` -- a `_Probe`, unpacked. The sentence is
+        None unless the program must be repaired; the state says what the
+        probe actually learned, and `solution_cache.worth_keeping` reads it:
+        "finished inside five seconds at the statement's own scale" is
+        evidence worth keeping an answer over, and "there was no time to ask"
+        or "no large input could be built" are not.
 
         `probed` is keyed by SOURCE, not a flag, and that is the whole fix for
         a hole this had: `probed = True` used to be set the moment a too_slow
@@ -4124,15 +4425,15 @@ class VerifyingSolver:
         existed to produce -- shipped having never been timed. A flag cannot
         tell "already asked about this program" from "already asked about a
         program that no longer exists", and only the first is a reason not to
-        ask again.
+        ask again. Only VERDICTS are remembered: a probe that ran out of clock
+        or could build no input knows nothing about the program, and a later
+        call with a generator the first bar did not have should be free to
+        find out.
 
-        Keyed this way it is also the answer to the other half. A model that
-        replies to a too_slow report with the SAME program reaches `duplicate`
-        below, whose `_resume_elsewhere` wants failures or a defect to carry
-        and a merely-slow candidate has neither; the round falls through to
-        here again. Re-running the probe would spend ten seconds relearning a
-        verdict already in hand, every round, until the deadline. The cache
-        re-issues it for nothing.
+        Every generator in hand is tried, in order, until one produces a
+        verdict. Both bars are asked for one, and the second exists precisely
+        so that a first generator that returns the wrong shape at every scale
+        is not the end of the probe.
 
         There is no budget floor. There was one, and it was a sub-budget
         pretending to be prudence: it skipped the probe whenever less than
@@ -4147,39 +4448,34 @@ class VerifyingSolver:
         code = candidate.code.strip()
         if not code:
             return None, "none"
-        if code in probed:
-            verdict = probed[code]
-            return verdict, ("too_slow" if verdict else "passed")
-        left = budget - (time.monotonic() - started)
-        if left <= 0:
-            # Never run, so nothing is known. Reported apart from `passed`
-            # because the difference decides whether this answer may be kept
-            # and handed out again without being run: an answer that was
-            # timed at scale is evidence, and one the clock ran out on is a
-            # claim. `solution_cache.worth_keeping` is the reader that cares.
-            return None, "skipped"
-        # Cleared HERE, by the caller, so it always describes the call about
-        # to be made. Cleared inside `_timed_out_at_scale` it was a latch on
-        # whatever ran last, and any caller that replaces that method -- a
-        # test, a subclass -- would read the previous run's answer.
-        self._probe_ran = False
-        verdict = await self._timed_out_at_scale(code, probe[0], task, left)
-        probed[code] = verdict
-        if verdict:
-            return verdict, "too_slow"
-        # `_timed_out_at_scale` also returns None when no valid large input
-        # could be generated at all, which is not a program that finished.
-        return None, ("passed" if self._probe_ran else "none")
+        known = probed.get(code)
+        if known is not None:
+            return known.sentence, known.state
+        result = _Probe(None, "none")
+        for generator in probe:
+            left = budget - (time.monotonic() - started)
+            if left <= 0:
+                # Never run, so nothing is known -- and reported apart from
+                # `passed` because the difference decides whether this answer
+                # may be kept and handed out again without being run.
+                result = _Probe(None, "skipped")
+                break
+            result = await self._timed_out_at_scale(code, generator, task, left)
+            if result.state != "none":
+                break
+        if result.state in ("passed", "too_slow", "oom", "crashed"):
+            probed[code] = result
+        return result.sentence, result.state
 
     async def _timed_out_at_scale(
         self, code: str, generator: str, task, left: float
-    ) -> Optional[str]:
+    ) -> _Probe:
         """One large valid input, run under the validator's own per-test limit.
 
-        Returns the sentence the repair prompt reports, or None when the
-        program finished, when no input could be had, or when there was no
-        time to ask. NEVER raises into the solve: every way this can fail ends
-        with the answer shipping exactly as it would have without it.
+        Returns a `_Probe`: the sentence a repair prompt reports when the
+        program must change, and the state that says what was learned. NEVER
+        raises into the solve: every way this can fail ends with the answer
+        shipping exactly as it would have without it.
 
         This is the one check here that needs no oracle. Every other verdict
         in this file compares what the program produced against what something
@@ -4190,97 +4486,177 @@ class VerifyingSolver:
         `per_test_timeout_s`, at sizes the bar structurally cannot reach: every
         case on the bar carries an `expected` derived by hand, and nobody
         derives one by hand for two hundred thousand elements.
+
+        Bounded by `left` and by nothing else. Each run is offered what is
+        left of the solve, and is ALSO waited for no longer than that: the
+        Docker executor cannot cut a container short, and for Rust one run
+        includes a release build that takes what it takes. A run the clock
+        cuts is `skipped`, not a verdict -- a timeout inside a window shorter
+        than the per-test limit says nothing about whether the program would
+        have finished in the full one.
         """
         if not code.strip() or not generator.strip():
-            return None
+            return _Probe(None, "none")
         began = time.monotonic()
 
         def remaining() -> float:
             return left - (time.monotonic() - began)
 
-        for scale in PROBE_SCALES:
-            # Two runs per rung, each bounded by the per-case limit, and the
-            # rung is not started unless both still fit. A probe cut half way
-            # through reports nothing and has spent the round it was meant to
-            # leave room for.
-            if remaining() < VERIFY_TIMEOUT_S * 2:
-                break
-            made = await asyncio.to_thread(
-                self._grader.outputs, generator, "python", "generate",
-                [{"args": [424242, scale]}],
-                max(1.0, min(remaining(), VERIFY_TIMEOUT_S * 2)),
-            )
-            if not made or not made[0].ok:
-                # Nearly always the transport, not the generator: a return
-                # value over `PROBE_MAX_BYTES` comes back as a crash. Try a
-                # smaller budget rather than conclude anything.
-                continue
-            case = made[0].value
-            if not isinstance(case, dict) or not isinstance(case.get("args"), list):
-                continue
-            size = len(json.dumps(case, default=str))
-            if size > PROBE_MAX_BYTES:
-                continue
-            ran = await asyncio.to_thread(
-                self._grader.outputs, code, task.language, task.entrypoint,
-                [case], max(1.0, min(remaining(), VERIFY_TIMEOUT_S * 2)),
-            )
-            if not ran:
+        async def run(*args) -> Optional[list]:
+            """`_Grader.outputs` off the loop, held to the clock, never raising.
+
+            None when the clock cut it or the executor could not be had; the
+            caller decides which state that is. A thread cannot be cancelled,
+            so a cut run finishes on its own in the background -- bounded by
+            the executor's own timeout -- with nothing waiting on it.
+            """
+            allowed = remaining()
+            if allowed <= 0:
                 return None
-            if ran[0].timed_out:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(self._grader.outputs, *args),
+                    timeout=allowed,
+                )
+            except asyncio.TimeoutError:
+                return None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - no executor is no verdict
+                print(f"[verify] the size probe could not run "
+                      f"({type(exc).__name__}: {exc}); the program is graded "
+                      f"on the bar's own cases alone")
+                raise _NoExecutor() from exc
+
+        try:
+            for scale in PROBE_SCALES:
+                if remaining() <= 0:
+                    print("[verify] the size probe: out of time before a large "
+                          "input could be built")
+                    return _Probe(None, "skipped")
+                made = await run(
+                    generator, "python", "generate",
+                    [{"args": [424242, scale]}],
+                    max(1.0, min(remaining(), VERIFY_TIMEOUT_S * 2)),
+                )
+                if made is None:
+                    print("[verify] the size probe: out of time while building "
+                          "a large input")
+                    return _Probe(None, "skipped")
+                if not made or not made[0].ok:
+                    # Nearly always the transport, not the generator: a return
+                    # value over `PROBE_MAX_BYTES` comes back as a crash. Try a
+                    # smaller budget rather than conclude anything.
+                    continue
+                case = made[0].value
+                if not isinstance(case, dict) or not isinstance(case.get("args"), list):
+                    continue
+                size = len(json.dumps(case, default=str))
+                if size > PROBE_MAX_BYTES:
+                    continue
+                # The budget the run is given. Twice the per-case limit when
+                # the solve can afford it, which is what makes `outputs` hand
+                # the one case the WHOLE limit: it sizes the per-case clock
+                # from what is left of the budget, and a case given less than
+                # the executor's own per-test timeout is killed by the outer
+                # watchdog first -- "no verdict", the shape of a crash. So a
+                # run is a VERDICT only when the case had the full clock
+                # (`full`); cut shorter, a timeout or a crash-shaped death
+                # says nothing about the program and is `skipped`.
+                window = max(1.0, min(remaining(), VERIFY_TIMEOUT_S * 2))
+                full = window >= VERIFY_TIMEOUT_S + 1.0
+                ran = await run(
+                    code, task.language, task.entrypoint, [case], window,
+                )
+                if ran is None:
+                    print("[verify] the size probe: out of time while the "
+                          "program ran at scale; nothing is known about it")
+                    return _Probe(None, "skipped")
+                if not ran:
+                    return _Probe(None, "none")
+                if not full and not ran[0].ok:
+                    print(
+                        f"[verify] the size probe: the program had not "
+                        f"finished a {size:,}-byte input when the solve's "
+                        f"clock cut it short of the validator's "
+                        f"{VERIFY_TIMEOUT_S:.0f}s; that is not a verdict"
+                    )
+                    return _Probe(None, "skipped")
+                if ran[0].timed_out:
+                    print(
+                        f"[verify] the size probe: the program did not finish on a "
+                        f"valid {size:,}-byte input inside {VERIFY_TIMEOUT_S:.0f}s — "
+                        f"the bar's own cases are all small by construction, and the "
+                        f"validator runs the hidden tests at the statement's limits"
+                    )
+                    return _Probe(
+                        f"I ran the program on one valid input of {size:,} bytes, "
+                        f"generated to the limits this statement states, and it did "
+                        f"not finish within {VERIFY_TIMEOUT_S:.0f} seconds.",
+                        "too_slow",
+                    )
+                if not ran[0].ok and _looks_out_of_memory(ran[0]):
+                    # The other way a program dies at size, and the one the probe
+                    # could not see until grading moved into a container: the
+                    # validator caps a candidate at 256 MiB with swap off and runs
+                    # every hidden test in ONE of them, so a single OOM kill fails
+                    # the whole suite rather than the case that caused it. That
+                    # makes it worth a repair round on exactly the same footing as
+                    # a timeout.
+                    print(
+                        f"[verify] the size probe: the program ran out of memory on "
+                        f"a valid {size:,}-byte input — the validator grades in a "
+                        f"container with 256 MiB and no swap, and one OOM there "
+                        f"fails every hidden test"
+                    )
+                    return _Probe(
+                        f"I ran the program on one valid input of {size:,} bytes, "
+                        f"generated to the limits this statement states, and it ran "
+                        f"out of memory. The validator runs every hidden test in a "
+                        f"single container limited to 256 MiB with no swap, where "
+                        f"one such kill fails the entire suite.",
+                        "oom",
+                    )
+                if not ran[0].ok:
+                    # Any OTHER crash at scale is far likelier to be the
+                    # generator handing the program an input the statement
+                    # does not actually allow than a fault in the program, and
+                    # reporting it as one would spend a round making a correct
+                    # answer worse. So: no sentence. But it is not a program
+                    # that FINISHED either, and it used to be recorded as one
+                    # -- a recursive solution that blew the stack at n=50000
+                    # went into the permanent cache as timed-and-passed.
+                    head = (ran[0].error or "").strip().splitlines()
+                    print(
+                        f"[verify] the size probe: the program crashed on a "
+                        f"{size:,}-byte input ({head[-1] if head else 'no detail'}); "
+                        f"probably the generator's input rather than the program, "
+                        f"so no repair is asked -- and no pass is recorded"
+                    )
+                    return _Probe(None, "crashed")
+                # `runtime_ms` is the executor's, and both Docker executors
+                # stamp a result with the whole container's wall time -- for
+                # Rust that includes the release build. Reported as what it is.
+                timing = (
+                    f"{ran[0].runtime_ms / 1000.0:.1f}s of container time"
+                    if task.language == "rust"
+                    else f"{ran[0].runtime_ms / 1000.0:.1f}s of {VERIFY_TIMEOUT_S:.0f}s"
+                )
                 print(
-                    f"[verify] the size probe: the program did not finish on a "
-                    f"valid {size:,}-byte input inside {VERIFY_TIMEOUT_S:.0f}s — "
-                    f"the bar's own cases are all small by construction, and the "
-                    f"validator runs the hidden tests at the statement's limits"
+                    f"[verify] the size probe: finished a valid {size:,}-byte input "
+                    f"in {timing}"
                 )
-                return (
-                    f"I ran the program on one valid input of {size:,} bytes, "
-                    f"generated to the limits this statement states, and it did "
-                    f"not finish within {VERIFY_TIMEOUT_S:.0f} seconds."
-                )
-            if not ran[0].ok and _looks_out_of_memory(ran[0]):
-                # The other way a program dies at size, and the one the probe
-                # could not see until grading moved into a container: the
-                # validator caps a candidate at 256 MiB with swap off and runs
-                # every hidden test in ONE of them, so a single OOM kill fails
-                # the whole suite rather than the case that caused it. That
-                # makes it worth a repair round on exactly the same footing as
-                # a timeout.
-                #
-                # Narrow on purpose. Any OTHER crash at scale is far likelier
-                # to be the generator handing the program an input the
-                # statement does not actually allow, and reporting that as a
-                # fault in the program spends a round making a correct answer
-                # worse.
-                print(
-                    f"[verify] the size probe: the program ran out of memory on "
-                    f"a valid {size:,}-byte input — the validator grades in a "
-                    f"container with 256 MiB and no swap, and one OOM there "
-                    f"fails every hidden test"
-                )
-                return (
-                    f"I ran the program on one valid input of {size:,} bytes, "
-                    f"generated to the limits this statement states, and it ran "
-                    f"out of memory. The validator runs every hidden test in a "
-                    f"single container limited to 256 MiB with no swap, where "
-                    f"one such kill fails the entire suite."
-                )
-            print(
-                f"[verify] the size probe: finished a valid {size:,}-byte input "
-                f"in {ran[0].runtime_ms / 1000.0:.1f}s of {VERIFY_TIMEOUT_S:.0f}s"
-            )
-            # The one path where the program was actually timed at size and
-            # finished. Everything else that returns None here -- no generator,
-            # no valid input, no time -- knows nothing about the program, and
-            # `_probe_now` must not report it as evidence.
-            self._probe_ran = True
-            return None
+                # The one path where the program was actually timed at size and
+                # finished. Everything else that returns here knows nothing
+                # about the program, and says so in its state.
+                return _Probe(None, "passed")
+        except _NoExecutor:
+            return _Probe(None, "none")
         print(
             "[verify] the size probe: no large input could be had; the program "
             "is graded on the bar's own cases alone"
         )
-        return None
+        return _Probe(None, "none")
 
     async def _open_within(
         self, budget: float, started: float, avoid: Optional[str],
@@ -4475,8 +4851,8 @@ class VerifyingSolver:
         #
         # Fifteen was picked to cap a demand computed from the suite size --
         # twenty cases would otherwise refuse to grade below a hundred seconds
-        # -- and nothing reconciled it with `ROUND_TRIP_FLOOR_S` = 12, which is
-        # what the repair loop demands before it will send another prompt. The
+        # -- and nothing reconciled it with the 12s round-trip floor the repair
+        # loop then had (since removed: the deadline is the only clock). The
         # two constants left a band, 12 to 15 seconds, in which the loop would
         # happily spend a whole model round trip but refused a local check that
         # measures 0.78 seconds for twenty cases. A cases-only correction
@@ -4515,12 +4891,14 @@ class VerifyingSolver:
         # ignorance rather than on evidence. That is the exact regression this
         # reserve was reverted for once already, and the guard is what keeps it
         # from coming back through the other side.
+        # The whole of `left`. A round trip used to be held back from it,
+        # and that was a budget inside the deadline: with twenty cases and
+        # twenty seconds left it graded eight of them, called the rest unrun,
+        # and a right answer went out not `self_verified` for want of the
+        # twelve seconds it was saving for a round the loop then did not
+        # start. Whether another round fits is the loop's question, asked
+        # against the deadline; the grade's job is to grade.
         grading_budget = left
-        if (
-            left is not None
-            and left - ROUND_TRIP_FLOOR_S >= VERIFY_TIMEOUT_S
-        ):
-            grading_budget = left - ROUND_TRIP_FLOOR_S
         # When the reserve starts running out from, so a SECOND grading pass
         # spends what the first one left rather than the same allowance over
         # again. Both suites can run in one `_grade` -- the validator's
