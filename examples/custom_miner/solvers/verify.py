@@ -253,21 +253,18 @@ CASES_ONLY_ROUNDS = 2
 FIRST_PHASE_ROUNDS = CASES_ONLY_ROUNDS + 1
 HANDOFF_ROUNDS = CASES_ONLY_ROUNDS + 1
 
-# How many rounds one model gets before the repair moves on, when there IS a
-# rotation to move it along. Lower than the numbers above, and deliberately:
-# those were sized for a handoff that could happen once, where leaving too
-# early meant leaving for good. A rotation can come back -- opus is on it
-# too -- so the cost of moving early is one extra conversation rather than a
-# model never asked again.
+# There is no "rounds one model gets before the repair moves on" any more, and
+# `SOLVER_REPAIR_ROTATE_FROM` is gone with it. A per-model round quota beside
+# the rotation list was the only way to say a RATIO while the list could name
+# each model once; the schedule says it in the list -- `opus, fable, opus` is
+# opus on two rounds in three -- so the quota is one setting expressing what
+# another setting already says. See `_scheduled_profile`.
 #
-# Two, so the author gets the round its context is worth and then the reading
-# changes. The measured shape this answers: of ten single-case disagreements
-# in a live run, nine ended with the program's own author ruling its own case
-# wrong and keeping its program. A second round with that same author is the
-# round least likely to find anything new.
-ROTATE_AFTER_ROUNDS = max(
-    1, int(os.environ.get("SOLVER_REPAIR_ROTATE_FROM", "2") or 2)
-)
+# The measured shape it answered is unchanged and the schedule answers it too:
+# of ten single-case disagreements in a live run, nine ended with the program's
+# own author ruling its own case wrong and keeping its program, so the round
+# after the author's first is the one least likely to find anything new -- and
+# on the shipped schedule that round is fable's.
 # The most of the bar ONE repair reply may rewrite, as a fraction. A reply
 # that corrects more than this is re-specifying the problem rather than fixing
 # a case, and is refused whole.
@@ -601,31 +598,46 @@ def _model_of(provider: Optional[str]) -> str:
     return name.split("@")[0].strip().lower()
 
 
-def _next_profile(rotation: Sequence, used: Sequence, provider: Optional[str]):
-    """The next model on the repair rotation, or None when it is spent.
+def _transport_limit(error: Optional[str]) -> bool:
+    """Whether a failed run failed because the ANSWER would not fit back.
 
-    Skips every model that has already had this repair -- `used` is the ones
-    it was handed to AND the one that is handing it on, because the model
-    answering now is the one whose reading just failed to fix it.
-
-    Recording the departing model is what makes this a rotation rather than a
-    shuttle. Without it only the CURRENT seat is skipped, so a repair that
-    went opus -> sonnet came back to opus on its next hop: `sonnet` is
-    excluded as the incumbent, `opus` is not in `used`, and the third reading
-    the rotation exists to reach is never asked.
-
-    `provider` is a label like `cli:opus@primary`, so the match is on the
-    model name appearing in it rather than on equality.
+    `rlvr/execution/_batch_runner.py` caps a case's framed status at 256 KiB
+    and the Rust runner caps raw stdout at 1 MB; past either, the run comes
+    back failed with a message about size. That is the harness declining to
+    carry a value, not the program doing anything wrong, and the two must not
+    be reported the same way -- one is a defect worth a repair round and the
+    other is the probe having asked for too much.
     """
-    here = (provider or "").lower()
-    seen = {profile.model for profile in used if profile is not None}
-    for profile in rotation:
-        if profile.model in seen:
-            continue
-        if profile.model and profile.model.lower() in here:
-            continue
-        return profile
-    return None
+    low = (error or "").lower()
+    return "too large" in low or "too big" in low
+
+
+def _scheduled_profile(rotation: Sequence, correction_round: int):
+    """Which model answers correction round `correction_round`, 1-indexed.
+
+    A POSITION in the schedule rather than a search through it, and the change
+    is what lets the schedule state a RATIO. The search this replaced skipped
+    every model that had already had the repair, so a model could appear once
+    per lap and no more -- which makes every model equal by construction and
+    leaves no way to say "opus twice for every fable once" except by inventing
+    a per-model round quota beside the list.
+
+    Indexing says it in the list itself. `opus, fable, opus` cycles as
+
+        1 opus   2 fable   3 opus   4 opus   5 fable   6 opus   7 opus   8 fable
+
+    -- opus on two rounds in three, fable on one, and the pattern is readable
+    off the setting without reference to anything here. A schedule naming one
+    model is a repair that never moves; naming each once is strict alternation;
+    repeating one is a ratio. None of those is a special case.
+
+    The counterpart is that the caller must not hand off on a round the
+    schedule does not move on: two consecutive `opus` entries mean the same
+    conversation continues, which is what keeps its context.
+    """
+    if not rotation:
+        return None
+    return rotation[(correction_round - 1) % len(rotation)]
 
 
 def _same_expected(left: Any, right: Any, language: str) -> bool:
@@ -2497,6 +2509,9 @@ class VerifyingSolver:
         # verdict.
         probe: list = []
         probed: dict[str, _Probe] = {}
+        # Correction rounds this PASS has sent, never reset -- the index the
+        # repair schedule is read at. See `_scheduled_profile`.
+        correction_rounds = 0
         # Correction rounds sent into the conversation now in hand. Reset when
         # the repair is carried elsewhere, so each conversation is judged on
         # what it did rather than on what the pass has spent.
@@ -2777,6 +2792,33 @@ class VerifyingSolver:
             # Whether the prompt just sent WITHDREW the offer to correct a
             # case. A withdrawal the reply can ignore is not one.
             program_only = False
+            def _schedule_moves() -> bool:
+                """Whether the NEXT correction round belongs somewhere else.
+
+                With a schedule this is not a budget question at all. The old
+                test asked whether this conversation had had its allotted
+                rounds; the schedule already says who answers round N, so the
+                only question left is whether that is who is answering now. Two
+                consecutive `opus` entries mean no handoff and the conversation
+                keeps its context, which is the whole reason the test is on the
+                MODEL rather than on a count.
+
+                A backend with no rotation to move along -- a browser fleet,
+                where every tab is the same model -- keeps the round budgets it
+                always had, because there a handoff buys a fresh conversation
+                and nothing else.
+                """
+                if not rotation:
+                    return rounds_here >= (
+                        HANDOFF_ROUNDS if rotated else FIRST_PHASE_ROUNDS
+                    )
+                want = _scheduled_profile(rotation, correction_rounds + 1)
+                return bool(
+                    want
+                    and want.model
+                    and want.model.lower() not in (provider or "").lower()
+                )
+
             async def _resume_elsewhere(
                 why: str, avoid: Optional[str] = None, slow: Optional[str] = None,
             ):
@@ -2855,39 +2897,13 @@ class VerifyingSolver:
                 # that is another reading, and then another, for as long as the
                 # deadline allows -- which is what bounds this now.
                 if rotation:
-                    # The model handing this on has had its rounds with it, so
-                    # it joins the used set rather than being skipped only
-                    # while it happens to be the incumbent.
-                    leaving = next(
-                        (
-                            profile for profile in rotation
-                            if profile.model
-                            and profile.model.lower() in (provider or "").lower()
-                        ),
-                        None,
-                    )
-                    if leaving is not None and leaving not in rotated:
-                        rotated.append(leaving)
-                    nxt = _next_profile(rotation, rotated, provider)
-                    if nxt is None:
-                        # Every model has had it once. That is a lap, not the
-                        # end: the correction runs until the program passes or
-                        # the deadline stops it (operator's rule), and a model
-                        # is stochastic -- its second look at a program another
-                        # model has since rewritten is a real chance. Stopping
-                        # here was a round cap of 3 x ROTATE_AFTER_ROUNDS that
-                        # shipped wrong programs with minutes left.
-                        rotated.clear()
-                        if leaving is not None:
-                            rotated.append(leaving)
-                        nxt = _next_profile(rotation, rotated, provider)
-                        if nxt is None:
-                            print("[verify] the repair is not carried on: the "
-                                  "rotation has no model but the one answering")
-                            return None
-                        print(f"[verify] every model on the rotation has had "
-                              f"the repair once; going round again with "
-                              f"{left_now:.0f}s left")
+                    # WHERE THE SCHEDULE SAYS, for the round about to be sent.
+                    # `correction_rounds` counts the rounds already sent, so
+                    # the next is `correction_rounds + 1`. It is a POSITION and
+                    # not a search, so it never runs out and there is no lap to
+                    # announce: the correction runs until the program passes or
+                    # the deadline stops it, which is the operator's rule.
+                    nxt = _scheduled_profile(rotation, correction_rounds + 1)
                     rotated.append(nxt)
                 else:
                     # No models to rotate through -- a browser fleet, where
@@ -2991,8 +3007,8 @@ class VerifyingSolver:
                 nothing is ever held for it -- but it was once CANCELLED the
                 first time it was not ready, at the first join, and that cut
                 the stage on the program turn's clock rather than the
-                deadline: whenever sonnet's cases turn ran longer than opus's
-                program turn, the one mechanism aimed at the solves where bar
+                deadline: whenever the second bar's cases turn ran longer
+                than the program turn, the one mechanism aimed at solves where bar
                 and program agree was thrown away with most of the budget
                 left. Now a bar that lands during round three is graded
                 against from round three.
@@ -3127,6 +3143,13 @@ class VerifyingSolver:
                     # and counting it would spend a third of this
                     # conversation's budget before a single failure existed.
                     rounds_here += 1
+                    # ...and the PASS's own count, which is what indexes the
+                    # schedule. `rounds_here` restarts at every handoff, so it
+                    # cannot say which round of the solve this is; the schedule
+                    # has to be positioned against a number that only ever goes
+                    # up. Counted here, before the send, so the round about to
+                    # go out is `correction_rounds` and the next is one more.
+                    correction_rounds += 1
                 round_started = time.monotonic()
                 correction_refused = False
                 # Empty-handed: nothing finished is in hand to ship, so a cut
@@ -3707,10 +3730,7 @@ class VerifyingSolver:
                         # the next iteration -- so counting here too would
                         # charge every too_slow round twice and hand off after
                         # half the rounds the setting names.
-                        if rounds_here >= (
-                            ROTATE_AFTER_ROUNDS if rotation
-                            else (HANDOFF_ROUNDS if rotated else FIRST_PHASE_ROUNDS)
-                        ):
+                        if _schedule_moves():
                             carried = await _resume_elsewhere(
                                 f"{rounds_here} round(s) with "
                                 f"{provider or 'this model'} did not make it "
@@ -3904,10 +3924,7 @@ class VerifyingSolver:
                         # the next iteration -- so counting here too would
                         # charge every too_slow round twice and hand off after
                         # half the rounds the setting names.
-                        if rounds_here >= (
-                            ROTATE_AFTER_ROUNDS if rotation
-                            else (HANDOFF_ROUNDS if rotated else FIRST_PHASE_ROUNDS)
-                        ):
+                        if _schedule_moves():
                             carried = await _resume_elsewhere(
                                 f"{rounds_here} round(s) with "
                                 f"{provider or 'this model'} did not make it "
@@ -3947,10 +3964,7 @@ class VerifyingSolver:
                 # solves of eleven, alternating between a reply the parser
                 # dropped and a rewrite that failed the same case, one ending
                 # with the budget gone and nothing submitted.
-                if rounds_here >= (
-                    ROTATE_AFTER_ROUNDS if rotation
-                    else (HANDOFF_ROUNDS if rotated else FIRST_PHASE_ROUNDS)
-                ):
+                if _schedule_moves():
                     carried = await _resume_elsewhere(
                         f"{rounds_here} correction round(s) with "
                         f"{provider or 'this model'} did not clear it",
@@ -4525,6 +4539,9 @@ class VerifyingSolver:
                 raise _NoExecutor() from exc
 
         try:
+            # The last rung that crashed, if any -- so a ladder that crashes
+            # all the way down still reports `crashed` rather than "no input".
+            crashed: Optional[tuple] = None
             for scale in PROBE_SCALES:
                 if remaining() <= 0:
                     print("[verify] the size probe: out of time before a large "
@@ -4614,22 +4631,41 @@ class VerifyingSolver:
                         "oom",
                     )
                 if not ran[0].ok:
-                    # Any OTHER crash at scale is far likelier to be the
-                    # generator handing the program an input the statement
-                    # does not actually allow than a fault in the program, and
-                    # reporting it as one would spend a round making a correct
-                    # answer worse. So: no sentence. But it is not a program
-                    # that FINISHED either, and it used to be recorded as one
-                    # -- a recursive solution that blew the stack at n=50000
-                    # went into the permanent cache as timed-and-passed.
+                    # A CRASH DESCENDS THE LADDER rather than ending it, which
+                    # is the only way to tell the two things it can mean apart.
+                    #
+                    # `PROBE_MAX_BYTES` bounds the INPUT; the runner also caps
+                    # what a case may hand BACK -- 256 KiB of framed status in
+                    # `_batch_runner`, and the subprocess executor keeps only
+                    # the last 256 KiB of stdout, where an over-long reply
+                    # loses its opening frame marker. So a correct program
+                    # whose answer is about the size of its input fails at the
+                    # top rung, and the two failures do not even read alike:
+                    # one says "serialized return value is too large" and the
+                    # other says "sandbox produced no verdict (crashed or
+                    # exited early)", which is also what a real crash says.
+                    #
+                    # No message can separate them; a smaller input can. The
+                    # generator has always retried at a smaller rung for
+                    # exactly this reason, and the program abandoning the two
+                    # smaller rungs meant the one shape a smaller input surely
+                    # fixes was the one shape that never got one. If every
+                    # rung crashes it is reported as a crash, as before.
                     head = (ran[0].error or "").strip().splitlines()
+                    detail = head[-1] if head else "no detail"
+                    crashed = (size, detail)
                     print(
-                        f"[verify] the size probe: the program crashed on a "
-                        f"{size:,}-byte input ({head[-1] if head else 'no detail'}); "
-                        f"probably the generator's input rather than the program, "
-                        f"so no repair is asked -- and no pass is recorded"
+                        f"[verify] the size probe: the program did not survive "
+                        f"a {size:,}-byte input ({detail}); "
+                        + (
+                            "the answer was too large for the runner to carry, "
+                            "which is this harness rather than the program"
+                            if _transport_limit(ran[0].error)
+                            else "trying a smaller input to tell a fault from "
+                                 "an input the statement does not allow"
+                        )
                     )
-                    return _Probe(None, "crashed")
+                    continue
                 # `runtime_ms` is the executor's, and both Docker executors
                 # stamp a result with the whole container's wall time -- for
                 # Rust that includes the release build. Reported as what it is.
@@ -4648,6 +4684,15 @@ class VerifyingSolver:
                 return _Probe(None, "passed")
         except _NoExecutor:
             return _Probe(None, "none")
+        if crashed is not None:
+            size, detail = crashed
+            print(
+                f"[verify] the size probe: the program crashed at every size "
+                f"down to {size:,} bytes ({detail}); more likely an input the "
+                f"statement does not allow than a fault, so no repair is asked "
+                f"-- and no pass is recorded"
+            )
+            return _Probe(None, "crashed")
         print(
             "[verify] the size probe: no large input could be had; the program "
             "is graded on the bar's own cases alone"

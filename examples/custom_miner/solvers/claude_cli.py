@@ -411,8 +411,8 @@ class Profile:
 def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profile, ...]:
     """What answers when the default model will not, in order.
 
-    `SOLVER_CLI_EMERGENCY_PROFILES=sonnet:medium,fable:low` -- each entry a
-    model alias the CLI accepts, optionally with an effort after a colon.
+    `SOLVER_CLI_EMERGENCY_PROFILES=fable:low` -- each entry a model alias
+    the CLI accepts, optionally with an effort after a colon.
 
     Sonnet first, and the order is a correctness judgement rather than a speed
     one. Latency says the opposite: on a real production problem the program
@@ -428,7 +428,7 @@ def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profil
     that it reads these statements the way the default model does.
     """
     default_effort = default_effort or cli_effort()
-    raw = _flag("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:medium,fable:low")
+    raw = _flag("SOLVER_CLI_EMERGENCY_PROFILES", "fable:low")
     profiles: list[Profile] = []
     for entry in raw.split(","):
         entry = entry.strip()
@@ -469,27 +469,30 @@ PHASES = ("cases", "program", "repair", "judge", "cases2")
 # What each of the two wants from a model is NOT the same thing, and one name
 # for both hid that.
 #
-# THE JUDGE IS ASKED TO BE RIGHT. It settles one expected value, and its answer
-# is taken as the verdict -- so the measurement that applies is the one about
-# agreement on expected values: `calibration/fixed_inputs.py`, opus and sonnet
-# each deriving `expected` for the same fixed inputs, agreed on 91 of 97. Close
-# enough to trust a value it rules on, far enough apart that the 6 it split on
-# are the statement's real ambiguities rather than one model's noise. That is a
-# measurement about SONNET specifically and it is why the judge names sonnet.
+# TWO MODELS, and sonnet is not one of them. The operator's decision, and it
+# settles both seats at once because there is only one model left that is not
+# the program's author: everything here that must not be opus is fable.
 #
-# THE SECOND BAR IS ASKED TO BE DIFFERENT. Its product is the UNION, not
-# agreement: `calibration/two_bar_overlap.py` measured two models choosing
-# their own inputs sharing about 2% of them, which is what makes agreement
-# useless as a signal here and the union worth a turn. That property belongs to
-# any two distinct models rather than to sonnet, so the second bar is the seat
-# where an operator's choice costs nothing the measurements can price -- and
-# fable is that choice.
+# What that costs, stated rather than glossed. The judge settles one expected
+# value and its answer is taken as the verdict, so the measurement that applied
+# to it was about agreement on expected values -- `calibration/fixed_inputs.py`,
+# opus and sonnet each deriving `expected` for the same fixed inputs, agreed on
+# 91 of 97. That study measured SONNET. Nothing under `calibration/` measures
+# fable's reading of a statement against anyone's, so the judge no longer has a
+# number behind it. Measuring fable the way `fixed_inputs.py` measured sonnet
+# is the work that would put one back.
 #
-# What fable has NO measurement for is the quality of the `expected` values it
-# writes, and the second bar does write them. The judge is the answer to that:
-# a case the program disputes is adjudicated rather than enforced, which is the
-# same protection a sonnet-written case gets.
-_JUDGE_READER = "sonnet"
+# What it does not cost: the SECOND BAR is asked to be different, not to be
+# right. Its product is the union -- `calibration/two_bar_overlap.py` measured
+# two models choosing their own inputs sharing about 2% of them -- and that
+# property belongs to any two distinct models. Fable was already this seat and
+# the argument for it is unchanged.
+#
+# And the two are now the same model, which is a real consequence rather than a
+# tidy one: a call the two BARS split on is deliberately kept away from the
+# judge, on the grounds that the judge would not be a third reading of it. That
+# rationale was false while the judge was sonnet and is true again now.
+_JUDGE_READER = "fable"
 _SECOND_BAR_READER = "fable"
 
 
@@ -498,7 +501,7 @@ def cli_phase_profiles(
 ) -> dict[str, Profile]:
     """Which model answers which phase.
 
-    `SOLVER_CLI_PHASE_PROFILES=cases=sonnet:medium,program=opus:low` -- one
+    `SOLVER_CLI_PHASE_PROFILES=cases=fable:low,program=opus:low` -- one
     entry per phase named in `PHASES`, each a model alias with an optional
     effort after a colon, exactly as `SOLVER_CLI_EMERGENCY_PROFILES` spells
     them.
@@ -529,7 +532,7 @@ def cli_phase_profiles(
         # here -- it reads a statement and some calls, never a program -- so
         # what a longer think costs is measured in seconds on a turn the logs
         # show finishing in three to ten.
-        "judge": Profile(_JUDGE_READER, "medium"),
+        "judge": Profile(_JUDGE_READER, "low"),
         "cases2": Profile(_SECOND_BAR_READER, "low"),
     }
     for entry in raw.split(","):
@@ -563,10 +566,18 @@ def cli_phase_profiles(
 def cli_repair_rotation(
     default_effort: Optional[str] = None,
 ) -> tuple[Profile, ...]:
-    """The models a correction round moves through, in order.
+    """The SCHEDULE a correction round walks: one entry per round, cycling.
 
-    `SOLVER_REPAIR_ROTATION=opus:low,sonnet:medium,fable:low`, spelled exactly
-    as the emergency ladder is.
+    `SOLVER_REPAIR_ROTATION=opus:low,fable:low,opus:low`, spelled exactly as
+    the emergency ladder is. Round N takes entry `(N-1) mod len`, so the
+    shipped setting reads straight off as
+
+        1 opus  2 fable  3 opus  4 opus  5 fable  6 opus  7 opus  8 fable
+
+    -- opus on two rounds in three. A REPEATED entry is how a ratio is said;
+    naming each model once is strict alternation; naming one is a repair that
+    never moves. Where two consecutive entries name the same model the
+    conversation is kept rather than reopened, so its context survives.
 
     A repair that stays where the program was written is a model being asked
     to find a bug in its own reading of the statement, and measured over 54
@@ -582,7 +593,7 @@ def cli_repair_rotation(
     program; the two behind it are the readers that did not.
     """
     default_effort = default_effort or cli_effort()
-    raw = _flag("SOLVER_REPAIR_ROTATION", "opus:low,sonnet:medium,fable:low")
+    raw = _flag("SOLVER_REPAIR_ROTATION", "opus:low,fable:low,opus:low")
     profiles: list[Profile] = []
     for entry in raw.split(","):
         entry = entry.strip()

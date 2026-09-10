@@ -12967,10 +12967,11 @@ def _fake_cli(tmp_path, monkeypatch, mode="ok", backups=0):
     else:
         monkeypatch.delenv("SOLVER_CLI_BACKUP_ACCOUNTS", raising=False)
     # The SHIPPED ladder, pinned explicitly so a test that hops runs onto the
-    # rung production runs onto: sonnet in low-thinking mode (operator's rule),
-    # then fable. It used to pin `sonnet:high`, so every behavioural hop test
-    # asserted an effort the miner never uses.
-    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:medium,fable:low")
+    # rung production runs onto. Two models, opus and fable, and no sonnet
+    # anywhere -- the operator's decision. A test that needs a LONGER ladder
+    # than production ships sets its own; this one may only ever be what the
+    # miner really runs, or a hop test proves nothing about the miner.
+    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "fable:low")
     monkeypatch.delenv("SOLVER_CLI_MODELS", raising=False)
     monkeypatch.delenv("SOLVER_CLI_RECOVERY_S", raising=False)
     return log
@@ -13327,6 +13328,13 @@ def test_a_limit_on_one_model_leaves_the_other_answering(
 
     log = _fake_cli(tmp_path, monkeypatch, mode="opus-limit")
     monkeypatch.setenv("SOLVER_CLI_MODELS", "opus,sonnet")
+    # Sonnet is the SUBJECT here, not a preference: `seven_day_sonnet` is a
+    # window name in the CLI's own schema, and reading it as a limit on the
+    # seat would turn away a model that still works. The miner does not run
+    # sonnet, and it still has to understand what the CLI says about it -- so
+    # this test names the ladder it needs rather than inheriting the shipped
+    # one, which is opus then fable.
+    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:low")
     backend = CliBackend()
 
     async def go():
@@ -13411,11 +13419,11 @@ def test_a_cli_that_hangs_without_a_word_is_given_up_on_quickly(
     # Every rung of the ladder was tried -- a stall is one pair's until
     # proven otherwise -- and each cost the first-event window, no more.
     assert spent < 12.0, f"a silent CLI held the slice for {spent:.1f}s"
-    assert backend.stats()["stalls"] == 3
+    # Two rungs now, not three: the shipped ladder is opus then fable.
+    assert backend.stats()["stalls"] == 2
     out = capsys.readouterr().out
     assert "produced no event at all" in out
-    assert "hop: cli:opus -> cli:sonnet" in out, out
-    assert "hop: cli:sonnet -> cli:fable" in out, out
+    assert "hop: cli:opus -> cli:fable" in out, out
 
 
 def test_a_failed_first_cli_turn_does_not_reuse_its_session_id(
@@ -13571,7 +13579,7 @@ def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session
 
     first, second, spent, conversation, after = asyncio.run(go())
     assert extract_code(first, "g") and extract_code(second, "g"), (first, second)
-    assert conversation.provider == "cli:sonnet" and conversation.hops == 1
+    assert conversation.provider == "cli:fable" and conversation.hops == 1
     # The EFFORT comes with the rung, not from the conversation it hopped out
     # of: taken from the ladder rather than written here, so this keeps saying
     # what it means when the ladder's efforts change.
@@ -13588,7 +13596,7 @@ def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session
     assert 0.9 < spent < 5.0, spent
     calls = _cli_calls(log)
     assert [(c["model"], c["effort"], c["resumed"]) for c in calls] == [
-        ("opus", "low", False), ("opus", "low", True), ("sonnet", "medium", True),
+        ("opus", "low", False), ("opus", "low", True), ("fable", "low", True),
     ], calls
     assert len({c["session"] for c in calls}) == 1, "the session was lost in the hop"
     # Every account, ten minutes: the service's problem, not a seat's -- and
@@ -13599,12 +13607,12 @@ def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session
     assert "*/opus" in out_table and 500 < out_table["*/opus"]["seconds"] <= 600, out_table
     assert "refused" in out_table["*/opus"]["why"] and "529" in out_table["*/opus"]["why"]
     # The next fresh solve goes straight to the emergency profile.
-    assert after.provider == "cli:sonnet"
+    assert after.provider == "cli:fable"
     assert after.effort == cli_emergency_profiles("low")[0].effort
     out = capsys.readouterr().out
-    assert "hop: cli:opus -> cli:sonnet" in out, out
+    assert "hop: cli:opus -> cli:fable" in out, out
     assert (
-        f"EMERGENCY MODE: cli:sonnet "
+        f"EMERGENCY MODE: cli:fable "
         f"(effort {cli_emergency_profiles('low')[0].effort})"
     ) in out, out
 
@@ -13624,7 +13632,7 @@ def test_a_server_error_result_is_read_the_same_way(tmp_path, monkeypatch):
 
     body, conversation = asyncio.run(go())
     assert extract_code(body, "g"), body
-    assert conversation.provider == "cli:sonnet"
+    assert conversation.provider == "cli:fable"
     assert "*/opus" in backend.stats()["out"]
 
 
@@ -13657,12 +13665,12 @@ def test_the_default_model_is_tried_again_after_the_recovery_window(
         return parked, probe, answer, again, parked_again
 
     parked, probe, answer, again, parked_again = asyncio.run(go())
-    assert parked.provider == "cli:sonnet"
+    assert parked.provider == "cli:fable"
     assert probe.provider == "cli:opus" and extract_code(answer, "g"), answer
     # `again` was handed opus -- the window had passed -- and hopped inside
     # its own turn; the solve after it is parked from the start.
-    assert again.provider == "cli:sonnet" and again.hops == 1
-    assert parked_again.provider == "cli:sonnet" and parked_again.hops == 0
+    assert again.provider == "cli:fable" and again.hops == 1
+    assert parked_again.provider == "cli:fable" and parked_again.hops == 0
     out = capsys.readouterr().out
     assert out.count("EMERGENCY MODE") == 2, out
     assert out.count("back to normal") == 1, out
@@ -13783,7 +13791,7 @@ def test_the_cli_retry_events_are_counted_here_not_read_off_the_event(
 
     body, conversation, spent = asyncio.run(go())
     assert extract_code(body, "g"), body
-    assert conversation.provider == "cli:sonnet" and conversation.hops == 1
+    assert conversation.provider == "cli:fable" and conversation.hops == 1
     # One account, so the wait is paid: one retry sat through, the second the
     # signal. What this is really about is that the count belongs to this
     # TURN rather than to the event's own `attempt` field.
@@ -13813,7 +13821,7 @@ def test_the_status_command_names_each_account(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "primary" in out and "signed in (subscription)" in out, out
     assert "claude-2" in out and "NOT signed in" in out, out
-    assert "ladder: opus/low, sonnet/medium, fable/low" in out, out
+    assert "ladder: opus/low, fable/low" in out, out
 
     _cli_modes(log, {"*": "ok"})
     assert claude_cli.main(["status"]) == 0
@@ -13895,7 +13903,7 @@ def test_a_drill_lets_the_operator_watch_the_ladder_move(
 
     monkeypatch.setenv("SOLVER_CLI_DRILL", "refuse:opus")
     backend = CliBackend()
-    assert backend.pick()[1].label == "sonnet/medium"
+    assert backend.pick()[1].label == "fable/low"
 
     monkeypatch.setenv("SOLVER_CLI_DRILL", "limit:nobody")
     with pytest.raises(SystemExit):
@@ -13931,7 +13939,7 @@ def test_the_default_ladder_is_the_measured_one(tmp_path, monkeypatch):
     _fake_cli(tmp_path, monkeypatch)
     monkeypatch.delenv("SOLVER_CLI_EMERGENCY_PROFILES", raising=False)
     assert [p.label for p in CliBackend().profiles] == [
-        "opus/low", "sonnet/medium", "fable/low"
+        "opus/low", "fable/low"
     ]
 
 
@@ -13956,7 +13964,7 @@ def test_the_cli_summary_names_the_ladder(tmp_path, monkeypatch):
     _fake_cli(tmp_path, monkeypatch, backups=1)
     monkeypatch.setenv("SOLVER_BACKEND", "cli")
     assert roster_module.describe([]) == (
-        "claude CLI (opus/low > sonnet/medium > fable/low; 2 accounts)"
+        "claude CLI (opus/low > fable/low; 2 accounts)"
     )
 
 
@@ -14470,30 +14478,37 @@ def test_a_phase_names_a_model_and_no_phase_names_one_by_default(monkeypatch):
     The second bar is asked to be DIFFERENT. Its product is the union of two
     readers' calls, and two models choosing their own inputs share about 2% of
     them (`calibration/two_bar_overlap.py`) -- a property of any two distinct
-    models rather than of sonnet, which is what makes this the seat an
-    operator can choose without contradicting a measurement.
+    models rather than of any particular one, which is what makes this the
+    seat an operator can choose without contradicting a measurement.
+
+    Both name FABLE now, and that is not an oversight: with two models on the
+    roster the only seat that is not the program's author is fable, so the
+    judge and the second bar are necessarily the same reader.
     """
     from solvers.claude_cli import Profile, cli_phase_profiles
 
     monkeypatch.delenv("SOLVER_CLI_PHASE_PROFILES", raising=False)
     assert cli_phase_profiles("low") == {
-        "judge": Profile("sonnet", "medium"),
+        "judge": Profile("fable", "low"),
         "cases2": Profile("fable", "low"),
     }, "the independent readers are named; cases and program are not"
 
-    monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", "cases=sonnet:high,program=fable")
+    monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", "cases=opus:high,program=fable")
     assert cli_phase_profiles("low") == {
-        "cases": Profile("sonnet", "high"),
+        "cases": Profile("opus", "high"),
         "program": Profile("fable", "low"),
-        "judge": Profile("sonnet", "medium"),
+        "judge": Profile("fable", "low"),
         "cases2": Profile("fable", "low"),
     }
-    # The two readers are named apart, so neither default may follow the
-    # other: one name for both is what this replaced.
-    assert (
-        cli_phase_profiles("low")["judge"].model
-        != cli_phase_profiles("low")["cases2"].model
-    ), "the judge and the second bar collapsed back onto one model"
+    # The two readers are still SEPARATE SETTINGS even though both now name
+    # fable, and that is the property worth pinning: one constant for both is
+    # what this replaced, and it is what would silently re-couple them the next
+    # time one of the two is moved.
+    monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", "judge=opus:low")
+    apart = cli_phase_profiles("low")
+    assert apart["judge"].model == "opus" and apart["cases2"].model == "fable", (
+        f"naming one reader moved the other: {apart}"
+    )
 
     # An operator can still name something else for them.
     monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", "judge=fable:low")
@@ -16078,28 +16093,36 @@ def test_an_out_of_memory_at_scale_is_reported_like_a_timeout():
 # --------------------------------------------------------------------------- #
 # The repair rotation
 # --------------------------------------------------------------------------- #
-def test_the_repair_rotation_skips_the_model_that_is_already_answering():
-    """Handing a model its own answer back is the round the rotation exists to
-    stop being. `provider` is a label like `cli:opus@primary`, so the match is
-    on the model name appearing in it."""
+def test_the_repair_schedule_is_a_position_and_not_a_search():
+    """What replaced the skip-the-used-models search, and why.
+
+    The search could name each model at most once per lap, so every model was
+    equal by construction and a RATIO could only be said by adding a per-model
+    round quota beside the list. A position says it in the list: a repeated
+    entry is a model that answers more often, and nothing else has to know."""
     from solvers.claude_cli import Profile
-    from solvers.verify import _next_profile
+    from solvers.verify import _scheduled_profile
 
-    ladder = (Profile("opus", "low"), Profile("sonnet", "low"),
-              Profile("fable", "low"))
+    ladder = (Profile("opus", "low"), Profile("fable", "low"),
+              Profile("opus", "low"))
 
-    # The seat answering is opus, so opus is skipped.
-    first = _next_profile(ladder, [], "cli:opus@primary")
-    assert first == Profile("sonnet", "low"), first
-    # The caller records the DEPARTING model too, which is what makes this a
-    # rotation rather than a shuttle: without opus in `used`, a repair that
-    # went opus -> sonnet comes straight back to opus and fable is never
-    # asked at all.
-    used = [Profile("opus", "low"), first]
-    second = _next_profile(ladder, used, "cli:sonnet@primary")
-    assert second == Profile("fable", "low"), second
-    # Spent: every model has had it.
-    assert _next_profile(ladder, [*used, second], "cli:fable@primary") is None
+    # Round N takes entry (N-1) mod len -- so a repeated entry repeats.
+    assert _scheduled_profile(ladder, 1) == Profile("opus", "low")
+    assert _scheduled_profile(ladder, 2) == Profile("fable", "low")
+    assert _scheduled_profile(ladder, 3) == Profile("opus", "low")
+    # ...and it wraps rather than running out. There is no "spent" state now:
+    # the deadline ends the correction, not the length of the list.
+    assert _scheduled_profile(ladder, 4) == _scheduled_profile(ladder, 1)
+    assert _scheduled_profile(ladder, 400) is not None
+
+    # A schedule naming one model is a repair that never moves; naming each
+    # once is strict alternation. Neither is a special case.
+    one = (Profile("opus", "low"),)
+    assert {_scheduled_profile(one, n).model for n in range(1, 6)} == {"opus"}
+    two = (Profile("opus", "low"), Profile("fable", "low"))
+    assert [_scheduled_profile(two, n).model for n in range(1, 5)] == [
+        "opus", "fable", "opus", "fable"
+    ]
 
 
 def test_a_rotated_repair_is_not_told_it_wrote_the_program():
@@ -16866,9 +16889,9 @@ def test_one_solve_uses_every_mechanism_and_the_next_one_is_free(
     from solvers import verify
 
     monkeypatch.setenv("SOLVER_SOLUTION_CACHE_DIR", str(tmp_path / "cache"))
-    # The constant is read at import, so the environment variable would be
-    # inert here; the attribute is what the loop reads.
-    monkeypatch.setattr(verify, "ROTATE_AFTER_ROUNDS", 1)
+    # No knob needed: the shipped schedule is `opus, fable, opus`, so round 1
+    # is opus and round 2 is fable -- the repair moves after one round because
+    # that is what the schedule says, not because a count was patched.
 
     wrong = "```python\ndef g(n):\n    return 0\n```"
     # A DIFFERENT wrong program on the second try, so the rotation is reached
@@ -16901,7 +16924,7 @@ def test_one_solve_uses_every_mechanism_and_the_next_one_is_free(
             None: [wrong],
         },
         # ...and the rotation lands somewhere that gets it right.
-        per_model={"sonnet": [right], "fable": [right]},
+        per_model={"opus": [right], "fable": [right]},
         # The author is opus, as in production, so the first hop must skip it.
         provider_of={"program": "cli:opus@primary"},
     )
@@ -16927,7 +16950,7 @@ def test_one_solve_uses_every_mechanism_and_the_next_one_is_free(
     # The repair left the model that wrote the program -- for the NEXT model
     # on the rotation, not back to the author.
     hops = [o for o in fleet.opened if o.startswith("profile:")]
-    assert hops and hops[0] == "profile:sonnet", fleet.opened
+    assert hops and hops[0] == "profile:fable", fleet.opened
     assert "profile:opus" not in hops, fleet.opened
     assert "repair=" in log, log
     # A model shown someone else's program is told so.
@@ -16980,34 +17003,80 @@ def test_one_solve_uses_every_mechanism_and_the_next_one_is_free(
 # --------------------------------------------------------------------------- #
 # Round three: the correction runs until it passes or the deadline stops it
 # --------------------------------------------------------------------------- #
-def test_the_rotation_goes_round_again_instead_of_stopping(monkeypatch):
-    """Every model having had the repair once is a lap, not the end.
+def test_the_repair_walks_the_schedule_and_keeps_context_when_it_stays():
+    """The schedule end to end, and the half of it that is not the sequence.
 
-    `_next_profile` returning None used to end the pass `exit=exhausted`
-    with most of the deadline left -- a round cap of 3 x ROTATE_AFTER_ROUNDS
-    hiding in the rotation. The operator's rule is pass or deadline.
+    Rounds go opus, fable, opus, opus, fable, opus, opus, fable -- the
+    operator's ratio, two rounds of opus for every one of fable. And where two
+    consecutive rounds name the SAME model the conversation is not reopened:
+    the handoff test is on the model, not on a round count, so round 4
+    continues round 3's conversation and keeps the context it built. Reopening
+    there would throw away the one thing a second round with the same reader
+    has going for it.
+
+    There is no lap to announce and no way to be spent. `_next_profile`
+    returning None used to end the pass `exit=exhausted` with most of the
+    deadline left; a position in a cycle has no such state, and the operator's
+    rule is pass or deadline.
     """
-    from solvers import verify
+    import itertools
 
-    monkeypatch.setattr(verify, "ROTATE_AFTER_ROUNDS", 1)
-    # Every seat answers wrong, and differently each time, so the rotation is
-    # reached by the round count rather than the duplicate guard.
-    wrongs = [f"```python\ndef g(n):\n    return {i}\n```" for i in range(1, 40)]
-    fleet = _Fleet(
-        per_phase={"cases": [CASES], "program": list(wrongs), None: list(wrongs)},
-        per_model={"opus": list(wrongs), "sonnet": list(wrongs), "fable": list(wrongs)},
+    events: list[tuple] = []
+    counter = itertools.count(1)
+
+    class _Watched(_Fleet):
+        async def open_profile(self, model, effort):
+            events.append(("open", model))
+            return await super().open_profile(model, effort)
+
+        def _seat(self, label, replies):
+            seat = super()._seat(label, replies)
+            send = seat.send
+
+            async def _rec(text, timeout_s, **kw):
+                if "previous_attempt" in text or "I ran" in text:
+                    events.append(("round", seat.provider))
+                    # A globally distinct wrong program each round, so neither
+                    # the duplicate guard nor the stale-round guard fires and
+                    # the schedule is the only thing moving the repair.
+                    return f"```python\ndef g(n):\n    return {next(counter)}\n```"
+                return await send(text, timeout_s, **kw)
+
+            seat.send = _rec
+            return seat
+
+    wrong = ["```python\ndef g(n):\n    return 0\n```"] * 60
+    fleet = _Watched(
+        per_phase={"cases": [CASES], "program": list(wrong), None: list(wrong)},
+        per_model={"opus": list(wrong), "fable": list(wrong)},
         provider_of={"program": "cli:opus@primary"},
     )
-    solver = VerifyingSolver(fleet, reserve_s=0, max_budget_s=120,
-                             independent_bar=True, max_attempts=7)
+    solver = VerifyingSolver(fleet, reserve_s=0, max_budget_s=200,
+                             independent_bar=True, max_attempts=9)
     with contextlib.redirect_stdout(io.StringIO()) as out:
-        asyncio.run(solver.solve_task(_two_seat_task(), 120.0))
+        asyncio.run(solver.solve_task(_two_seat_task(), 200.0))
     log = out.getvalue()
 
-    hops = [o for o in fleet.opened if o.startswith("profile:")]
-    assert hops[:4] == ["profile:sonnet", "profile:fable", "profile:opus",
-                        "profile:sonnet"], hops
-    assert "going round again" in log, log
+    rounds = [w.split(":")[1].split("@")[0] for k, w in events if k == "round"]
+    assert rounds[:8] == [
+        "opus", "fable", "opus", "opus", "fable", "opus", "opus", "fable"
+    ], rounds
+
+    # Rounds 4 and 7 stay put: no open between round 3 and 4, or 6 and 7.
+    order = [k for k, _ in events]
+    seen = 0
+    stayed = []
+    for i, (kind, _) in enumerate(events):
+        if kind != "round":
+            continue
+        seen += 1
+        if seen > 1 and events[i - 1][0] == "round":
+            stayed.append(seen)
+    assert stayed[:2] == [4, 7], (
+        f"a same-model round reopened the conversation: stayed at {stayed}"
+    )
+
+    # It cycles rather than stopping, and the deadline is what ends it.
     assert "exit=exhausted" not in log, log
     assert "exit=maxattempts" in log, log
 
@@ -17025,10 +17094,10 @@ def test_a_too_slow_program_is_carried_to_the_next_model(monkeypatch):
     from solvers import verify
     from solvers.verify import _Probe
 
-    monkeypatch.setattr(verify, "ROTATE_AFTER_ROUNDS", 2)
     slow = "```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"
-    # A second slow program, different in text: two too_slow rounds with the
-    # author, the second report named as a repeat, then the rotation.
+    # A second slow program, different in text: the author gets round 1, the
+    # second report is named as a repeat, and the schedule moves to fable on
+    # round 2 -- no knob, that is what `opus, fable, opus` says.
     slow2 = "```python\ndef g(n):\n    total = sum(int(c) for c in str(n))\n    return total\n```"
     quick = "```python\ndef g(n):\n    return sum(map(int, str(n)))\n```"
     gen = ("```python\ndef generate(seed, scale):\n"
@@ -17036,9 +17105,14 @@ def test_a_too_slow_program_is_carried_to_the_next_model(monkeypatch):
     fleet = _Fleet(
         per_phase={"cases": [CASES + "\n" + gen], "program": [slow, slow2, slow],
                    None: [slow]},
-        per_model={"sonnet": [quick], "fable": [quick]},
+        per_model={"opus": [quick], "fable": [quick]},
         provider_of={"program": "cli:opus@primary"},
     )
+    # Two rounds with the AUTHOR and then a carry, which is what this test
+    # needs and what the schedule is now the knob for: the shipped
+    # `opus, fable, opus` moves after round 1, so a report can never be
+    # re-sent to the same conversation and named a repeat.
+    monkeypatch.setenv("SOLVER_REPAIR_ROTATION", "opus:low,opus:low,fable:low")
     solver = VerifyingSolver(fleet, reserve_s=0, max_budget_s=120,
                              independent_bar=True)
 
@@ -17054,8 +17128,8 @@ def test_a_too_slow_program_is_carried_to_the_next_model(monkeypatch):
     log = out.getvalue()
 
     assert "too_slow report has now gone out 2 times" in log, log
-    assert "profile:sonnet" in fleet.opened, fleet.opened
-    carried = fleet.sent["sonnet"][0]
+    assert "profile:fable" in fleet.opened, fleet.opened
+    carried = fleet.sent["fable"][0]
     assert "did not finish" in carried, carried[-600:]
     assert "not yours" in carried, carried[-600:]
     assert "map(int" in answer.code, answer.code
@@ -17069,7 +17143,7 @@ def test_a_repeated_slow_program_is_carried_on_with_its_verdict(monkeypatch):
     from solvers import verify
     from solvers.verify import _Probe
 
-    monkeypatch.setattr(verify, "ROTATE_AFTER_ROUNDS", 1)
+    # The shipped schedule moves to fable on round 2 without any patching.
     slow = "```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"
     quick = "```python\ndef g(n):\n    return sum(map(int, str(n)))\n```"
     gen = ("```python\ndef generate(seed, scale):\n"
@@ -17077,9 +17151,14 @@ def test_a_repeated_slow_program_is_carried_on_with_its_verdict(monkeypatch):
     fleet = _Fleet(
         per_phase={"cases": [CASES + "\n" + gen], "program": [slow, slow],
                    None: [slow]},
-        per_model={"sonnet": [quick]},
+        per_model={"fable": [quick]},
         provider_of={"program": "cli:opus@primary"},
     )
+    # Two rounds with the AUTHOR and then a carry, which is what this test
+    # needs and what the schedule is now the knob for: the shipped
+    # `opus, fable, opus` moves after round 1, so a report can never be
+    # re-sent to the same conversation and named a repeat.
+    monkeypatch.setenv("SOLVER_REPAIR_ROTATION", "opus:low,opus:low,fable:low")
     solver = VerifyingSolver(fleet, reserve_s=0, max_budget_s=120,
                              independent_bar=True)
 
@@ -17091,8 +17170,8 @@ def test_a_repeated_slow_program_is_carried_on_with_its_verdict(monkeypatch):
     with contextlib.redirect_stdout(io.StringIO()) as out:
         answer = asyncio.run(solver.solve_task(_two_seat_task(), 120.0))
     log = out.getvalue()
-    assert "profile:sonnet" in fleet.opened, fleet.opened
-    assert "did not finish" in fleet.sent["sonnet"][0]
+    assert "profile:fable" in fleet.opened, fleet.opened
+    assert "did not finish" in fleet.sent["fable"][0]
     assert "map(int" in answer.code and "exit=stalled" not in log, log
 
 
@@ -17466,3 +17545,118 @@ def test_a_stored_answer_without_its_evidence_is_a_miss(monkeypatch, tmp_path):
             answer = asyncio.run(solver.solve_task(task, 120.0))
         assert "cache=hit" not in out.getvalue(), record
         assert "sum(int(c)" in answer.code, record
+
+
+def test_the_repair_schedule_is_opus_fable_opus_and_nothing_else():
+    """The operator's sequence, stated as a sequence and pinned as one.
+
+        round 1 opus   2 fable   3 opus   4 opus   5 fable   6 opus   7 opus   8 fable
+
+    Two rounds of opus for every one of fable, and no third model anywhere.
+    The schedule is a POSITION in the list rather than a search through it,
+    which is what lets a repeated entry state the ratio: `opus, fable, opus`
+    cycles into exactly the sequence above."""
+    from solvers.claude_cli import cli_repair_rotation
+    from solvers.verify import _scheduled_profile
+
+    rotation = cli_repair_rotation()
+    assert [f"{p.model}:{p.effort}" for p in rotation] == [
+        "opus:low", "fable:low", "opus:low"
+    ], rotation
+
+    got = [_scheduled_profile(rotation, n).model for n in range(1, 9)]
+    assert got == [
+        "opus", "fable", "opus", "opus", "fable", "opus", "opus", "fable"
+    ], got
+
+    # It cycles rather than running out: there is no lap to announce and no
+    # end to reach, because the deadline is what ends the correction.
+    long_run = [_scheduled_profile(rotation, n).model for n in range(1, 31)]
+    assert long_run.count("opus") == 20 and long_run.count("fable") == 10, (
+        f"ratio drifted: {long_run.count('opus')}:{long_run.count('fable')}"
+    )
+    # An empty schedule is not a crash — a browser fleet has no models to name.
+    assert _scheduled_profile((), 1) is None
+
+
+def test_no_default_anywhere_names_sonnet():
+    """The operator's decision: two models, opus and fable, and sonnet is not
+    one of them. Every seat that must not be the program's author is fable,
+    because with two models there is nothing else it could be."""
+    from solvers.claude_cli import (
+        cli_emergency_profiles, cli_models, cli_phase_profiles,
+        cli_repair_rotation,
+    )
+
+    named = (
+        list(cli_models())
+        + [p.model for p in cli_emergency_profiles()]
+        + [p.model for p in cli_repair_rotation()]
+        + [p.model for p in cli_phase_profiles().values()]
+    )
+    assert "sonnet" not in named, named
+    assert set(named) == {"opus", "fable"}, sorted(set(named))
+
+    # The two seats that must not be the program's author.
+    phases = cli_phase_profiles()
+    assert phases["cases2"].model == "fable", phases["cases2"]
+    assert phases["judge"].model == "fable", phases["judge"]
+    # ...and every effort is `low`: the one measurement of effort here is that
+    # a program turn took fable 38s, opus 86s, sonnet 161s at low, and either
+    # model at high did not finish inside the deadline.
+    for name, profile in phases.items():
+        assert profile.effort == "low", (name, profile)
+
+
+def test_the_probe_descends_on_a_crash_instead_of_concluding_from_one():
+    """A crash at the top rung means one of two things and the message cannot
+    say which.
+
+    `PROBE_MAX_BYTES` bounds the generated INPUT; the runner also caps what a
+    case may hand BACK — 256 KiB of framed status — so a correct program whose
+    answer is about the size of its input fails at the largest rung. Observed
+    in production as `probe=crashed ... serialized return value is too large`,
+    and the subprocess executor reports the same thing as "sandbox produced no
+    verdict (crashed or exited early)", which is also exactly what a real crash
+    says.
+
+    No message separates them. A smaller input does — and the generator has
+    always been retried at a smaller rung for this reason, while the program
+    was not, so the one shape a smaller input surely fixes was the one shape
+    that never got one. That cost more than a wasted probe: `probe=passed` is
+    the only state `solution_cache.worth_keeping` accepts."""
+    from solvers import verify as verify_mod
+    from solvers.verify import VerifyingSolver
+
+    solver = VerifyingSolver.__new__(VerifyingSolver)
+    solver._grader = verify_mod._Grader()
+
+    class _Task:
+        language, entrypoint = "python", "solve"
+
+    generator = (
+        "def generate(seed, scale):\n"
+        "    n = max(2, scale // 8)\n"
+        "    return {'args': [[i % 100000 for i in range(n)]]}\n"
+    )
+
+    # An answer four times the size of its input: too large to carry back at
+    # the top rung, comfortable at a smaller one. The program is CORRECT.
+    verdict = asyncio.run(solver._timed_out_at_scale(
+        "def solve(xs):\n    return [str(x) * 4 for x in xs]\n",
+        generator, _Task(), 90.0,
+    ))
+    assert verdict.state == "passed", (
+        f"a harness limit was reported as the program's fault: {verdict}"
+    )
+    assert verdict.sentence is None, verdict
+
+    # A program that really does fail, at every size: still reported as one,
+    # and still without asking for a repair — a crash at scale is likelier an
+    # input the statement does not allow than a fault worth a round.
+    always = asyncio.run(solver._timed_out_at_scale(
+        "def solve(xs):\n    raise RuntimeError('boom')\n",
+        generator, _Task(), 90.0,
+    ))
+    assert always.state == "crashed", always
+    assert always.sentence is None, always

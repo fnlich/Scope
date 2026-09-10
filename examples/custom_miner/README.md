@@ -1488,7 +1488,7 @@ Four rules keep the split from becoming a second way to lose:
 Each phase may name its own model and effort:
 
 ```
-SOLVER_CLI_PHASE_PROFILES=cases=sonnet:medium,program=opus:low
+SOLVER_CLI_PHASE_PROFILES=cases=fable:low,program=opus:low
 ```
 
 Phases are `cases`, `program`, `repair`, `judge` and `cases2`. The first three
@@ -1496,27 +1496,45 @@ are **unset by default**, and that is deliberate rather than cautious: every one
 of the 102 solves in the archived runs opened on the same model, so those logs
 say nothing whatever about how another model answers a cases turn or a program
 turn here. A default naming one would be a guess with a measurement's authority.
-Measure it on your own traffic, then set it. `judge` and `cases2` DO default,
-and to **different** models, because what each wants from one is different.
-Both are a reading of the statement the program's author did not make, so
-neither is ever the model that writes programs -- but the judge is asked to be
-*right* about one expected value, and the second bar is asked to be
-*different*.
+Measure it on your own traffic, then set it.
 
-- `judge` defaults to **`sonnet:medium`**. Its answer settles a case, and
-  sonnet is the model measured for that: 91 of 97 expected values agreed with
-  opus, inputs held fixed (`calibration/fixed_inputs.py`). Medium because it is
-  the one turn where being right is the entire product, and the cheapest --
-  it never reads a program.
-- `cases2` defaults to **`fable:low`**. The second bar's product is the union
-  of two readers' calls, and two models choosing their own inputs share about
-  2% of them (`calibration/two_bar_overlap.py`) -- a property of any two
-  distinct models rather than of sonnet. Fable's `expected` values have no
-  study behind them; the judge is what keeps a bad one from being enforced.
+`judge` and `cases2` DO default, and both to **`fable:low`** — necessarily, on
+a roster of two models, because the only seat that is not the program's author
+is fable. Both are a reading of the statement the program's author did not
+make; what each is asked for still differs, and only one of the two is affected
+by naming fable:
 
-Correction rounds rotate through `SOLVER_REPAIR_ROTATION`
-(`opus:low,sonnet:medium,fable:low`) until the program passes or the deadline
-stops it -- around again when every model has had it once.
+- `cases2` is asked to be **different**, not right. The second bar's product is
+  the union of two readers' calls, and two models choosing their own inputs
+  share about 2% of them (`calibration/two_bar_overlap.py`) — a property of any
+  two distinct models. Fable was already this seat and the argument is intact.
+- `judge` is asked to be **right** about one expected value, and the study that
+  backed it measured *sonnet*: 91 of 97 expected values agreed with opus, inputs
+  held fixed (`calibration/fixed_inputs.py`). Nothing under `calibration/`
+  measures fable's reading, so the judge no longer has a number behind it.
+  Measuring fable the way `fixed_inputs.py` measured sonnet is the work that
+  would put one back.
+
+Both now naming one model has a consequence worth knowing: a call the two bars
+split on is deliberately kept away from the judge, because the judge would not
+be a third reading of it. That is true again.
+
+Correction rounds walk `SOLVER_REPAIR_ROTATION` as a **schedule**, one entry per
+round, cycling — round N takes entry `(N-1) mod len`. The default
+`opus:low,fable:low,opus:low` therefore reads straight off:
+
+| round | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| model | opus | fable | opus | opus | fable | opus | opus | fable |
+
+— opus on two rounds in three. A **repeated entry is how a ratio is stated**;
+naming each model once is strict alternation; naming one is a repair that never
+moves. Two consecutive entries naming the same model keep the same conversation,
+so its context survives. There is no lap and nothing to be spent: only a passing
+program or the deadline ends it. Round 2 is not opus because a repair that stays
+where the program was written asks a model to find a fault in its own reading —
+measured, nine of ten single-case disagreements ended with the author ruling its
+own case wrong and keeping its program.
 
 What a phase names is a **preference, never a pin**, and the two escapes are
 what make it safe to use at all:
