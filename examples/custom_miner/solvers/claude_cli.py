@@ -513,11 +513,13 @@ def cli_phase_profiles(
     wearing a measurement's clothes; which model belongs where is a number to
     be measured on this corpus and then written down.
 
-    `judge` and `cases2` are SET, and to different models for different
-    reasons -- the judge to be right about one value, the second bar to be a
-    different reading from the program's author. See `_JUDGE_READER` and
-    `_SECOND_BAR_READER`. An operator may still name something else for
-    either, and does so the same way.
+    `judge` and `cases2` are SET, and both to fable -- on a roster of two
+    models the only seat that is not the program's author is the other one.
+    They stay two constants rather than one because what each is asked for
+    differs (the judge to be right about a value, the second bar to be a
+    different reading), and because naming one must not move the other. See
+    `_JUDGE_READER` and `_SECOND_BAR_READER`. An operator may still name
+    something else for either, and does so the same way.
 
     A phase named here is a PREFERENCE, never a pin: `open_for` falls through
     to the ordinary ladder when that model is out on every account, so an

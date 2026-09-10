@@ -2904,7 +2904,11 @@ class VerifyingSolver:
                     # announce: the correction runs until the program passes or
                     # the deadline stops it, which is the operator's rule.
                     nxt = _scheduled_profile(rotation, correction_rounds + 1)
-                    rotated.append(nxt)
+                    # NOT recorded in `rotated`. That list answers "has this
+                    # pass already been carried once", which is a question only
+                    # the no-rotation branch below asks; a schedule has no such
+                    # state, and a list that looks like it tracks the rotation
+                    # while nothing consults it is worse than no list.
                 else:
                     # No models to rotate through -- a browser fleet, where
                     # every tab is the same model and a handoff buys a fresh
@@ -3724,12 +3728,12 @@ class VerifyingSolver:
                         # asked the same thing until the deadline, never
                         # reaching the rotation that is the one thing left.
                         #
-                        # CHECKED, not counted. `rounds_here` is incremented
+                        # ASKED, not counted. `correction_rounds` advances
                         # where a correction prompt is SENT, at the top of the
                         # loop, and the prompt this branch builds is sent by
-                        # the next iteration -- so counting here too would
-                        # charge every too_slow round twice and hand off after
-                        # half the rounds the setting names.
+                        # the next iteration -- so the schedule is read here
+                        # for the round that is about to go out, and advancing
+                        # it here as well would skip a round of it.
                         if _schedule_moves():
                             carried = await _resume_elsewhere(
                                 f"{rounds_here} round(s) with "
@@ -3918,12 +3922,12 @@ class VerifyingSolver:
                         # asked the same thing until the deadline, never
                         # reaching the rotation that is the one thing left.
                         #
-                        # CHECKED, not counted. `rounds_here` is incremented
+                        # ASKED, not counted. `correction_rounds` advances
                         # where a correction prompt is SENT, at the top of the
                         # loop, and the prompt this branch builds is sent by
-                        # the next iteration -- so counting here too would
-                        # charge every too_slow round twice and hand off after
-                        # half the rounds the setting names.
+                        # the next iteration -- so the schedule is read here
+                        # for the round that is about to go out, and advancing
+                        # it here as well would skip a round of it.
                         if _schedule_moves():
                             carried = await _resume_elsewhere(
                                 f"{rounds_here} round(s) with "
