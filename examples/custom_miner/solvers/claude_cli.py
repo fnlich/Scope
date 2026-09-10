@@ -411,8 +411,8 @@ class Profile:
 def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profile, ...]:
     """What answers when the default model will not, in order.
 
-    `SOLVER_CLI_EMERGENCY_PROFILES=sonnet:medium,fable:low` -- each entry a model
-    alias the CLI accepts, optionally with an effort after a colon.
+    `SOLVER_CLI_EMERGENCY_PROFILES=sonnet:medium,fable:low` -- each entry a
+    model alias the CLI accepts, optionally with an effort after a colon.
 
     Sonnet first, and the order is a correctness judgement rather than a speed
     one. Latency says the opposite: on a real production problem the program
@@ -498,9 +498,10 @@ def cli_phase_profiles(
 ) -> dict[str, Profile]:
     """Which model answers which phase.
 
-    `SOLVER_CLI_PHASE_PROFILES=cases=sonnet:medium,program=opus:low` -- one entry
-    per phase named in `PHASES`, each a model alias with an optional effort
-    after a colon, exactly as `SOLVER_CLI_EMERGENCY_PROFILES` spells them.
+    `SOLVER_CLI_PHASE_PROFILES=cases=sonnet:medium,program=opus:low` -- one
+    entry per phase named in `PHASES`, each a model alias with an optional
+    effort after a colon, exactly as `SOLVER_CLI_EMERGENCY_PROFILES` spells
+    them.
 
     `cases` and `program` are UNSET by default, and deliberately so. Every
     solve in the two archived production runs -- 102 of them -- opened on the
@@ -564,8 +565,8 @@ def cli_repair_rotation(
 ) -> tuple[Profile, ...]:
     """The models a correction round moves through, in order.
 
-    `SOLVER_REPAIR_ROTATION=opus:low,sonnet:medium,fable:low`, spelled exactly as
-    the emergency ladder is.
+    `SOLVER_REPAIR_ROTATION=opus:low,sonnet:medium,fable:low`, spelled exactly
+    as the emergency ladder is.
 
     A repair that stays where the program was written is a model being asked
     to find a bug in its own reading of the statement, and measured over 54

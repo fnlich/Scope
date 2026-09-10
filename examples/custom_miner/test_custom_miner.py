@@ -13903,7 +13903,7 @@ def test_a_drill_lets_the_operator_watch_the_ladder_move(
 
 
 def test_the_default_ladder_is_the_measured_one(tmp_path, monkeypatch):
-    """Every rung is `low`, and sonnet comes before fable.
+    """Two rungs at `low`, sonnet at `medium`, and sonnet before fable.
 
     Effort is measured: on a real production problem one program turn took
     fable 38s at low, opus 86s, sonnet 161s, and either model at high did not
