@@ -12970,7 +12970,7 @@ def _fake_cli(tmp_path, monkeypatch, mode="ok", backups=0):
     # rung production runs onto: sonnet in low-thinking mode (operator's rule),
     # then fable. It used to pin `sonnet:high`, so every behavioural hop test
     # asserted an effort the miner never uses.
-    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:low,fable:low")
+    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:medium,fable:low")
     monkeypatch.delenv("SOLVER_CLI_MODELS", raising=False)
     monkeypatch.delenv("SOLVER_CLI_RECOVERY_S", raising=False)
     return log
@@ -13572,7 +13572,12 @@ def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session
     first, second, spent, conversation, after = asyncio.run(go())
     assert extract_code(first, "g") and extract_code(second, "g"), (first, second)
     assert conversation.provider == "cli:sonnet" and conversation.hops == 1
-    assert conversation.effort == "low"
+    # The EFFORT comes with the rung, not from the conversation it hopped out
+    # of: taken from the ladder rather than written here, so this keeps saying
+    # what it means when the ladder's efforts change.
+    from solvers.claude_cli import cli_emergency_profiles
+
+    assert conversation.effort == cli_emergency_profiles("low")[0].effort
     # ONE account, so there is nowhere for the turn to go and the wait is the
     # right answer: the first retry is sat through, the second is the signal,
     # and the 4s and 16s behind it are never paid. Moving on is only better
@@ -13583,7 +13588,7 @@ def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session
     assert 0.9 < spent < 5.0, spent
     calls = _cli_calls(log)
     assert [(c["model"], c["effort"], c["resumed"]) for c in calls] == [
-        ("opus", "low", False), ("opus", "low", True), ("sonnet", "low", True),
+        ("opus", "low", False), ("opus", "low", True), ("sonnet", "medium", True),
     ], calls
     assert len({c["session"] for c in calls}) == 1, "the session was lost in the hop"
     # Every account, ten minutes: the service's problem, not a seat's -- and
@@ -13594,10 +13599,14 @@ def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session
     assert "*/opus" in out_table and 500 < out_table["*/opus"]["seconds"] <= 600, out_table
     assert "refused" in out_table["*/opus"]["why"] and "529" in out_table["*/opus"]["why"]
     # The next fresh solve goes straight to the emergency profile.
-    assert after.provider == "cli:sonnet" and after.effort == "low"
+    assert after.provider == "cli:sonnet"
+    assert after.effort == cli_emergency_profiles("low")[0].effort
     out = capsys.readouterr().out
     assert "hop: cli:opus -> cli:sonnet" in out, out
-    assert "EMERGENCY MODE: cli:sonnet (effort low)" in out, out
+    assert (
+        f"EMERGENCY MODE: cli:sonnet "
+        f"(effort {cli_emergency_profiles('low')[0].effort})"
+    ) in out, out
 
 
 def test_a_server_error_result_is_read_the_same_way(tmp_path, monkeypatch):
@@ -13804,7 +13813,7 @@ def test_the_status_command_names_each_account(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "primary" in out and "signed in (subscription)" in out, out
     assert "claude-2" in out and "NOT signed in" in out, out
-    assert "ladder: opus/low, sonnet/low, fable/low" in out, out
+    assert "ladder: opus/low, sonnet/medium, fable/low" in out, out
 
     _cli_modes(log, {"*": "ok"})
     assert claude_cli.main(["status"]) == 0
@@ -13886,7 +13895,7 @@ def test_a_drill_lets_the_operator_watch_the_ladder_move(
 
     monkeypatch.setenv("SOLVER_CLI_DRILL", "refuse:opus")
     backend = CliBackend()
-    assert backend.pick()[1].label == "sonnet/low"
+    assert backend.pick()[1].label == "sonnet/medium"
 
     monkeypatch.setenv("SOLVER_CLI_DRILL", "limit:nobody")
     with pytest.raises(SystemExit):
@@ -13894,12 +13903,19 @@ def test_a_drill_lets_the_operator_watch_the_ladder_move(
 
 
 def test_the_default_ladder_is_the_measured_one(tmp_path, monkeypatch):
-    """Every rung is `low`, and sonnet comes before fable.
+    """Two rungs at `low`, sonnet at `medium`, and sonnet before fable.
 
     Effort is measured: on a real production problem one program turn took
     fable 38s at low, opus 86s, sonnet 161s, and either model at high did not
     finish inside 200s. A rung that cannot answer inside the deadline is not a
-    rung, which is why nothing above `low` is here.
+    rung, which is what the band is measured for.
+
+    SONNET SITS ABOVE THAT BAND NOW, at `medium`, and it is the one rung here
+    whose effort is an operator's choice rather than a measurement: medium was
+    never timed, and it lies between a measured 161s and a measured
+    did-not-finish. This test pins it so that the choice stays deliberate --
+    an emergency rung answers a WHOLE solve inside 290s, and if this one starts
+    coming back empty, its effort is the first thing to put back.
 
     The ORDER between the two is a correctness judgement, not a speed one, and
     it goes the other way from the latency. An emergency rung answers a whole
@@ -13914,7 +13930,9 @@ def test_the_default_ladder_is_the_measured_one(tmp_path, monkeypatch):
 
     _fake_cli(tmp_path, monkeypatch)
     monkeypatch.delenv("SOLVER_CLI_EMERGENCY_PROFILES", raising=False)
-    assert [p.label for p in CliBackend().profiles] == ["opus/low", "sonnet/low", "fable/low"]
+    assert [p.label for p in CliBackend().profiles] == [
+        "opus/low", "sonnet/medium", "fable/low"
+    ]
 
 
 def test_the_cli_backend_counts_what_a_solve_costs_the_seat(tmp_path, monkeypatch):
@@ -13938,7 +13956,7 @@ def test_the_cli_summary_names_the_ladder(tmp_path, monkeypatch):
     _fake_cli(tmp_path, monkeypatch, backups=1)
     monkeypatch.setenv("SOLVER_BACKEND", "cli")
     assert roster_module.describe([]) == (
-        "claude CLI (opus/low > sonnet/low > fable/low; 2 accounts)"
+        "claude CLI (opus/low > sonnet/medium > fable/low; 2 accounts)"
     )
 
 
@@ -14437,29 +14455,45 @@ def test_a_phase_names_a_model_and_no_phase_names_one_by_default(monkeypatch):
     What the split buys -- independence, and two turns side by side instead of
     back to back -- holds whichever model answers each.
 
-    `judge` and `cases2` DO ship one, and the difference is that neither is a
-    claim about which model is better. Both exist to be a reader that is not
+    `judge` and `cases2` DO ship one, and to DIFFERENT models, because what
+    each wants from one is different. Both exist to be a reader that is not
     the one writing the program, and `avoid=` cannot say that here: it
     resolves against the ladder, and `cases2` is launched before the program's
-    own provider is even known. Sonnet is the name because it is the only one
-    measured against opus on this corpus -- `calibration/fixed_inputs.py`, 91
-    of 97 expected values agreed with the inputs held fixed.
+    own provider is even known.
+
+    The judge is asked to be RIGHT -- it settles one expected value and the
+    loop treats that as the verdict -- so it names the model measured for
+    exactly that: `calibration/fixed_inputs.py`, 91 of 97 expected values
+    agreed with opus, inputs held fixed. At medium, because being right is the
+    whole product of the one turn that never reads a program.
+
+    The second bar is asked to be DIFFERENT. Its product is the union of two
+    readers' calls, and two models choosing their own inputs share about 2% of
+    them (`calibration/two_bar_overlap.py`) -- a property of any two distinct
+    models rather than of sonnet, which is what makes this the seat an
+    operator can choose without contradicting a measurement.
     """
     from solvers.claude_cli import Profile, cli_phase_profiles
 
     monkeypatch.delenv("SOLVER_CLI_PHASE_PROFILES", raising=False)
     assert cli_phase_profiles("low") == {
-        "judge": Profile("sonnet", "low"),
-        "cases2": Profile("sonnet", "low"),
+        "judge": Profile("sonnet", "medium"),
+        "cases2": Profile("fable", "low"),
     }, "the independent readers are named; cases and program are not"
 
     monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", "cases=sonnet:high,program=fable")
     assert cli_phase_profiles("low") == {
         "cases": Profile("sonnet", "high"),
         "program": Profile("fable", "low"),
-        "judge": Profile("sonnet", "low"),
-        "cases2": Profile("sonnet", "low"),
+        "judge": Profile("sonnet", "medium"),
+        "cases2": Profile("fable", "low"),
     }
+    # The two readers are named apart, so neither default may follow the
+    # other: one name for both is what this replaced.
+    assert (
+        cli_phase_profiles("low")["judge"].model
+        != cli_phase_profiles("low")["cases2"].model
+    ), "the judge and the second bar collapsed back onto one model"
 
     # An operator can still name something else for them.
     monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", "judge=fable:low")
@@ -15312,7 +15346,7 @@ def test_only_a_usage_limit_moves_a_turn_to_the_backup_account(
 
     _fake_cli(tmp_path, monkeypatch)
     monkeypatch.setenv("SOLVER_CLI_BACKUP_ACCOUNTS", str(tmp_path / "seat2"))
-    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:low,fable:low")
+    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:medium,fable:low")
     backend = CliBackend()
     primary, backup = backend.accounts[0], backend.accounts[1]
     assert backup is not primary, backend.accounts
@@ -15632,7 +15666,7 @@ def test_a_pinned_repair_seat_survives_the_avoid_that_sends_it_there(
     from solvers.claude_cli import CliBackend
 
     _fake_cli(tmp_path, monkeypatch)
-    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "fable:low,sonnet:low")
+    monkeypatch.setenv("SOLVER_CLI_EMERGENCY_PROFILES", "fable:low,sonnet:medium")
     monkeypatch.setenv("SOLVER_CLI_PHASE_PROFILES", "repair=fable:medium")
     backend = CliBackend()
 
@@ -17286,9 +17320,10 @@ def test_a_limit_moves_a_pinned_conversation_to_the_same_model_elsewhere(
     tmp_path, monkeypatch
 ):
     """A usage limit is the account's. Walking the ladder first re-sent a
-    `judge` or `cases2` conversation pinned to sonnet as the other account's
-    DEFAULT model -- the program's own -- removing the independence while
-    leaving the line that claims it."""
+    `judge` or `cases2` conversation -- each pinned to a reader that is NOT
+    the one writing programs -- as the other account's DEFAULT model, which is
+    the program's own, removing the independence while leaving the line that
+    claims it."""
     from solvers.claude_cli import CliBackend
 
     log = _fake_cli(tmp_path, monkeypatch, backups=1)

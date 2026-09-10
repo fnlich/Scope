@@ -670,12 +670,19 @@ def _union_bars(
 
     Keyed by the CALL, so a case both bars happened to write appears once.
     Where they wrote the same call and disagree about what it returns, the
-    first bar's answer stands and the key is returned in `split`: that is the
-    6% `calibration/fixed_inputs.py` measured when it held the inputs fixed
-    and asked two readers for the expected values, and it is the statement
-    being genuinely ambiguous rather than either model being careless. A
-    disagreement there is not evidence against the program, and `split` is
-    what lets the caller treat it that way.
+    first bar's answer stands and the key is returned in `split`. A
+    disagreement there is the statement being genuinely ambiguous rather than
+    either model being careless, so it is not evidence against the program,
+    and `split` is what lets the caller treat it that way.
+
+    How OFTEN that happens is measured for one pair only:
+    `calibration/fixed_inputs.py` held the inputs fixed, asked opus and sonnet
+    for the expected values, and they split on 6 of 97. The second bar is no
+    longer sonnet, so that 6% is not this pair's rate and nothing here should
+    be read as claiming it is -- what carries over is the ARGUMENT, which
+    never depended on the number: two readings of one statement that differ
+    about a value have found an ambiguity in the statement, whoever the two
+    readers are.
     """
     seen = {_case_key(case): case for case in first}
     split: dict[tuple, Any] = {}

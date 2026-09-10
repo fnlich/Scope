@@ -411,8 +411,8 @@ class Profile:
 def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profile, ...]:
     """What answers when the default model will not, in order.
 
-    `SOLVER_CLI_EMERGENCY_PROFILES=sonnet:low,fable:low` -- each entry a model
-    alias the CLI accepts, optionally with an effort after a colon.
+    `SOLVER_CLI_EMERGENCY_PROFILES=sonnet:medium,fable:low` -- each entry a
+    model alias the CLI accepts, optionally with an effort after a colon.
 
     Sonnet first, and the order is a correctness judgement rather than a speed
     one. Latency says the opposite: on a real production problem the program
@@ -428,7 +428,7 @@ def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profil
     that it reads these statements the way the default model does.
     """
     default_effort = default_effort or cli_effort()
-    raw = _flag("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:low,fable:low")
+    raw = _flag("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:medium,fable:low")
     profiles: list[Profile] = []
     for entry in raw.split(","):
         entry = entry.strip()
@@ -466,12 +466,31 @@ PHASES = ("cases", "program", "repair", "judge", "cases2")
 # everywhere, which keeps the preference from ever deciding whether anyone
 # answers at all.
 #
-# Sonnet is the name because it is the only one with a measurement behind it:
-# `calibration/fixed_inputs.py`, opus and sonnet each deriving `expected` for
-# the same fixed inputs, agreed on 91 of 97 -- close enough to trust a case it
-# writes, far enough apart that the 6 it split on are the statement's real
-# ambiguities rather than one model's noise.
-_INDEPENDENT_READER = "sonnet"
+# What each of the two wants from a model is NOT the same thing, and one name
+# for both hid that.
+#
+# THE JUDGE IS ASKED TO BE RIGHT. It settles one expected value, and its answer
+# is taken as the verdict -- so the measurement that applies is the one about
+# agreement on expected values: `calibration/fixed_inputs.py`, opus and sonnet
+# each deriving `expected` for the same fixed inputs, agreed on 91 of 97. Close
+# enough to trust a value it rules on, far enough apart that the 6 it split on
+# are the statement's real ambiguities rather than one model's noise. That is a
+# measurement about SONNET specifically and it is why the judge names sonnet.
+#
+# THE SECOND BAR IS ASKED TO BE DIFFERENT. Its product is the UNION, not
+# agreement: `calibration/two_bar_overlap.py` measured two models choosing
+# their own inputs sharing about 2% of them, which is what makes agreement
+# useless as a signal here and the union worth a turn. That property belongs to
+# any two distinct models rather than to sonnet, so the second bar is the seat
+# where an operator's choice costs nothing the measurements can price -- and
+# fable is that choice.
+#
+# What fable has NO measurement for is the quality of the `expected` values it
+# writes, and the second bar does write them. The judge is the answer to that:
+# a case the program disputes is adjudicated rather than enforced, which is the
+# same protection a sonnet-written case gets.
+_JUDGE_READER = "sonnet"
+_SECOND_BAR_READER = "fable"
 
 
 def cli_phase_profiles(
@@ -479,9 +498,10 @@ def cli_phase_profiles(
 ) -> dict[str, Profile]:
     """Which model answers which phase.
 
-    `SOLVER_CLI_PHASE_PROFILES=cases=sonnet:low,program=opus:low` -- one entry
-    per phase named in `PHASES`, each a model alias with an optional effort
-    after a colon, exactly as `SOLVER_CLI_EMERGENCY_PROFILES` spells them.
+    `SOLVER_CLI_PHASE_PROFILES=cases=sonnet:medium,program=opus:low` -- one
+    entry per phase named in `PHASES`, each a model alias with an optional
+    effort after a colon, exactly as `SOLVER_CLI_EMERGENCY_PROFILES` spells
+    them.
 
     `cases` and `program` are UNSET by default, and deliberately so. Every
     solve in the two archived production runs -- 102 of them -- opened on the
@@ -490,9 +510,11 @@ def cli_phase_profiles(
     wearing a measurement's clothes; which model belongs where is a number to
     be measured on this corpus and then written down.
 
-    `judge` and `cases2` are SET, and for a reason that is not about which
-    model is better: see `_INDEPENDENT_READER`. An operator may still name
-    something else for them, and does so the same way.
+    `judge` and `cases2` are SET, and to different models for different
+    reasons -- the judge to be right about one value, the second bar to be a
+    different reading from the program's author. See `_JUDGE_READER` and
+    `_SECOND_BAR_READER`. An operator may still name something else for
+    either, and does so the same way.
 
     A phase named here is a PREFERENCE, never a pin: `open_for` falls through
     to the ordinary ladder when that model is out on every account, so an
@@ -501,8 +523,14 @@ def cli_phase_profiles(
     default_effort = default_effort or cli_effort()
     raw = _flag("SOLVER_CLI_PHASE_PROFILES", "")
     chosen: dict[str, Profile] = {
-        "judge": Profile(_INDEPENDENT_READER, "low"),
-        "cases2": Profile(_INDEPENDENT_READER, "low"),
+        # Medium, alone among the shipped efforts, and for the one turn where
+        # being right IS the product: the judge decides a single expected value
+        # and the loop then treats it as settled. It is also the cheapest turn
+        # here -- it reads a statement and some calls, never a program -- so
+        # what a longer think costs is measured in seconds on a turn the logs
+        # show finishing in three to ten.
+        "judge": Profile(_JUDGE_READER, "medium"),
+        "cases2": Profile(_SECOND_BAR_READER, "low"),
     }
     for entry in raw.split(","):
         entry = entry.strip()
@@ -537,8 +565,8 @@ def cli_repair_rotation(
 ) -> tuple[Profile, ...]:
     """The models a correction round moves through, in order.
 
-    `SOLVER_REPAIR_ROTATION=opus:low,sonnet:low,fable:low`, spelled exactly as
-    the emergency ladder is.
+    `SOLVER_REPAIR_ROTATION=opus:low,sonnet:medium,fable:low`, spelled exactly
+    as the emergency ladder is.
 
     A repair that stays where the program was written is a model being asked
     to find a bug in its own reading of the statement, and measured over 54
@@ -554,7 +582,7 @@ def cli_repair_rotation(
     program; the two behind it are the readers that did not.
     """
     default_effort = default_effort or cli_effort()
-    raw = _flag("SOLVER_REPAIR_ROTATION", "opus:low,sonnet:low,fable:low")
+    raw = _flag("SOLVER_REPAIR_ROTATION", "opus:low,sonnet:medium,fable:low")
     profiles: list[Profile] = []
     for entry in raw.split(","):
         entry = entry.strip()
@@ -944,9 +972,10 @@ class CliConversation:
             # A limit and a sign-out are the account's; a model benched
             # everywhere is refused there too and falls through to the
             # ladder. Walking the ladder first re-sent a `judge` or `cases2`
-            # conversation pinned to sonnet as the other account's DEFAULT --
-            # the program's own model, which removed the independence while
-            # leaving the line that claims it. `busy` decided on the other
+            # conversation -- each pinned to a reader that is NOT the one
+            # writing programs -- as the other account's DEFAULT, which is the
+            # program's own model, removing the independence while leaving the
+            # line that claims it. `busy` decided on the other
             # account's freedom a moment ago; if that moment has passed, the
             # ladder is still better than returning nothing for a turn that
             # was killed in order to move.
