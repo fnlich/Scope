@@ -1488,7 +1488,7 @@ Four rules keep the split from becoming a second way to lose:
 Each phase may name its own model and effort:
 
 ```
-SOLVER_CLI_PHASE_PROFILES=cases=sonnet:low,program=opus:low
+SOLVER_CLI_PHASE_PROFILES=cases=sonnet:medium,program=opus:low
 ```
 
 Phases are `cases`, `program`, `repair`, `judge` and `cases2`. The first three
@@ -1497,11 +1497,25 @@ of the 102 solves in the archived runs opened on the same model, so those logs
 say nothing whatever about how another model answers a cases turn or a program
 turn here. A default naming one would be a guess with a measurement's authority.
 Measure it on your own traffic, then set it. `judge` and `cases2` DO default,
-to `sonnet:low`: both exist to be a reading of the statement the program's
-author did not make, so their default is "a different model from the one that
-writes programs", and sonnet in low-thinking mode is the measured choice (see
-`.env.example`). Correction rounds rotate through `SOLVER_REPAIR_ROTATION`
-(`opus:low,sonnet:low,fable:low`) until the program passes or the deadline
+and to **different** models, because what each wants from one is different.
+Both are a reading of the statement the program's author did not make, so
+neither is ever the model that writes programs -- but the judge is asked to be
+*right* about one expected value, and the second bar is asked to be
+*different*.
+
+- `judge` defaults to **`sonnet:medium`**. Its answer settles a case, and
+  sonnet is the model measured for that: 91 of 97 expected values agreed with
+  opus, inputs held fixed (`calibration/fixed_inputs.py`). Medium because it is
+  the one turn where being right is the entire product, and the cheapest --
+  it never reads a program.
+- `cases2` defaults to **`fable:low`**. The second bar's product is the union
+  of two readers' calls, and two models choosing their own inputs share about
+  2% of them (`calibration/two_bar_overlap.py`) -- a property of any two
+  distinct models rather than of sonnet. Fable's `expected` values have no
+  study behind them; the judge is what keeps a bad one from being enforced.
+
+Correction rounds rotate through `SOLVER_REPAIR_ROTATION`
+(`opus:low,sonnet:medium,fable:low`) until the program passes or the deadline
 stops it -- around again when every model has had it once.
 
 What a phase names is a **preference, never a pin**, and the two escapes are
