@@ -923,11 +923,12 @@ class CliConversation:
             # The SAME MODEL on another account first, whatever the verdict.
             # A limit and a sign-out are the account's; a model benched
             # everywhere is refused there too and falls through to the
-            # ladder. Walking the ladder first re-sent a `judge` or `cases2`
-            # conversation -- each pinned to a reader that is NOT the one
-            # writing programs -- as the other account's DEFAULT, which is the
-            # program's own model, removing the independence while leaving the
-            # line that claims it. `busy` decided on the other
+            # ladder. Walking the ladder first re-sent an `oracle` or
+            # `repair` conversation -- each pinned to a model chosen to differ
+            # from the one writing the candidate -- as the other account's
+            # DEFAULT, which is the candidate's own model, removing the
+            # difference while leaving the line that claims it. `busy` decided
+            # on the other
             # account's freedom a moment ago; if that moment has passed, the
             # ladder is still better than returning nothing for a turn that
             # was killed in order to move.
@@ -982,10 +983,12 @@ class CliConversation:
 
         The MODEL is kept, and that is the other half. This is a move about
         seats, and the conversations that reach it most are the ones pinned to
-        a model for a reason: `judge` and `cases2` exist to be a reading the
-        program's author did not make, and answering them on whatever the next
-        account defaults to would remove the independence while leaving the
-        line that claims it.
+        a model for a reason: the `oracle` is deliberately the weaker
+        instruction and the `repair` turn is deliberately a different model
+        from the one that wrote the candidate. Answering either on whatever
+        the next account defaults to would collapse both back onto the
+        candidate's own model, removing the difference the design is built on
+        while leaving the line that claims it.
 
         Nothing doing once the session has started: a session lives in its
         account's config directory, so it cannot move. There the wait is the
@@ -999,10 +1002,11 @@ class CliConversation:
             # THE SAME MODEL on another account, not that account's default.
             # This is a move about processes, and the profile is nothing to do
             # with it -- while the conversations that most often reach here are
-            # exactly the ones pinned to a model for a reason: `cases2` and
-            # `judge` exist to be a reading the program's author did not make,
-            # and quietly answering them on the default model would remove the
-            # independence without removing the line that claims it.
+            # exactly the ones pinned to a model for a reason: the `oracle`
+            # and the `repair` turn are both chosen to differ from the
+            # candidate's model, and quietly answering them on the default
+            # would remove that difference without removing the line that
+            # claims it.
             if self._backend.outage_for(account, self.model)[0] > 0:
                 continue
             if self._backend.slot_for(account).locked():

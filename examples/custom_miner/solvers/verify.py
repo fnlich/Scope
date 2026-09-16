@@ -187,6 +187,16 @@ PROBE_SCALES = (PROBE_MAX_BYTES, PROBE_MAX_BYTES // 4, PROBE_MAX_BYTES // 16)
 # that decides whether another round, pass or handoff is started.
 MIN_SLICE_S = 1.0
 
+# A repair round that changed nothing AND cost less than this did not involve
+# the model at all: the read came back with text that was already on the page.
+# Re-asking that costs no time, so the loop would resend the same prompt at
+# machine speed until the deadline -- measured at 2,567 rounds for one answer
+# that never changed. A round that took a real round trip is the other thing
+# entirely: the model answered, and answered the same, and the next ask is a
+# real chance the remaining budget is there to pay for. Time is what tells the
+# two apart; the count cannot.
+STALE_ROUND_S = 2.0
+
 
 
 
@@ -1345,36 +1355,17 @@ class _Shipped(NamedTuple):
         )
 
 
-@dataclass
 class _Plan:
-    """What the NEXT pass of one solve should do. One per `solve_task`.
-
-    Only `two_phase` so far, and it exists because a cases turn that costs a
-    whole pass used to cost EVERY pass. `solve_task` retries `_attempt` up to
-    `MAX_PASSES` times while it is holding nothing, and nothing remembered that
-    turn 1 had already proved unaffordable here -- so a task whose cases turn
-    timed out burned all four passes on four more cases turns and submitted
-    nothing, having never once asked for a program.
+    """What one solve did, gathered as it happens. One per `solve_task`.
 
     Per-solve rather than per-solver: solves run concurrently on one instance,
-    and a flag on `self` would let one task's bad luck disable the split for
-    every other task in flight.
+    and a counter on `self` would mix one task's rounds into another's.
 
-    It answers "was turn 1 unaffordable HERE", so only a failure that belongs to
-    the task and the site clears it. A tab that went blind is retired on the
-    spot and the next pass is served by another one, so its failure says nothing
-    about the task -- see `_attempt`, where the two are told apart.
-
-    Cleared, the next pass asks for the program ALONE. There is no combined
-    turn to fall back to: cases written beside a program are back-filled from
-    what it happens to do and agree with its bugs, which is the whole argument
-    for splitting the turns, and a prompt that asks for a second block the
-    grader will not trust spends output tokens inside the deadline. The cost is
-    real and it is the right one: that task goes out ungraded rather than
-    graded against evidence worth nothing.
+    Everything on it is written to be READ -- it is what `summary()` turns
+    into the one `[verify]` line an operator greps, and every field on it
+    earns its place by being the detector for a named failure. Nothing here
+    steers the solve.
     """
-
-    two_phase: bool = True
 
     def __init__(self) -> None:
         # What the summary line reports beside the tally, so a hidden-suite
@@ -2265,7 +2256,7 @@ class VerifyingSolver:
             oracle = await oracle_task
 
             # -- 7 and 8: compare, then repair whichever is wrong ----------
-            differential = Differential(self._grader)
+            differential = Differential(self._grader, VERIFY_TIMEOUT_S)
             router = Router()
             # Every (candidate, reference, failing cases) this pass has seen.
             # A round that leaves all three unchanged moved nothing, and the
@@ -2282,6 +2273,16 @@ class VerifyingSolver:
             # unexamined.
             last_patched = ""
             last_code = ""
+            # How long the round that produced the reply now in hand took. Only
+            # read when that round changed nothing -- see `STALE_ROUND_S`.
+            round_s = float("inf")
+            # Which conversation produced the reply now being graded. Stage 6
+            # writes the first candidate; from round 2 a candidate repair is
+            # written by the repair conversation instead, and "the model was
+            # still writing" is a fact about whichever tab actually wrote it.
+            # Reading it off the stage-6 conversation forever would let one
+            # unfinished first draft end every later round as a cutoff.
+            writer = conversation
             attempt = 0
             while True:
                 attempt += 1
@@ -2294,7 +2295,7 @@ class VerifyingSolver:
                 if plan is not None:
                     plan.rounds += 1
 
-                still_writing = getattr(conversation, "still_writing", False)
+                still_writing = getattr(writer, "still_writing", False)
                 # `cases=None`: the structural check, the Rust compile and the
                 # validator's own examples happen here; the candidate is RUN by
                 # the differential below, once, rather than twice.
@@ -2314,9 +2315,18 @@ class VerifyingSolver:
                 examples_failed = bool(
                     candidate.total and candidate.passed < candidate.total
                 )
-                if examples_failed:
+                # A structural defect -- a program that will not parse, or Rust
+                # that will not compile -- accuses the candidate on its own
+                # evidence, with no reference involved. It has to drive a
+                # repair by itself: live traffic ships no public examples, so
+                # `compile_defect` is the ONLY check a Rust answer gets, and a
+                # loop that consulted only the differential shipped a program
+                # that does not build without ever asking for a fix.
+                defective = bool(candidate.defect)
+                if examples_failed or defective:
                     report = DifferentialReport(
-                        note="the validator's own examples failed"
+                        note=("the validator's own examples failed"
+                              if examples_failed else candidate.defect)
                     )
                 else:
                     report = await asyncio.to_thread(
@@ -2337,7 +2347,14 @@ class VerifyingSolver:
                 stalled = signature in seen
                 seen.add(signature)
 
-                score = report.score()
+                # The differential first, then the candidate's OWN quality as
+                # the tie-break. Ranking on the comparison alone made every
+                # report that established nothing score identically -- so a
+                # program repaired out of a structural defect could not
+                # outrank the defective one it replaced, and the broken
+                # version shipped. `Candidate.score`'s last term is "has no
+                # defect", which is exactly the missing comparison.
+                score = (report.score(), candidate.score)
                 if _supersedes(candidate, best, still_writing) and (
                     best is None or score > best_score
                 ):
@@ -2363,10 +2380,39 @@ class VerifyingSolver:
                     # on evidence the reference had no part in.
                     report.note = slow
 
-                blamed_elsewhere = bool(candidate.defect) or examples_failed or (
+                if still_writing:
+                    # The model had not finished when the read stopped, so what
+                    # is in hand is a FRAGMENT of an answer rather than a wrong
+                    # one, and a repair report about a half-written program
+                    # describes a bug its author was still in the middle of not
+                    # writing. Measured against the old browser backend:
+                    #
+                    #   captured=''   -> "your reply did not reach me as code",
+                    #                    sent to a model still writing it
+                    #   captured='def g(n):\n    total = 0\n    while n > 0:'
+                    #                 -> "the code is not valid Python", about a
+                    #                    program the model had not finished
+                    #
+                    # `_send_within` already reads past its own slice rather
+                    # than stop early, so reaching here means the whole budget
+                    # is gone and there is no round to spend anyway. Stop, and
+                    # say which turn ran out -- the summary otherwise blames
+                    # the inputs turn for the candidate turn's failure.
+                    print(
+                        f"[verify] {provider or 'this model'} was still writing "
+                        f"when the budget ran out; "
+                        + ("submitting the part that arrived"
+                           if candidate.code.strip()
+                           else "nothing arrived to submit")
+                        + " rather than interrupting it with a repair prompt"
+                    )
+                    note_exit("cutoff")
+                    break
+
+                blamed_elsewhere = defective or examples_failed or (
                     plan is not None and plan.probe in ("too_slow", "oom")
                 )
-                if examples_failed:
+                if examples_failed or defective:
                     # Ground truth accuses the candidate and nothing else is in
                     # dispute, so the router is not consulted at all.
                     blame = "candidate"
@@ -2379,6 +2425,19 @@ class VerifyingSolver:
                     plan.flipped = router.flipped
                 if not blame:
                     note_exit("converged")
+                    break
+                if stalled and round_s < STALE_ROUND_S:
+                    # Nothing moved, and the round that moved nothing was free.
+                    # Whatever wrote that reply was not a model. Flipping to
+                    # the reference would ask the same tab the same way, so
+                    # this stops the pass whoever the router blames.
+                    print(
+                        f"[verify] {provider or 'this model'} returned the same "
+                        f"program in {round_s:.1f}s without being asked again — "
+                        f"the tab is replaying an old reply rather than "
+                        f"answering; submitting the last version"
+                    )
+                    note_exit("stalled")
                     break
                 if stalled and blame == last_patched:
                     # The round that just ran changed neither program, and the
@@ -2406,18 +2465,20 @@ class VerifyingSolver:
                     )
                 last_code = candidate.code
                 last_patched = blame
+                round_started = time.monotonic()
                 reply = await self._send_within(
                     repair_conv,
                     build_differential_repair_prompt(
                         task, analysis,
                         candidate.code if blame == "candidate" else oracle,
                         ("\n".join(candidate.failures) if examples_failed
-                         else report.prompt_text()),
+                         else report.prompt_text()),  # the defect rides in `defect=`
                         kind=blame,
                         defect=candidate.defect if blame == "candidate" else None,
                     ),
                     max(1.0, left()),
                 )
+                round_s = time.monotonic() - round_started
                 phases.mark(f"{attempt + 2} repair {blame}")
                 if not reply.strip():
                     note_exit("empty")
@@ -2432,6 +2493,7 @@ class VerifyingSolver:
                     oracle = patched
                 else:
                     candidate_reply = reply
+                    writer = repair_conv
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - never lose an answer in hand

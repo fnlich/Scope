@@ -140,9 +140,22 @@ class DifferentialReport:
         A repair round that does not raise this leaves the previous version in
         place, so the cost of blaming the wrong program is a wasted round and
         never a worse answer shipped.
+
+        A KNOWN mismatch outranks everything else this can say, agreements
+        included, because payment is all or nothing. A program that disagreed
+        with the reference anywhere is a certain zero; one that was never run
+        is merely unmeasured, and unmeasured still has a chance. Ranking
+        `agreed` first said the opposite and was measured saying it: a draft
+        that agreed on 1 of 3 inputs and disagreed on the other 2 outranked the
+        correction written after it was shown those two, because the
+        correction came back with too little clock left to run anything and
+        scored a truthful zero everywhere. The known-wrong program shipped.
+
+        `unrun` therefore sits BELOW `mismatch` rather than beside it: both are
+        bad, but one is a verdict and the other is an absence.
         """
-        return (1 if self.ok else 0, self.agreed, -self.mismatch,
-                -self.oracle_crash, -self.unrun)
+        return (1 if self.ok else 0, -self.mismatch, -self.oracle_crash,
+                self.agreed, -self.unrun)
 
     def summary(self) -> str:
         parts = [
@@ -283,8 +296,16 @@ class Differential:
     that happened to produce a byte-identical oracle.
     """
 
-    def __init__(self, grader: Any) -> None:
+    def __init__(self, grader: Any, per_case_s: float = 5.0) -> None:
         self._grader = grader
+        # What ONE case costs at worst. The floor below which starting a run
+        # buys nothing: every case gets this long, nothing bounds the run as a
+        # whole, and a candidate that times out on each of six cases spends six
+        # multiples of it. Measured under the previous design: 6 x 5s = 30s of
+        # executor time bought with 0.2s of budget, on a verdict nothing could
+        # act on -- there was no time left for a repair round and the answer
+        # went out unverified anyway.
+        self._per_case_s = max(0.0, float(per_case_s))
         self._memo: dict[tuple[str, str], list[Any]] = {}
         self.oracle_runs = 0
         self.oracle_reused = 0
@@ -335,6 +356,13 @@ class Differential:
             return report
         if not (oracle or "").strip():
             report.note = "no oracle to compare against"
+            return report
+        if budget_s is not None and budget_s < self._per_case_s:
+            # Not enough left for even one case. The floor is ONE case rather
+            # than the whole suite: a partial run that DOES fit is worth more
+            # than no evidence, and the grader bounds the rest itself.
+            report.unrun = len(inputs)
+            report.note = "not enough budget left to run a single input"
             return report
 
         runs = self.expectations(
