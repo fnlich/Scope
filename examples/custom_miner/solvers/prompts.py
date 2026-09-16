@@ -2547,12 +2547,12 @@ finish: keep the sizes small.
 
 Each case is the exact bytes written to the program's stdin.
 
-{{
+{
   "cases": [
-    {{"name": "short name", "stdin": "raw stdin, including its newlines",
-     "notes": "which trap this one is aimed at"}}
+    {"name": "short name", "stdin": "raw stdin, including its newlines",
+     "notes": "which trap this one is aimed at"}
   ]
-}}
+}
 
 Write 6 to 15 cases. Cover the ordinary path first, then: the smallest legal
 input, the boundaries of every range the statement names, and one case per trap

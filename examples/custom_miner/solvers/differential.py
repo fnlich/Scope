@@ -83,6 +83,12 @@ class DifferentialReport:
     agreed: int = 0
     mismatch: int = 0
     oracle_crash: int = 0
+    # Cases that were sent to be graded and never produced a verdict, because
+    # the budget ran out mid-suite or the executor came back short. NOT
+    # agreement: `check_detailed` counts `total` as every case it was handed,
+    # so without this an unrun case is silently indistinguishable from a
+    # passing one -- which is the whole failure this design exists to stop.
+    unrun: int = 0
     # Failures only. A passing case is counted, not stored.
     cases: list[CaseResult] = field(default_factory=list)
     # The cases with the oracle's answers filled in, for whoever grades next.
@@ -92,12 +98,22 @@ class DifferentialReport:
 
     @property
     def ok(self) -> bool:
-        """Every input ran and the two programs agreed on all of them.
+        """Every input ran, and the two programs agreed on all of them.
 
-        `ran > 0` is load-bearing: a report with no cases has established
-        nothing, and must never read as a clean one.
+        Three clauses, and each rules out a different way of looking finished
+        without having been checked. `ran > 0`: a report with no cases has
+        established nothing. `oracle_crash == 0`: a reference that fell over
+        cannot vouch for anything. `unrun == 0`: a suite the clock cut short
+        proved only as much as it got through, and reading the rest as
+        agreement is exactly the `corrected=0/18 exit=converged` line this
+        design was built to stop printing.
         """
-        return self.ran > 0 and self.mismatch == 0 and self.oracle_crash == 0
+        return (
+            self.ran > 0
+            and self.mismatch == 0
+            and self.oracle_crash == 0
+            and self.unrun == 0
+        )
 
     @property
     def blame(self) -> str:
@@ -123,13 +139,15 @@ class DifferentialReport:
         never a worse answer shipped.
         """
         return (1 if self.ok else 0, self.agreed, -self.mismatch,
-                -self.oracle_crash)
+                -self.oracle_crash, -self.unrun)
 
     def summary(self) -> str:
         parts = [
             f"ran={self.ran}", f"agreed={self.agreed}",
             f"mismatch={self.mismatch}", f"oracle_crash={self.oracle_crash}",
         ]
+        if self.unrun:
+            parts.append(f"unrun={self.unrun}")
         if self.mutated:
             parts.append(f"mutated={self.mutated}")
         if self.note:
@@ -203,9 +221,19 @@ class Differential:
         if cached is not None:
             self.oracle_reused += 1
             return cached
-        runs = self._grader.outputs(
-            oracle, language, entrypoint, inputs, budget_s=budget_s
-        )
+        try:
+            runs = self._grader.outputs(
+                oracle, language, entrypoint, inputs, budget_s=budget_s
+            )
+        except Exception as exc:  # noqa: BLE001 - a broken grader loses no answer
+            # The standing rule everywhere else in this solver: an executor
+            # that cannot be built costs the CHECK, never the answer. An empty
+            # run list makes every input an unanswered one, which is what it
+            # is -- and the report then reads as having established nothing
+            # rather than as having established agreement.
+            print(f"[verify] the reference could not be run, so nothing was "
+                  f"checked against it: {type(exc).__name__}: {exc}")
+            runs = []
         self._memo[key] = runs
         self.oracle_runs += 1
         return runs
@@ -258,23 +286,43 @@ class Differential:
             report.note = "the reference answered nothing"
             return report
 
-        passed, total, _failures, failed, actuals = self._grader.check_detailed(
-            candidate, language, entrypoint, gradable,
-            names=gradable_names, budget_s=budget_s,
-        )
-        report.ran = report.oracle_crash + total
+        try:
+            passed, total, failures, failed, actuals = (
+                self._grader.check_detailed(
+                    candidate, language, entrypoint, gradable,
+                    names=gradable_names, budget_s=budget_s,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - a broken grader loses no answer
+            print(f"[verify] local grading unavailable, so the candidate could "
+                  f"not be compared: {type(exc).__name__}: {exc}")
+            report.unrun = len(gradable)
+            report.note = "the candidate could not be run"
+            return report
+        # `total` is every case that was HANDED OVER, not every case that ran:
+        # a budget that expires mid-suite leaves the rest unrun, and
+        # `check_detailed` reports them in neither `passed` nor `failures`.
+        # Counting them as agreement is how a suite that proved a third of
+        # itself reads as a clean one.
+        observed = passed + len(failures)
         report.agreed = passed
+        report.unrun = max(0, total - observed)
+        report.ran = report.oracle_crash + observed
 
+        # `failed` and `actuals` are built together, one append each per
+        # failing case, so they are parallel TO EACH OTHER and not to the case
+        # list. Indexing `actuals` by a position in `gradable` reads the wrong
+        # element whenever the failures are not a prefix -- and silently, since
+        # a short read just falls off the end and becomes "produced nothing",
+        # which is the one thing a repair prompt must not be told about a
+        # program that did produce something.
         by_index = {id(case): i for i, case in enumerate(gradable)}
-        for case in failed:
+        for case, produced in zip(failed, actuals):
             index = by_index.get(id(case))
             if index is None:
                 index = _match_case(gradable, case)
             name = gradable_names[index] if index is not None else "case"
             expected = case.get("expected") if isinstance(case, dict) else None
-            produced = actuals[index] if (
-                index is not None and index < len(actuals)
-            ) else None
             report.mismatch += 1
             report.cases.append(CaseResult(
                 name=name,
@@ -282,9 +330,7 @@ class Differential:
                 blames="candidate",
                 detail=_candidate_detail(produced),
                 oracle_out=_clip(expected),
-                candidate_out=_clip(
-                    getattr(produced, "value", None) if produced else None
-                ),
+                candidate_out=_clip(getattr(produced, "value", None)),
             ))
         return report
 

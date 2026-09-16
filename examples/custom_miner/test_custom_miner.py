@@ -17889,7 +17889,7 @@ def test_a_disagreement_blames_the_candidate_and_says_so_in_a_field():
     failing = {"args": [[1, 2, 3]], "kwargs": {}, "expected": 6}
     grader = _FakeGrader(
         oracle_runs={"ORACLE": [_run(0), _run(6)]},
-        check=lambda code, examples, names: (1, 2, ["bad"], [examples[1]], [None, _run(7)]),
+        check=lambda code, examples, names: (1, 2, ["bad"], [examples[1]], [_run(7)]),
     )
     report = _differential(grader).compare(
         "CANDIDATE", "ORACLE", "python", "solve", _PY_INPUTS,
@@ -18320,3 +18320,120 @@ def test_a_rust_case_is_the_bytes_on_stdin():
     )
     assert cases == [{"name": "one", "args": ["3\n1 2 3\n"],
                       "kwargs": {}, "notes": ""}], cases
+
+
+def test_a_suite_the_clock_cut_short_never_reads_as_agreement():
+    """REGRESSION. `check_detailed` reports `total` as every case it was
+    HANDED, not every case that ran -- a budget that expires mid-suite leaves
+    the rest in neither `passed` nor `failures`. Counting the difference as
+    agreement made a report that proved two cases out of five read exactly as
+    clean as one that proved all five, which is the `corrected=0/18
+    exit=converged` line this whole design exists to stop printing."""
+    inputs = [{"name": f"c{i}", "args": [[i]], "kwargs": {}} for i in range(5)]
+    grader = _FakeGrader(
+        oracle_runs={"ORACLE": [_run(i) for i in range(5)]},
+        # Two ran and passed; three never ran. No failures reported.
+        check=lambda code, examples, names: (2, 5, [], [], []),
+    )
+    report = _differential(grader).compare(
+        "CANDIDATE", "ORACLE", "python", "solve", inputs,
+    )
+    assert report.unrun == 3, report.summary()
+    assert report.agreed == 2, report.summary()
+    assert not report.ok, f"a third of the suite proved nothing: {report.summary()}"
+    assert "unrun=3" in report.summary(), report.summary()
+
+    # And a suite that really did run every case is still clean.
+    whole = _FakeGrader(
+        oracle_runs={"ORACLE": [_run(i) for i in range(5)]},
+        check=lambda code, examples, names: (5, 5, [], [], []),
+    )
+    good = _differential(whole).compare(
+        "CANDIDATE", "ORACLE", "python", "solve", inputs,
+    )
+    assert good.ok and good.unrun == 0, good.summary()
+
+
+def test_the_value_a_failing_program_produced_reaches_the_repair_prompt():
+    """REGRESSION. `failed` and `actuals` are appended together, once per
+    failing case, so they are parallel TO EACH OTHER and not to the case list.
+    Indexing `actuals` by a position in the case list read the wrong element
+    whenever the failures were not a prefix -- and silently, because a short
+    read fell off the end and became 'this program produced nothing'. Telling
+    a repair model that a program produced nothing when it produced a wrong
+    value points the whole round at the wrong fault."""
+    inputs = [{"name": f"c{i}", "args": [[i]], "kwargs": {}} for i in range(5)]
+    grader = _FakeGrader(
+        oracle_runs={"ORACLE": [_run(i) for i in range(5)]},
+        # Only the LAST case fails, so `actuals` has exactly one entry.
+        check=lambda code, examples, names: (
+            4, 5, ["bad"], [examples[4]], [_run(99)],
+        ),
+    )
+    report = _differential(grader).compare(
+        "CANDIDATE", "ORACLE", "python", "solve", inputs,
+    )
+    assert report.mismatch == 1, report.summary()
+    case = report.cases[0]
+    assert case.name == "c4", case
+    assert case.candidate_out == "99", case
+    assert case.oracle_out == "4", case
+    assert "produced nothing" not in case.detail, case
+    assert "99" in report.prompt_text(), report.prompt_text()
+
+
+@pytest.mark.parametrize("language", ["python", "rust"])
+def test_no_stage_prompt_ships_a_doubled_brace(language):
+    """REGRESSION. The JSON shapes in these prompts are written with `{{` so
+    that `str.format` renders them as `{`. The Rust inputs template carries no
+    placeholders and so was never formatted, and shipped its braces doubled to
+    the model on every Rust solve -- half of live traffic. A model shown
+    `{{"cases": ...}}` is being told the wrong shape to reply in."""
+    for name, text in _all_stage_prompts(_stage_task(language)).items():
+        assert "{{" not in text, (name, language)
+        assert "}}" not in text, (name, language)
+
+    # The shape it does ship is the one the parser reads back.
+    from solvers import prompts
+
+    text = _all_stage_prompts(_stage_task(language))["inputs"]
+    assert '"cases"' in text and '{\n  "cases"' in text, text[:200]
+    key = "stdin" if language == "rust" else "args"
+    assert f'"{key}"' in text, text
+
+
+def test_a_grader_that_cannot_run_costs_the_check_and_never_the_answer():
+    """The standing rule everywhere else in this solver: an executor that
+    cannot be built costs the CHECK, not the answer. `_run_self_tests` has
+    caught this since it was written; the differential did not, and would
+    have propagated a missing Docker daemon straight up into the solve.
+
+    Both halves have to degrade, and both have to degrade to 'nothing was
+    established' rather than to 'everything agreed'."""
+    inputs = [{"name": "a", "args": [[1]], "kwargs": {}}]
+
+    class _Broken:
+        def outputs(self, *a, **k):
+            raise RuntimeError("no docker daemon")
+
+        def check_detailed(self, *a, **k):
+            raise RuntimeError("no docker daemon")
+
+    report = _differential(_Broken()).compare(
+        "CANDIDATE", "ORACLE", "python", "solve", inputs,
+    )
+    assert not report.ok, report.summary()
+    assert report.agreed == 0, report.summary()
+
+    # And when only the candidate side is broken, the reference still ran --
+    # so the failure is recorded as unrun, not as agreement.
+    class _HalfBroken(_Broken):
+        def outputs(self, *a, **k):
+            return [_run(1)]
+
+    half = _differential(_HalfBroken()).compare(
+        "CANDIDATE", "ORACLE", "python", "solve", inputs,
+    )
+    assert not half.ok, half.summary()
+    assert half.unrun == 1, half.summary()
+    assert half.agreed == 0, half.summary()
