@@ -17816,3 +17816,341 @@ def test_the_trap_block_is_what_the_later_prompts_will_read():
         assert "(no traps recorded)" not in block, task.problem_id
         assert "Traps:" in block and "Algorithm sketch:" in block
         assert len(block) > 400, (task.problem_id, len(block))
+
+
+# --------------------------------------------------------------------------- #
+# Two programs, opposed instructions, the same inputs
+# --------------------------------------------------------------------------- #
+_PY_INPUTS = [
+    {"name": "empty", "args": [[]], "kwargs": {}},
+    {"name": "three", "args": [[1, 2, 3]], "kwargs": {}},
+]
+
+
+def _differential(grader):
+    from solvers.differential import Differential
+
+    return Differential(grader)
+
+
+class _FakeGrader:
+    """Stands in for `_Grader`, answering the two calls the harness makes."""
+
+    def __init__(self, oracle_runs=None, check=None):
+        self._oracle_runs = oracle_runs or {}
+        self._check = check
+        self.outputs_calls = []
+        self.check_calls = []
+
+    def outputs(self, code, language, entrypoint, inputs, budget_s=None):
+        self.outputs_calls.append(code)
+        return list(self._oracle_runs.get(code, []))
+
+    def check_detailed(self, code, language, entrypoint, examples, names=None,
+                       budget_s=None):
+        self.check_calls.append((code, list(examples)))
+        return self._check(code, examples, names or [])
+
+
+def _run(value=None, ok=True, error=None, timed_out=False):
+    from solvers.verify import _Run
+
+    return _Run(ok=ok, value=value, error=error, timed_out=timed_out)
+
+
+def test_the_oracles_output_is_the_expectation_and_nothing_is_asked_for_one():
+    """The whole design turns on this. The old shape asked a MODEL what a call
+    should return; here the reference program is executed and what it produced
+    is fed back in as `expected`. That makes the comparison the validator's
+    own -- values_equal for Python, outputs_match for Rust -- instead of a
+    reimplementation of it."""
+    grader = _FakeGrader(
+        oracle_runs={"ORACLE": [_run(0), _run(6)]},
+        check=lambda code, examples, names: (len(examples), len(examples), [], [], []),
+    )
+    report = _differential(grader).compare(
+        "CANDIDATE", "ORACLE", "python", "solve", _PY_INPUTS,
+    )
+    assert report.ok, report.summary()
+    assert report.agreed == 2 and report.mismatch == 0
+
+    # The expectations handed to the grader are the oracle's actual outputs.
+    _code, graded = grader.check_calls[0]
+    assert [case["expected"] for case in graded] == [0, 6], graded
+
+
+def test_a_disagreement_blames_the_candidate_and_says_so_in_a_field():
+    """THE REGRESSION. The upstream router decided with
+    `all("oracle" in case.detail ...)`, and the detail for an honest
+    disagreement reads `candidate != oracle` -- which contains the substring
+    "oracle". So a report where every case was a real disagreement patched the
+    reference instead of the program that ships. `blames` is set where the
+    failure is classified, so no wording can move it."""
+    failing = {"args": [[1, 2, 3]], "kwargs": {}, "expected": 6}
+    grader = _FakeGrader(
+        oracle_runs={"ORACLE": [_run(0), _run(6)]},
+        check=lambda code, examples, names: (1, 2, ["bad"], [examples[1]], [None, _run(7)]),
+    )
+    report = _differential(grader).compare(
+        "CANDIDATE", "ORACLE", "python", "solve", _PY_INPUTS,
+    )
+    assert report.mismatch == 1 and report.oracle_crash == 0
+    assert report.blame == "candidate", report.summary()
+    assert [c.blames for c in report.cases] == ["candidate"], report.cases
+
+    # And the detail is still allowed to mention the reference in prose.
+    assert "oracle" not in report.cases[0].blames.replace("candidate", "")
+
+
+def test_a_reference_that_falls_over_blames_the_reference():
+    """A case the oracle could not answer has no expectation, so the candidate
+    is never graded on it. Being unable to check a case is not the case
+    failing, and grading against a missing value would blame the candidate for
+    the reference's crash."""
+    grader = _FakeGrader(
+        oracle_runs={"ORACLE": [_run(ok=False, error="ZeroDivisionError"), _run(6)]},
+        check=lambda code, examples, names: (len(examples), len(examples), [], [], []),
+    )
+    report = _differential(grader).compare(
+        "CANDIDATE", "ORACLE", "python", "solve", _PY_INPUTS,
+    )
+    assert report.oracle_crash == 1 and report.mismatch == 0
+    assert report.blame == "oracle", report.summary()
+    # Only the one the oracle answered was sent to be graded.
+    _code, graded = grader.check_calls[0]
+    assert len(graded) == 1 and graded[0]["expected"] == 6, graded
+
+
+def test_a_disagreement_outranks_a_crash_when_both_happened():
+    """A mismatch is a concrete input the candidate got wrong. A reference
+    that fell over on some other input is weaker evidence, so the repair goes
+    to the candidate."""
+    grader = _FakeGrader(
+        oracle_runs={"ORACLE": [_run(ok=False, error="boom"), _run(6)]},
+        check=lambda code, examples, names: (0, 1, ["bad"], [examples[0]], [_run(7)]),
+    )
+    report = _differential(grader).compare(
+        "CANDIDATE", "ORACLE", "python", "solve", _PY_INPUTS,
+    )
+    assert report.mismatch == 1 and report.oracle_crash == 1
+    assert report.blame == "candidate", report.summary()
+
+
+def test_a_report_that_established_nothing_is_never_a_clean_one():
+    """`ran > 0` is the load-bearing clause. An empty suite that reads as ok
+    is exactly the 57s-of-290 line this rebuild exists to stop printing."""
+    grader = _FakeGrader(check=lambda *a: (0, 0, [], [], []))
+    diff = _differential(grader)
+
+    for report in (
+        diff.compare("C", "O", "python", "solve", []),
+        diff.compare("", "O", "python", "solve", _PY_INPUTS),
+        diff.compare("C", "", "python", "solve", _PY_INPUTS),
+    ):
+        assert not report.ok, report.summary()
+        assert report.blame == "", report.summary()
+
+
+def test_repair_is_monotone_against_the_score():
+    """A round that does not improve the score leaves the previous version in
+    place, so blaming the wrong program costs a round and never a worse answer
+    shipped. Clean outranks any number of agreements; among unclean reports
+    more agreement and less disagreement win."""
+    from solvers.differential import DifferentialReport
+
+    clean = DifferentialReport(ran=2, agreed=2)
+    partial = DifferentialReport(ran=4, agreed=3, mismatch=1)
+    worse = DifferentialReport(ran=4, agreed=1, mismatch=3)
+    nothing = DifferentialReport()
+
+    assert clean.score() > partial.score() > worse.score() > nothing.score()
+    # More agreement at the same mismatch count is still progress.
+    assert DifferentialReport(ran=6, agreed=5, mismatch=1).score() > partial.score()
+
+
+def test_the_reference_is_not_rerun_while_only_the_candidate_changes():
+    """For Rust every run of the oracle otherwise costs a fresh container and
+    a full opt-level=2 build, and the oracle normally survives a candidate
+    repair untouched. Memoised on the source text, so a real edit to the
+    oracle does re-run it."""
+    grader = _FakeGrader(
+        oracle_runs={"ORACLE": [_run(0), _run(6)], "ORACLE v2": [_run(1), _run(7)]},
+        check=lambda code, examples, names: (len(examples), len(examples), [], [], []),
+    )
+    diff = _differential(grader)
+
+    for candidate in ("C1", "C2", "C3"):
+        diff.compare(candidate, "ORACLE", "rust", "main", _PY_INPUTS)
+    assert grader.outputs_calls == ["ORACLE"], grader.outputs_calls
+    assert diff.oracle_runs == 1 and diff.oracle_reused == 2
+
+    diff.compare("C4", "ORACLE v2", "rust", "main", _PY_INPUTS)
+    assert grader.outputs_calls == ["ORACLE", "ORACLE v2"], grader.outputs_calls
+
+
+def test_a_different_case_list_is_a_different_memo_entry():
+    """The bar grows as the model adds cases. Keying only on the oracle source
+    would hand the old expectations to the new inputs."""
+    grader = _FakeGrader(
+        oracle_runs={"ORACLE": [_run(0), _run(6)]},
+        check=lambda code, examples, names: (len(examples), len(examples), [], [], []),
+    )
+    diff = _differential(grader)
+    diff.compare("C", "ORACLE", "python", "solve", _PY_INPUTS)
+    diff.compare("C", "ORACLE", "python", "solve", _PY_INPUTS + [
+        {"name": "more", "args": [[9]], "kwargs": {}},
+    ])
+    assert grader.outputs_calls == ["ORACLE", "ORACLE"], grader.outputs_calls
+
+
+def test_the_failure_report_carries_both_sides_and_stays_bounded():
+    """The repair prompt is shown what each program produced for the same
+    input -- that is the evidence. Past a handful the model stops reading them
+    as evidence, and a disagreement on a 200 KB value does not need all of
+    it."""
+    from solvers.differential import MAX_REPORTED
+
+    big = "x" * 5000
+    inputs = [{"name": f"c{i}", "args": [[i]], "kwargs": {}} for i in range(6)]
+    grader = _FakeGrader(
+        oracle_runs={"ORACLE": [_run(big) for _ in inputs]},
+        check=lambda code, examples, names: (
+            0, len(examples), ["bad"] * len(examples), list(examples),
+            [_run("y" * 5000) for _ in examples],
+        ),
+    )
+    report = _differential(grader).compare(
+        "CANDIDATE", "ORACLE", "python", "solve", inputs,
+    )
+    text = report.prompt_text()
+    assert report.mismatch == 6
+    assert text.count("FAIL ") == MAX_REPORTED, text[:400]
+    assert len(text) <= 3500 + 4
+    assert "reference produced" in text and "this program produced" in text
+
+
+def test_two_real_programs_are_compared_by_actually_running_them(monkeypatch):
+    """End to end on the real grader, no doubles: a correct candidate agrees
+    with the oracle, a subtly wrong one is caught with the concrete input that
+    caught it, and the wrong one is blamed rather than the reference.
+
+    The oracle here is written the way the oracle prompt asks for one -- the
+    slow literal reading -- and the candidate the way the candidate prompt
+    does. They disagree on the empty list, which is exactly the kind of case a
+    hidden suite contains and a public example never shows."""
+    from solvers.differential import Differential
+    from solvers.verify import _Grader
+
+    monkeypatch.setenv("SOLVER_VERIFY_EXECUTOR", "subprocess")
+
+    oracle = (
+        "def solve(xs):\n"
+        "    total = 0\n"
+        "    for x in xs:\n"
+        "        total += x\n"
+        "    return total\n"
+    )
+    right = "def solve(xs):\n    return sum(xs)\n"
+    # max() of an empty sequence raises; sum() returns 0. A naive reading of
+    # "the largest running total" that never considers the empty case.
+    wrong = "def solve(xs):\n    return max(xs) if xs else None\n"
+
+    inputs = [
+        {"name": "empty", "args": [[]], "kwargs": {}},
+        {"name": "ones", "args": [[1, 1, 1]], "kwargs": {}},
+        {"name": "mixed", "args": [[5, -2, 4]], "kwargs": {}},
+    ]
+
+    diff = Differential(_Grader())
+    good = diff.compare(right, oracle, "python", "solve", inputs, budget_s=60.0)
+    assert good.ok, good.summary()
+    assert good.ran == 3 and good.agreed == 3, good.summary()
+    assert good.blame == "", good.summary()
+
+    bad = diff.compare(wrong, oracle, "python", "solve", inputs, budget_s=60.0)
+    assert not bad.ok, bad.summary()
+    assert bad.blame == "candidate", bad.summary()
+    assert bad.oracle_crash == 0, bad.summary()
+    assert bad.mismatch >= 2, bad.summary()
+    assert {c.blames for c in bad.cases} == {"candidate"}, bad.cases
+
+    # The evidence names the case and carries both sides.
+    report = bad.prompt_text()
+    assert "FAIL " in report and "reference produced" in report, report
+
+    # And the reference was run once for the whole exercise, not once per
+    # candidate -- the memo is what makes a repair loop affordable.
+    assert diff.oracle_runs == 1 and diff.oracle_reused == 1
+
+
+def test_a_reference_that_crashes_on_real_code_is_the_one_blamed(monkeypatch):
+    """A naive oracle written for small inputs really does fall over on some
+    of the cases the model invents. That must never be charged to the
+    candidate, which may be perfectly correct on the very same input."""
+    from solvers.differential import Differential
+    from solvers.verify import _Grader
+
+    monkeypatch.setenv("SOLVER_VERIFY_EXECUTOR", "subprocess")
+
+    oracle = "def solve(xs):\n    return sum(xs) / len(xs)\n"
+    candidate = "def solve(xs):\n    return sum(xs) / len(xs) if xs else 0\n"
+    inputs = [
+        {"name": "empty", "args": [[]], "kwargs": {}},
+        {"name": "two", "args": [[2, 4]], "kwargs": {}},
+    ]
+
+    report = Differential(_Grader()).compare(
+        candidate, oracle, "python", "solve", inputs, budget_s=60.0,
+    )
+    assert report.oracle_crash == 1, report.summary()
+    assert report.mismatch == 0, report.summary()
+    assert report.blame == "oracle", report.summary()
+    assert report.cases[0].blames == "oracle", report.cases
+
+
+def test_a_program_that_mutates_its_arguments_is_noted_and_not_failed(monkeypatch):
+    """The validator's runner forks a child per case and never compares the
+    arguments before and after, so mutation is invisible to the hidden suite.
+    Failing it locally would throw away programs that would have scored. The
+    upstream harness fails it; this one must not."""
+    from solvers.differential import Differential
+    from solvers.verify import _Grader
+
+    monkeypatch.setenv("SOLVER_VERIFY_EXECUTOR", "subprocess")
+
+    oracle = "def solve(xs):\n    return sorted(xs)\n"
+    # Sorts the caller's list in place, then returns it. Same answer.
+    mutating = "def solve(xs):\n    xs.sort()\n    return xs\n"
+    inputs = [{"name": "unsorted", "args": [[3, 1, 2]], "kwargs": {}}]
+
+    report = Differential(_Grader()).compare(
+        mutating, oracle, "python", "solve", inputs, budget_s=60.0,
+    )
+    assert report.ok, report.summary()
+    assert report.mismatch == 0, report.summary()
+
+
+def test_the_rust_comparison_is_the_judges_own(monkeypatch):
+    """Rust answers are compared by splitting on ASCII whitespace, so a
+    println! reference and a print!("{}\\n") candidate are the same answer.
+    That comes free from feeding the oracle's stdout back as `expected` and
+    letting the grader compare -- there is no second implementation of it
+    here to drift."""
+    from rlvr.execution.rust_judge import outputs_match
+
+    assert outputs_match("1 2 3\n", "1 2 3")
+    assert outputs_match("1\n2\n3\n", "1 2 3")
+    assert not outputs_match("1 2 3", "1 2 4")
+
+    # And the harness passes the reference's stdout through untouched, which
+    # is the only thing that has to be true for the above to apply.
+    grader = _FakeGrader(
+        oracle_runs={"ORACLE": [_run("1 2 3\n")]},
+        check=lambda code, examples, names: (1, 1, [], [], []),
+    )
+    _differential(grader).compare(
+        "CANDIDATE", "ORACLE", "rust", "main",
+        [{"name": "one", "args": ["3\n1 2 3\n"], "kwargs": {}}],
+    )
+    _code, graded = grader.check_calls[0]
+    assert graded[0]["expected"] == "1 2 3\n", graded
