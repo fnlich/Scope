@@ -48,7 +48,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, NamedTuple, Optional, Protocol, Sequence
+from typing import Any, NamedTuple, Optional, Protocol
 
 from rlvr.types import TestCase
 
@@ -2236,10 +2236,28 @@ class VerifyingSolver:
             # -- 4, 5, 6 side by side --------------------------------------
             probe: Optional[list] = [] if self._size_probe else None
             probed: dict[str, _Probe] = {}
-            inputs_task = asyncio.create_task(self._write_inputs(
-                task, analysis, budget, started, avoid, probe, plan, phases))
-            oracle_task = asyncio.create_task(self._write_oracle(
-                task, analysis, budget, started, avoid, plan, phases))
+            # `SOLVER_SELF_TESTS=0` turns the local check off, and with it both
+            # turns that exist only to produce one. Live traffic ships no
+            # public examples, so with this off nothing is graded, nothing is
+            # compared and the repair loop never fires -- the answer is
+            # whatever the candidate turn said. It is off the default path and
+            # it is a shipped configuration, for an operator who wants one turn
+            # per solve and will take the score that comes with it.
+            #
+            # Both turns go together. Inputs with no reference cannot be
+            # answered and a reference with no inputs has nothing to run on, so
+            # keeping either one alone would buy a conversation and a model's
+            # time for a comparison that cannot happen.
+            inputs_task = (
+                asyncio.create_task(self._write_inputs(
+                    task, analysis, budget, started, avoid, probe, plan, phases))
+                if self._self_tests else None
+            )
+            oracle_task = (
+                asyncio.create_task(self._write_oracle(
+                    task, analysis, budget, started, avoid, plan, phases))
+                if self._self_tests else None
+            )
 
             conversation = await self._open_within(
                 budget, started, avoid, phase="candidate"
@@ -2252,8 +2270,11 @@ class VerifyingSolver:
             )
             phases.mark("2 candidate")
 
-            inputs = await inputs_task
-            oracle = await oracle_task
+            inputs = await inputs_task if inputs_task is not None else []
+            oracle = await oracle_task if oracle_task is not None else ""
+            if not self._self_tests:
+                print("[verify] the local check is off "
+                      "(SOLVER_SELF_TESTS=0); the candidate ships unchecked")
 
             # -- 7 and 8: compare, then repair whichever is wrong ----------
             differential = Differential(self._grader, VERIFY_TIMEOUT_S)
@@ -2475,6 +2496,14 @@ class VerifyingSolver:
                          else report.prompt_text()),  # the defect rides in `defect=`
                         kind=blame,
                         defect=candidate.defect if blame == "candidate" else None,
+                        # What the prompt may claim was RUN. A defect is found
+                        # before execution, so a repair that says "I compared
+                        # it against a reference" is describing a run that did
+                        # not happen -- and a model told its logic disagreed
+                        # rewrites logic that was never the problem.
+                        found_by=("examples" if examples_failed
+                                  else "unrun" if defective
+                                  else "differential"),
                     ),
                     max(1.0, left()),
                 )

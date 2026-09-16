@@ -18,7 +18,30 @@ What the validator actually does with the code:
 
 The public examples are rendered into the prompt because the statement alone
 is frequently ambiguous about ordering, tie-breaking and output shape, and
-those examples are the only disambiguation a miner is given.
+those examples are the only disambiguation a miner is given. All 97 recorded
+production tasks ship none, so on live traffic that paragraph never renders
+and the statement is the whole of the specification.
+
+FIVE PROMPTS, one per stage of a solve, and every one of them is built the
+same way -- statement header, worked examples where there are any, the trap
+block, the one task this stage is for, then the output contract LAST:
+
+    build_analysis_prompt   stage 3: add to the free trap scan
+    build_inputs_prompt     stage 4: inputs only, never their answers
+    build_oracle_prompt     stage 5: a reference, correctness-first
+    build_candidate_prompt  stage 6: the program that ships, complexity-first
+    build_differential_repair_prompt
+                            stage 8: whichever of the two is wrong
+
+Stages 5 and 6 are deliberately opposed -- that difference is the whole of the
+evidence the comparison produces; see ``solvers/differential.py``. Stage 4 is
+forbidden to supply an expected value, and the extractor drops any that arrive
+anyway: the reference program computes every expectation by being RUN, which
+is what stops the bar and the program sharing one misreading of the statement.
+
+The extraction half of this file is older than the stage design and outlives
+it: ``fenced_blocks``, ``sanitize_code``, ``extract_code`` and the JSON
+salvage below were each written against a way a real reply was thrown away.
 """
 
 from __future__ import annotations
@@ -27,7 +50,7 @@ import ast
 import builtins
 import json
 import re
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 # ChatGPT wraps code in ``` fences; the DOM reader already returns the inner
 # text of a <pre><code> block, but a reply that arrived as plain text (or a
@@ -227,9 +250,6 @@ Only what is inside the fence is ever read.
 
 """
 
-TESTS_OUTPUT_CONTRACT = _ONE_BLOCK + """\
-That block is `json`, and it holds test cases. Do NOT write the program yet —
-you will be asked for it next."""
 
 # ...and the same contract when a SIZE PROBE is wanted as well. Two blocks, in
 # a fixed order, because the second one is not a test case and must not be
@@ -273,107 +293,6 @@ WHOLE_PROGRAM = (
     "the corrected program, COMPLETE — every import, helper and definition it "
     "needs to run on its own, not a diff and not only the part you changed"
 )
-
-
-# Turn 1. The cases, before the program exists.
-#
-# The ordering is the user's and it is right: the ordinary case first, so the
-# common path is checked at all, then the boundaries where implementations
-# actually break. Counts are stated per class rather than as a total, because a
-# total invites a model to spend it all on the easy classes.
-#
-# ONE ordinary case, not three. Three of them are three runs of the same code
-# path: the common path is either right or it is not, and a second and third
-# typical input almost never disagree with the first. They are not free either
-# -- every case is an executor run inside the solve's own deadline, a
-# subprocess for Python and a container for Rust, and the repair loop re-runs
-# the whole suite on every round. Two of those runs were buying a re-answer to
-# a question already answered. The classes below are where implementations
-# actually break, and the budget belongs to them.
-#
-# "You have not written the program yet, and that is deliberate" is the whole
-# argument for splitting the turns. Cases written ALONGSIDE a program can be
-# back-filled from what the program happens to do, and then they agree with its
-# bugs. Cases written first cannot.
-TESTS_TASK_PYTHON = """\
-Write the test cases for this problem — the cases, not the program. You will be
-asked for the program in my next message, and these cases are what it will be
-RUN against before it is submitted, so a case you leave out is a case nobody
-runs.
-
-[{{"name": "ordinary",   "args": [[3, 1, 2]], "expected": 6}},
- {{"name": "empty",      "args": [[]],        "expected": 0}},
- {{"name": "one item",   "args": [[5]],       "expected": 5}}]
-
-- `args` is the argument list for `{entrypoint}(*args)`; `kwargs` is optional.
-- `expected` is the exact value the program must RETURN, written as JSON.
-- Every value must be JSON: no tuples, no sets, no `inf`, no `NaN`, no code.
-- `name` is a short label so a failure report can say which case broke.
-
-Write, in this order:
-
-1. ONE ordinary case. A typical input, nothing special about it. It is the
-   common path, and a suite that tests only boundaries never checks it.
-2. THE EMPTY VALUE, or zero: an empty list, an empty string, `0`, `{{}}` —
-   whichever of them this statement allows.
-3. ONE: a single element, `n = 1`, the smallest legal input.
-4. THE BOUNDARY: every limit, threshold and modulus the statement names, tested
-   AT that exact value, and the largest value it allows.
-5. THE CASES THIS PROBLEM IS LIKELY TO BE GOT WRONG ON: inputs where a
-   plausible implementation returns something the statement does not — ties and
-   duplicates, every element equal, already sorted, exactly reversed, a rule the
-   statement states given one input that makes it fire and one that NEARLY does,
-   and whatever else this particular problem makes easy to get wrong.
-6. ONE CASE FOR EVERY DISTINCT RESULT THE STATEMENT NAMES: each refusal, each
-   sentinel, each empty answer, each result shaped differently from the
-   ordinary one. A result the statement mentions once and no example shows is
-   still a result the program has to produce.
-
-Skip a class only when the statement makes it impossible. At most {limit} cases
-in total. Derive every `expected` from the STATEMENT by reasoning it out.
-You have not written the program yet, and that is deliberate: a case computed
-from code agrees with the code's bugs, which is exactly what a test is supposed
-to catch."""
-
-
-TESTS_TASK_RUST = """\
-Write the test cases for this problem — the cases, not the program. You will be
-asked for the program in my next message, and these cases are what it will be
-RUN against before it is submitted, so a case you leave out is a case nobody
-runs.
-
-[{{"name": "ordinary", "args": ["3\\n1 2 3\\n"], "expected": "6"}},
- {{"name": "one item", "args": ["1\\n5\\n"],     "expected": "5"}}]
-
-- `args` holds exactly ONE string: the complete stdin the program reads.
-- `expected` is the complete stdout it must write, as a string.
-- Output is compared after splitting on whitespace, so spacing is forgiving but
-  an extra or missing token is not.
-- `name` is a short label so a failure report can say which case broke.
-
-Write, in this order:
-
-1. ONE ordinary case. A typical input, nothing special about it. It is the
-   common path, and a suite that tests only boundaries never checks it.
-2. THE EMPTY VALUE, or zero: the smallest legal input, a count of zero, and an
-   empty payload after the count if the format allows one.
-3. ONE: a single element, `n = 1`.
-4. THE BOUNDARY: every limit, threshold and modulus the statement names, tested
-   AT that exact value, and the largest value it allows.
-5. THE CASES THIS PROBLEM IS LIKELY TO BE GOT WRONG ON: inputs where a
-   plausible implementation writes something the statement does not — ties and
-   duplicates, every element equal, already sorted, exactly reversed, a rule the
-   statement states given one input that makes it fire and one that NEARLY does,
-   and whatever else this particular problem makes easy to get wrong.
-6. ONE CASE FOR EVERY DISTINCT RESULT THE STATEMENT NAMES: each refusal, each
-   sentinel, each empty answer, each result shaped differently from the
-   ordinary one. A result the statement mentions once and no example shows is
-   still a result the program has to write.
-
-Skip a class only when the statement makes it impossible. At most {limit} cases
-in total. Derive every `expected` from the STATEMENT by reasoning it out.
-You have not written the program yet, and that is deliberate: a case computed
-from code agrees with the code's bugs."""
 
 
 # What the size probe asks for, appended to the cases task when one is wanted.
@@ -436,105 +355,6 @@ def extract_generator(reply: str) -> str:
     return ""
 
 
-# What the cases prompt says about the program turn, and what it says instead
-# when there is not going to be one. Under the independent bar (the default)
-# and for the second bar, the conversation is closed after the cases and never
-# asked for a program -- so "you will be asked for it next" was a false
-# premise about the task the reader was doing.
-_PROGRAM_NEXT = (
-    "You will be\nasked for the program in my next message, and these cases "
-    "are what it will be\nRUN against before it is submitted"
-)
-_PROGRAM_ELSEWHERE = (
-    "The program is being\nwritten elsewhere, from this same statement, by "
-    "someone who will not see these\ncases; they are what it will be RUN "
-    "against before it is submitted"
-)
-_NOT_YET = ("Do NOT write the program yet —\nyou will be asked for it next.",
-            "Do NOT write the program yet — you will be asked for it next.")
-_NOT_AT_ALL = ("Do NOT write the program — it is being written elsewhere, and "
-               "you will not be\nasked for it.")
-
-
-def build_tests_prompt(
-    language: str, statement: str, entrypoint: str, examples: list[dict[str, Any]],
-    want_probe: bool = False, independent: bool = False,
-) -> str:
-    """Turn 1: ask for the cases, and optionally the size probe beside them.
-
-    `independent` says this conversation will NOT be asked for the program:
-    the bar is being written beside a program conversation it never sees.
-    What changes is only the truth of two sentences -- see `_PROGRAM_NEXT`.
-
-    `want_probe` adds one more fenced block to the SAME turn rather than
-    another turn, and that is the entire cost argument: a third model turn is
-    +50% on a two-turn solve, against seats already running at 90-95% of a
-    five-hour window, while a second block on a turn already being taken is
-    some prompt tokens and some output. What it buys is the only failure class
-    the bar cannot reach -- see `TESTS_OUTPUT_CONTRACT_WITH_PROBE`.
-
-    It is optional at every step. No generator in the reply, a generator that
-    will not run, an input too big for the sandbox to hand back: each ends with
-    the probe skipped and the solve exactly as it was.
-    """
-    is_rust = language == "rust"
-    parts = [
-        "<output>",
-        TESTS_OUTPUT_CONTRACT_WITH_PROBE if want_probe else TESTS_OUTPUT_CONTRACT,
-        "</output>", "",
-        f'<problem language="{"rust" if is_rust else "python"}" '
-        f'entrypoint="{entrypoint}">',
-        statement.strip(),
-        "</problem>", "",
-    ]
-    rendered = _render_examples(language, examples)
-    if rendered:
-        parts += [
-            '<examples note="PUBLIC EXAMPLES — already known to be right. Your '
-            'cases must AGREE with these and go far beyond them.">',
-            rendered, "</examples>", "",
-        ]
-    task = (TESTS_TASK_RUST if is_rust else TESTS_TASK_PYTHON).format(
-        entrypoint=entrypoint, limit=MAX_SELF_TESTS
-    )
-    if independent:
-        assert _PROGRAM_NEXT in task, "the cases template moved"
-        task = task.replace(_PROGRAM_NEXT, _PROGRAM_ELSEWHERE)
-        for stale in _NOT_YET:
-            parts[1] = parts[1].replace(stale, _NOT_AT_ALL)
-        assert _NOT_AT_ALL in parts[1], "the cases contract moved"
-    if want_probe:
-        task += "\n\n" + GENERATOR_TASK.format(
-            shape=(_PROBE_SHAPE_RUST if is_rust else _PROBE_SHAPE_PYTHON).format(
-                entrypoint=entrypoint
-            )
-        )
-    parts += ["<task>", task, "</task>"]
-    return "\n".join(parts)
-
-
-def _render_cases(cases: list[dict[str, Any]], language: str, entrypoint: str) -> str:
-    """The agreed cases, as the call the grader will actually make."""
-    lines = []
-    for index, case in enumerate(cases, 1):
-        name = case.get("name") or ""
-        label = f"{index}. {name}: " if name else f"{index}. "
-        if language == "rust":
-            lines.append(
-                f"{label}stdin {json.dumps(case.get('args', [''])[0])} "
-                f"-> stdout {json.dumps(case.get('expected'))}"
-            )
-        else:
-            args = ", ".join(json.dumps(a) for a in case.get("args", []))
-            kwargs = "".join(
-                f", {k}={json.dumps(v)}" for k, v in (case.get("kwargs") or {}).items()
-            )
-            lines.append(
-                f"{label}{entrypoint}({args}{kwargs}) -> {json.dumps(case.get('expected'))}"
-            )
-    return "\n".join(lines)
-
-
 # Two of these are facts about THIS grader, not general advice, and both cost a
 # solve when guessed at: the comparison is structural and strict about bools,
 # and each test is on a five-second clock.
@@ -579,6 +399,23 @@ RUST_ENVIRONMENT = """\
   BufWriter rather than printing in a loop."""
 
 
+# What the worked examples ARE, said where they are read rather than in a
+# checklist further down. Two claims, and they pull in opposite directions on
+# purpose: they are ground truth, so they settle the ordering and tie-breaking
+# a statement leaves open -- and they are a FLOOR, because a program written to
+# satisfy the two examples shown and nothing else is the commonest way to pass
+# every check this miner has and score zero on the hidden suite.
+#
+# Live traffic ships none of these (all 97 archived requests carry an empty
+# list), so this text is read by `rehearse --examples N` and by any task that
+# starts shipping them -- not by production today.
+EXAMPLES_LABEL = (
+    "WORKED EXAMPLES — already known to be right, and a floor, not the "
+    "specification.\nWhere the statement is ambiguous they decide; where it is "
+    "not, the hidden tests\ngo far beyond them."
+)
+
+
 def _render_examples(language: str, examples: list[dict[str, Any]]) -> str:
     """Render public examples in the shape the grader will actually use."""
     if not examples:
@@ -601,539 +438,13 @@ def _render_examples(language: str, examples: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-OWN_CASES_NOTE = (
-    "YOUR OWN cases from the previous message. Every one of these is RUN "
-    "against your program before it is submitted."
-)
-INDEPENDENT_CASES_NOTE = (
-    "Test cases written from the same statement by someone who has not seen "
-    "your program. Every one of these is RUN against your program before it "
-    "is submitted."
-)
-
-# ...and the same bar described to a reader who did not write the program
-# either. Both notes above say "your program"; to a model handed someone
-# else's program that is the false premise `build_resume_prompt` exists to
-# remove, and a message that says "not yours" two lines below "YOUR OWN cases"
-# is contradicting itself about the one fact the round turns on.
-FOREIGN_CASES_NOTE = (
-    "Test cases written from this same statement by a reader who has seen "
-    "neither the program below nor whoever wrote it. Every one of these is "
-    "RUN against the program before it is submitted."
-)
-
-
-def build_code_prompt(
-    language: str,
-    statement: str,
-    entrypoint: str,
-    examples: list[dict[str, Any]],
-    cases: Optional[Sequence[dict[str, Any]]] = None,
-    cases_note: Optional[str] = None,
-) -> str:
-    """Turn 2: ask for the program, and only the program.
-
-    ``cases`` is what turn 1 obtained, and it decides one thing:
-
-    * a list      -- the cases exist, so they are restated as the bar this
-                     program has to clear.
-    * ``None``/[] -- turn 1 produced nothing usable, or was never asked. No bar
-                     to point at, and the answer still goes out.
-
-    Either way the contract is ONE block. A reply carrying a second one is a
-    reply that spent output tokens inside the deadline on something nothing
-    reads: the cases were settled a turn ago, and `extract_code` would have to
-    step over whatever else arrived.
-
-    Laid out in delimited sections, and the order is the argument. The output
-    contract goes FIRST because it is the only instruction whose failure costs
-    the entire answer rather than degrading it; on the browser backends the
-    site's nudge repeats it last, so there it holds both the primacy and the
-    recency slot (the CLI backend appends nothing). The problem and its
-    examples come next, because instructions about how to solve something are
-    unreadable before you know what it is. Everything that shapes HOW to answer
-    comes last, closest to where generation begins.
-
-    The examples are labelled a floor rather than the specification. They are the
-    friendliest thing in the message and the easiest to over-fit to, and the
-    label is what stops them being read as the whole job.
-
-    """
-    is_rust = language == "rust"
-    given = list(cases or [])
-    rules = (RUST_RULES if is_rust else PYTHON_RULES).format(entrypoint=entrypoint)
-    environment = RUST_ENVIRONMENT if is_rust else PYTHON_ENVIRONMENT
-    contract = CODE_OUTPUT_CONTRACT.format(language="Rust" if is_rust else "Python")
-
-    parts = [
-        "<output>", contract, "</output>", "",
-        f'<problem language="{"rust" if is_rust else "python"}" '
-        f'entrypoint="{entrypoint}">',
-        statement.strip(),
-        "</problem>", "",
-    ]
-    rendered = _render_examples(language, examples)
-    if rendered:
-        parts += [
-            "<examples note=\"PUBLIC EXAMPLES — a floor, not the specification, "
-            "and already known to be right. Your program must reproduce these "
-            "exactly, and where the statement is ambiguous they decide.\">",
-            rendered,
-            "</examples>", "",
-        ]
-    parts += ["<contract>", rules, "", environment, "</contract>"]
-    if given:
-        # The bar, stated as the calls the grader will actually make. These are
-        # the model's OWN cases from the previous turn, echoed rather than
-        # referred to: a model asked to honour "the cases you sent" has to
-        # scroll back past its own JSON to find them, and what it half-
-        # remembers is what the program gets checked against.
-        #
-        # Last in the message, which is where it belongs: it is what the
-        # program has to clear, read immediately before the program is written.
-        # `cases_note` says WHOSE these are. Sequentially they are the model's
-        # own, one turn back; carried to a fresh conversation under the
-        # independent bar they are not, and a message that says "YOUR OWN"
-        # here and "someone who has not seen your program" a paragraph later
-        # is contradicting itself about the one fact the round turns on.
-        parts += [
-            "",
-            f'<must_pass note="{cases_note or OWN_CASES_NOTE}">',
-            _render_cases(given, language, entrypoint),
-            "</must_pass>",
-        ]
-    return "\n".join(parts)
-
-
-def build_resume_prompt(
-    language: str,
-    statement: str,
-    entrypoint: str,
-    examples: list[dict[str, Any]],
-    cases: Optional[Sequence[dict[str, Any]]],
-    code: str,
-    failures: list[str],
-    defect: Optional[str] = None,
-    from_self_tests: bool = False,
-    bar_is_independent: bool = False,
-    failed_cases: Optional[Sequence[dict[str, Any]]] = None,
-    foreign: bool = False,
-    case_confirmed: bool = False,
-    too_slow: Optional[str] = None,
-) -> str:
-    """A repair round for a conversation that no longer exists.
-
-    `too_slow` is the size probe's sentence when the program in hand passes
-    every case and is merely too slow at scale. Without it a carried too_slow
-    repair reported an empty failure list and offered a case correction for
-    cases that did not exist; the receiving model was never told the problem
-    was speed.
-
-    Repairs normally stay inside one conversation, because the model can see
-    its own previous attempt there and the prompt need only carry what went
-    wrong. When the tab that produced the answer cannot be used again -- the
-    prompt will not go into it, or the page died -- that context is gone with
-    it, and the round used to be abandoned along with it. Measured over a
-    production run: fifteen answers went out carrying failures nobody had asked
-    the model to fix, with an average of 129 seconds of budget unspent.
-
-    So the whole conversation is reconstituted in one message: the problem as
-    turn 2 states it, the program that was produced, and what happened when it
-    ran. A fresh tab has no history, so nothing here may assume any.
-
-    `foreign` says the model being asked is not the one that wrote the
-    program. That is now the ordinary case rather than the emergency one: a
-    correction round hands the repair to the next model on the rotation
-    precisely so that the reading which produced the bug is not the reading
-    asked to find it. What it changes is only the truth of the sentences --
-    "YOUR program" is false to a model seeing this code for the first time,
-    and a false premise gets argued with instead of acted on.
-    """
-    base = build_code_prompt(
-        language, statement, entrypoint, examples, cases=cases,
-        cases_note=(
-            FOREIGN_CASES_NOTE if foreign
-            else INDEPENDENT_CASES_NOTE if bar_is_independent
-            else None
-        ),
-    )
-    report = build_repair_prompt(
-        failures, language, entrypoint, defect=defect,
-        from_self_tests=from_self_tests, bar_is_independent=bar_is_independent,
-        foreign=foreign, case_confirmed=case_confirmed, too_slow=too_slow,
-        # The ones that FAILED, rendered in full beside the whole bar above.
-        # `build_repair_prompt` only renders them when it is given them, and
-        # this caller never was -- so the one prompt that reaches a second
-        # model arrived with the failing cases in the clipped failure line
-        # only. For Rust that line cuts stdin at 160 characters, which is not
-        # enough to reproduce the failure and not enough to correct the case.
-        failed_cases=failed_cases,
-    )
-    attempt_note = (
-        "A program written by someone else from this same statement. It is "
-        "not yours and you are not being asked to defend it. This is what "
-        "happened when I ran it."
-        if foreign else
-        "YOUR program, from a conversation that ended before it could be "
-        "corrected. This is what happened when I ran it."
-    )
-    return "\n".join([
-        base,
-        "",
-        f'<previous_attempt note="{attempt_note}">',
-        f"```{'rust' if language == 'rust' else 'python'}",
-        code.strip(),
-        "```",
-        "",
-        report,
-        "</previous_attempt>",
-    ])
-
-
-def _ran_against(
-    target: str, independent: bool, foreign: bool = False
-) -> str:
-    """How to describe the bar to the conversation being asked to repair.
-
-    It has to be TRUE, and which sentence is true depends on where the cases
-    were written. Sequentially they are the model's own, one turn back, and
-    "the test cases you sent" is exact. Written beside the program in another
-    conversation they are not: that model never saw them, never sent them, and
-    telling it otherwise is a false premise about the one thing the round turns
-    on. The two framings also ask for different reasoning -- "one of my two
-    answers is wrong" versus "someone else read this statement differently" --
-    and the second is the true one when the bar is independent, which is the
-    whole reason the bar is written elsewhere.
-
-    `foreign` is the third case and it is about the PROGRAM rather than the
-    bar: the repair has been handed to a model that did not write the code it
-    is being shown. "The test cases you sent" and "your program" are both
-    false there, and a model told it wrote something it did not spends the
-    round reconciling the claim instead of the failure.
-    """
-    if foreign:
-        return (
-            f"Someone else wrote this program from the same statement, and "
-            f"someone else again wrote test cases from it. I ran {target} "
-            f"against those cases and got:"
-        )
-    if independent:
-        return (
-            f"Someone else read the same statement and wrote test cases from "
-            f"it, without seeing your program. I ran {target} against them "
-            f"and got:"
-        )
-    return f"I ran {target} against the test cases you sent and got:"
-
-
-# The shape a corrected case has to arrive in, said in the prompt that asks
-# for one. It was not said anywhere the repairing conversation could see.
-#
-# `_case_items` requires `expected`, and for Rust an `args` of exactly one
-# string. Those key names appear only in `TESTS_TASK_RUST`/`TESTS_TASK_PYTHON`
-# -- sent to the CASES conversation, which since the bar went independent is a
-# DIFFERENT conversation, and the program prompt carries no `<must_pass>` block
-# on that path at all. So the only rendering of a case the repairing model had
-# ever seen was the failure line, `stdin "..." -> stdout "..."`, and a reply
-# mirroring that dialect is dropped by the parser without a word.
-#
-# The reply then fails `extract_code` too -- a `[` is not a program -- so the
-# next prompt is "your previous reply did not reach me as code", the model
-# re-sends the program, it fails the same case, and the offer comes back. That
-# is the loop, and it cannot end: `corrected=` was non-zero on 20 of 102 solves
-# before the bar moved and 0 of 11 after.
-_CASE_SHAPE_RUST = (
-    '`{"args": ["<the complete stdin, as one string>"], '
-    '"expected": "<the complete stdout, as a string>"}`'
-)
-_CASE_SHAPE_PYTHON = (
-    '`{"args": [...], "kwargs": {}, "expected": <the value it should return>}`'
-)
-
-
-def build_repair_prompt(
-    failures: list[str],
-    language: str,
-    entrypoint: str,
-    defect: Optional[str] = None,
-    from_self_tests: bool = False,
-    stalled: int = 0,
-    insist_on_program: bool = False,
-    bar_is_independent: bool = False,
-    failed_cases: Optional[Sequence[dict[str, Any]]] = None,
-    too_slow: Optional[str] = None,
-    case_confirmed: bool = False,
-    foreign: bool = False,
-) -> str:
-    """Ask for a fix, quoting the concrete failures the local grader found.
-
-    The failures come from running the candidate through the validator's own
-    executor, so this is real evidence rather than a vague 'try again' — which
-    is the difference between a repair loop that converges and one that drifts.
-
-    A ``defect`` is the other kind of problem entirely, and it must not be
-    dressed up as the first. Defects are found BEFORE anything is executed —
-    nothing arrived, it will not parse, there is no ``fn main`` — so telling the
-    model "I ran the program against the examples and got: the program does not
-    define `fn main()`" is not evidence but a contradiction. Faced with one, a
-    model rewrites the logic, which was never the problem, and the repair round
-    is spent for nothing. Ask about delivery when delivery failed, and about
-    shape when the shape is wrong.
-
-    What is NOT here is method. Earlier versions spent a paragraph on how to
-    think about the failure -- trace the call, do not guess from the shape of
-    it, re-check the fix against every other case silently, do not change both
-    to make them agree. That is work which never reaches the reply, competing
-    with the failure itself for attention, and it is the same class of
-    instruction the two-phase rewrite already took out of turns 1 and 2. The
-    error, and the one line naming what may come back. Nothing else.
-
-    "Do not change both" is not lost by leaving it unsaid: it is enforced in
-    ``verify.py``, where a reply that rewrites the program AND the cases is
-    graded against the bar as it stood before it arrived. The grader keeps the
-    promise, so the prompt stops asking for it.
-
-    The case array asked for is JUST THE FAILING CASES, not the whole suite,
-    and that is a change in what the miner does as much as in what it asks for.
-    The prompt reports one disagreement, so the natural reply is that one case
-    corrected -- and demanding the complete array back meant a twenty-case suite
-    was re-sent to fix one of them: slower, likelier to be truncated mid-array,
-    and refused outright whenever it came back one case short, which left the
-    wrong case breaking a correct program on every remaining round of the solve.
-    ``_merge_cases`` applies what comes back to the suite instead of replacing
-    it, and only the cases the program actually failed are in play, so a short
-    array cannot lower a bar the program has already cleared.
-
-    ``stalled`` is how many times this exact report has already been sent in
-    this solve, and it is the one thing here that is not about the failure.
-    Without it the loop re-sends a byte-identical prompt into a conversation
-    that already holds the answer it produced last time, and the likeliest
-    continuation of "same context, same question" is the same reply: measured
-    on one live solve, eleven sends, one prompt repeated eight times verbatim,
-    the whole budget spent without the program changing once. Naming the
-    repetition is what makes the next round a different question -- still not
-    method, and still no advice about the problem itself.
-    """
-    detail = "\n".join(f"  - {line}" for line in failures)
-    if bar_is_independent and failed_cases:
-        # The conversation being repaired has NEVER seen these cases: the
-        # failure line above is the only thing it knows about the input, and
-        # for Rust that line clips the stdin to 160 characters. A model that
-        # cannot see the whole input cannot reproduce the failure, and a
-        # corrected case it sends back cannot match the original by key. So
-        # the failing case(s) go in whole, exactly as the grader runs them.
-        detail += (
-            "\n\nThe failing case(s) in full, exactly as they are run:\n"
-            + _render_cases(list(failed_cases), language, entrypoint)
-        )
-    if too_slow:
-        # A TIMEOUT, and it gets its own branch because it is the one failure
-        # here that has no expectation behind it. Every other line in this
-        # prompt reports that the program produced X where the bar said Y, and
-        # the bar may be the party that is wrong -- which is why the case
-        # escape hatch exists a few branches down. "It did not finish in five
-        # seconds" has no second party. Nothing about the answer is in dispute
-        # and there is nothing on the bar to correct, so the offer is not made
-        # and the whole of the round goes to the one thing that can change.
-        #
-        # It also never says the answer was wrong, because it is not known to
-        # be: the program may be perfectly correct and merely too slow, and a
-        # model told its logic is broken rewrites logic that was right.
-        body = (
-            f"{too_slow}\n\n"
-            f"The validator runs every hidden test under the same five-second "
-            f"limit, at the sizes the statement allows, so this is a failure "
-            f"there whatever the answer would have been. Nothing is known to be "
-            f"wrong with what the program COMPUTES — do not change the answer "
-            f"it gives on the cases it already passes.\n\n"
-            f"Send back ONE fenced block, with nothing outside it: "
-            f"{WHOLE_PROGRAM}, with an algorithm that finishes at that size."
-        )
-    elif defect == NO_CODE:
-        body = (
-            "Your previous reply did not reach me as code. I can only read the "
-            "chat message itself.\n\n"
-            f"Send the program again as one ordinary fenced code block written "
-            f"directly in the chat, with nothing outside it: {WHOLE_PROGRAM}."
-        )
-    elif defect:
-        body = (
-            f"I could not run your previous reply: {defect}.\n\n"
-            f"Send back ONE fenced code block, with nothing outside it: "
-            f"{WHOLE_PROGRAM}."
-        )
-    elif from_self_tests and case_confirmed:
-        # The escape hatch, closed by EVIDENCE rather than by exhaustion.
-        #
-        # The branch below closes it after several rounds in which the program
-        # did not change, which is a statement about the loop rather than
-        # about the case. This one closes it because a third model, shown the
-        # same statement and these inputs and no program at all, worked out
-        # the same expected value the case carries. Two independent readings
-        # agreeing is the strongest evidence available here that the case is
-        # right, and it is worth having: measured over 54 live solves, nine of
-        # ten single-case disagreements ended with the program's own author
-        # ruling its own case wrong and keeping the program.
-        #
-        # It says what was done rather than asserting the program is broken.
-        # The program may still be right in every other respect; what is
-        # settled is that this case is not the thing to change.
-        target = "the program" if language == "rust" else f"`{entrypoint}`"
-        body = (
-            f"{_ran_against(target, bar_is_independent, foreign)}\n"
-            f"{detail}\n\n"
-            f"I asked someone else to read the statement and work out what "
-            f"that call must return, without showing them any program. They "
-            f"arrived at the same value the case expects, so the case stands "
-            f"and it is the program that has to change. Send back ONE fenced "
-            f"block, with nothing outside it: {WHOLE_PROGRAM}."
-        )
-    elif from_self_tests and insist_on_program:
-        # The case escape hatch, withdrawn. It exists because the model's own
-        # cases may be wrong -- turn 1 reasons its `expected` values out before
-        # any program exists -- and a repair round that blames the code for a
-        # wrong case breaks a correct program. But an escape hatch left open
-        # while nothing converges is not that: several rounds running in which
-        # the PROGRAM did not change is the one thing a correction phase cannot
-        # afford, whether those rounds spent themselves correcting the bar or
-        # re-sending the same code. So the offer is made, and then it stops
-        # being made.
-        #
-        # The sentence says the program has not changed, and nothing about what
-        # the replies contained, because only the first of those is known to be
-        # true here. Telling a model that re-sent identical code that it had
-        # "already corrected the cases" is a false premise, and a false premise
-        # is answered by arguing with it.
-        target = "the program" if language == "rust" else f"`{entrypoint}`"
-        body = (
-            f"{_ran_against(target, bar_is_independent, foreign)}\n"
-            f"{detail}\n\n"
-            f"The program has not changed for several rounds now, so this time "
-            f"it is the program that has to. Send back ONE fenced block, with "
-            f"nothing outside it: {WHOLE_PROGRAM}."
-        )
-    elif from_self_tests:
-        # Deliberately not "your solution is WRONG". A disagreement proves only
-        # that two readings of the statement contradict each other -- and
-        # telling the model the CODE is at fault when the CASE was wrong is how
-        # a repair round breaks a correct program. Measured over a production
-        # run: of the 26 solves that reached a correction round, 24 resolved
-        # the disagreement by rewriting the CASE, and a judge upheld those
-        # rewrites 22 times of 25 and sided with the original case none. The
-        # output rule names both ways out and lets the model pick.
-        target = "the program" if language == "rust" else f"`{entrypoint}`"
-        body = (
-            f"{_ran_against(target, bar_is_independent, foreign)}\n"
-            f"{detail}\n\n"
-            f"Send back ONE fenced block: {WHOLE_PROGRAM} — or, if the case "
-            f"was wrong rather than the program, a `json` array holding just "
-            f"the case(s) above, corrected — each element "
-            f"{_CASE_SHAPE_RUST if language == 'rust' else _CASE_SHAPE_PYTHON}"
-            f", those key names exactly. Send one or the other, not both."
-        )
-    else:
-        target = "the program" if language == "rust" else f"`{entrypoint}`"
-        body = (
-            f"I ran {target} against the examples and got:\n"
-            f"{detail}\n\n"
-            f"Send back ONE fenced block, with nothing outside it: "
-            f"{WHOLE_PROGRAM}."
-        )
-    if stalled:
-        how_often = "once" if stalled == 1 else f"{stalled} times"
-        body += (
-            f"\n\nYou have already been shown this exact report {how_often} in "
-            f"this conversation, and the reply came back with the same program "
-            f"each time. Do not send that program again — solve it a different "
-            f"way."
-        )
-    return body
-
-
-# The most cases one reply may contribute. Each one is an executor run against
-# the solve's own budget -- a subprocess for Python, a container for Rust -- so
-# a model that emits forty of them would spend the deadline proving its own
-# program right instead of getting it submitted.
-MAX_SELF_TESTS = 20
-
-
-def extract_self_tests(
-    reply: str, entrypoint: str, language: str = "python"
-) -> list[dict[str, Any]]:
-    """The cases the model wrote for its OWN program, or [].
-
-    Production ships no `public_examples`: measured over a live run, 56 solves
-    in a row reported `examples=0/0`. So the repair loop -- the one mechanism
-    here that turns a nearly-right answer into a right one -- never had anything
-    to run, and `verified` was False on every answer because nothing could be
-    checked rather than because anything was wrong.
-
-    A model cannot verify its own understanding of a statement, and nothing here
-    pretends otherwise: cases that encode the same misreading as the code agree
-    with it, and that class goes uncaught. What they DO catch is the commoner
-    one by far -- the model knows what the answer should be and coded it wrong.
-    That is exactly the "nearly right" class this miner exists to close, and it
-    is objectively checkable: the program either produces the model's own stated
-    value or it does not.
-
-    Returns [] for anything unexpected. A malformed block must degrade to the
-    behaviour that existed before this function did, never to an exception --
-    it is parsed on the path that decides what gets submitted.
-    """
-    if not reply or not entrypoint:
-        return []
-    # `sanitize_code` first, as `extract_code` has always done. A reply read off
-    # the RENDERED PAGE -- which is what happens whenever the copy control fails
-    # -- carries the page's own characters: a non-breaking space where the model
-    # typed a space, a zero-width joiner from a syntax highlighter. Neither
-    # `json.loads` nor `ast.literal_eval` accepts one as whitespace, so a single
-    # invisible character dropped an entire corrected suite. That fallback is in
-    # the log this was found from.
-    reply = sanitize_code(reply)
-    # ...and drop the model's own reasoning, for the same reason `extract_code`
-    # drops it: a draft the model tried and ABANDONED is still text on the page.
-    # Measured -- a `<think>` block holding `expected: 999` became the bar the
-    # program was graded against, beating the real answer written below it.
-    reply = _OPEN_THINK_RE.sub("", _THINK_RE.sub("", reply))
-    fenced = fenced_blocks(reply)
-    for block in fenced:
-        # The program is skipped by `_parse_cases` rather than by an
-        # is-this-the-program check, and that is deliberate. Such a check has no
-        # reachable upside -- no Python or Rust program starts with `[` -- and a
-        # real downside: `_defines` for Rust is a text search for `fn main`, so a
-        # task about generating Rust would have its cases thrown away for
-        # quoting the phrase in an expected value. The structural test is both
-        # sufficient and the one that cannot misfire.
-        cases = _parse_cases(block, language)
-        if cases:
-            return _thin(cases, MAX_SELF_TESTS)
-    if fenced:
-        # It used fences and none of them was a suite, so it did not send one.
-        # Digging through the prose AROUND a block a model deliberately fenced
-        # would read an array it was discussing as cases it meant to run.
-        return []
-    # NO fence anywhere. The contract asks for one, and a reply that ignores it
-    # entirely is still a reply -- the array is right there in the text, and
-    # `_parse_cases`'s structural gate is what decides, not the fence. Measured:
-    # a corrected suite sent as bare text scored zero cases, so the same wrong
-    # case broke the program on every remaining round.
-    #
-    # Unless the bare reply is a PROGRAM, in which case it is the answer to the
-    # other half of the repair prompt and not a suite at all. A module whose
-    # leading constant is a list of dicts carrying `expected` -- a routing
-    # table, a fixture, a spec -- otherwise parsed as the model's own test
-    # cases, and the program was then graded against data lifted out of itself.
-    # `python_defect`/`rust_defect` is the same question `extract_code` asks on
-    # its own no-fence path, so "is this source" means one thing in both.
-    bare = reply.strip()
-    if bare:
-        defect = (
-            rust_defect(bare) if language == "rust"
-            else python_defect(bare, entrypoint)
-        )
-        if defect is None:
-            return []
-    return _thin(_parse_cases(reply, language, scan_prose=True), MAX_SELF_TESTS)
+# The most inputs one reply may contribute. Each one is now TWO executor runs
+# against the solve's own budget -- the reference produces the expectation and
+# the candidate is graded on it -- a subprocess apiece for Python and a
+# container apiece for Rust. A model that emits forty would spend the deadline
+# measuring instead of getting an answer submitted, and the prompt asks for 8
+# to 20, so this is the ceiling it was already told about.
+MAX_INPUTS = 20
 
 
 def _thin(cases: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -1429,12 +740,13 @@ def salvage_case_array(text: str) -> Optional[str]:
     and for a reason that has cost whole solves: claude.ai renders extended
     thinking inside the element the assistant selector matches, so falling back
     to the message text once submitted 13,200 characters of reasoning as a Rust
-    program. That rule has one blind spot, and it is exactly the reply a repair
-    round asks for. `extract_self_tests` can dig a corrected case array out of
-    prose, but it never gets the chance: a model that writes the array as
-    ordinary text renders no `pre code`, so the page read returns None and the
-    reply reaches `prompts.py` as the empty string. The fallback was
-    unreachable from the one path that needed it.
+    program. That rule has one blind spot, and it is exactly the reply the
+    INPUTS turn asks for -- the only turn that still wants a JSON array rather
+    than code. `inputs_from_payload` can read an array out of anything, but it
+    never gets the chance: a model that writes the array as ordinary text
+    renders no `pre code`, so the page read returns None and the reply reaches
+    `prompts.py` as the empty string. The fallback was unreachable from the one
+    path that needed it.
 
     This is the narrow way through, and it stays narrow on purpose:
 
@@ -1472,9 +784,17 @@ def _case_items(raw: list, language: str) -> list[dict[str, Any]]:
     question too: "did this bracketed span actually hold cases, or should I look
     at the next one?" is the same question as "is this a suite".
 
-    An item counts only if it is a dict carrying `expected`. No amount of
-    dialect tolerance upstream touches that -- it is what keeps a program, a
-    prompt echo or a stray list of numbers from being read as a suite.
+    An item counts only if it is a dict carrying `args` or `expected`. No
+    amount of dialect tolerance upstream touches that -- it is what keeps a
+    program, a prompt echo or a stray list of numbers from being read as a
+    suite.
+
+    `args` alone is enough because the inputs turn is now forbidden to supply
+    an expected value: the reference program computes every expectation by
+    being run. Requiring `expected` made this gate reject exactly the array
+    the live design asks for, which silently disabled the prose salvage on the
+    one turn that still sends a JSON array. An item with neither key is not a
+    case in any dialect.
     """
     cases: list[dict[str, Any]] = []
     # One case per CALL. Two cases with the same arguments are either the same
@@ -1486,7 +806,7 @@ def _case_items(raw: list, language: str) -> list[dict[str, Any]]:
     # model-authored case to replace both. Measured on the real function.
     seen: set[tuple] = set()
     for item in raw:
-        if not isinstance(item, dict) or "expected" not in item:
+        if not isinstance(item, dict) or not ({"args", "expected"} & set(item)):
             continue
         args = item.get("args", [])
         if not isinstance(args, list):
@@ -1500,7 +820,11 @@ def _case_items(raw: list, language: str) -> list[dict[str, Any]]:
             # is the honest outcome: a case that cannot run is not evidence.
             if len(args) != 1 or not isinstance(args[0], str):
                 continue
-            if not isinstance(item.get("expected"), str):
+            # An expected value, IF the model supplied one, must be the stdout
+            # string the judge compares. A number there matches neither the
+            # reference's output nor the program's. Absent is fine: that is
+            # what the inputs turn is asked for.
+            if "expected" in item and not isinstance(item["expected"], str):
                 continue
         key = (repr(args), repr(sorted(kwargs.items(), key=repr)))
         if key in seen:
@@ -1873,8 +1197,9 @@ def _defines(code: str, entrypoint: str, language: str = "python") -> bool:
     return False
 
 
-# Said by both defect checks, and recognised by `build_repair_prompt`, because
-# "nothing arrived" needs a different conversation from "what arrived is wrong".
+# Said by both defect checks, and carried into the repair prompt as a `defect`
+# with `found_by="unrun"`, because "nothing arrived" needs a different
+# conversation from "what arrived is wrong".
 NO_CODE = "the reply contained no code"
 
 
@@ -2268,8 +1593,8 @@ def rust_defect(code: str) -> Optional[str]:
 
     The order of the two matters. Telling a model "your program does not define
     `fn main()`" about something that was never a program is the contradiction
-    `build_repair_prompt` exists to avoid, so a block that is not Rust at all
-    says exactly that instead.
+    `_FOUND_BY` exists to avoid, so a block that is not Rust at all says exactly
+    that instead.
     """
     if not code.strip():
         return NO_CODE
@@ -2441,11 +1766,33 @@ The program below fails the check reported under it. Repair it.
 
 You did not write this program. Read the failure as evidence about the program,
 not as a claim you have to defend — and read the statement yourself rather than
-trusting that the program's author read it correctly.
+trusting that the program's author read it correctly."""
 
-The failure was found by running this program and a separate reference
-implementation on the same inputs and comparing what they produced. Where they
-disagree, at least one of them is wrong about the statement."""
+# HOW the failure was found, and it has to be true. A repair prompt that
+# describes a run that did not happen asks the wrong question: told its logic
+# disagreed with a reference, a model rewrites logic -- and when the real fault
+# is that the program never compiled, or never arrived, the rewrite goes
+# straight back to the same place. Measured under the previous design on a Rust
+# task: two complete, plausible programs, both reported as "I ran the program
+# and got: the reply contained no code", both repaired against evidence that
+# did not exist.
+_FOUND_BY = {
+    "differential": (
+        "The failure was found by running this program and a separate reference\n"
+        "implementation on the same inputs and comparing what they produced. Where\n"
+        "they disagree, at least one of them is wrong about the statement."
+    ),
+    "examples": (
+        "The failure was found by running this program against the worked examples\n"
+        "that shipped with the statement. Those are ground truth: where the program\n"
+        "disagrees with one, the program is wrong."
+    ),
+    "unrun": (
+        "NOTHING WAS RUN. A local check refused this program before it could\n"
+        "execute, so there is no failing input and no wrong answer — only the\n"
+        "reason below. Fix that reason; the logic has not been judged."
+    ),
+}
 
 
 def build_analysis_prompt(task, heuristic) -> str:
@@ -2470,12 +1817,27 @@ def build_inputs_prompt(task, analysis, want_probe: bool = False) -> str:
     reference to answer, so none of them is ever the size the validator runs.
     "Did it finish at scale" needs no expected value and so needs no oracle.
     """
+    python = _is_python(task)
     entrypoint = getattr(task, "entrypoint", "") or "solve"
     body = (
         _INPUTS_TASK_PYTHON.format(entrypoint=entrypoint)
-        if _is_python(task)
+        if python
         else _INPUTS_TASK_RUST
     )
+    if want_probe:
+        # `{shape}` is what the generator must RETURN, and it is the only part
+        # of this that `_probe_now` reads by name. Concatenating the task
+        # unformatted shipped the literal five characters to the model, which
+        # then invented a shape: the generator ran, returned something the
+        # probe could not call the program with, and the size check was
+        # skipped in silence on every solve that asked for it.
+        tail = GENERATOR_TASK.format(
+            shape=(_PROBE_SHAPE_PYTHON if python else _PROBE_SHAPE_RUST).format(
+                entrypoint=entrypoint
+            )
+        ) + "\n\n" + TESTS_OUTPUT_CONTRACT_WITH_PROBE
+    else:
+        tail = INPUTS_OUTPUT_CONTRACT
     return (
         _statement_header(task)
         + "\nWHAT THE STATEMENT HIDES:\n"
@@ -2483,8 +1845,7 @@ def build_inputs_prompt(task, analysis, want_probe: bool = False) -> str:
         + "\n"
         + body
         + "\n\n"
-        + (GENERATOR_TASK + "\n\n" + TESTS_OUTPUT_CONTRACT_WITH_PROBE
-           if want_probe else INPUTS_OUTPUT_CONTRACT)
+        + tail
     )
 
 
@@ -2537,7 +1898,7 @@ def build_candidate_prompt(task, analysis) -> str:
     )
     return (
         _statement_header(task)
-        + (f"\n{examples}\n" if examples else "")
+        + (f"\n{EXAMPLES_LABEL}\n{examples}\n" if examples else "")
         + "\nWHAT THE STATEMENT HIDES:\n"
         + analysis.as_prompt_block()
         + "\n"
@@ -2555,7 +1916,7 @@ def build_candidate_prompt(task, analysis) -> str:
 
 def build_differential_repair_prompt(
     task, analysis, code: str, report: str, kind: str = "candidate",
-    defect: Optional[str] = None,
+    defect: Optional[str] = None, found_by: str = "differential",
 ) -> str:
     """Stage 8. Self-contained: the repair model has no conversation to read.
 
@@ -2563,6 +1924,11 @@ def build_differential_repair_prompt(
     is told it is looking at. Repairing the reference is not the same job as
     repairing the program that ships: the reference may be as slow as it likes
     and only has to stop falling over, while the candidate has to stay fast.
+
+    `found_by` says how the failure was found, and it is not decoration -- see
+    `_FOUND_BY`. An unknown value falls back to the differential wording, which
+    is the one every repair the orchestrator actually sends uses unless it says
+    otherwise.
     """
     python = _is_python(task)
     language = "python" if python else "rust"
@@ -2588,6 +1954,8 @@ def build_differential_repair_prompt(
         + analysis.as_prompt_block()
         + "\n"
         + _REPAIR_TASK
+        + "\n\n"
+        + _FOUND_BY.get(found_by, _FOUND_BY["differential"])
         + "\n\n"
         + aim
         + "\n\nTHE PROGRAM:\n"
@@ -2646,9 +2014,15 @@ def extract_inputs(reply: str, language: str) -> list[dict[str, Any]]:
     if payload is None:
         payload = _loads_cases(reply or "")
     if payload is None:
-        salvaged = salvage_case_array(reply or "")
-        if salvaged:
-            payload = _loads_cases(salvaged)
+        # `salvage_case_array` hands back a RE-FENCED block, because its other
+        # caller wants something that reads like an ordinary reply. Passing
+        # that straight to the JSON reader parses the backticks as part of the
+        # array, so the salvage succeeded and its result was dropped one line
+        # later -- the prose rescue was unreachable from here.
+        for block in fenced_blocks(salvage_case_array(reply or "") or ""):
+            payload = _loads_cases(block)
+            if payload is not None:
+                break
     return inputs_from_payload(payload, language)
 
 
@@ -2703,4 +2077,9 @@ def inputs_from_payload(payload: Any, language: str) -> list[dict[str, Any]]:
             "kwargs": kwargs,
             "notes": str(item.get("notes") or item.get("note") or "").strip(),
         })
-    return cases
+    # Capped, and thinned rather than truncated -- see `_thin`. The cap was
+    # lost when the cases turn became the inputs turn, and it costs more here
+    # than it did there: every input is now run TWICE, once by the reference
+    # and once by the candidate, so an over-long reply buys double the
+    # executor time it used to.
+    return _thin(cases, MAX_INPUTS)

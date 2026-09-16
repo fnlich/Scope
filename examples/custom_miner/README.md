@@ -133,48 +133,41 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 - **Never raise.** On any failure return empty `code` — a zero is survivable, a
   crash loop is not. `custom_miner.py` already wraps your solver this way.
 
-### The prompt is one delimited document, and the order is the argument
+### Every stage prompt is the same document, and the order is the argument
 
-Every solve takes **two turns** — the cases first, then the program — and both
-are laid out the same way:
+A solve takes five kinds of turn, and all five are laid out the same way:
 
 ```
-TURN 1 (cases)                      TURN 2 (program)
-<output>   one json block           <output>   one code block          ← first
-<problem>  the statement            <problem>  the statement
-<examples> a floor to agree with    <examples> a floor, not the spec
-<task>     which cases, in order    <contract> what is TRUE: how it is
-                                               run, compared, and what
-                                               the environment does
-                                               silently
-                                    <must_pass> the model's OWN cases
-                                                from turn 1          ← last
+language / entrypoint            ← what it is
+PROBLEM STATEMENT                ← the statement, verbatim
+WORKED EXAMPLES                  ← only when the task ships any; live traffic never does
+WHAT THE STATEMENT HIDES         ← the trap block, heuristics + the analysis turn
+<the task>                       ← the one thing THIS stage is for
+RULES / THE ENVIRONMENT IT RUNS IN
+the output contract              ← one fenced block, and what is in it   ← last
 ```
-Both turns ask for **one** block, and there is no third shape: the single-turn
-prompt that asked for a program and its cases together is gone — see
-*[The cases are written before the program exists](#the-cases-are-written-before-the-program-exists)*.
-…then the site's nudge, appended after everything, repeats the output rule.
 
-The output contract holds **both ends**. It is the only instruction whose
-failure costs the entire answer rather than degrading it, so it gets primacy and
-recency and nothing else competes for either. The problem comes next, because
-instructions about how to solve something are unreadable before you know what it
-is. What the program has to clear comes last, immediately before it is written.
+…then the site's nudge, where there is one, repeats the output rule.
 
-**Everything else has been deleted, and the deletion is the design.** Turn 2
-used to carry a `<method>` — a six-step numbered procedure — wrapping an
-`<edge_cases>` checklist of twelve input shapes, a `<self_check>` of seven
-re-reads, and a closing coda. Inside that one message *"a wrong answer pays
-zero"* was stated four times, *"work silently, not in the reply"* three times,
-and *"send only the program"* three times over plus the nudge; turn 1's case
-classes were then restated almost verbatim as turn 2's edge cases, so the model
-was told the same thing twice across two turns and neither telling was the one
-it was graded against.
+The output contract sits **last**, which is the opposite end from where it used
+to sit. It is still the only instruction whose failure costs the entire answer
+rather than degrading it — but an instruction about how to answer is read at
+the moment answering starts, not two kilobytes before the model knows the
+question. Every stage asks for **one** block, and says so by number; the one
+exception is the inputs turn when it is also asked for a size-probe generator,
+which asks for two and says *that* by number.
+
+**Everything else has been deleted, and the deletion is the design.** The
+program turn used to carry a `<method>` — a six-step numbered procedure —
+wrapping an `<edge_cases>` checklist of twelve input shapes, a `<self_check>`
+of seven re-reads, and a closing coda. Inside that one message *"a wrong answer
+pays zero"* was stated four times, *"work silently, not in the reply"* three
+times, and *"send only the program"* three times over plus the nudge.
 
 None of that was free. Every sentence is an instruction a model can obey
-*instead of* answering, and a procedure that says how to think competes with the
-task for the same attention. The prompts now state **what is true** — how the
-code is invoked, compared and timed — and **what it must clear**, and stop.
+*instead of* answering, and a procedure that says how to think competes with
+the task for the same attention. The prompts now state **what is true** — how
+the code is invoked, compared and timed — and **what it must clear**, and stop.
 
 The hurrying went with it. `"every character you emit spends wall-clock inside
 the deadline"`, `"keep every trace terse"`, `"the payment rule pays the slowest
@@ -197,14 +190,16 @@ so. And **hash order is not stable across processes**: measured, four runs of
 order every time — so a solution tested with integers looks stable and is not.
 Rust randomises `HashMap`/`HashSet` iteration for the same reason.
 
-### The hidden suite is where the score is, so turn 1 is written for it
+### The hidden suite is where the score is, so the inputs turn is written for it
 
-The public examples are the friendly ones, and on live traffic there are usually
-none at all. Grading is on the **complete hidden suite**, written to break a
-solution that only handles the shape it was shown — so the cases the program
-will be checked against are asked for *first, in their own turn*, before the
-program exists to back-fill them from. Turn 1 names six classes and their
-order is the instruction:
+The public examples are the friendly ones, and on live traffic there are none
+at all — all 97 archived requests carry an empty list. Grading is on the
+**complete hidden suite**, written to break a solution that only handles the
+shape it was shown. So the inputs the program will be checked against are
+asked for in their own turn, beside the program rather than after it, and
+without answers attached — see *[Nothing is asked what a call should
+return](#nothing-is-asked-what-a-call-should-return)*. The turn names the
+classes and their order is the instruction:
 
     ONE ORDINARY     a typical input — the common path an all-boundary suite
                      never checks, and where a program wrong down the middle
@@ -228,16 +223,17 @@ of its public examples demonstrates. A model that never wrote a case for that
 result usually never wrote the branch either, and the hidden suite always
 tests it.
 
-That list used to be nine classes with a per-class count, and it was restated
-almost verbatim in turn 2 as an `<edge_cases>` checklist the model was asked to
-walk before answering. Both are gone: the classes belong to the turn that
-produces cases, and turn 2 is handed the cases themselves under `<must_pass>`,
-which is the same information as something the grader will actually run.
+The prompt asks for 8 to 20 of them and the parser keeps at most 20, thinned
+rather than truncated: the first three plus an even stride through the rest,
+because the classes arrive easiest-first and a head slice would throw away
+every boundary. Twenty is a ceiling with a price behind it — each input is run
+**twice**, once by the reference to produce the expectation and once by the
+candidate to be graded on it, and for Rust that is two containers.
 
-The examples are rendered *with* the problem and labelled a floor rather than
-the specification — and, since the statement is the spec, the label carries the
-one disambiguation rule a solver gets: where the statement is ambiguous, the
-examples decide.
+The examples, where a task ships any, are rendered *with* the problem and
+labelled a floor rather than the specification — and, since the statement is
+the spec, the label carries the one disambiguation rule a solver gets: where
+the statement is ambiguous, the examples decide.
 
 Each language is then warned about its own way of losing a large number, because
 they are not the same failure:
@@ -259,10 +255,10 @@ they are not the same failure:
 
 ### What was removed, and what it cost
 
-Turn 2 used to end with a `<self_check>`: seven things to re-read the program
-for, drawn from real submissions. Read off 43 answers a live miner sent, ten
-were the model's own bugs and **eight of those ten were visible on a careful
-re-read** — no test, no execution, no cleverness required:
+The program turn used to end with a `<self_check>`: seven things to re-read the
+program for, drawn from real submissions. Read off 43 answers a live miner
+sent, ten were the model's own bugs and **eight of those ten were visible on a
+careful re-read** — no test, no execution, no cleverness required:
 
 | what shipped | what a re-read would have caught |
 | --- | --- |
@@ -277,11 +273,11 @@ re-read** — no test, no execution, no cleverness required:
 The evidence is kept here because it is worth knowing what these models get
 wrong. The *section* is gone, deliberately: it was the third place in one
 message telling the model to work silently before replying, it competed with the
-task for attention, and the cases from turn 1 catch the same class of bug by
-running the program rather than by asking it to look again. That is the trade —
-a mechanism that sometimes caught a bug, exchanged for a prompt with one job in
-it. If a future run shows those bugs coming back, the answer is a better case
-turn, not another checklist.
+task for attention, and running the program against a reference catches the same
+class of bug by executing it rather than by asking it to look again. That is the
+trade — a mechanism that sometimes caught a bug, exchanged for a prompt with one
+job in it. If a future run shows those bugs coming back, the answer is a better
+inputs turn, not another checklist.
 
 The code is no longer asked for **unexplained**, either. That bullet — no
 comments, no docstrings — existed because output costs wall-clock, and
@@ -1212,7 +1208,9 @@ arrives anyway.
 
 Every input has to be small enough for a deliberately slow reference to finish,
 which is also what keeps the suite affordable: the whole thing is re-run on
-every repair round.
+every repair round. The parser keeps at most twenty of them, thinned rather
+than truncated — the first three plus an even stride through the rest, because
+the classes arrive easiest-first and a head slice would drop every boundary.
 
 ### The three writing turns run side by side
 
@@ -1296,6 +1294,13 @@ against none. `agreed=`, `mismatch=` and `oracle_crash=` say what the
 comparison established; `repair=fable:cand>fable:oracle` says which artifact
 each round patched; `regressed=` and `flipped=` are the instruments for the
 routing heuristic being wrong.
+
+`rounds=` and `corrected=` are kept across the rebuild for a reason that is
+not about reading the line: `calibration/bar_ab.py` is the only consumer of
+this format, and its failure mode is silence — a regex that stops matching
+returns zero rows rather than raising. A test runs its regexes over a line a
+real solve just printed, so a future field cannot quietly take the comparison
+tool with it.
 
 ### A short deadline must still get an answer
 
@@ -1697,6 +1702,8 @@ fresh conversation.
 |---|---|---|
 | `SOLVER_MAX_ATTEMPTS` | `0` | Rounds per solve, `0` meaning **unlimited** — correct until it passes or the request's deadline stops it. A count here is a second, private deadline under the only real one, and there is no partial credit for stopping early. Set a number to cap it anyway |
 | `SOLVER_MAX_BUDGET_S` | `3600` | The protocol's own maximum for `deadline_s`, so it cannot bind on a spec-compliant request. Lowering it below the advertised deadline throws away answers the validator would still pay for |
+| `SOLVER_LLM_ANALYSIS` | `true` | Stage 3: ask a model to add to the free trap scan before anything else is written. The scan itself is regexes and always runs, so off is a poorer prompt rather than a broken solve — the same place a solve lands when the turn fails. Measured over the 97 recorded tasks, the scan alone finds a median of 5 traps and never fewer than 3 |
+| `SOLVER_SELF_TESTS` | `true` | The local check at all — stages 4 and 5 as well as the grading. Live traffic ships no public examples, so off means nothing is compared, the repair loop never fires, and the candidate turn's first answer ships. One writing turn per solve instead of three |
 | `SOLVER_VERIFY_EXECUTOR` | `docker` | Python grading backend, matching the validator's 256 MiB / no-swap container; Rust always uses Docker. When no daemon answers, Python falls back to `subprocess` (1 GiB) with a once-per-run warning, tries Docker again every `SOLVER_EXECUTOR_RETRY_S`, and answers graded that way are kept out of the on-disk cache |
 | `SOLVER_EXECUTOR_RETRY_S` | `300` | How long an executor that could not be BUILT stays unavailable before a solve tries again. Without a daemon, building the Rust executor runs `docker info` — 60ms against a missing socket, up to 20s against a hung one — and it used to run once per Rust task, inside the solve's budget. A hold rather than a verdict: a daemon started after the miner is picked up on its own |
 | `MINER_RESPONSE_GRACE_S` | `5` | How far past `deadline_s` the solve may run. The validator reads until `deadline_s + 10` (`_MINER_RESPONSE_GRACE_S`, `rlvr/neurons/decentralized.py`), and the reference handler stopped at `deadline_s` flat. Not all ten: the rest is the response's own trip across the wire. `0` restores the reference behaviour |
@@ -2175,7 +2182,6 @@ Five layers, cheapest first, each isolating a different failure:
 ```bash
 # from the repo root
 python -m pytest examples/custom_miner    # 1. code only — no browser, no chain
-python scripts/two_turn_demo.py           # 1b. see the two turns, still no browser
 
 # from examples/custom_miner
 cd examples/custom_miner

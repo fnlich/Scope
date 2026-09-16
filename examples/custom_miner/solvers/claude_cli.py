@@ -422,10 +422,12 @@ def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profil
     measures a problem that justifies it. But an emergency rung answers a
     whole solve, not a phase, and the subnet pays only for a complete pass of
     the hidden suite: 161s inside a 290s deadline is affordable, and a wrong
-    answer at 38s earns exactly what no answer earns. Sonnet is also the model
-    `fixed_inputs.py` measured against opus -- 94% agreement on expected
-    values with the inputs held fixed -- so it is the one rung with evidence
-    that it reads these statements the way the default model does.
+    answer at 38s earns exactly what no answer earns. Sonnet is also the one rung
+    with evidence that it reads these statements the way the default model
+    does: measured against opus with the inputs held fixed, the two agreed on
+    91 of 97 expected values -- see `calibration/inputs_only.py`, which carries
+    that result now that the script producing it has been retired with the
+    design it settled.
     """
     default_effort = default_effort or cli_effort()
     raw = _flag("SOLVER_CLI_EMERGENCY_PROFILES", "fable:low")

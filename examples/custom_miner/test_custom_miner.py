@@ -51,9 +51,6 @@ from solvers.chatgpt_web import chatgpt_site  # noqa: E402
 from solvers.claude_web import claude_site  # noqa: E402
 from solvers.prompts import (  # noqa: E402
     NO_CODE,
-    build_code_prompt,
-    build_repair_prompt,
-    build_tests_prompt,
     extract_code,
     python_defect,
 )
@@ -1958,37 +1955,35 @@ def test_the_wire_is_only_taken_once_it_has_stopped_changing(monkeypatch):
     assert not (got or "").strip(), f"returned prose as an answer: {got!r}"
 
 
-def test_corrected_cases_written_as_prose_are_not_thrown_away():
-    """The one reply "code blocks or nothing" could not read, and a repair round
-    asks for it by name.
+def test_a_reply_that_is_all_prose_reaches_the_solver_as_prose():
+    """The page read must hand back what the model actually wrote, and the
+    extractor must refuse to call it a program.
 
-    The rule is right and stays: claude.ai renders extended thinking inside the
-    element the assistant selector matches, and falling back to the message text
-    once submitted 13,200 characters of reasoning as a Rust program. But the
-    repair prompt offers a second shape outright — "or, if the case was wrong
-    rather than the program, a `json` array" — and a model that writes that
-    array as ordinary text renders no `pre code`. The page read returned None,
-    the reply reached `prompts.py` as the empty string, and the loop answered a
-    correction it had asked for with "your reply did not reach me as code".
-
-    `extract_self_tests` could always dig an array out of prose. It was simply
-    never handed any.
-    """
+    The rule the second half pins is right and stays: claude.ai renders
+    extended thinking inside the element the assistant selector matches, and
+    falling back to the message text once submitted 13,200 characters of
+    reasoning as a Rust program. Both halves are needed together -- a read that
+    returned nothing would report "your reply did not reach me" about a reply
+    that plainly did, and an extractor that took prose would submit it."""
     page = _FakePage({"#composer": [_Node()], "#send": [_Node()], "#assistant": []})
     page.on_click = lambda _: page.dom.__setitem__("#assistant", [_Node(
         text="You are right — the case was wrong, not the program. Corrected:\n\n"
-             '[{"name": "zero", "args": [0], "expected": 0}, '
-             '{"name": "carry", "args": [12345], "expected": 15}]\n\n'
-             "The program itself is fine as sent."
+             '[{"name": "zero", "args": [0]}, {"name": "carry", "args": [12345]}]'
+             "\n\nThe program itself is fine as sent."
     )])
-    from solvers.prompts import extract_self_tests
-
     reply = asyncio.run(_tab(page, _site()).send("fix it", 1.0))
 
-    assert extract_self_tests(reply, "g", "python") == [
-        {"args": [0], "kwargs": {}, "expected": 0, "name": "zero"},
-        {"args": [12345], "kwargs": {}, "expected": 15, "name": "carry"},
-    ], f"the corrected cases were lost: {reply!r}"
+    from solvers.prompts import extract_inputs
+
+    # The array is dug out of the prose, because that fallback is the only
+    # thing standing between a model that ignored the fence and a solve with
+    # no bar at all -- and the inputs turn is the one turn that still asks for
+    # a JSON array. The gate it passes is structural: `args` is enough, since
+    # the inputs turn is forbidden to supply an expected value.
+    assert extract_inputs(reply, "python") == [
+        {"name": "zero", "args": [0], "kwargs": {}, "notes": ""},
+        {"name": "carry", "args": [12345], "kwargs": {}, "notes": ""},
+    ], f"the salvaged inputs were lost: {reply!r}"
     assert extract_code(reply, "g", "python") == "", (
         f"prose came back as a program, which is what the None rule prevents: "
         f"{reply!r}"
@@ -2257,9 +2252,7 @@ def test_an_editor_that_reformats_the_prompt_is_not_contamination():
     failed too and the tab was thrown away.
 
     What may not happen is a word appearing that we never typed."""
-    from solvers.prompts import build_tests_prompt
-
-    prompt = build_tests_prompt("python", "Do a thing.", "g", [])
+    prompt = _all_stage_prompts(_stage_task("python"))["inputs"]
     reformatted = "\n".join(
         re.sub(r"^(- |[0-9]+\. )", "", line) for line in prompt.splitlines()
     )
@@ -2557,27 +2550,27 @@ def test_a_delivery_failure_is_not_reported_as_a_wrong_answer():
     Seen live on a Rust task: two complete, plausible programs, both reported as
     no code, both repaired against evidence that did not exist.
     """
-    from solvers.prompts import NO_CODE, build_repair_prompt
+    prompt = _repair_prompt("rust", defect=NO_CODE, found_by="unrun")
 
-    prompt = build_repair_prompt([], "rust", "main", defect=NO_CODE)
-    assert "did not reach me as code" in prompt
+    assert NO_CODE in prompt
     # Where the reply has to be WRITTEN is the whole of the fix, and it is said
     # positively rather than as a list of the places it must not go. The ban on
     # artifacts and canvases is the nudge's job, and the nudge is appended to
     # every send including this one -- see `_submit`.
     assert "directly in the chat" in prompt
-    assert "I ran" not in prompt, "still claims to have run something"
-    assert "WRONG" not in prompt, "still blames the answer for a delivery fault"
+    assert "NOTHING WAS RUN" in prompt, "still claims to have run something"
+    assert "comparing what they produced" not in prompt, (
+        "described a comparison against a reference that never happened"
+    )
 
 
 def test_a_real_failure_still_quotes_the_evidence():
     """The other branch must keep working: when code DID arrive and failed, the
     concrete counter-example is what makes the repair loop converge."""
-    from solvers.prompts import build_repair_prompt
+    prompt = _repair_prompt("python", report="g(*[12345]) returned 14, expected 15")
 
-    prompt = build_repair_prompt(["g(*[12345]) returned 14, expected 15"], "python", "g")
     assert "returned 14, expected 15" in prompt
-    assert "I ran `g` against the examples" in prompt
+    assert "running this program and a separate reference" in prompt
 
 
 # --- a model that reasons before it answers ------------------------------- #
@@ -2968,15 +2961,14 @@ def test_a_defect_is_not_reported_as_a_failed_run():
     the examples and got: the program does not define `fn main()`" is not
     evidence, it is a contradiction -- and a model told its logic failed will
     rewrite the logic, which was never the problem."""
-    from solvers.prompts import build_repair_prompt
-
-    prompt = build_repair_prompt(
-        [], "rust", "main", defect="the program does not define `fn main()`"
+    prompt = _repair_prompt(
+        "rust", defect="the program does not define `fn main()`", found_by="unrun",
     )
     assert "does not define `fn main()`" in prompt
-    assert "could not run" in prompt
-    assert "I ran" not in prompt, "still claims to have executed it"
-    assert "WRONG" not in prompt, "still blames logic that never ran"
+    assert "NOTHING WAS RUN" in prompt, "still claims to have executed it"
+    assert "the logic has not been judged" in prompt, (
+        "still blames logic that never ran"
+    )
 
 
 def test_the_repair_round_hears_about_the_defect_not_about_the_examples():
@@ -3658,14 +3650,25 @@ def test_each_language_is_warned_about_its_own_way_of_losing_a_large_number():
     """The large-number failure is not the same failure in both languages, and
     telling either one the other's story wastes the only prompt there is:
     Python cannot overflow at all, and Rust cannot grow an integer."""
-    from solvers.prompts import build_code_prompt
+    # The ENVIRONMENT block, not the whole prompt. The trap block above it is
+    # written from the statement and is language-agnostic -- "stresses overflow
+    # and exactness" is a note about which INPUTS are worth trying, true in
+    # both languages. What must not cross over is the environment's own story
+    # about how each language loses a number, which is where the decision is.
+    def environment(prompt):
+        return prompt.split("THE ENVIRONMENT IT RUNS IN:", 1)[1].lower()
 
-    rust = build_code_prompt("rust", "Do a thing.", "main", [])
-    python = build_code_prompt("python", "Do a thing.", "solve", [])
+    rust = environment(_candidate_prompt("rust"))
+    python = environment(_candidate_prompt("python"))
 
-    assert "OVERFLOW IS SILENT" in rust and "i64" in rust
-    assert "overflow" not in python.lower().replace("never overflow", ""), (
-        "told Python about an overflow it cannot have"
+    assert "overflow is silent" in rust and "i64" in rust
+    assert "wraps" in rust, "did not say what silent overflow actually does"
+    for rust_only in ("i64", "i128", "wraps", "opt-level"):
+        assert rust_only not in python, (
+            f"told Python about {rust_only!r}, which is Rust's failure"
+        )
+    assert "never overflow" in python, (
+        "left Python to guess whether its integers can overflow"
     )
     assert "recursion limit is 1000" in python
     assert "recursion limit" not in rust, "told Rust about Python's limit"
@@ -3766,38 +3769,41 @@ def test_the_examples_are_framed_as_a_floor_not_the_specification():
     it says in the same breath that these are a floor and that the cases below
     still apply — so the task can be where a task belongs.
     """
-    from solvers.prompts import build_code_prompt
-
-    prompt = build_code_prompt(
-        "python", "Do a thing.", "solve",
-        [{"args": [[1]], "kwargs": {}, "expected": 1}],
+    prompt = _candidate_prompt(
+        "python", [{"args": [[1]], "kwargs": {}, "expected": 1}]
     )
-    assert "a floor, not the specification" in prompt
-    assert "already known to be right" in prompt, "the label drops their standing"
-    assert prompt.index("<problem") < prompt.index("<examples"), (
+    flat = " ".join(prompt.split())
+    assert "a floor, not the specification" in flat
+    assert "already known to be right" in flat, "the label drops their standing"
+    assert prompt.index("PROBLEM STATEMENT") < prompt.index("WORKED EXAMPLES"), (
         "the examples are separated from the problem they belong to"
     )
+    # ...and a task with none says nothing about examples at all, rather than
+    # labelling an empty list. Every one of the 97 archived requests is this.
+    assert "WORKED EXAMPLES" not in _candidate_prompt("python")
 
 
 def test_the_output_contract_holds_the_first_word_and_the_nudge_the_last():
     """The only instruction whose failure costs the ENTIRE answer rather than
     degrading it, so it gets both ends and nothing competes for either."""
-    from solvers.prompts import build_code_prompt, build_tests_prompt
-
-    for site, language, entry in ((claude_site(), "rust", "main"),
-                                  (chatgpt_site(), "python", "solve")):
-        for prompt in (
-            build_code_prompt(language, "Do a thing.", entry, []),
-            build_tests_prompt(language, "Do a thing.", entry, []),
-        ):
-            assert prompt.startswith("<output>"), prompt[:40]
-            head = prompt.split("</output>")[0]
-            # ONE block, and in BOTH turns. The count is the load-bearing part:
+    for site, language in ((claude_site(), "rust"), (chatgpt_site(), "python")):
+        for name, prompt in _all_stage_prompts(_stage_task(language)).items():
+            # The contract is the LAST thing every stage says, which is the
+            # other end from where it used to sit. A model reads an
+            # instruction about how to answer at the moment it starts
+            # answering, not two kilobytes before it knows the question.
+            tail = prompt.rsplit("Reply with", 1)[-1] if "Reply with" in prompt \
+                else prompt[-600:]
+            # ONE block, in every stage but the one that asks for a probe
+            # generator beside the inputs. The count is the load-bearing part:
             # `extract_code` picks the block that DEFINES the entrypoint, so a
-            # second one is what could still confuse it — and since the split
-            # there is no turn that wants two.
-            assert "ONE fenced block" in head, head[:200]
-            assert "TWO fenced blocks" not in head, head[:200]
+            # second one is what could confuse it, and only the probe turn
+            # wants two -- where it says so, by number.
+            if name == "inputs+probe":
+                assert "TWO fenced blocks" in tail, (name, language, tail[:200])
+            else:
+                assert "ONE fenced block" in tail, (name, language, tail[:200])
+                assert "TWO fenced blocks" not in tail, (name, language)
         # ...and the site's nudge, appended after everything, repeats it.
         assert site.nudge.startswith(
             "START your reply with the fenced block"
@@ -3814,9 +3820,7 @@ def test_a_repair_carries_the_error_and_no_method_for_thinking():
     change both to make them agree. That is work which never reaches the reply,
     competing with the failure itself for attention, and it is the same class of
     instruction the two-phase rewrite already took out of turns 1 and 2."""
-    from solvers.prompts import build_repair_prompt
-
-    prompt = build_repair_prompt(["solve([]) raised IndexError"], "python", "solve")
+    prompt = _repair_prompt("python", report="solve([]) raised IndexError")
     assert "solve([]) raised IndexError" in prompt, prompt
     for method in ("in your reasoning", "silently", "trace the failing",
                    "do not guess", "re-check", "same rules as before",
@@ -3826,10 +3830,11 @@ def test_a_repair_carries_the_error_and_no_method_for_thinking():
         )
     # ...and a DEFECT is answered with delivery, never with a run report.
     for defect in ("the program does not define fn main()", NO_CODE):
-        repair = build_repair_prompt([], "rust", "main", defect=defect)
-        assert "I ran" not in repair, (
+        repair = _repair_prompt("rust", defect=defect, found_by="unrun")
+        assert "comparing what they produced" not in repair, (
             f"answered a delivery failure with evidence that does not exist: {defect!r}"
         )
+        assert "NOTHING WAS RUN" in repair, defect
 
 
 # --- a message that is all reasoning is not an answer --------------------- #
@@ -3864,7 +3869,7 @@ def test_reasoning_is_reported_as_nothing_arrived_not_as_a_broken_program():
     round. "Your program has no fn main()" is a contradiction when no program
     was sent: the model rewrites logic that was never the problem. "Nothing
     reached me as code" is the one that gets a code block back."""
-    from solvers.prompts import build_repair_prompt, rust_defect
+    from solvers.prompts import rust_defect
 
     prose = (
         "Let me carefully work through this problem.\n"
@@ -3874,8 +3879,8 @@ def test_reasoning_is_reported_as_nothing_arrived_not_as_a_broken_program():
     defect = rust_defect(extract_code(prose, "main", "rust"))
     assert defect == NO_CODE, f"reasoning was diagnosed as {defect!r}"
 
-    repair = build_repair_prompt([], "rust", "main", defect=defect)
-    assert "did not reach me as code" in repair, repair[:120]
+    repair = _repair_prompt("rust", code="", defect=defect, found_by="unrun")
+    assert NO_CODE in repair, repair[:200]
     assert "does not define" not in repair, (
         "still telling the model to fix a program it never sent"
     )
@@ -4515,7 +4520,6 @@ def test_a_compile_failure_becomes_a_defect_the_repair_round_can_use():
     — every task on the run this was written for — a defect is the only thing
     that can make the loop ask again at all."""
     _rustc_or_skip()
-    from solvers.prompts import build_repair_prompt
 
     solver = _solver([])
     task = SimpleNamespace(
@@ -4527,8 +4531,10 @@ def test_a_compile_failure_becomes_a_defect_the_repair_round_can_use():
     assert "does not compile" in candidate.defect
     assert candidate.code.strip(), "threw the answer away instead of repairing it"
 
-    repair = build_repair_prompt([], "rust", "main", defect=candidate.defect)
-    assert "could not run your previous reply" in repair
+    repair = _repair_prompt(
+        "rust", code=candidate.code, defect=candidate.defect, found_by="unrun",
+    )
+    assert "NOTHING WAS RUN" in repair
     assert "cannot find function" in repair, repair[:200]
 
 
@@ -4837,19 +4843,16 @@ def test_the_examples_decide_when_the_statement_is_ambiguous():
     """The examples are the only disambiguation a solver is given — the README
     says so and nothing in the prompt used to. Without the rule the model has
     to guess which of its readings the author meant."""
-    from solvers.prompts import build_code_prompt
-
-    for language, entry in (("rust", "main"), ("python", "solve")):
+    for language in ("rust", "python"):
         # Normalised, because the prompt is hard-wrapped: the phrase under test
         # spans a line break and an indent, and asserting on the raw text would
         # fail on formatting rather than on meaning.
         prompt = " ".join(
-            build_code_prompt(
-                language, "Do a thing.", entry,
-                [{"args": [1], "kwargs": {}, "expected": 1}],
+            _candidate_prompt(
+                language, [{"args": [1], "kwargs": {}, "expected": 1}]
             ).split()
-        )
-        # It lives on the <examples> label now, which is the one place it can
+        ).lower()
+        # It lives on the worked-examples label, which is the one place it can
         # be read at the moment it applies -- and the only place it survives
         # deleting the procedure that used to carry it.
         assert "where the statement is ambiguous they decide" in prompt, (
@@ -4862,10 +4865,8 @@ def test_both_contracts_say_there_is_no_partial_credit():
     """It changes the risk calculus. A model that thinks a near-miss scores
     something will reach for the clever implementation; one that knows a single
     wrong hidden case scores zero will not."""
-    from solvers.prompts import build_code_prompt
-
-    for language, entry in (("rust", "main"), ("python", "solve")):
-        prompt = build_code_prompt(language, "Do a thing.", entry, [])
+    for language in ("rust", "python"):
+        prompt = _candidate_prompt(language)
         assert "no partial credit" in prompt
         assert "Correctness is the whole of it" in prompt
         # The stake, not the tariff. What follows "no partial credit" used to be
@@ -7387,6 +7388,68 @@ def test_the_summary_stays_a_table():
     assert rehearse._fit("a\n  b   c", 96) == "a b c"
 
 
+def test_the_local_check_can_be_turned_off_and_then_nothing_is_asked_for_one():
+    """`SOLVER_SELF_TESTS=0` is a shipped configuration and it has to mean
+    something.
+
+    It was a constructor argument the solver stored and never read, so an
+    operator who set it paid for the inputs and reference turns anyway and got
+    a differential they had asked not to have. Off means off: neither turn is
+    opened, nothing is compared, no repair round fires, and the line says so
+    rather than leaving `ran=0` to be read as a failure."""
+    # 12345: the reference sums every digit and gets 15; `WRONG` stops at the
+    # leading digit and gets 14. They have to disagree or there is no repair
+    # round for the ON case to find.
+    inputs = '```json\n[{"name": "carry", "args": [12345]}]\n```'
+    reference = "```python\ndef g(n):\n    return sum(int(d) for d in str(n))\n```"
+    asked: list[str] = []
+
+    class _Counting(_Chat):
+        async def send(self, text, timeout_s, extend_to_s=None):
+            phase = _phase_of(text)
+            asked.append(phase)
+            if phase == "inputs":
+                return inputs
+            if phase == "oracle":
+                return reference
+            if phase == "analysis":
+                return ""
+            return WRONG          # disagrees with the reference on every input
+
+    class _Backend2(_Backend):
+        async def open(self, avoid=None):
+            return _Counting(self._script, self._provider)
+
+    task = SolveTask(problem_id="off", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=60.0)
+
+    def solve(self_tests):
+        backend = _Backend2([])
+        solver = VerifyingSolver(backend, reserve_s=0, max_budget_s=60,
+                                 second_opinion=False, self_tests=self_tests)
+        asked.clear()
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            answer = asyncio.run(solver.solve_task(task, timeout_s=60.0))
+        return answer, log.getvalue(), list(asked)
+
+    # ON: the two turns run, the disagreement is found, a repair is sent.
+    answer, out, phases = solve(True)
+    assert "inputs" in phases and "oracle" in phases, phases
+    assert "repair" in phases, phases
+    assert "mismatch=1" in out, out
+
+    # OFF: neither turn is opened at all, and nothing is repaired.
+    answer, out, phases = solve(False)
+    assert "inputs" not in phases, f"asked for inputs with the check off: {phases}"
+    assert "oracle" not in phases, f"asked for a reference with the check off: {phases}"
+    assert "repair" not in phases, f"repaired against nothing: {phases}"
+    assert "the local check is off" in out, out
+    # ...and the candidate still ships. Off is a cheaper solve, not a lost one.
+    assert answer.code.strip(), out
+    assert answer.verified is False and answer.self_verified is False
+
+
 def test_the_summary_line_still_parses_with_the_calibration_regex():
     """`calibration/bar_ab.py` reads the `[verify]` and `[phase]` lines, and it
     is the ONLY consumer of their format.
@@ -8054,44 +8117,29 @@ def test_a_repair_ends_on_the_rule_for_what_may_come_back():
     """The last thing a repair says is what it will accept, because that is the
     sentence the reply has to obey.
 
-    Which sentence depends on whose cases failed. The validator's examples
-    shipped with the task and are ground truth, so only the PROGRAM may change
-    there. The model's own cases may themselves be wrong -- turn 1 derives its
-    `expected` values by reasoning -- so that branch names both ways out and
-    lets the model pick."""
-    from solvers.prompts import WHOLE_PROGRAM, build_repair_prompt
+    There is now ONE sentence, and that is the change. A repair used to offer
+    the model a second way out -- rewrite the failing CASE instead of the
+    program -- because the bar's expected values were themselves reasoned to
+    by a model and could be wrong. Nothing reasons to an expected value any
+    more: the reference program is run and its outputs are the expectations,
+    so a disagreement is between two programs and the only thing that can come
+    back is a program."""
+    from solvers.prompts import WHOLE_PROGRAM
 
-    failure = ["g(*[0], **{}) returned 1, expected 0"]
+    prompt = _repair_prompt("python", report="g(*[0], **{}) returned 1, expected 0")
 
-    theirs = build_repair_prompt(failure, "python", "g")
-    assert theirs.rstrip().endswith(f"{WHOLE_PROGRAM}."), theirs
-    assert "json" not in theirs, (
-        "offered to rewrite the validator's own examples, which are ground truth"
+    assert WHOLE_PROGRAM in prompt, prompt
+    assert "json" not in prompt.lower(), (
+        "offered to rewrite a case, which no longer exists as a way out"
     )
-    assert "before you send" not in theirs.lower(), (
+    assert "before you send" not in prompt.lower(), (
         "the repair prompt reintroduced the phrase that caused narration"
     )
-
-    mine = build_repair_prompt(failure, "python", "g", from_self_tests=True)
-    assert mine.rstrip().endswith("Send one or the other, not both."), mine
-    assert "a `json` array holding just the case(s) above, corrected" in mine, mine
-    # ...and it NAMES THE KEYS, because the conversation being repaired has
-    # never seen them. `_case_items` requires `expected`; those key names are
-    # stated only in the cases task, which since the bar went independent goes
-    # to a different conversation. A reply in the only dialect this one has
-    # seen -- the `stdin "..." -> stdout "..."` failure line -- is dropped by
-    # the parser without a word, and `corrected=` fell from 20 solves of 102
-    # to 0 of 11 when the bar moved.
-    for key in ('"args"', '"expected"'):
-        assert key in mine, f"the offer does not name {key}: {mine[-300:]}"
-    # The FAILING cases on one side, ALL of the program on the other, and the
-    # asymmetry is deliberate. A program sent in pieces cannot run; a case
-    # array sent in pieces is merged into the suite by `_merge_cases`, where
-    # only the failing cases are in play and the suite keeps its size. This
-    # branch is the only one live traffic can reach -- every archived request
-    # ships zero `public_examples` -- and it was the only one of the four that
-    # said nothing about the program being complete.
-    assert WHOLE_PROGRAM in mine, mine
+    # ...and the same holds when the REFERENCE is the thing being patched: it
+    # is still a program that has to come back whole.
+    reference = _repair_prompt("python", kind="oracle")
+    assert WHOLE_PROGRAM in reference, reference
+    assert "REFERENCE implementation" in reference, reference
 
 
 def test_a_round_that_sends_only_what_it_changed_is_told_to_send_it_all():
@@ -8108,7 +8156,7 @@ def test_a_round_that_sends_only_what_it_changed_is_told_to_send_it_all():
     for the whole program rather than for different logic -- the same
     distinction the defect branch already makes between "your logic is wrong"
     and "I could not run this at all"."""
-    from solvers.prompts import build_repair_prompt, dropped_definitions
+    from solvers.prompts import dropped_definitions
 
     previous = ("import math\n"
                 "def digits(n):\n    return [int(c) for c in str(n)]\n"
@@ -8119,10 +8167,13 @@ def test_a_round_that_sends_only_what_it_changed_is_told_to_send_it_all():
     assert defect and "`digits`" in defect, defect
     assert "only part of the program" in defect, defect
 
-    prompt = build_repair_prompt([], "python", "g", defect=defect)
+    prompt = _repair_prompt("python", code=only_the_fix, defect=defect,
+                            found_by="unrun")
     assert "digits" in prompt, "the repair never named what was missing"
     assert "not only the part you changed" in prompt, prompt
-    assert "I ran" not in prompt, "blamed logic that was never run"
+    assert "comparing what they produced" not in prompt, (
+        "blamed logic that was never run"
+    )
 
 
 def test_a_whole_program_that_drops_a_helper_it_no_longer_calls_is_fine():
@@ -11375,32 +11426,28 @@ def test_a_phase_model_is_a_preference_and_never_a_pin(tmp_path, monkeypatch):
 def test_a_repair_round_says_truthfully_whose_cases_it_ran():
     """The one sentence a repair round turns on, and it has to be true.
 
-    Sequentially the bar IS the model's own, one turn back, and "the test cases
-    you sent" is exact. Written beside the program in another conversation it
-    is not: that model never saw them and never sent them. The framings ask for
-    different reasoning -- "one of my two answers is wrong" against "someone
-    else read this statement differently" -- so the false one does not merely
-    misdescribe the round, it asks the wrong question.
-    """
-    from solvers.prompts import build_repair_prompt
+    Stage 8 runs on a different model, in its own conversation, and it wrote
+    neither the program nor the inputs. "The test cases you sent" would be
+    false about all three. The framings ask for different reasoning -- "one of
+    my two answers is wrong" against "two programs disagree and at least one
+    is wrong about the statement" -- so a false one does not merely misdescribe
+    the round, it asks the wrong question.
 
-    shared = build_repair_prompt(
-        ["g(7) -> 0, expected 7"], "python", "g", from_self_tests=True,
-        bar_is_independent=False,
-    )
-    split = build_repair_prompt(
-        ["g(7) -> 0, expected 7"], "python", "g", from_self_tests=True,
-        bar_is_independent=True,
-    )
-    assert "the test cases you sent" in shared
-    assert "you sent" not in split, split
-    assert "without seeing your program" in split, split
-    # Both keep the escape hatch: the case may be the thing that is wrong, and
-    # measured over a production run it usually was -- 24 of the 26 solves that
-    # reached a correction round resolved the disagreement by rewriting the
-    # case, and a judge upheld 22 of 25 of those and the original case none.
-    for prompt in (shared, split):
-        assert "if the case was wrong rather than the program" in prompt
+    Three ways a failure can be found, three sentences, and each is checked
+    against what actually ran.
+    """
+    differential = _repair_prompt("python", report="g(7) -> 0, expected 7")
+    examples = _repair_prompt("python", report="g(7) -> 0, expected 7",
+                              found_by="examples")
+    unrun = _repair_prompt("python", defect="it does not parse", found_by="unrun")
+
+    assert "You did not write this program" in differential
+    assert "a separate reference" in differential and "you sent" not in differential
+    assert "shipped with the statement" in examples, examples
+    assert "ground truth" in examples, examples
+    assert "NOTHING WAS RUN" in unrun, unrun
+    for prompt in (differential, examples, unrun):
+        assert "the test cases you sent" not in prompt, prompt
 
 
 # --------------------------------------------------------------------------- #
@@ -12500,6 +12547,30 @@ def _stage_task(language="python"):
     )
 
 
+def _repair_prompt(language="python", *, code="def solve(xs):\n    return 0",
+                   report="ran=3 agreed=2 mismatch=1", defect=None,
+                   found_by="differential", kind="candidate"):
+    """One stage-8 prompt, built the way the orchestrator builds it."""
+    from solvers import prompts
+    from solvers.analyze import heuristic_analyze
+
+    task = _stage_task(language)
+    return prompts.build_differential_repair_prompt(
+        task, heuristic_analyze(task), code, report,
+        kind=kind, defect=defect, found_by=found_by,
+    )
+
+
+def _candidate_prompt(language="python", examples=()):
+    """One stage-6 prompt, optionally with worked examples attached."""
+    from solvers import prompts
+    from solvers.analyze import heuristic_analyze
+
+    task = _stage_task(language)
+    task.public_examples = list(examples)
+    return prompts.build_candidate_prompt(task, heuristic_analyze(task))
+
+
 def _all_stage_prompts(task):
     from solvers import prompts
     from solvers.analyze import heuristic_analyze
@@ -12508,6 +12579,13 @@ def _all_stage_prompts(task):
     return {
         "analysis": prompts.build_analysis_prompt(task, analysis),
         "inputs": prompts.build_inputs_prompt(task, analysis),
+        # The probe variant is a SEPARATE prompt, not a flag on the same one:
+        # it appends the generator task, and appending is where a template
+        # goes out unformatted. Listing only the plain variant here is how
+        # `{shape}` shipped to the model on every solve that asked for a
+        # size probe.
+        "inputs+probe": prompts.build_inputs_prompt(
+            task, analysis, want_probe=True),
         "oracle": prompts.build_oracle_prompt(task, analysis),
         "candidate": prompts.build_candidate_prompt(task, analysis),
         "repair": prompts.build_differential_repair_prompt(
@@ -12519,11 +12597,23 @@ def _all_stage_prompts(task):
 @pytest.mark.parametrize("language", ["python", "rust"])
 def test_no_stage_prompt_ships_an_unrendered_placeholder(language):
     """A `{entrypoint}` that reached a model is a prompt that told it to
-    define a function literally called that."""
+    define a function literally called that.
+
+    Named rather than listed, because the list is what failed: this asserted
+    `{entrypoint}` and `{language}` by name and passed while `{shape}` — the
+    one that tells the probe generator what to RETURN — went out verbatim on
+    every solve that asked for a size probe. Any `{lower_case_identifier}`
+    surviving into a prompt is the same bug whatever it is called."""
+    import re
+
+    # Not every brace is a placeholder: these prompts show JSON shapes on
+    # purpose. A format field is a bare lower-case identifier and nothing
+    # else -- `{"cases": ...}` and `{}` are not one.
+    placeholder = re.compile(r"\{[a-z][a-z0-9_]*\}")
     for name, text in _all_stage_prompts(_stage_task(language)).items():
-        assert "{entrypoint}" not in text, name
-        assert "{language}" not in text, name
         assert text.strip(), name
+        left = placeholder.findall(text)
+        assert not left, f"{name} ({language}) shipped {left}"
 
 
 def test_the_inputs_turn_is_forbidden_to_answer_its_own_cases():
@@ -12720,10 +12810,24 @@ def test_no_stage_prompt_ships_a_doubled_brace(language):
     that `str.format` renders them as `{`. The Rust inputs template carries no
     placeholders and so was never formatted, and shipped its braces doubled to
     the model on every Rust solve -- half of live traffic. A model shown
-    `{{"cases": ...}}` is being told the wrong shape to reply in."""
+    `{{"cases": ...}}` is being told the wrong shape to reply in.
+
+    `}}` on its own is NOT the tell: `{"args": [...], "kwargs": {}}` is a
+    correctly rendered JSON shape with a nested empty object, and forbidding
+    it would forbid the shape the probe generator is asked for. An UNRENDERED
+    template always carries `{{`, so that is what is banned -- plus the
+    balance, which an unrendered one keeps but a half-formatted one does
+    not."""
     for name, text in _all_stage_prompts(_stage_task(language)).items():
         assert "{{" not in text, (name, language)
-        assert "}}" not in text, (name, language)
+        depth = lowest = 0
+        for character in text:
+            if character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                lowest = min(lowest, depth)
+        assert (depth, lowest) == (0, 0), (name, language, depth, lowest)
 
     # The shape it does ship is the one the parser reads back.
     from solvers import prompts
