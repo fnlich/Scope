@@ -2445,3 +2445,414 @@ def rust_defect(code: str) -> Optional[str]:
     # Rust can fail. See `_rust_unclosed` for why it only ever reports a
     # delimiter left open at the end.
     return _rust_unclosed(code)
+
+
+# =========================================================================== #
+# The nine-stage solve: analysis, inputs, oracle, candidate, repair
+# =========================================================================== #
+#
+# Five prompts, and what separates them is the whole design rather than a
+# tuning preference.
+#
+# The ORACLE and the CANDIDATE are asked for the same program from opposed
+# instructions. The oracle is told the inputs are tiny and that nested loops
+# are fine; the candidate is told the hidden tests are at the stated maximums.
+# If they were one prompt the two programs would copy the same misreading and
+# comparing them would establish nothing -- the difference between the
+# instructions IS the evidence.
+#
+# The INPUTS turn is forbidden to supply expected values. It used to be asked
+# for them, and that made the bar an echo of the same model's reading of the
+# statement. Here the reference program computes them by being run, so the
+# turn only has to invent inputs -- a strictly easier thing to be right about.
+
+
+def _statement_header(task) -> str:
+    """The statement, and the few facts about it every stage needs."""
+    language = str(getattr(task, "language", "") or "python")
+    return (
+        f"language: {language}\n"
+        f"entrypoint: {getattr(task, 'entrypoint', '') or ''}\n"
+        "\nPROBLEM STATEMENT:\n"
+        f"{getattr(task, 'statement', '') or ''}\n"
+    )
+
+
+def _is_python(task) -> bool:
+    return str(getattr(task, "language", "") or "").strip().lower() == "python"
+
+
+ANALYSIS_TASK = """\
+You are reading a competitive-programming statement to find what would make a
+straightforward implementation fail the hidden tests. You are NOT writing the
+solution, and you will not be asked to.
+
+Return JSON with exactly this shape:
+
+{
+  "summary": "one paragraph",
+  "signature": "def name(...) or fn main()",
+  "traps": [{"name": "", "evidence": "", "mitigation": "", "severity": "high|medium"}],
+  "invariants": ["..."],
+  "edge_cases": ["..."],
+  "algorithm_sketch": "a concrete data structure and algorithm, not buzzwords",
+  "complexity_time": "",
+  "complexity_memory": "",
+  "naive_failure": "why writing the obvious program straight out fails here",
+  "io_notes": ""
+}
+
+Look hardest at: bounds too large to iterate, structures too large to build,
+behaviour that continues after an explicit list is exhausted, index bases,
+bytes against characters against graphemes, state that is versioned or shared,
+counting rules that fire on one event and not another, and the exact tokens the
+output must contain."""
+
+ANALYSIS_OUTPUT_CONTRACT = _ONE_BLOCK + """\
+That block is `json`, and it holds the analysis described above."""
+
+# The inputs turn. Two rules do the work: inputs only, and keep them small
+# enough that a deliberately slow reference can answer them.
+_INPUTS_TASK_PYTHON = """\
+Invent test INPUTS for this problem. Inputs only — you are not being asked what
+they should return, and any expected value you write will be discarded.
+
+A separate, deliberately slow reference implementation will be run on these
+inputs to compute the answers, so every input must be one such a program can
+finish: keep n small, usually 20 or less.
+
+Each case is an argument list for `{entrypoint}`, called as
+`{entrypoint}(*args, **kwargs)`.
+
+{{
+  "cases": [
+    {{"name": "short name", "args": [...], "kwargs": {{}},
+     "notes": "which trap this one is aimed at"}}
+  ]
+}}
+
+Write 8 to 20 cases. `args` must be JSON — lists, not tuples. Cover the
+ordinary path first, then: empty and single-element inputs, the boundaries of
+every range the statement names, records the statement calls invalid, and one
+case per trap listed above. Every case must be legal input under the statement;
+a case the statement forbids proves nothing about the program."""
+
+_INPUTS_TASK_RUST = """\
+Invent test INPUTS for this problem. Inputs only — you are not being asked what
+they should print, and any expected output you write will be discarded.
+
+A separate, deliberately slow reference implementation will be run on these
+inputs to compute the answers, so every input must be one such a program can
+finish: keep the sizes small.
+
+Each case is the exact bytes written to the program's stdin.
+
+{{
+  "cases": [
+    {{"name": "short name", "stdin": "raw stdin, including its newlines",
+     "notes": "which trap this one is aimed at"}}
+  ]
+}}
+
+Write 6 to 15 cases. Cover the ordinary path first, then: the smallest legal
+input, the boundaries of every range the statement names, and one case per trap
+listed above. Every stdin must be well-formed under the statement — if it says
+all input is valid, do not send input that is not."""
+
+INPUTS_OUTPUT_CONTRACT = _ONE_BLOCK + """\
+That block is `json`, and it holds the cases. Do NOT write any program."""
+
+_ORACLE_TASK = """\
+Write a REFERENCE implementation of this problem.
+
+It will only ever be run on tiny inputs, and it exists to be obviously correct
+rather than fast. Optimise for nothing except following the statement exactly:
+
+- Prefer the direct, literal reading of every sentence. Simulate what the
+  statement describes step by step.
+- Nested loops are fine. Recomputing from scratch is fine. Do not reach for a
+  closed form, and do not skip a branch because it looks rare — a rare branch
+  is exactly what this is for.
+- Handle every case the statement admits, including the empty and degenerate
+  ones, rather than assuming they will not come up.
+- Do not optimise. If you find yourself choosing a clever structure, choose the
+  obvious one instead."""
+
+_CANDIDATE_TASK = """\
+Write the SOLUTION to this problem — the program that will be submitted.
+
+The hidden tests include the largest inputs the statement allows, and there is
+no partial credit, so it must be both correct and fast enough at those sizes:
+
+- Correct on every case the statement admits, the degenerate ones included.
+- Fast at the stated maximums. If the statement names a bound you would have to
+  iterate to reach, you need a closed form, a compressed representation or an
+  implicit one — not a faster loop.
+- Every trap listed above is a trap you are expected to have handled."""
+
+# The repair turn, and the one thing about it that is structural: the model
+# answering it did NOT write the program it is being shown. The repair phase
+# names a different model from the candidate phase deliberately -- a model
+# asked to repair its own program defends its own reading of the statement --
+# and the cost of that is exactly this prompt, which cannot rely on a
+# conversation and has to carry the statement, the traps and the code itself.
+_REPAIR_TASK = """\
+The program below fails the check reported under it. Repair it.
+
+You did not write this program. Read the failure as evidence about the program,
+not as a claim you have to defend — and read the statement yourself rather than
+trusting that the program's author read it correctly.
+
+The failure was found by running this program and a separate reference
+implementation on the same inputs and comparing what they produced. Where they
+disagree, at least one of them is wrong about the statement."""
+
+
+def build_analysis_prompt(task, heuristic) -> str:
+    """Stage 3. The free heuristic pass is shown so the model adds to it."""
+    return (
+        _statement_header(task)
+        + "\nAlready found by a mechanical scan of the statement:\n"
+        + heuristic.trap_block()
+        + "\n\n"
+        + ANALYSIS_TASK
+        + "\n\n"
+        + ANALYSIS_OUTPUT_CONTRACT
+    )
+
+
+def build_inputs_prompt(task, analysis) -> str:
+    """Stage 4. Inputs only; the reference computes the answers."""
+    entrypoint = getattr(task, "entrypoint", "") or "solve"
+    body = (
+        _INPUTS_TASK_PYTHON.format(entrypoint=entrypoint)
+        if _is_python(task)
+        else _INPUTS_TASK_RUST
+    )
+    return (
+        _statement_header(task)
+        + "\nWHAT THE STATEMENT HIDES:\n"
+        + analysis.as_prompt_block()
+        + "\n"
+        + body
+        + "\n\n"
+        + INPUTS_OUTPUT_CONTRACT
+    )
+
+
+def build_oracle_prompt(task, analysis) -> str:
+    """Stage 5. Correctness-first, small-n, deliberately not clever."""
+    python = _is_python(task)
+    entrypoint = getattr(task, "entrypoint", "") or "solve"
+    shape = (
+        f"Define exactly one top-level function named `{entrypoint}` and RETURN "
+        "the answer. Standard library only, no printing, no stdin."
+        if python
+        else "One complete program with `fn main()`, reading stdin and writing "
+        "stdout. Standard library only, no crates, no unsafe."
+    )
+    return (
+        _statement_header(task)
+        + "\nWHAT THE STATEMENT HIDES:\n"
+        + analysis.as_prompt_block()
+        + "\n"
+        + _ORACLE_TASK
+        + "\n\n"
+        + shape
+        + "\n"
+        + (
+            "Python integers are unbounded; use them rather than worrying "
+            "about overflow.\n"
+            if python
+            else "Use i128 wherever a value might exceed i64. This program is "
+            "never run on large input, so a slow but safe choice costs "
+            "nothing.\n"
+        )
+        + "\n"
+        + CODE_OUTPUT_CONTRACT.format(
+            language="python" if python else "rust"
+        )
+    )
+
+
+def build_candidate_prompt(task, analysis) -> str:
+    """Stage 6. Complexity-first. This is the program that ships."""
+    python = _is_python(task)
+    entrypoint = getattr(task, "entrypoint", "") or "solve"
+    rules = (
+        PYTHON_RULES.format(entrypoint=entrypoint) if python else RUST_RULES
+    )
+    environment = PYTHON_ENVIRONMENT if python else RUST_ENVIRONMENT
+    examples = _render_examples(
+        "python" if python else "rust",
+        list(getattr(task, "public_examples", None) or []),
+    )
+    return (
+        _statement_header(task)
+        + (f"\n{examples}\n" if examples else "")
+        + "\nWHAT THE STATEMENT HIDES:\n"
+        + analysis.as_prompt_block()
+        + "\n"
+        + _CANDIDATE_TASK
+        + "\n\nRULES:\n"
+        + rules
+        + "\n\nTHE ENVIRONMENT IT RUNS IN:\n"
+        + environment
+        + "\n\n"
+        + CODE_OUTPUT_CONTRACT.format(
+            language="python" if python else "rust"
+        )
+    )
+
+
+def build_differential_repair_prompt(
+    task, analysis, code: str, report: str, kind: str = "candidate",
+    defect: Optional[str] = None,
+) -> str:
+    """Stage 8. Self-contained: the repair model has no conversation to read.
+
+    `kind` says WHICH artifact is being repaired, and it changes what the model
+    is told it is looking at. Repairing the reference is not the same job as
+    repairing the program that ships: the reference may be as slow as it likes
+    and only has to stop falling over, while the candidate has to stay fast.
+    """
+    python = _is_python(task)
+    language = "python" if python else "rust"
+    entrypoint = getattr(task, "entrypoint", "") or "solve"
+    oracle = kind == "oracle"
+    keep = (
+        f"Keep the function name `{entrypoint}`."
+        if python
+        else "Keep a single `fn main()`."
+    )
+    aim = (
+        "This is the REFERENCE implementation, not the submitted one. It only "
+        "runs on tiny inputs, so do not make it faster — make it stop failing "
+        "and keep it obviously correct."
+        if oracle
+        else "This is the program that will be SUBMITTED. It must stay correct "
+        "at the largest inputs the statement allows; a repair that fixes this "
+        "case and makes the program quadratic has not helped."
+    )
+    return (
+        _statement_header(task)
+        + "\nWHAT THE STATEMENT HIDES:\n"
+        + analysis.as_prompt_block()
+        + "\n"
+        + _REPAIR_TASK
+        + "\n\n"
+        + aim
+        + "\n\nTHE PROGRAM:\n"
+        + f"```{language}\n{code.strip()}\n```\n"
+        + (f"\nA local check also reports: {defect}\n" if defect else "")
+        + "\nWHAT THE CHECK FOUND:\n"
+        + report.strip()
+        + "\n\n"
+        + keep
+        + "\n\nReply with "
+        + WHOLE_PROGRAM
+        + ".\n\n"
+        + CODE_OUTPUT_CONTRACT.format(language=language)
+    )
+
+
+def extract_analysis(reply: str) -> Any:
+    """The analysis JSON out of a reply, or None. Never raises.
+
+    Stage 3 is the one stage allowed to produce nothing, so every failure here
+    is a `None` the caller keeps the heuristic analysis for.
+    """
+    for block in fenced_blocks(reply or ""):
+        value = _loads_cases(block)
+        if isinstance(value, dict):
+            return value
+    value = _loads_cases(reply or "")
+    if isinstance(value, dict):
+        return value
+    salvaged = _object_span(reply or "")
+    return _loads_cases(salvaged) if salvaged else None
+
+
+def _object_span(text: str) -> Optional[str]:
+    """The outermost `{...}` in `text`, for a model that skipped the fence."""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    return text[start:end + 1]
+
+
+def extract_inputs(reply: str, language: str) -> list[dict[str, Any]]:
+    """Stage 4's cases, as inputs. Any expected value present is DROPPED.
+
+    Dropping it is not defensive tidying. A model that supplies an expected
+    value has answered a question it was told not to answer, and taking it
+    would put that model's reading of the statement back into the bar -- which
+    is the exact correlation the reference program exists to break.
+    """
+    payload: Any = None
+    for block in fenced_blocks(reply or ""):
+        payload = _loads_cases(block)
+        if payload is not None:
+            break
+    if payload is None:
+        payload = _loads_cases(reply or "")
+    if payload is None:
+        salvaged = salvage_case_array(reply or "")
+        if salvaged:
+            payload = _loads_cases(salvaged)
+    return inputs_from_payload(payload, language)
+
+
+def inputs_from_payload(payload: Any, language: str) -> list[dict[str, Any]]:
+    """The parsed JSON as input-only cases. Never raises."""
+    raw: Any = None
+    if isinstance(payload, dict):
+        for key in _CASE_KEYS:
+            if isinstance(payload.get(key), list):
+                raw = payload[key]
+                break
+    elif isinstance(payload, list):
+        raw = payload
+    if not isinstance(raw, list):
+        return []
+
+    rust = str(language or "").strip().lower() == "rust"
+    cases: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip() or f"case {index + 1}"
+        if rust:
+            stdin = item.get("stdin")
+            if stdin is None:
+                stdin = item.get("input")
+            if not isinstance(stdin, str):
+                continue
+            args: list[Any] = [stdin]
+            kwargs: dict[str, Any] = {}
+        else:
+            args = item.get("args")
+            if args is None:
+                args = item.get("input")
+            if args is None:
+                args = []
+            if not isinstance(args, list):
+                args = [args]
+            kwargs = item.get("kwargs")
+            kwargs = kwargs if isinstance(kwargs, dict) else {}
+        try:
+            key = json.dumps([args, kwargs], sort_keys=True, default=str)
+        except Exception:  # noqa: BLE001 - an unserialisable case is not one
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        cases.append({
+            "name": name,
+            "args": args,
+            "kwargs": kwargs,
+            "notes": str(item.get("notes") or item.get("note") or "").strip(),
+        })
+    return cases

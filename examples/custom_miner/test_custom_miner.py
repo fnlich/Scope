@@ -18154,3 +18154,169 @@ def test_the_rust_comparison_is_the_judges_own(monkeypatch):
     )
     _code, graded = grader.check_calls[0]
     assert graded[0]["expected"] == "1 2 3\n", graded
+
+
+# --------------------------------------------------------------------------- #
+# The five stage prompts
+# --------------------------------------------------------------------------- #
+def _stage_task(language="python"):
+    return SolveTask(
+        problem_id="x", language=language,
+        statement="Implement `solve(xs)`. n is at most 200000.",
+        entrypoint="solve" if language == "python" else "main",
+        public_examples=[], deadline_s=300.0,
+    )
+
+
+def _all_stage_prompts(task):
+    from solvers import prompts
+    from solvers.analyze import heuristic_analyze
+
+    analysis = heuristic_analyze(task)
+    return {
+        "analysis": prompts.build_analysis_prompt(task, analysis),
+        "inputs": prompts.build_inputs_prompt(task, analysis),
+        "oracle": prompts.build_oracle_prompt(task, analysis),
+        "candidate": prompts.build_candidate_prompt(task, analysis),
+        "repair": prompts.build_differential_repair_prompt(
+            task, analysis, "CODE", "ran=3 agreed=2 mismatch=1",
+        ),
+    }
+
+
+@pytest.mark.parametrize("language", ["python", "rust"])
+def test_no_stage_prompt_ships_an_unrendered_placeholder(language):
+    """A `{entrypoint}` that reached a model is a prompt that told it to
+    define a function literally called that."""
+    for name, text in _all_stage_prompts(_stage_task(language)).items():
+        assert "{entrypoint}" not in text, name
+        assert "{language}" not in text, name
+        assert text.strip(), name
+
+
+def test_the_inputs_turn_is_forbidden_to_answer_its_own_cases():
+    """This is what makes the bar evidence instead of an echo. A model that
+    supplies expected values has answered a question it was told not to
+    answer, and taking them would put that model's reading of the statement
+    straight back into the thing meant to check it."""
+    from solvers import prompts
+
+    for language in ("python", "rust"):
+        text = _all_stage_prompts(_stage_task(language))["inputs"]
+        assert "discarded" in text, language
+        assert "reference implementation" in text, language
+
+    # And the parser enforces it even when the model ignores the instruction.
+    cases = prompts.extract_inputs(
+        '```json\n{"cases": ['
+        '{"name":"a","args":[[]],"expected":0},'
+        '{"name":"b","args":[[1,2]],"expected":3}]}\n```',
+        "python",
+    )
+    assert len(cases) == 2, cases
+    assert all("expected" not in case for case in cases), cases
+
+
+def test_the_two_programs_are_asked_for_opposite_things():
+    """The oracle and the candidate are the same problem under opposed
+    instructions, and that difference is the entire evidence the design
+    produces. If both prompts asked for a fast correct program the two
+    answers would share their misreadings and comparing them would establish
+    nothing."""
+    prompts_by_stage = _all_stage_prompts(_stage_task("python"))
+    oracle, candidate = prompts_by_stage["oracle"], prompts_by_stage["candidate"]
+
+    assert "REFERENCE" in oracle and "Do not optimise" in oracle
+    assert "tiny inputs" in oracle
+    assert "SOLUTION" in candidate and "largest inputs" in candidate
+    # The oracle must not be told to be fast, nor the candidate to be slow.
+    assert "Nested loops are fine" in oracle
+    assert "Nested loops are fine" not in candidate
+
+
+@pytest.mark.parametrize("language", ["python", "rust"])
+def test_the_candidate_is_told_about_the_environment_it_runs_in(language):
+    """The measured sentences live in PYTHON_ENVIRONMENT and RUST_ENVIRONMENT
+    -- silent integer overflow at opt-level=2 above all -- and the program
+    that ships is the one that needs them."""
+    text = _all_stage_prompts(_stage_task(language))["candidate"]
+    if language == "rust":
+        assert "INTEGER OVERFLOW IS SILENT HERE" in text
+    else:
+        assert "recursion limit" in text
+
+
+def test_the_repair_prompt_stands_on_its_own():
+    """The repair phase names a different model from the candidate phase, so
+    the first repair round CANNOT inherit the candidate's conversation. Its
+    prompt has to carry the statement, the traps and the program itself or
+    the model is reading a failure report about code it cannot see."""
+    from solvers import prompts
+    from solvers.analyze import heuristic_analyze
+
+    task = _stage_task("python")
+    text = prompts.build_differential_repair_prompt(
+        task, heuristic_analyze(task), "def solve(xs):\n    return 0\n",
+        "ran=3 agreed=2 mismatch=1\nFAIL empty: they disagree",
+    )
+    assert task.statement in text
+    assert "def solve(xs):" in text
+    assert "mismatch=1" in text
+    assert "Traps:" in text
+    assert "You did not write this program" in text
+
+
+def test_repairing_the_reference_is_not_the_same_job_as_repairing_the_answer():
+    """The reference may be as slow as it likes and only has to stop falling
+    over; the candidate has to stay fast at the stated maximums. Telling the
+    model the wrong one of those is how a repair round makes things worse."""
+    from solvers import prompts
+    from solvers.analyze import heuristic_analyze
+
+    task = _stage_task("python")
+    analysis = heuristic_analyze(task)
+    oracle = prompts.build_differential_repair_prompt(
+        task, analysis, "CODE", "report", kind="oracle")
+    candidate = prompts.build_differential_repair_prompt(
+        task, analysis, "CODE", "report", kind="candidate")
+
+    assert "do not make it faster" in oracle
+    assert "SUBMITTED" in candidate and "quadratic" in candidate
+    assert "do not make it faster" not in candidate
+
+
+def test_a_reply_that_is_not_json_costs_the_analysis_and_nothing_else():
+    """Stage 3 is the one stage allowed to produce nothing."""
+    from solvers import prompts
+
+    for junk in ("", "I could not do that", "```python\nx = 1\n```"):
+        assert prompts.extract_analysis(junk) is None, junk
+    assert prompts.extract_inputs(junk, "python") == []
+
+
+def test_inputs_are_read_out_of_prose_and_deduplicated():
+    """Models write the array unfenced, and they repeat cases. Every case is
+    an executor run inside the solve's own deadline, so a duplicate is paid
+    for twice and proves nothing the first one did not."""
+    from solvers import prompts
+
+    cases = prompts.extract_inputs(
+        '```json\n{"cases":[{"args":[[1]]},{"args":[[1]]},{"args":[[2]]}]}\n```',
+        "python",
+    )
+    assert len(cases) == 2, cases
+    # A bare list, no wrapper object.
+    assert len(prompts.extract_inputs(
+        '```json\n[{"args":[[1]]},{"args":[[2]]}]\n```', "python")) == 2
+
+
+def test_a_rust_case_is_the_bytes_on_stdin():
+    """Rust is graded by running a program, so a case is its stdin -- and the
+    grader reads that from args[0]."""
+    from solvers import prompts
+
+    cases = prompts.extract_inputs(
+        '```json\n{"cases":[{"name":"one","stdin":"3\\n1 2 3\\n"}]}\n```', "rust",
+    )
+    assert cases == [{"name": "one", "args": ["3\n1 2 3\n"],
+                      "kwargs": {}, "notes": ""}], cases
