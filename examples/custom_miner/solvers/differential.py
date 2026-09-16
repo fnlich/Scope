@@ -31,11 +31,13 @@ Three consequences worth stating, because each one removed code:
     reference instead of the program that ships. `CaseResult.blames` is set
     where the failure is classified and there is a test on it.
 
-  * Mutation of caller-owned arguments is NOT a failure here. The upstream
-    harness deep-copies arguments and fails a case that changed them. This
-    miner's grader forks a child per case, exactly as the validator's does, so
-    mutation is invisible to the hidden suite -- failing it locally would throw
-    away programs that would have scored. It is recorded and never enforced.
+  * Mutation of caller-owned arguments is NOT checked here, and cannot be. The
+    upstream harness deep-copies arguments and fails a case that changed them.
+    This grader forks a child per case, exactly as the validator's does, and
+    never compares the arguments before and after -- so mutation is invisible
+    to the hidden suite too. Enforcing it locally would fail programs that
+    would have scored, and there is no signal to report it with even if we
+    wanted to. A test pins that a mutating program still passes.
 
 The oracle is memoised per solve on the hash of its source. It rarely changes
 while the candidate is being repaired, and for Rust every run of it otherwise
@@ -62,14 +64,18 @@ OUTPUT_CLIP = 400
 
 @dataclass
 class CaseResult:
-    """One input, and what the two programs did with it."""
+    """One input the two programs did NOT agree on.
+
+    Only failures are recorded -- a passing case is counted and discarded --
+    so there is no `ok` field to read. What a case needs to carry is which
+    artifact it accuses and what each side produced.
+    """
 
     name: str
-    ok: bool
     detail: str = ""
-    # "" when the case passed. Otherwise the artifact to repair: `oracle` when
-    # the reference could not produce a value at all, `candidate` when both ran
-    # and disagreed. Never inferred from `detail`.
+    # The artifact to repair: `oracle` when the reference could not produce a
+    # value at all, `candidate` when both ran and disagreed. Set where the
+    # failure is classified and never inferred from `detail`.
     blames: str = ""
     oracle_out: str = ""
     candidate_out: str = ""
@@ -91,10 +97,7 @@ class DifferentialReport:
     unrun: int = 0
     # Failures only. A passing case is counted, not stored.
     cases: list[CaseResult] = field(default_factory=list)
-    # The cases with the oracle's answers filled in, for whoever grades next.
-    graded: list[dict[str, Any]] = field(default_factory=list)
     note: str = ""
-    mutated: int = 0
 
     @property
     def ok(self) -> bool:
@@ -148,8 +151,6 @@ class DifferentialReport:
         ]
         if self.unrun:
             parts.append(f"unrun={self.unrun}")
-        if self.mutated:
-            parts.append(f"mutated={self.mutated}")
         if self.note:
             parts.append(self.note)
         return " ".join(parts)
@@ -165,6 +166,77 @@ class DifferentialReport:
                 lines.append(f"  this program produced: {case.candidate_out}")
         text = "\n".join(lines)
         return text if len(text) <= limit else text[:limit] + " ..."
+
+
+# How many times the same failure may be blamed on the candidate before the
+# router stops believing itself and patches the reference instead.
+#
+# Two, not one. A first disagreement genuinely is more likely the candidate's
+# fault: it was written under the harder instruction, against the larger
+# inputs, with the compression and closed forms that is where bugs live. One
+# failed repair is ordinary -- models miss on the first try. Two failed repairs
+# on the SAME case, with nothing else accusing the candidate, is the signature
+# of a reference that is itself wrong about the statement, and continuing to
+# patch a correct program is how a solve spends its whole deadline going
+# backwards.
+FLIP_AFTER = 2
+
+
+class Router:
+    """Which artifact the next repair should patch. One per solve.
+
+    The default is `report.blame`: a disagreement accuses the candidate, a
+    reference that fell over accuses the reference. That default is a
+    heuristic and it can be wrong -- on the closest available measurement, two
+    independent encodings of one statement, the shipped program was the wrong
+    party 7 times in 27 and the second encoding 11. So the router does two
+    things the bare default cannot.
+
+    It listens to signals that do not come from the reference. `compile_defect`
+    and the size probe accuse the candidate on their own evidence, and when
+    either has spoken the router never second-guesses them -- there is no
+    ambiguity about who is at fault.
+
+    Otherwise it counts. The same set of failing cases blamed on the candidate
+    `FLIP_AFTER` times over hands the next round to the reference instead, and
+    `flipped` records that it happened. A DIFFERENT set of failures is a
+    different argument and starts its own count, so a solve making real
+    progress never flips.
+
+    One caveat, stated because it is asymmetric and the code cannot fix it:
+    `compile_defect` is Rust-only. On Python the independent signal is the size
+    probe alone, so a wrongly-blamed Python candidate gets both rounds before
+    the router reconsiders, on weaker evidence than a Rust one would.
+    """
+
+    def __init__(self, flip_after: int = FLIP_AFTER) -> None:
+        self._blamed: dict[tuple, int] = {}
+        self.flipped = 0
+
+    def choose(
+        self, report: "DifferentialReport", *,
+        candidate_blamed_independently: bool = False,
+    ) -> str:
+        """`"candidate"`, `"oracle"`, or `""` when there is nothing to repair."""
+        default = report.blame
+        if default != "candidate":
+            return default
+        if candidate_blamed_independently:
+            # Something that is not the reference says the candidate is wrong.
+            # There is no dispute to arbitrate.
+            return "candidate"
+
+        key = tuple(sorted(case.name for case in report.cases if case.blames == "candidate"))
+        seen = self._blamed.get(key, 0)
+        if seen >= FLIP_AFTER:
+            # Reset rather than latch: if the reference was not the problem
+            # either, the next round goes back to the candidate instead of
+            # flipping for the rest of the solve.
+            self._blamed[key] = 0
+            self.flipped += 1
+            return "oracle"
+        self._blamed[key] = seen + 1
+        return "candidate"
 
 
 def _clip(value: Any, limit: int = OUTPUT_CLIP) -> str:
@@ -270,7 +342,7 @@ class Differential:
             if run is None or not getattr(run, "ok", False):
                 report.oracle_crash += 1
                 report.cases.append(CaseResult(
-                    name=name, ok=False, blames="oracle",
+                    name=name, blames="oracle",
                     detail=_oracle_detail(run),
                 ))
                 continue
@@ -281,7 +353,6 @@ class Differential:
             })
             gradable_names.append(name)
 
-        report.graded = gradable
         if not gradable:
             report.note = "the reference answered nothing"
             return report
@@ -326,7 +397,6 @@ class Differential:
             report.mismatch += 1
             report.cases.append(CaseResult(
                 name=name,
-                ok=False,
                 blames="candidate",
                 detail=_candidate_detail(produced),
                 oracle_out=_clip(expected),

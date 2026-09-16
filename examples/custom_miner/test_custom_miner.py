@@ -18437,3 +18437,87 @@ def test_a_grader_that_cannot_run_costs_the_check_and_never_the_answer():
     assert not half.ok, half.summary()
     assert half.unrun == 1, half.summary()
     assert half.agreed == 0, half.summary()
+
+
+# --------------------------------------------------------------------------- #
+# Which artifact a repair round patches
+# --------------------------------------------------------------------------- #
+def _mismatch_report(*names):
+    from solvers.differential import CaseResult, DifferentialReport
+
+    return DifferentialReport(
+        ran=len(names) + 1, agreed=1, mismatch=len(names),
+        cases=[CaseResult(name=n, blames="candidate") for n in names],
+    )
+
+
+def test_the_same_failure_blamed_twice_hands_the_next_round_to_the_reference():
+    """THE FLIP RULE. A disagreement accuses the candidate by default, and
+    that default can be wrong -- on the closest measurement available, two
+    independent encodings of one statement, the shipped program was the wrong
+    party 7 times in 27 and the second encoding 11.
+
+    Two rounds, not one: a first disagreement really is likelier the
+    candidate's fault, since it was written under the harder instruction, and
+    one failed repair is ordinary. Two failed repairs on the SAME case with
+    nothing else accusing it is the signature of a reference that is itself
+    wrong."""
+    from solvers.differential import Router
+
+    router = Router()
+    report = _mismatch_report("boundary")
+
+    assert router.choose(report) == "candidate"
+    assert router.choose(report) == "candidate"
+    assert router.choose(report) == "oracle", "the router never reconsidered"
+    assert router.flipped == 1
+
+    # And it resets rather than latching: if the reference was not the problem
+    # either, the next round goes back to the candidate.
+    assert router.choose(report) == "candidate"
+    assert router.flipped == 1
+
+
+def test_a_solve_making_progress_never_flips():
+    """A DIFFERENT set of failing cases is a different argument, so it starts
+    its own count. Without that, three rounds each fixing one case and
+    uncovering another would flip on the third and start patching a reference
+    that was never implicated."""
+    from solvers.differential import Router
+
+    router = Router()
+    for name in ("first", "second", "third", "fourth"):
+        assert router.choose(_mismatch_report(name)) == "candidate", name
+    assert router.flipped == 0
+
+
+def test_a_signal_that_is_not_the_reference_is_never_second_guessed():
+    """`compile_defect` and the size probe accuse the candidate on their own
+    evidence. When either has spoken there is no dispute to arbitrate, so the
+    count is not even consulted."""
+    from solvers.differential import Router
+
+    router = Router()
+    report = _mismatch_report("boundary")
+    for _ in range(5):
+        assert router.choose(
+            report, candidate_blamed_independently=True) == "candidate"
+    assert router.flipped == 0
+
+
+def test_a_reference_that_fell_over_is_repaired_without_waiting_for_two_rounds():
+    """The flip rule arbitrates DISAGREEMENTS. A reference that could not
+    produce a value at all is not a disagreement -- nothing is in dispute, the
+    reference is simply broken -- so it is repaired at once."""
+    from solvers.differential import CaseResult, DifferentialReport, Router
+
+    router = Router()
+    crashed = DifferentialReport(
+        ran=2, agreed=1, oracle_crash=1,
+        cases=[CaseResult(name="empty", blames="oracle")],
+    )
+    assert router.choose(crashed) == "oracle"
+    assert router.flipped == 0, "a crash is not a flip"
+
+    # And a clean report asks for no repair at all.
+    assert Router().choose(DifferentialReport(ran=3, agreed=3)) == ""
