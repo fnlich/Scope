@@ -2621,8 +2621,15 @@ def build_analysis_prompt(task, heuristic) -> str:
     )
 
 
-def build_inputs_prompt(task, analysis) -> str:
-    """Stage 4. Inputs only; the reference computes the answers."""
+def build_inputs_prompt(task, analysis, want_probe: bool = False) -> str:
+    """Stage 4. Inputs only; the reference computes the answers.
+
+    `want_probe` asks for the size-probe generator as a second block. It rides
+    on this turn rather than costing one of its own for the same reason it
+    always has: every case here is small enough for a deliberately slow
+    reference to answer, so none of them is ever the size the validator runs.
+    "Did it finish at scale" needs no expected value and so needs no oracle.
+    """
     entrypoint = getattr(task, "entrypoint", "") or "solve"
     body = (
         _INPUTS_TASK_PYTHON.format(entrypoint=entrypoint)
@@ -2636,7 +2643,8 @@ def build_inputs_prompt(task, analysis) -> str:
         + "\n"
         + body
         + "\n\n"
-        + INPUTS_OUTPUT_CONTRACT
+        + (GENERATOR_TASK + "\n\n" + TESTS_OUTPUT_CONTRACT_WITH_PROBE
+           if want_probe else INPUTS_OUTPUT_CONTRACT)
     )
 
 

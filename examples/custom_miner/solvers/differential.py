@@ -216,8 +216,17 @@ class Router:
     def choose(
         self, report: "DifferentialReport", *,
         candidate_blamed_independently: bool = False,
+        stalled: bool = False,
     ) -> str:
-        """`"candidate"`, `"oracle"`, or `""` when there is nothing to repair."""
+        """`"candidate"`, `"oracle"`, or `""` when there is nothing to repair.
+
+        `stalled` says the round that just ran left BOTH programs byte for byte
+        as they were. That is not one of the two repairs this rule counts -- it
+        is evidence that repairing this artifact is not working at all, which
+        is a stronger signal than the counter it short-circuits. So a stall
+        flips immediately rather than waiting out a count that a repair
+        producing nothing will never advance.
+        """
         default = report.blame
         if default != "candidate":
             return default
@@ -228,6 +237,8 @@ class Router:
 
         key = tuple(sorted(case.name for case in report.cases if case.blames == "candidate"))
         seen = self._blamed.get(key, 0)
+        if stalled:
+            seen = max(seen, FLIP_AFTER)
         if seen >= FLIP_AFTER:
             # Reset rather than latch: if the reference was not the problem
             # either, the next round goes back to the candidate instead of
