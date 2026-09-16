@@ -17660,3 +17660,159 @@ def test_the_probe_descends_on_a_crash_instead_of_concluding_from_one():
     ))
     assert always.state == "crashed", always
     assert always.sentence is None, always
+
+
+# --------------------------------------------------------------------------- #
+# Reading the statement before any model is asked
+# --------------------------------------------------------------------------- #
+def _recorded_requests():
+    """The archived production requests, as solver tasks."""
+    directory = Path(__file__).resolve().parent.parent / "problems"
+    for path in sorted(directory.glob("*.json")):
+        request = json.loads(path.read_text()).get("request") or {}
+        if not request.get("statement"):
+            continue
+        yield SolveTask(
+            problem_id=request.get("problem_id", path.stem),
+            language=request.get("language", "python"),
+            statement=request["statement"],
+            entrypoint=request.get("entrypoint", "solve"),
+            public_examples=request.get("public_examples") or [],
+            deadline_s=float(request.get("deadline_s") or 300.0),
+        )
+
+
+def test_the_trap_scan_has_something_to_say_about_every_recorded_task():
+    """The free pass runs on every solve, so a statement it reads nothing out
+    of is a statement the oracle and the candidate start on separately. Over
+    the recorded corpus it is never silent, and the two traps that hold for
+    every task on this subnet -- stdlib only, and no public examples to
+    anchor anything -- are on all of them."""
+    from solvers.analyze import heuristic_analyze, trap_names
+
+    tasks = list(_recorded_requests())
+    assert len(tasks) >= 90, f"corpus looks truncated: {len(tasks)} tasks"
+
+    for task in tasks:
+        names = trap_names(heuristic_analyze(task))
+        assert len(names) >= 3, f"{task.problem_id} read only {names}"
+        assert "sandbox_constraints" in names, task.problem_id
+        assert "no_public_examples" in names, task.problem_id
+        assert len(set(names)) == len(names), f"duplicate trap: {names}"
+
+
+def test_the_language_contract_matches_the_language():
+    """Python is graded by calling a function and Rust by running a program,
+    and a solver told the wrong one writes the wrong shape of answer."""
+    from solvers.analyze import heuristic_analyze, trap_names
+
+    for task in _recorded_requests():
+        names = trap_names(heuristic_analyze(task))
+        if task.language == "python":
+            assert "python_contract" in names, task.problem_id
+            assert "rust_contract" not in names, task.problem_id
+        else:
+            assert "rust_contract" in names, task.problem_id
+            assert "python_contract" not in names, task.problem_id
+
+
+def test_the_statements_own_wording_outranks_the_standing_contract():
+    """`sandbox_constraints` is added twice: once at high severity when the
+    statement itself says so, once at medium as the standing rule. First
+    writer wins, so a statement that spells the constraint out keeps the
+    version that says the statement spelled it out."""
+    from solvers.analyze import heuristic_analyze
+
+    spelled_out = SolveTask(
+        problem_id="x", language="python",
+        statement="Use the standard library only. Perform no input/output.",
+        entrypoint="solve", public_examples=[], deadline_s=300.0,
+    )
+    silent = SolveTask(
+        problem_id="y", language="python",
+        statement="Return the sum of the list.",
+        entrypoint="solve", public_examples=[], deadline_s=300.0,
+    )
+    loud = [t for t in heuristic_analyze(spelled_out).traps
+            if t.name == "sandbox_constraints"][0]
+    quiet = [t for t in heuristic_analyze(silent).traps
+             if t.name == "sandbox_constraints"][0]
+    assert loud.severity == "high", loud
+    assert quiet.severity == "medium", quiet
+
+
+def test_the_model_may_add_a_trap_and_may_never_remove_one():
+    """A regex that matched is evidence the words are there. A model naming
+    the same trap is agreeing, not correcting -- so the heuristic's wording
+    survives the merge and the model's is dropped. The asymmetry is the
+    point: a missed trap costs the solve, a redundant one costs tokens."""
+    from solvers.analyze import Analysis, Trap, merge_analysis
+
+    base = Analysis(
+        traps=[Trap("index_base", "the heuristic saw it", "convert once")],
+        source="heuristic",
+    )
+    extra = Analysis(
+        traps=[
+            Trap("index_base", "the model rewrote this", "something else"),
+            Trap("brand_new", "only the model saw this", "handle it"),
+        ],
+        algorithm_sketch="sort, then sweep",
+        source="llm",
+    )
+    merged = merge_analysis(base, extra)
+    names = [t.name for t in merged.traps]
+
+    assert names == ["index_base", "brand_new"], names
+    kept = [t for t in merged.traps if t.name == "index_base"][0]
+    assert kept.evidence == "the heuristic saw it", kept
+    # Prose is the other way round: a regex cannot write a sketch.
+    assert merged.algorithm_sketch == "sort, then sweep"
+    assert merged.source == "heuristic+llm"
+
+
+def test_an_unusable_analysis_reply_leaves_the_heuristic_standing():
+    """Stage 3 is the one stage allowed to produce nothing. Every shape the
+    model can fail in has to end with the free pass still in hand, because
+    the alternative to a partial analysis is no analysis."""
+    from solvers.analyze import analysis_from_json, heuristic_analyze
+
+    task = SolveTask(
+        problem_id="x", language="python", statement="Do a thing.",
+        entrypoint="solve", public_examples=[], deadline_s=300.0,
+    )
+    base = heuristic_analyze(task)
+    for junk in (None, [], "", 0, {"traps": "not a list"}, {"traps": [1, 2]}):
+        out = analysis_from_json(junk, base)
+        assert [t.name for t in out.traps] == [t.name for t in base.traps], junk
+
+
+def test_a_trap_whose_evidence_the_model_called_why_is_still_a_trap():
+    """`evidence` is the documented key and `why` is what a model writes when
+    it paraphrases the schema. Reading only the documented one silently threw
+    the whole trap away."""
+    from solvers.analyze import analysis_from_json, heuristic_analyze
+
+    task = SolveTask(
+        problem_id="x", language="python", statement="Do a thing.",
+        entrypoint="solve", public_examples=[], deadline_s=300.0,
+    )
+    merged = analysis_from_json(
+        {"traps": [{"name": "tail", "why": "the stream runs out",
+                    "mitigation": "model the tail"}]},
+        heuristic_analyze(task),
+    )
+    tail = [t for t in merged.traps if t.name == "tail"]
+    assert tail and tail[0].evidence == "the stream runs out", merged.traps
+
+
+def test_the_trap_block_is_what_the_later_prompts_will_read():
+    """Every stage after this one is handed the same block. If it renders to
+    nothing, three prompts go out having each read the statement alone."""
+    from solvers.analyze import heuristic_analyze
+
+    for task in list(_recorded_requests())[:20]:
+        block = heuristic_analyze(task).as_prompt_block()
+        assert "(no traps recorded)" not in block, task.problem_id
+        assert "Traps:" in block and "Algorithm sketch:" in block
+        assert len(block) > 400, (task.problem_id, len(block))
