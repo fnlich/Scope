@@ -1656,7 +1656,11 @@ class CliBackend:
         # Consecutive unexplained failures per (account, model).
         self._failures: dict[tuple[str, str], int] = {}
         # The pair a fresh solve was last handed, so a change is said once.
-        self._mode: tuple[str, str] = (self.accounts[0].name, self.default.model)
+        # (account, model, can it actually answer). The third element is what
+        # stops a fully-out seat reading as a recovery -- see `_announce`.
+        self._mode: tuple[str, str, bool] = (
+            self.accounts[0].name, self.default.model, True
+        )
         # How much of each seat's window is used, as the last turn on it
         # reported: (share, when it resets). See `SWITCH_AT`.
         self._usage: dict[str, tuple[float, Optional[float]]] = {}
@@ -1873,13 +1877,41 @@ class CliBackend:
 
     def _announce(self, account: Account, profile: Profile) -> None:
         """Say when a fresh solve is not going to the default pair, once."""
-        pair = (account.name, profile.model)
-        top = (self.accounts[0].name, self.default.model)
-        if pair == self._mode:
+        # Whether the pair being announced can ANSWER, not just which pair it
+        # is. `pick` hands out the default pair when nothing on the ladder is
+        # healthy -- deliberately, so `send` turns it away with the reason in a
+        # millisecond -- and `_announce` cannot tell that fall-through from a
+        # genuine recovery by the pair alone.
+        #
+        # Measured, one account: a 529 storm parks opus, `fable` takes over and
+        # EMERGENCY MODE is printed. The seat then spends its five-hour window,
+        # every model goes out, `pick` falls back to the default pair, and the
+        # line that reached the operator at the moment NOTHING could answer was
+        #
+        #   [cli] back to normal: cli:opus (effort low) answers again
+        #
+        # which is the worst thing this backend can say: it announces recovery
+        # at the moment of total outage, and an operator reading it goes back
+        # to sleep. The state is (pair, can it serve), so a seat going fully
+        # out is a change and says so.
+        wait_here, why_here = self.outage_for(account, profile.model)
+        state = (account.name, profile.model, wait_here <= 0)
+        top = (self.accounts[0].name, self.default.model, True)
+        if state == self._mode:
             return
-        self._mode = pair
+        self._mode = state
         label = self.provider_of(account, profile) + f" (effort {profile.effort})"
-        if pair == top:
+        if wait_here > 0:
+            # Handed out because there was nothing else, not because it works.
+            print(f"[cli] NOTHING CAN ANSWER: every pair on the ladder is out. "
+                  f"{label} is handed out and will be turned away "
+                  f"({why_here}; {_minutes(wait_here)} until it is tried "
+                  f"again). Solves score zero until then"
+                  + ("" if len(self.accounts) > 1 else
+                     "; a second account is what answers a spent seat "
+                     "(SOLVER_CLI_BACKUP_ACCOUNTS)"))
+            return
+        if state == top:
             print(f"[cli] back to normal: {label} answers again")
             return
         wait, why = self.outage_for(self.accounts[0], self.default.model)
@@ -2221,6 +2253,21 @@ class CliBackend:
             "backend": "claude-cli",
             "accounts": [a.name for a in self.accounts],
             "default": self.default.label,
+            # WHICH RUNG IS ANSWERING, which `out` cannot say: it records what
+            # is broken, not who took over, and most of its entries are neither
+            # a limit nor an emergency. This was printed by `_announce` and
+            # nowhere else, so the one question an operator asks of
+            # /solver-status -- "am I on the emergency rung right now?" -- could
+            # only be answered by grepping the log. `serving` is false when the
+            # ladder had nothing healthy and this pair was handed out to be
+            # turned away.
+            "answering": {
+                "account": self._mode[0],
+                "model": self._mode[1],
+                "serving": self._mode[2],
+                "is_default": (self._mode[0], self._mode[1])
+                              == (self.accounts[0].name, self.default.model),
+            },
             "ladder": [p.label for p in self.profiles],
             "concurrency": self._limit,
             "sessions_opened": self._opened,

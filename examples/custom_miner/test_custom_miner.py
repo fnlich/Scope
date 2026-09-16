@@ -10759,6 +10759,96 @@ def test_a_limit_mid_conversation_hands_the_repair_to_a_fresh_one(
     assert carried.provider == "cli:opus@claude-2", carried.provider
 
 
+def test_a_seat_with_nothing_left_says_so_instead_of_reading_as_recovery(
+    tmp_path, monkeypatch, capsys
+):
+    """REGRESSION, and the worst line this backend could print.
+
+    `pick` hands out the DEFAULT pair when nothing on the ladder is healthy --
+    deliberately, so `send` turns it away with the reason in a millisecond
+    rather than spawning a process that cannot work. `_announce` compared only
+    the (account, model) pair, so it could not tell that fall-through from a
+    genuine recovery.
+
+    The sequence that produced it, measured on one account: a 529 storm parks
+    opus, `fable` takes over, EMERGENCY MODE is printed and the mode is now
+    fable. The seat then spends its five-hour window, EVERY model goes out,
+    `pick` falls back to opus -- and because opus is the default pair, the line
+    that reached the operator at the moment nothing could answer was
+
+        [cli] back to normal: cli:opus (effort low) answers again
+
+    An operator reading that goes back to sleep while every solve scores zero.
+    The announced state is now (pair, can it serve), so going fully out is a
+    change and says what it costs.
+    """
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch)
+    backend = CliBackend()
+
+    # 1. A refused model: the emergency rung answers, on this one account.
+    backend.note_degraded("opus", "529 overloaded")
+    backend._announce(*backend.pick())
+    assert "EMERGENCY MODE" in capsys.readouterr().out
+
+    # 2. The whole seat is spent. Nothing on the ladder can answer.
+    backend.note_limit(backend.accounts[0], "*", time.time() + 3600, "five_hour")
+    assert backend._healthy() == [], "this reproduction needs an empty ladder"
+    backend._announce(*backend.pick())
+    out = capsys.readouterr().out
+    assert "back to normal" not in out, (
+        "announced a recovery at the moment the seat went fully out:\n" + out
+    )
+    assert "NOTHING CAN ANSWER" in out, out
+    # It says what it COSTS, and -- on a single seat -- what fixes it.
+    assert "score zero" in out and "SOLVER_CLI_BACKUP_ACCOUNTS" in out, out
+
+    # 3. Saying it once is the rule everywhere else here; it holds.
+    backend._announce(*backend.pick())
+    assert capsys.readouterr().out == "", "repeated the same state"
+
+    # 4. And a seat that comes BACK from fully out still announces recovery --
+    #    the guard must not latch.
+    backend._out.clear()
+    backend._announce(*backend.pick())
+    assert "back to normal" in capsys.readouterr().out
+
+
+def test_solver_status_says_which_rung_is_answering(tmp_path, monkeypatch, capsys):
+    """`out` says what is BROKEN; it cannot say who took over.
+
+    Most of its entries are neither a limit nor an emergency -- a wedged pair,
+    a refused model, a signed-out seat -- and a seat can be steered away from
+    at 95% of its window with `out` completely empty. So the one question an
+    operator asks of /solver-status, "am I on the emergency rung right now?",
+    had no answer there: the current pair was printed by `_announce` and kept
+    nowhere a machine could read it."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch)
+    backend = CliBackend()
+
+    assert backend.stats()["answering"] == {
+        "account": "primary", "model": "opus",
+        "serving": True, "is_default": True,
+    }
+
+    # The emergency rung, and `is_default` is the flag to alert on.
+    backend.note_degraded("opus", "529 overloaded")
+    backend._announce(*backend.pick())
+    answering = backend.stats()["answering"]
+    assert answering["model"] == "fable" and answering["is_default"] is False
+    assert answering["serving"] is True, "fable can answer; it is not an outage"
+
+    # Nothing left: the pair is handed out to be turned away, and says so.
+    backend.note_limit(backend.accounts[0], "*", time.time() + 3600, "five_hour")
+    backend._announce(*backend.pick())
+    assert backend.stats()["answering"]["serving"] is False
+
+    capsys.readouterr()
+
+
 def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session(
     tmp_path, monkeypatch, capsys
 ):

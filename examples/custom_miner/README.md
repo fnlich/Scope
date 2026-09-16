@@ -1713,8 +1713,35 @@ fresh conversation.
 section naming the two checks a Rust answer gets before it is submitted — the
 local compile gate and the grading executor. It reports what is already known
 and probes nothing, so polling it is cheap even when the Docker daemon is hung.
-Watch it — a browser miner fails quietly, and silence looks identical to
-success.
+Watch it — a miner fails quietly, and silence looks identical to success.
+
+On the CLI backend, four keys under `fleet` answer the four questions worth
+asking, and they answer different ones — do not read any of them for another:
+
+```json
+"answering": {"account": "primary", "model": "fable",
+              "serving": true, "is_default": false},
+"out":       {"*/opus": {"seconds": 540, "why": "refused: 529 overloaded"}},
+"usage":     {"primary": 0.82},
+"hops":      3
+```
+
+* **`answering`** — *which rung is serving right now.* `is_default: false` is
+  the emergency rung; alert on it. `serving: false` means the ladder had
+  nothing healthy and this pair was handed out only to be turned away, so
+  every solve is scoring zero until something recovers.
+* **`out`** — *what is broken,* not who took over. Most entries are neither a
+  limit nor an emergency: a wedged pair, a refused model, a signed-out seat.
+  A key of `account/*` is the whole seat; `*/model` is that model everywhere.
+* **`usage`** — *how close a seat is to its window.* A seat steered away from
+  at 95% (`SOLVER_CLI_SWITCH_AT`) has **nothing in `out`** — being nearly spent
+  is not an outage — so this is the only place that state is visible.
+* **`hops`** — how often the ladder is moving. Rising with a healthy `out` is
+  churn worth investigating.
+
+`python -m solvers.claude_cli status` answers none of these. It builds its own
+`CliBackend` in its own process, so its outage table is empty by construction:
+it is a sign-in and ladder check, and it cannot see a running miner's state.
 
 Both Rust checks are also probed once at startup, right after the fleet warms
 up, because neither is otherwise looked at until a Rust challenge has already
