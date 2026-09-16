@@ -55,8 +55,8 @@ def env_on(name: str, default: bool = True) -> bool:
     `0`, `false`, `no` and `off` are off; anything else set is on; unset is
     the default. Every boolean the solver reads goes through here -- the
     solver's switches, the roster's, the browser sites' stream flags, the
-    Rust compile check -- because they used to disagree: `SOLVER_JUDGE=off`
-    left the judge on while `SOLVER_CLI_ALLOW_OVERAGE=off` turned overage off,
+    Rust compile check -- because they used to disagree: `SOLVER_SELF_TESTS=off`
+    left them on while `SOLVER_CLI_ALLOW_OVERAGE=off` turned overage off,
     `CLAUDE_STREAM=false` left streaming on, and `CLAUDE_STREAM_FIRST=true`
     did nothing at all. An operator who writes one spelling for one knob
     writes it for the next.

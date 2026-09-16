@@ -39,6 +39,7 @@ and always requires the container.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import os
@@ -47,21 +48,23 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, NamedTuple, Optional, Protocol, Sequence
+from typing import Any, NamedTuple, Optional, Protocol
 
 from rlvr.types import TestCase
 
+from .analyze import analysis_from_json, heuristic_analyze
+from .differential import Differential, DifferentialReport, Router
 from .prompts import (
-    build_code_prompt,
-    build_expected_prompt,
-    build_repair_prompt,
-    build_resume_prompt,
-    build_tests_prompt,
+    build_analysis_prompt,
+    build_candidate_prompt,
+    build_differential_repair_prompt,
+    build_inputs_prompt,
+    build_oracle_prompt,
     dropped_definitions,
+    extract_analysis,
     extract_code,
-    extract_expected,
     extract_generator,
-    extract_self_tests,
+    extract_inputs,
     python_defect,
     rust_defect,
 )
@@ -176,17 +179,6 @@ PROBE_MAX_BYTES = 240 * 1024
 # limit is not close.
 PROBE_SCALES = (PROBE_MAX_BYTES, PROBE_MAX_BYTES // 4, PROBE_MAX_BYTES // 16)
 
-# The most failing cases one round will put to an independent reader.
-#
-# Not a budget -- it is a statement about what the judge is FOR. One or two
-# cases disagreeing is two readings of a statement differing about a clause,
-# which is the question a third reading can settle. Half the bar disagreeing
-# is not that: it is a wrong program, nobody is confused about the statement,
-# and the round is better spent asking for a better program. Measured over 54
-# live solves, ten of the fifteen correction rounds were single-case
-# disagreements and three were 6, 14 and 19 cases at once -- the split is real
-# and it falls here.
-MAX_ADJUDICATED = 2
 
 # The least slice a read can be handed: `send(prompt, max(MIN_SLICE_S, left))`
 # pads every slice up to it, so a round or a pass started with less than this
@@ -195,93 +187,19 @@ MAX_ADJUDICATED = 2
 # that decides whether another round, pass or handoff is started.
 MIN_SLICE_S = 1.0
 
-# There is deliberately no round-trip floor here. There was one (12s, 20s on
-# the CLI backend), and it was a second clock under the deadline: below it the
-# loop refused another correction round and shipped a program it knew to be
-# wrong with time still on the validator's clock. A round started with too
-# little left is cut by the deadline like any other read, `_supersedes` keeps
-# the fragment from displacing the answer in hand, and the delivery reserve
-# ships that answer. The deadline is the only clock. (Operator's rule.)
-
-# Under this, a round did not involve the model. `send` blocks on a chat UI
-# until the reply finishes -- tens of seconds, normally -- so a round that came
-# back in under a couple of seconds read something that was already on the page.
-# It is the difference between a model that answered the same way twice and a
-# tab that is handing back the previous answer forever, and only the second is
-# a reason to stop correcting.
+# A repair round that changed nothing AND cost less than this did not involve
+# the model at all: the read came back with text that was already on the page.
+# Re-asking that costs no time, so the loop would resend the same prompt at
+# machine speed until the deadline -- measured at 2,567 rounds for one answer
+# that never changed. A round that took a real round trip is the other thing
+# entirely: the model answered, and answered the same, and the next ask is a
+# real chance the remaining budget is there to pay for. Time is what tells the
+# two apart; the count cannot.
 STALE_ROUND_S = 2.0
 
-# How many rounds running may leave the PROGRAM untouched before the repair
-# prompt stops offering to correct a case at all and asks for the program.
-#
-# The escape hatch is there because the model's own cases can be wrong -- turn 1
-# reasons its `expected` values out before any program exists -- and a round
-# that blames the code for a wrong case breaks a correct program. Left open
-# while nothing converges it is no longer that: two rounds running without the
-# program changing is the one thing a correction phase cannot afford, whether
-# they were spent correcting the bar or re-sending the same code. Two, not one,
-# because the first correction is the ordinary case this whole path was built
-# for.
-CASES_ONLY_ROUNDS = 2
 
-# ------------------------------------------------------- the round budget --
-# How many correction rounds one conversation gets before the repair is
-# carried to another model, and how many that one gets before the answer in
-# hand is the answer.
-#
-# Measured over 102 production solves: 76 needed no correction at all, 20
-# finished after ONE round of it, 4 after two, 1 after three, and 1 ran to
-# eight. So 96 of 102 are done inside two correction rounds and 101 inside
-# three -- a third round on the first conversation costs one solve in a
-# hundred, and everything past it has never once paid.
-#
-# What it prevents is on a later log, after the case-escape hatch fell silent:
-# three solves of eleven spent SEVEN, NINE and NINE correction rounds
-# alternating between a reply the parser dropped and a rewrite that failed the
-# same case, 115-200s each, one of them ending `exit=cutoff` with the budget
-# gone. Nothing in the loop stopped it: `SOLVER_MAX_ATTEMPTS` defaults to 0,
-# which is unlimited, and the deadline was the only terminator.
-#
-# Both are `CASES_ONLY_ROUNDS + 1`, and that is a relationship rather than two
-# numbers that happen to be equal. The case offer is withdrawn after
-# CASES_ONLY_ROUNDS rounds that left the program untouched, and the withdrawal
-# is worth nothing unless a round remains for it to act in: a budget equal to
-# the threshold would fire the withdrawal and end the conversation on the same
-# round, so the one prompt that says "this time it is the program that has to
-# change" would never be sent. One more, and it is sent exactly once, which is
-# what it is for. The handoff gets the same for the same reason.
-FIRST_PHASE_ROUNDS = CASES_ONLY_ROUNDS + 1
-HANDOFF_ROUNDS = CASES_ONLY_ROUNDS + 1
 
-# How many rounds one model gets before the repair moves on, when there IS a
-# rotation to move it along. Lower than the numbers above, and deliberately:
-# those were sized for a handoff that could happen once, where leaving too
-# early meant leaving for good. A rotation can come back -- opus is on it
-# too -- so the cost of moving early is one extra conversation rather than a
-# model never asked again.
-#
-# Two, so the author gets the round its context is worth and then the reading
-# changes. The measured shape this answers: of ten single-case disagreements
-# in a live run, nine ended with the program's own author ruling its own case
-# wrong and keeping its program. A second round with that same author is the
-# round least likely to find anything new.
-ROTATE_AFTER_ROUNDS = max(
-    1, int(os.environ.get("SOLVER_REPAIR_ROTATE_FROM", "2") or 2)
-)
-# The most of the bar ONE repair reply may rewrite, as a fraction. A reply
-# that corrects more than this is re-specifying the problem rather than fixing
-# a case, and is refused whole.
-#
-# Measured on a production day: the share of the bar rewritten by each of the
-# thirteen correction replies was 5, 7, 7, 8, 8, 10, 10, 10, 10, 11, 15, 29
-# and 68 percent. A third fires on the 68 and on nothing else. That reply came
-# from a program already known wrong on two inputs: it rewrote fifteen of its
-# twenty-two cases with nine seconds left, and the solve shipped reporting it
-# had passed all twenty-two.
-BULK_CORRECTION_SHARE = 3
-# How many bulk rewrites a pass tolerates before the case offer is withdrawn
-# for good. Refusing without this is a spin: the reply comes back the same.
-MAX_BULK_REFUSALS = 2
+
 
 
 class Conversation(Protocol):
@@ -375,12 +293,12 @@ class Candidate:
     # code can be wrong -- see there.
     partial: bool = False
     # The cases from `self_cases`' suite that this program did NOT pass. What
-    # a correction round is allowed to change: see `_merge_cases`.
+    # the differential found it disagreed with the reference on.
     failed_cases: list[dict[str, Any]] = field(default_factory=list)
     # What the program actually produced for each of those, in the same order.
-    # `failures` renders this for a model to read; the judge needs the value,
-    # because settling which of the program and the case is wrong means
-    # comparing an independent reading against both.
+    # `failures` renders this for a model to read; the value itself is what a
+    # repair prompt quotes beside the reference's answer, so a model can see
+    # the two side by side rather than be told they differ.
     failed_actuals: list["_Run"] = field(default_factory=list)
     # The cases this program was actually graded against. Kept for the
     # solution cache: an answer handed out again without being re-run is a
@@ -553,31 +471,8 @@ def _ident(task) -> str:
     return str(getattr(task, "problem_id", "") or "")[:12]
 
 
-def _expectation(case: dict) -> str:
-    """What a case expects, as one comparable string. A correction is a case
-    that came back with the same call and a different one of these; a case
-    re-sent under a new name with the same answer is not a correction."""
-    return json.dumps(case.get("expected"), sort_keys=True, default=str)
 
 
-def _case_key(case: dict) -> tuple:
-    """What makes two cases the same case: the call, not the answer.
-
-    A correction changes what a case EXPECTS. Keying on the input is what lets
-    the corrected version be recognised as the same case rather than an
-    additional one -- and it is why `expected` is deliberately absent from the
-    key.
-    """
-    # `key=repr` on the sort, not the default comparison: a kwargs dict with
-    # keys of mixed type (`{1: 2, "a": 3}`) makes `sorted` raise TypeError, and
-    # `ast.literal_eval` -- the tolerant parser a corrected array may come
-    # through -- can produce exactly that where `json.loads` cannot. The whole
-    # pass is wrapped in a handler that would report the crash as a dead
-    # backend and abandon the solve.
-    return (
-        repr(case.get("args", [])),
-        repr(sorted((case.get("kwargs") or {}).items(), key=repr)),
-    )
 
 
 def _ago(when: Any) -> str:
@@ -601,209 +496,55 @@ def _model_of(provider: Optional[str]) -> str:
     return name.split("@")[0].strip().lower()
 
 
-def _next_profile(rotation: Sequence, used: Sequence, provider: Optional[str]):
-    """The next model on the repair rotation, or None when it is spent.
+def _transport_limit(error: Optional[str]) -> bool:
+    """Whether a failed run failed because the ANSWER would not fit back.
 
-    Skips every model that has already had this repair -- `used` is the ones
-    it was handed to AND the one that is handing it on, because the model
-    answering now is the one whose reading just failed to fix it.
-
-    Recording the departing model is what makes this a rotation rather than a
-    shuttle. Without it only the CURRENT seat is skipped, so a repair that
-    went opus -> sonnet came back to opus on its next hop: `sonnet` is
-    excluded as the incumbent, `opus` is not in `used`, and the third reading
-    the rotation exists to reach is never asked.
-
-    `provider` is a label like `cli:opus@primary`, so the match is on the
-    model name appearing in it rather than on equality.
+    `rlvr/execution/_batch_runner.py` caps a case's framed status at 256 KiB
+    and the Rust runner caps raw stdout at 1 MB; past either, the run comes
+    back failed with a message about size. That is the harness declining to
+    carry a value, not the program doing anything wrong, and the two must not
+    be reported the same way -- one is a defect worth a repair round and the
+    other is the probe having asked for too much.
     """
-    here = (provider or "").lower()
-    seen = {profile.model for profile in used if profile is not None}
-    for profile in rotation:
-        if profile.model in seen:
-            continue
-        if profile.model and profile.model.lower() in here:
-            continue
-        return profile
-    return None
+    low = (error or "").lower()
+    return "too large" in low or "too big" in low
 
 
-def _same_expected(left: Any, right: Any, language: str) -> bool:
-    """Whether two answers to the same call are the same answer.
 
-    THE VALIDATOR'S OWN COMPARISON, imported rather than reimplemented, and
-    that is not fastidiousness. Two earlier attempts to measure whether two
-    readings agree compared with `json.dumps` and reported 0% and 48%
-    agreement; every point of the difference was whitespace, because a Rust
-    answer is stdout judged on whitespace tokens and `"OK 2\\nD 0"` and
-    `"OK 2 D 0"` are the same answer. A comparison stricter than the grader's
-    invents disagreements, and one looser reports a pass the validator will
-    not give.
+
+
+
+
+
+
+
+def _record_differential(
+    candidate: Candidate, report: "DifferentialReport",
+    inputs: list[dict[str, Any]],
+) -> None:
+    """Write what the comparison found onto the candidate.
+
+    The rest of the solver -- `_supersedes`, the solution cache, the summary
+    line -- already speaks in `self_passed`/`self_total`, so the differential
+    reports through those rather than beside them. The mapping is the strict
+    one on purpose:
+
+    `self_total` is every input, INCLUDING the ones the reference could not
+    answer and the ones the clock never reached. `self_passed` is only the
+    inputs where both programs ran and agreed. So `self_verified`, which wants
+    `self_passed == self_total`, stays false for a suite that was cut short or
+    whose reference fell over -- neither of which is evidence about the
+    program, and neither of which may open the answer cache.
     """
-    if language == "rust":
-        from rlvr.execution.rust_judge import outputs_match
-
-        if not isinstance(left, str) or not isinstance(right, str):
-            return False
-        return outputs_match(left, right)
-    from rlvr.execution.compare import values_equal
-
-    try:
-        return bool(values_equal(left, right))
-    except Exception:  # noqa: BLE001 - an uncomparable pair is not a match
-        return False
-
-
-def _union_bars(
-    first: list[dict], second: list[dict], language: str = "python"
-) -> tuple[list[dict], dict[tuple, Any]]:
-    """Two independently written bars, joined. Returns (cases, split).
-
-    UNION, not intersection, and the measurement says why. Two models asked to
-    choose test inputs for the same statement shared five of the 233 they
-    wrote (`calibration/two_bar_overlap.py`) -- so an intersection would be
-    empty on almost every solve, and agreement about WHICH inputs to test can
-    carry no signal at all. What that same 2% overlap means for a union is the
-    opposite and is the whole point: the second reader's cases are almost
-    entirely inputs the first never thought to probe, written by a reading of
-    the statement that is not the one that produced the program.
-
-    Keyed by the CALL, so a case both bars happened to write appears once.
-    Where they wrote the same call and disagree about what it returns, the
-    first bar's answer stands and the key is returned in `split`. A
-    disagreement there is the statement being genuinely ambiguous rather than
-    either model being careless, so it is not evidence against the program,
-    and `split` is what lets the caller treat it that way.
-
-    How OFTEN that happens is measured for one pair only:
-    `calibration/fixed_inputs.py` held the inputs fixed, asked opus and sonnet
-    for the expected values, and they split on 6 of 97. The second bar is no
-    longer sonnet, so that 6% is not this pair's rate and nothing here should
-    be read as claiming it is -- what carries over is the ARGUMENT, which
-    never depended on the number: two readings of one statement that differ
-    about a value have found an ambiguity in the statement, whoever the two
-    readers are.
-    """
-    seen = {_case_key(case): case for case in first}
-    split: dict[tuple, Any] = {}
-    merged = list(first)
-    for case in second:
-        key = _case_key(case)
-        mine = seen.get(key)
-        if mine is None:
-            seen[key] = case
-            merged.append(case)
-        elif not _same_expected(
-            mine.get("expected"), case.get("expected"), language
-        ):
-            # The GRADER's comparison, not `_expectation`'s string form. For
-            # Rust a verdict is stdout compared on whitespace tokens, so
-            # `"OK 2\nD 0"` and `"OK 2 D 0"` are the same answer -- and
-            # calling them a disagreement would mark the case `split`, which
-            # is what keeps it away from the judge. Two bars that agree would
-            # then look like an ambiguity, and the case would go back to being
-            # settled by the program's own author.
-            split[key] = case.get("expected")
-    return merged, split
-
-
-def _merge_cases(
-    agreed: list[dict], revised: list[dict], failed: list[dict]
-) -> tuple[list[dict], str]:
-    """The agreed suite with a correction applied. Returns (cases, what changed).
-
-    A correction round happens because the program disagreed with a case, and
-    only one of the two can be wrong. The repair prompt says so and offers both
-    ways out: send the program back fixed, or -- if the CASE was the thing that
-    was wrong -- send that case back corrected.
-
-    What a correction may touch is exactly the cases the program FAILED. That
-    single rule is what makes accepting a short array safe:
-
-      * A case the program PASSES cannot be corrected, dropped or weakened. The
-        bar a program has already cleared is not up for negotiation, so the
-        obvious way to game this -- delete the case you cannot pass -- is not
-        reachable from here.
-      * A failing case may be corrected in place (same call, new expectation)
-        or swapped for a different one, when the call itself was the thing that
-        made no sense. Both are what "the case was wrong" means in practice.
-      * The suite keeps its SIZE. Every failing case removed must be replaced,
-        so a bar cannot be cleared by deleting what the program could not pass;
-        and it cannot GROW here either, because cases written beside a program
-        agree with its bugs and the program turn is already refused its own for
-        that reason.
-
-    Replacing the whole suite was the alternative, and refusing anything shorter
-    was what came before. Both were wrong in the same place. Demanding the full
-    array back meant a twenty-case suite was re-sent to correct one of them,
-    which is slower, likelier to be truncated mid-array, and -- when it came
-    back one case short for any reason at all -- refused outright, so the one
-    wrong case broke a correct program on every remaining round of the solve.
-    """
-    if not revised:
-        return list(agreed), ""
-    out = {_case_key(case) for case in failed}
-    keep = [case for case in agreed if _case_key(case) not in out]
-    seen = {_case_key(case) for case in keep}
-    merged = list(keep)
-    for case in revised:
-        key = _case_key(case)
-        if key in seen:
-            # It re-states a case the program PASSES. Not a correction this
-            # round is entitled to make, and not a hostile act either -- a
-            # model that re-sends its whole suite lands here on every passing
-            # case. Keep the version that was agreed.
-            continue
-        merged.append(case)
-        seen.add(key)
-    corrected = len(merged) - len(keep)
-    # A failing case the reply did NOT re-state stays as it was. The prompt
-    # may report two disagreements and the natural reply corrects one of
-    # them; read as "the other was dropped" that reply was refused outright,
-    # every round, and the one case the model had fixed never landed.
-    # Untouched is not deleted: the case is still on the bar, still failing,
-    # and still reported next round.
-    for case in failed:
-        if len(merged) >= len(agreed):
-            break
-        if _case_key(case) not in seen:
-            merged.append(case)
-            seen.add(_case_key(case))
-    if corrected == 0:
-        # Nothing moved. Either the reply re-sent the suite unchanged -- the
-        # ordinary shape, and nothing to say about it -- or every case it
-        # carried matched one the program PASSES and was skipped above. The
-        # second is worth a word: it is what a correction looks like when the
-        # failing set this round was merged against is not the set the prompt
-        # actually quoted, and that has been a real bug rather than a
-        # hypothetical one.
-        return list(agreed), "" if not failed else "NOTHING: the correction changed no case that failed"
-    if len(merged) != len(agreed):
-        # The suite keeps its SIZE. Only the failing cases may change, and each
-        # one has to be replaced rather than simply removed -- "the program can
-        # drop the case it disagrees with and attach the corrected one in its
-        # place", with the second half enforced.
-        #
-        # Both directions of this were measured breaking a solve.
-        #
-        # SHORTER is a bar cleared by deletion. A repair that came back with
-        # only the cases it already passed dropped the one it did not, and a
-        # program failing 1 of 2 went out reported `self=1/1`, verified on
-        # local, on a bar it had rewritten in the same breath.
-        #
-        # LONGER is back-filling wearing a correction's clothes. Cases written
-        # beside a program agree with its bugs -- which is the entire argument
-        # for asking for them in a separate turn -- and a repair round that
-        # re-sends the program with its own cases attached would otherwise get
-        # them onto the bar by the side door the program turn is refused at.
-        # Measured: a buggy program adding two cases of its own to a one-case
-        # bar and finishing 2/3 instead of 0/1.
-        return list(agreed), (
-            f"REFUSED: {len(agreed) - len(keep)} case(s) failed and "
-            f"{corrected} came back; a failing case may be "
-            f"corrected, not dropped, and the suite may not grow here"
-        )
-    return merged, f"{corrected} failing case(s) corrected"
+    candidate.self_cases = len(inputs)
+    candidate.self_total = len(inputs)
+    candidate.self_passed = report.agreed
+    candidate.self_observed = report.agreed + report.mismatch
+    candidate.from_self_tests = report.ran > 0
+    candidate.failures = [
+        f"{case.name}: {case.detail}" for case in report.cases
+    ]
+    candidate.self_bar = list(inputs)
 
 
 def _inherit_evidence(candidate: Candidate, prior: Candidate) -> None:
@@ -847,13 +588,10 @@ def _inherit_evidence(candidate: Candidate, prior: Candidate) -> None:
         candidate.self_passed, candidate.self_total = prior.self_passed, prior.self_total
         candidate.self_observed = prior.self_observed
         candidate.failures = list(prior.failures)
-        # WITH the cases they came from. Splitting these was a silent hole: the
-        # inherited `failures` built a repair prompt quoting concrete cases and
-        # offering to take them back corrected, while the empty `failed_cases`
-        # left `_merge_cases` with nothing in play -- so the correction the
-        # prompt had just asked for matched an existing key, read as "it
-        # re-states a case the program passes", and was dropped without a word.
-        # The feature and its own evidence have to move together.
+        # WITH the cases they came from. A repair prompt quotes the concrete
+        # inputs the two programs disagreed on, so inherited failure TEXT
+        # without the cases behind it describes evidence the round no longer
+        # holds. The feature and its own evidence move together.
         candidate.failed_cases = list(prior.failed_cases)
         candidate.failed_actuals = list(prior.failed_actuals)
         if not candidate.self_bar:
@@ -1289,9 +1027,8 @@ class _Grader:
             failed.append(examples[index])
             # What the program actually produced, kept beside the case it
             # produced it for. `_describe` renders this for a model to read;
-            # a judge needs the value itself, because deciding whether the
-            # program or the case is wrong means comparing an independent
-            # reading against BOTH of them.
+            # the differential needs the value itself, because a repair prompt
+            # shows what each program returned for the same input.
             actuals.append(
                 _Run(
                     ok=bool(getattr(result, "value_ok", False))
@@ -1311,9 +1048,9 @@ class _Grader:
     ) -> tuple[int, int, list[str], list[dict[str, Any]]]:
         """`check_detailed` without the actual values. See it for everything.
 
-        Kept as the four-tuple every caller but the judge wants, rather than
-        widened in place: unpacking is positional, and a fifth element would
-        have been a silent `ValueError` in each of them.
+        Kept as the four-tuple every caller but the differential wants,
+        rather than widened in place: unpacking is positional, and a fifth
+        element would have been a silent `ValueError` in each of them.
         """
         passed, total, failures, failed, _ = self.check_detailed(
             code, language, entrypoint, examples, names=names,
@@ -1591,59 +1328,44 @@ class _Shipped(NamedTuple):
     """
 
     exit: str = ""
-    bar_provider: Optional[str] = None
     rounds: int = 0
     corrected: int = 0
     probe: str = ""
-    bar2_provider: Optional[str] = None
-    union: Optional[tuple] = None
-    adjudicated: tuple = ()
-    contested: int = 0
+    tests_provider: Optional[str] = None
+    oracle_provider: Optional[str] = None
+    ran: int = 0
+    agreed: int = 0
+    mismatch: int = 0
+    oracle_crash: int = 0
     repair: tuple = ()
-    split: int = 0
+    patched: tuple = ()
+    regressed: int = 0
+    flipped: int = 0
 
     @classmethod
     def of(cls, plan: "_Plan") -> "_Shipped":
         return cls(
-            exit=plan.exit, bar_provider=plan.bar_provider, rounds=plan.rounds,
-            corrected=plan.corrected, probe=plan.probe,
-            bar2_provider=plan.bar2_provider, union=plan.union,
-            adjudicated=tuple(plan.adjudicated.items()),
-            contested=plan.contested, repair=tuple(plan.repair),
-            split=plan.split,
+            exit=plan.exit, rounds=plan.rounds, corrected=plan.corrected,
+            probe=plan.probe, tests_provider=plan.tests_provider,
+            oracle_provider=plan.oracle_provider, ran=plan.ran,
+            agreed=plan.agreed, mismatch=plan.mismatch,
+            oracle_crash=plan.oracle_crash, repair=tuple(plan.repair),
+            patched=tuple(plan.patched), regressed=plan.regressed,
+            flipped=plan.flipped,
         )
 
 
-@dataclass
 class _Plan:
-    """What the NEXT pass of one solve should do. One per `solve_task`.
-
-    Only `two_phase` so far, and it exists because a cases turn that costs a
-    whole pass used to cost EVERY pass. `solve_task` retries `_attempt` up to
-    `MAX_PASSES` times while it is holding nothing, and nothing remembered that
-    turn 1 had already proved unaffordable here -- so a task whose cases turn
-    timed out burned all four passes on four more cases turns and submitted
-    nothing, having never once asked for a program.
+    """What one solve did, gathered as it happens. One per `solve_task`.
 
     Per-solve rather than per-solver: solves run concurrently on one instance,
-    and a flag on `self` would let one task's bad luck disable the split for
-    every other task in flight.
+    and a counter on `self` would mix one task's rounds into another's.
 
-    It answers "was turn 1 unaffordable HERE", so only a failure that belongs to
-    the task and the site clears it. A tab that went blind is retired on the
-    spot and the next pass is served by another one, so its failure says nothing
-    about the task -- see `_attempt`, where the two are told apart.
-
-    Cleared, the next pass asks for the program ALONE. There is no combined
-    turn to fall back to: cases written beside a program are back-filled from
-    what it happens to do and agree with its bugs, which is the whole argument
-    for splitting the turns, and a prompt that asks for a second block the
-    grader will not trust spends output tokens inside the deadline. The cost is
-    real and it is the right one: that task goes out ungraded rather than
-    graded against evidence worth nothing.
+    Everything on it is written to be READ -- it is what `summary()` turns
+    into the one `[verify]` line an operator greps, and every field on it
+    earns its place by being the detector for a named failure. Nothing here
+    steers the solve.
     """
-
-    two_phase: bool = True
 
     def __init__(self) -> None:
         # What the summary line reports beside the tally, so a hidden-suite
@@ -1653,80 +1375,49 @@ class _Plan:
         # from a clean one.
         self.rounds = 0
         self.corrected = 0
-        # Which model wrote the BAR, when it was written somewhere other than
-        # where the program was. The summary line is what a hidden-suite
-        # outcome is joined back to, and with a cases model and a program
-        # model that can differ, "which model answered" is two questions.
-        # This is also the instrument that makes `SOLVER_CLI_PHASE_PROFILES`
-        # measurable rather than guessable: without it there is no way to ask
-        # whether the bar's model changed anything.
-        self.bar_provider: Optional[str] = None
-        # What the FIRST grade found, before any repair: how many of the
-        # program's cases it failed the moment it was written. This is phase
-        # 3's trigger rate, and it is the number the correction phase turns on.
-        # Measured over the 102 archived solves, 76 of them never entered a
-        # correction round at all -- so the loop that converges 25 times out of
-        # 26 was only ever offered a quarter of the traffic, and the ~20 wrong
-        # answers those runs shipped are mostly among the 76 it never saw. A
-        # log that reports `rounds=1` cannot tell "the program was right" from
-        # "the cases could not tell", and those need opposite work.
-        #
-        # The first grade of the SOLVE, not of the pass that shipped. A second
-        # pass runs only after the first failed to deliver, and this asks
-        # whether the bar found anything on this task at all -- so a 3/18 from
-        # an abandoned first pass is the answer even when the second pass's
-        # fresh program cleared the same bar. Unlike `exit`, which describes
-        # how the solve ended and so takes the LAST pass.
-        self.disagreed: Optional[tuple[int, int]] = None
-        # Which condition ended the correction loop. Every way out of the pass
-        # notes a reason before returning -- the seven `break`s, the cases
-        # turn that never answered, and the backend failure -- so the line
-        # never carries an earlier pass's reason for this one, or nothing.
+        # WHICH MODEL wrote the inputs and which wrote the reference. With
+        # five phases that can each name a different model, "which model
+        # answered" stopped being one question -- and these two decide whether
+        # a disagreement meant anything. A reference written by the same model
+        # at the same effort as the candidate is not an independent reading of
+        # the statement, and its agreement is not evidence.
+        self.tests_provider: Optional[str] = None
+        self.oracle_provider: Optional[str] = None
+        # What running the two programs on the same inputs established, for
+        # the answer that SHIPPED. `ran=0` is the case worth being able to
+        # see: the old line printed `corrected=0/18 disagreed=0/18
+        # exit=converged` for a solve that had established nothing, which is
+        # the same line a solve that checked eighteen cases and passed them
+        # all prints. These four tell them apart.
+        self.ran = 0
+        self.agreed = 0
+        self.mismatch = 0
+        self.oracle_crash = 0
+        # Which condition ended the loop, and what the SIZE PROBE said about
+        # the program that shipped. See `note_exit` and `note_probe`.
         self.exit = ""
-        # What the SIZE PROBE said about the program that shipped. The probe
-        # answers the one question the bar structurally cannot -- every case on
-        # the bar carries a hand-derived `expected`, so none of them is ever the
-        # size the validator runs -- and until this field existed the log could
-        # not tell an answer timed at scale from one that was never timed. The
-        # states are worth keeping apart -- see `_Probe`: `passed` is
-        # evidence; `too_slow` and `oom` are answers that shipped known-bad at
-        # scale because the clock ran out mid-repair; `crashed` died at scale
-        # some other way; `skipped` and `none` were never timed. Describes the
-        # program that SHIPPED: cleared whenever a different program becomes
-        # the one in hand, so a verdict never outlives the program it was
-        # about.
         self.probe = ""
-        # Calls the two bars both wrote and disagreed about. Neither a failure
-        # nor a verdict on its own -- see `_union_bars` and the split routing
-        # in `_attempt` -- but the one number that says how ambiguous the
-        # statement was, so it is recorded.
-        self.split = 0
-        # The SECOND bar: which model wrote it, and what the union came to.
-        # `union` is (bar1, bar2, union) case counts, so a line can say whether
-        # the second reader contributed anything the first had not thought of
-        # -- two models share about 2% of their chosen inputs, measured, which
-        # is the entire reason a second bar is worth a turn.
-        self.bar2_provider: Optional[str] = None
-        self.union: Optional[tuple[int, int, int]] = None
-        # How the judge settled cases the bar and the program disagreed about,
-        # counted by route. `case` means an independent reading agreed with the
-        # bar and the program had to change; `program` means it agreed with the
-        # program and the case was corrected; `contested` means it agreed with
-        # neither, which is the statement being genuinely ambiguous.
-        #
-        # This is the instrument for the finding that motivated the judge: over
-        # 54 live solves, nine of ten single-case disagreements ended with the
-        # program's own author editing its own case. Without a route breakdown
-        # there is no way to see whether that ratio moved.
-        self.adjudicated: dict[str, int] = {}
-        self.contested = 0
-        # Which models the correction rounds ran on, in order. A repair that
-        # stays where the program was written is a model reviewing its own
-        # reading; this says whether it left, and where it went.
+        # Which models the repair rounds ran on, in order, and WHICH ARTIFACT
+        # each round patched -- `cand` or `oracle`. The second is the
+        # instrument for the routing heuristic: a mismatch blames the
+        # candidate and a reference crash blames the reference, and neither is
+        # certain. Without a record of what each round chose there is no way
+        # to ask afterwards whether it chose right.
         self.repair: list[str] = []
-
-    def note_adjudicated(self, route: str) -> None:
-        self.adjudicated[route] = self.adjudicated.get(route, 0) + 1
+        self.patched: list[str] = []
+        # Repair rounds that did NOT improve the verdict score. Repair is
+        # monotone -- a round that scores no better leaves the previous
+        # candidate in place -- so this is free to record, and it is the
+        # signature of the one failure the differential cannot rule out by
+        # itself: blaming the program that was already correct. A healthy
+        # solve prints 0; a rising count with `mismatch` flat is the number to
+        # watch.
+        self.regressed = 0
+        # Times the router gave up on the candidate and patched the reference
+        # instead, having blamed the same failure twice with nothing else
+        # accusing it. Bounds the damage of a wrong blame and makes it
+        # countable.
+        self.flipped = 0
 
     def note_probe(self, verdict: str) -> None:
         """The LAST verdict wins, for the same reason `exit` does.
@@ -1821,9 +1512,6 @@ class VerifyingSolver:
         cache_size: int = 256,
         second_opinion: bool = True,
         self_tests: bool = True,
-        independent_bar: Optional[bool] = None,
-        second_bar: Optional[bool] = None,
-        judge: Optional[bool] = None,
     ):
         self._backend = backend
         # 0 means UNLIMITED, and that is the default. Correctness is the whole
@@ -1835,54 +1523,18 @@ class VerifyingSolver:
         self._max_budget = max(5.0, float(max_budget_s))
         self._second_opinion = bool(second_opinion)
         self._self_tests = bool(self_tests)
-        # Where the cases are written -- see `_attempt`. Read from the
-        # environment when the caller says nothing, because it decides how
-        # many conversations a solve holds open and a scripted backend that
-        # hands every conversation the same replies cannot serve two.
-        self._independent_bar = (
-            _env_on("SOLVER_INDEPENDENT_BAR")
-            if independent_bar is None
-            else bool(independent_bar)
-        )
-        # A SECOND bar, beside the first, on another model. Requires the
-        # independent bar: it is a third concurrent conversation, and the
-        # sequential shape has no place to put it.
-        #
-        # Costs one cases turn of output tokens per solve and no wall-clock,
-        # and it is the only thing here that reaches a solve where the bar and
-        # the program agreed with each other and were both wrong.
-        self._second_bar = self._independent_bar and (
-            _env_on("SOLVER_SECOND_BAR")
-            if second_bar is None
-            else bool(second_bar)
-        )
-        # The judge: a third reader, asked what a disputed call returns.
-        # Costs a short turn and only on the rounds that have a disagreement
-        # to settle -- about a quarter of solves. See `_adjudicate`.
-        self._judge = (
-            _env_on("SOLVER_JUDGE")
-            if judge is None
-            else bool(judge)
-        )
-        # The models a correction round moves through. Empty for any backend
-        # that has no models to choose between -- a browser fleet -- in which
-        # case the loop behaves as it always did: one handoff to a fresh tab.
-        try:
-            from .claude_cli import cli_repair_rotation
-
-            self._rotation = cli_repair_rotation()
-        except (Exception, SystemExit):
-            # `SystemExit`, explicitly: `cli_repair_rotation` raises it on a
-            # malformed value, as every other config reader in that module
-            # does, and it is a BaseException -- so `except Exception` was a
-            # fallback that could never run. A typo in one env var must cost
-            # the rotation, not the miner.
-            print("[verify] SOLVER_REPAIR_ROTATION could not be read; "
-                  "correction rounds stay where the program was written")
-            self._rotation = ()
-        # The size probe: one extra fenced block on the cases turn, and one
+        # Stage 3, the analysis turn. The only stage with a switch of its
+        # own, because it is the only one whose output is optional: the free
+        # heuristic scan runs either way, and turning this off leaves the
+        # solve reading the statement with regexes alone. On by default --
+        # with it off the later prompts see fewer traps, which is a worse
+        # prompt rather than a broken one.
+        self._llm_analysis = _env_on("SOLVER_LLM_ANALYSIS")
+        # The size probe: one extra fenced block on the inputs turn, and one
         # local run of the finished program on a large valid input. No extra
-        # model turn, and no oracle -- see `_timed_out_at_scale`.
+        # model turn, and no reference -- see `_timed_out_at_scale`. It is
+        # also one of the two signals that accuse the candidate without the
+        # reference's help, which is what the router's flip rule listens to.
         self._size_probe = (
             _env_on("SOLVER_SIZE_PROBE")
         )
@@ -2159,7 +1811,8 @@ class VerifyingSolver:
                     # `from_self_tests`: the model shipped cases and they ran,
                     # so there was something to grade after all.
                     #
-                    # NO CODE: `_run_self_tests` is gated on `code.strip()`, so
+                    # NO CODE: the differential is gated on a non-empty
+                    # candidate, so
                     # an empty candidate reports `from_self_tests=False`
                     # whatever turn 1 produced -- and the warning then blames
                     # the cases turn for the PROGRAM turn's failure. Measured:
@@ -2264,21 +1917,22 @@ class VerifyingSolver:
         if best.code.strip() and solution_cache.worth_keeping(
             self_verified=best.self_verified,
             failures=bool(best.failures),
-            contested=shipped.contested,
+            contested=0,
             probe=shipped.probe,
         ) and not self._grader.degraded(task.language):
             record = solution_cache.record(
                 code=best.code, raw=best.raw, task=task, bar=best.self_bar,
                 probe=shipped.probe,
                 # Every model that touched what a hit is served on, in the
-                # order they touched it, once each: the bars it cleared, the
-                # program's author, the models the repair went through.
+                # order they touched it, once each: the inputs, the reference,
+                # the candidate's author, and the models the repair went
+                # through.
                 providers=list(dict.fromkeys(
                     p for p in (
-                        shipped.bar_provider, shipped.bar2_provider,
+                        shipped.tests_provider, shipped.oracle_provider,
                         won_with, *shipped.repair,
                     )
-                    if p and p != "late"
+                    if p
                 )),
             )
             await asyncio.to_thread(solution_cache.save, key, record)
@@ -2286,13 +1940,10 @@ class VerifyingSolver:
         print(
             f"[verify] {task.language} entrypoint={task.entrypoint} "
             f"provider={won_with or 'none'} "
-            + (f"bar={shipped.bar_provider} " if shipped.bar_provider else "")
-            + (f"bar2={shipped.bar2_provider} " if shipped.bar2_provider else "")
-            + (
-                f"union={shipped.union[2]}({shipped.union[0]}+{shipped.union[1]}) "
-                if shipped.union else ""
-            )
-            + (f"split={shipped.split} " if shipped.split else "")
+            + (f"inputs={shipped.tests_provider} "
+               if shipped.tests_provider else "")
+            + (f"reference={shipped.oracle_provider} "
+               if shipped.oracle_provider else "")
             + f"examples={best.passed}/{best.total} "
             + (
                 f"self={best.self_passed}/{best.self_total} "
@@ -2307,35 +1958,37 @@ class VerifyingSolver:
             + f"verified={best.verified} "
             # `verified=False` is the only thing a live solve could ever print,
             # because no request ships public examples -- so on its own it said
-            # the same thing about an answer that passed every case it had and
-            # about one that was never run. This says which, without ever
-            # claiming the word `verified` for a model agreeing with itself.
+            # the same thing about an answer that agreed with the reference
+            # everywhere and one that was never run at all.
             + (
-                f"(verified on local: passed all {best.self_total} of its "
-                f"own cases; no public examples exist to confirm it) "
+                f"(verified on local: agreed with an independently written "
+                f"reference on all {best.self_total} inputs; no public "
+                f"examples exist to confirm it) "
                 if best.self_verified
                 else ""
             )
+            # What the comparison actually established. `ran=` is the field
+            # that stops this line saying the same thing about a checked
+            # answer and an unchecked one -- the failure that motivated the
+            # whole design.
+            + f"ran={shipped.ran} agreed={shipped.agreed} "
+            + f"mismatch={shipped.mismatch} "
+            + (f"oracle_crash={shipped.oracle_crash} "
+               if shipped.oracle_crash else "")
             + f"rounds={shipped.rounds} corrected={shipped.corrected}/{best.self_total}"
-            # What the FIRST grade found and what ended the loop. `rounds=1`
-            # alone cannot tell a program that was right from one whose cases
-            # could not tell, and those need opposite work: 76 of the 102
-            # archived solves reported rounds=1, and most of that run's wrong
-            # answers are among them.
+            # WHICH artifact each repair round patched, and whether the router
+            # ever had to take a round back off the candidate. `regressed=` is
+            # the instrument for a wrong blame; `flipped=` says the flip rule
+            # fired.
             + (
-                f" disagreed={plan.disagreed[0]}/{plan.disagreed[1]}"
-                if plan.disagreed is not None
-                else " disagreed=none"
+                " repair=" + ">".join(
+                    f"{who}:{what}" for who, what
+                    in zip(shipped.repair, shipped.patched)
+                )
+                if shipped.repair else ""
             )
-            # How the judge settled what the bar and the program disagreed
-            # about, and what the probe said about the program that shipped.
-            + (
-                " adjudicated="
-                + ",".join(f"{route}:{n}" for route, n in shipped.adjudicated)
-                if shipped.adjudicated else ""
-            )
-            + (f" contested={shipped.contested}" if shipped.contested else "")
-            + (f" repair={'>'.join(shipped.repair)}" if shipped.repair else "")
+            + (f" regressed={shipped.regressed}" if shipped.regressed else "")
+            + (f" flipped={shipped.flipped}" if shipped.flipped else "")
             + (f" probe={shipped.probe}" if shipped.probe else "")
             + (f" exit={shipped.exit}" if shipped.exit else "")
             + " "
@@ -2347,28 +2000,39 @@ class VerifyingSolver:
             verified=best.verified, passed=best.passed, total=best.total,
             self_verified=best.self_verified,
             self_passed=best.self_passed, self_total=best.self_total,
+            # The join key between a shipped answer and its hidden-suite
+            # outcome. The names that were here before and still mean the same
+            # thing keep their spelling, so anything reading an archive from
+            # before this change still finds them.
             diagnostics={
                 "provider": won_with,
-                "bar_provider": shipped.bar_provider,
-                "bar2_provider": shipped.bar2_provider,
-                "union": list(shipped.union) if shipped.union else None,
-                "split": shipped.split,
+                "tests_provider": shipped.tests_provider,
+                "oracle_provider": shipped.oracle_provider,
+                # What the answer was checked against. Kept for the solution
+                # cache and for the archive: an answer served again without
+                # being re-run is a question about its evidence.
                 "bar": best.self_bar,
                 "self_passed": best.self_passed,
                 "self_total": best.self_total,
                 "self_observed": best.self_observed,
                 "self_verified": best.self_verified,
-                # WHICH cases it failed, and what it produced for them, not
-                # just how many. A wrong answer in the archive is a question
-                # about one case, and a count cannot answer it.
+                # WHICH inputs it disagreed on, not just how many. A wrong
+                # answer in the archive is a question about one case, and a
+                # count cannot answer it.
                 "failed_cases": best.failed_cases,
                 "failures": best.failures,
-                "disagreed": list(plan.disagreed) if plan.disagreed else None,
-                "adjudicated": dict(shipped.adjudicated),
-                "contested": shipped.contested,
+                # What the differential established, and what the repair loop
+                # did about it.
+                "ran": shipped.ran,
+                "agreed": shipped.agreed,
+                "mismatch": shipped.mismatch,
+                "oracle_crash": shipped.oracle_crash,
                 "rounds": shipped.rounds,
                 "corrected": shipped.corrected,
                 "repair": list(shipped.repair),
+                "patched": list(shipped.patched),
+                "regressed": shipped.regressed,
+                "flipped": shipped.flipped,
                 "probe": shipped.probe,
                 "exit": shipped.exit,
                 "elapsed_s": round(elapsed, 1),
@@ -2376,58 +2040,129 @@ class VerifyingSolver:
             },
         )
 
-    async def _ask_for_cases(
-        self, conversation, task, left: float, probe=None, independent: bool = False,
+    # -- stage 3: what the statement hides -------------------------------- #
+    async def _analyse(
+        self, task, heuristic, budget: float, started: float,
+        avoid: Optional[str], phases: "_Phases",
     ):
-        """Turn 1: the model's cases, before it has written the program.
+        """Ask a model to add to the free trap scan. Never costs the solve.
 
-        Returns the cases, or ``[]`` when the reply carried none usable, or
-        ``None`` when the CONVERSATION is the problem -- unreadable, or still
-        writing -- in which case turn 2 must not be sent into it at all.
-
-        Read against the SOLVE's clock and nothing else: turn 1 gets whatever
-        is left, the same ceiling the program turn gets. There is no partial
-        budget here to cut a thinking model off with -- see the note above
-        `_Plan` for why every version of that cap was a mistake.
+        This is the ONE stage allowed to produce nothing. Every failure --
+        an unreadable conversation, a reply that is not JSON, a backend that
+        raises -- ends with the heuristic analysis still in hand, which is the
+        same place the solve would have been had the stage never run. So it is
+        wrapped whole rather than guarded condition by condition.
         """
-        slice_s = max(1.0, left)
-        # `probe` is a list the caller passes to receive the generator, rather
-        # than a second return value: this returns cases, [] and None with
-        # three different meanings the whole solve turns on, and widening that
-        # to a tuple to carry an optional extra would put the probe in the way
-        # of the bar. Absent list, no ask, and the turn is byte-identical to
-        # what it was.
-        want_probe = probe is not None
-        prompt = build_tests_prompt(
-            task.language, task.statement, task.entrypoint, task.public_examples,
-            want_probe=want_probe,
-            # Whether this conversation will be asked for the program. The
-            # bar's own conversation never is, and the prompt used to promise
-            # it would be.
-            independent=independent,
-        )
-        # The slice IS everything left, and everything left runs to the point
-        # the answer stops being deliverable. Nothing is held back to extend to.
-        reply = await conversation.send(prompt, slice_s)
-        if getattr(conversation, "still_writing", False) or getattr(
-            conversation, "empty_reason", None
-        ) in ("unreadable", "unfinished"):
-            print(
-                f"[verify] the cases turn came back "
-                f"{getattr(conversation, 'empty_reason', None) or 'unfinished'}; "
-                f"the program request cannot go into a conversation that has "
-                f"not answered the last one"
+        conversation = None
+        try:
+            conversation = await self._open_within(
+                budget, started, avoid, phase="analysis"
             )
-            return None
-        if want_probe:
-            found = extract_generator(reply)
-            if found:
-                probe.append(found)
-        cases = extract_self_tests(reply, task.entrypoint, task.language)
-        if not cases:
-            print("[verify] the cases turn produced none usable; "
-                  "asking for the program without them")
-        return cases
+            reply = await self._send_within(
+                conversation,
+                build_analysis_prompt(task, heuristic),
+                max(1.0, budget - (time.monotonic() - started)),
+            )
+            merged = analysis_from_json(extract_analysis(reply), heuristic)
+            phases.mark("1 analysis")
+            added = len(merged.traps) - len(heuristic.traps)
+            print(f"[verify] the analysis turn added {added} trap(s) to the "
+                  f"{len(heuristic.traps)} the scan already had")
+            return merged
+        except Exception as exc:  # noqa: BLE001 - the heuristic pass stands
+            print(f"[verify] the analysis turn produced nothing usable "
+                  f"({type(exc).__name__}: {exc}); going on with the scan "
+                  f"alone")
+            return heuristic
+        finally:
+            if conversation is not None:
+                with contextlib.suppress(Exception):
+                    await conversation.close()
+
+    # -- stage 4: the inputs, with no answers ----------------------------- #
+    async def _write_inputs(
+        self, task, analysis, budget: float, started: float,
+        avoid: Optional[str], probe: Optional[list], plan: Optional["_Plan"],
+        phases: "_Phases",
+    ) -> list[dict[str, Any]]:
+        """Inputs only. Runs beside the oracle and the candidate.
+
+        A failure here costs the CHECK and not the answer: with no inputs
+        there is nothing to run either program on, the differential reports
+        that it established nothing, and the candidate ships ungraded rather
+        than not at all.
+        """
+        conversation = None
+        turn = time.monotonic()
+        try:
+            conversation = await self._open_within(
+                budget, started, avoid, phase="tests"
+            )
+            if plan is not None:
+                plan.tests_provider = getattr(conversation, "provider", None)
+            reply = await self._send_within(
+                conversation,
+                build_inputs_prompt(task, analysis, want_probe=probe is not None),
+                max(1.0, budget - (time.monotonic() - started)),
+            )
+            if probe is not None:
+                found = extract_generator(reply)
+                if found:
+                    probe.append(found)
+            cases = extract_inputs(reply, task.language)
+            phases.mark("1 inputs", beside=True, ended=turn)
+            if not cases:
+                print("[verify] the inputs turn produced none usable; the "
+                      "candidate will ship unchecked unless a repair finds one")
+            return cases
+        except Exception as exc:  # noqa: BLE001 - never lose the answer to the bar
+            print(f"[verify] the inputs turn failed ({type(exc).__name__}: {exc}); "
+                  f"there is nothing to run either program on")
+            return []
+        finally:
+            if conversation is not None:
+                with contextlib.suppress(Exception):
+                    await conversation.close()
+
+    # -- stage 5: the reference, written to be obviously right ------------ #
+    async def _write_oracle(
+        self, task, analysis, budget: float, started: float,
+        avoid: Optional[str], plan: Optional["_Plan"], phases: "_Phases",
+    ) -> str:
+        """The slow literal program the candidate is compared against.
+
+        Opened on its own phase and its own conversation, and that separation
+        is the design rather than tidiness: the reference must not be able to
+        see the candidate, or it stops being an independent reading of the
+        statement and becomes a second draft of the same one.
+        """
+        conversation = None
+        turn = time.monotonic()
+        try:
+            conversation = await self._open_within(
+                budget, started, avoid, phase="oracle"
+            )
+            if plan is not None:
+                plan.oracle_provider = getattr(conversation, "provider", None)
+            reply = await self._send_within(
+                conversation,
+                build_oracle_prompt(task, analysis),
+                max(1.0, budget - (time.monotonic() - started)),
+            )
+            code = extract_code(reply, task.entrypoint, task.language)
+            phases.mark("1 reference", beside=True, ended=turn)
+            if not code.strip():
+                print("[verify] the reference turn produced no program; "
+                      "nothing can be compared against the candidate")
+            return code
+        except Exception as exc:  # noqa: BLE001 - never lose the answer to the bar
+            print(f"[verify] the reference turn failed ({type(exc).__name__}: {exc}); "
+                  f"the candidate cannot be checked against one")
+            return ""
+        finally:
+            if conversation is not None:
+                with contextlib.suppress(Exception):
+                    await conversation.close()
 
     async def _attempt(
         self,
@@ -2437,1818 +2172,370 @@ class VerifyingSolver:
         plan: Optional["_Plan"] = None,
         pass_no: int = 1,
     ) -> tuple[Optional[Candidate], Optional[str]]:
-        """One model, one conversation: initial answer plus repair rounds.
+        """One pass of the nine stages. Returns the best candidate and who wrote it.
 
-        The repair rounds deliberately stay in that single conversation so the
-        model sees its own previous attempt beside the failure report. Returns
-        the best candidate it produced and which provider produced it.
+        The shape, and why it is this shape:
+
+          * stage 3 runs alone, because every later prompt is handed its result;
+          * stages 4, 5 and 6 run TOGETHER, because none consumes another's
+            output -- the critical path is one analysis plus the slowest of
+            three, not the sum of four;
+          * stage 7 runs the reference and the candidate on the same inputs and
+            is the only stage with no model call in it;
+          * stage 8 repairs whichever artifact the router names, on a phase
+            whose model is deliberately not the one that wrote the candidate.
+
+        One clock governs all of it. A stage runs if the deadline has not been
+        reached; nothing here asks whether a stage is "worth starting", because
+        every constant that would answer that is a guess about how long a model
+        will take.
         """
         started = time.monotonic()
-        # 1.0, not 5.0. A floor above what the caller can afford does not buy a
-        # longer read, it buys a cancelled solve: `solve_task` has already cut
-        # the request down to something deliverable, and raising it back here
-        # undoes that silently.
         budget = max(1.0, remaining)
         best: Optional[Candidate] = None
-        conversation = None
-        provider: Optional[str] = None
-        # Which provider produced `best` -- not which one this pass is talking
-        # to NOW. They part company the moment a repair is carried elsewhere:
-        # the pass then ends holding an answer from the first model and a
-        # conversation with the second, and returning the latter credits the
-        # wrong account. That is the one question the per-provider tally exists
-        # to answer, so it follows `best` rather than the conversation.
-        #
-        # Bound out here beside `provider`, for the same reason: `open()` can
-        # raise, the handler below catches it, and the return then reads a name
-        # the try block never got to bind.
+        best_score: tuple = ()
         best_provider: Optional[str] = None
-        # The cases conversation and the turn running in it, when the bar is
-        # written somewhere other than where the program is. Bound out here
-        # beside `best_provider` and for the same reason: the cleanup below
-        # runs for every way this returns, including the ones that never got
-        # as far as opening them.
-        bar: list = []
-        bar_task: Optional[asyncio.Task] = None
-        bar_started = 0.0
-        # The SECOND bar, written beside the first by a different model. Same
-        # shape, same lifetime, and bound out here for the same reason: the
-        # cleanup below runs for every way this returns.
-        bar2: list = []
-        bar2_task: Optional[asyncio.Task] = None
-        bar2_started = 0.0
-        # Cases the two bars wrote for the same call and disagree about, as
-        # {key: what the second bar expected}. Not a failure of either: two
-        # readings differing about one call is the statement being ambiguous
-        # there, and a program that disagrees with such a case is not thereby
-        # shown to be wrong.
-        split_keys: dict[tuple, Any] = {}
-        # Cases an independent reader has already ruled on, so no case is put
-        # to one twice in a pass: the answer would be the same and the turn
-        # would not.
-        adjudicated: dict[tuple, tuple[str, Any]] = {}
-        # One retry of an empty cases turn, per pass. See where it fires.
-        bar_retried = False
-        # The size probe's generator, filled in by the cases turn, and what it
-        # said about each program it was asked about. Keyed by source: asking
-        # twice about the SAME program answers the same, and a round that
-        # changes the program produces a new key, so the replacement is timed
-        # in its turn rather than shipping on the strength of its predecessor's
-        # verdict.
-        probe: list = []
-        probed: dict[str, _Probe] = {}
-        # Correction rounds sent into the conversation now in hand. Reset when
-        # the repair is carried elsewhere, so each conversation is judged on
-        # what it did rather than on what the pass has spent.
-        rounds_here = 0
-        # Whether the program turn's phase line already went out -- it does,
-        # early, when the retry runs between the turn and its grading.
-        program_marked = False
+        conversation = None
+        repair_conv = None
+        provider: Optional[str] = None
+
+        def left() -> float:
+            return budget - (time.monotonic() - started)
+
+        def note_exit(reason: str) -> None:
+            if plan is not None:
+                plan.note_exit(reason)
+
         try:
-            # BOUNDED by what is left. `BrowserFleet.open` waits for a free tab
-            # up to `MINER_TAB_WAIT_S`, which ships at 120s, and nothing here
-            # ever passed a smaller number -- so on a busy fleet a solve could
-            # spend 120s per pass waiting, three passes, 360s against a 280s
-            # deadline, and return empty having sent no prompt at all. Measured:
-            # budget 40s, elapsed 50.1s, `open()` called at t=0 and t=25.1,
-            # prompts sent 0.
             phases = _Phases(budget, started, pass_no, ident=_ident(task))
             if plan is not None:
-                # Per pass, like `exit=`: the summary line describes the pass
-                # that shipped, and a second pass runs only after the first
-                # delivered nothing. Left accumulating, a solve whose first
-                # pass spent three rounds and died reported `rounds=4` for
-                # the one round its second pass actually took.
-                #
-                # Everything here is per pass for that reason, and `probe`
-                # most of all. It gates the on-disk cache, so a first pass
-                # that timed a program at scale and then failed to deliver
-                # would have vouched for the SECOND pass's program -- a
-                # different program, never timed -- and put it on disk to be
-                # served again unexamined.
+                # Per pass, like `exit`: the summary line describes the pass
+                # that SHIPPED, and a second pass runs only after the first
+                # delivered nothing.
                 plan.rounds = 0
                 plan.corrected = 0
                 plan.probe = ""
-                plan.adjudicated = {}
-                plan.contested = 0
                 plan.repair = []
-                plan.union = None
-                plan.split = 0
-                plan.bar_provider = None
-                plan.bar2_provider = None
+                plan.patched = []
+                plan.regressed = 0
+                plan.flipped = 0
+                plan.ran = plan.agreed = 0
+                plan.mismatch = plan.oracle_crash = 0
+                plan.tests_provider = None
+                plan.oracle_provider = None
+
+            # -- 2. the free trap scan -------------------------------------
+            analysis = heuristic_analyze(task)
+
+            # -- 3. the analysis turn --------------------------------------
+            if self._llm_analysis and left() >= MIN_SLICE_S:
+                analysis = await self._analyse(
+                    task, analysis, budget, started, avoid, phases
+                )
+
+            # -- 4, 5, 6 side by side --------------------------------------
+            probe: Optional[list] = [] if self._size_probe else None
+            probed: dict[str, _Probe] = {}
+            # `SOLVER_SELF_TESTS=0` turns the local check off, and with it both
+            # turns that exist only to produce one. Live traffic ships no
+            # public examples, so with this off nothing is graded, nothing is
+            # compared and the repair loop never fires -- the answer is
+            # whatever the candidate turn said. It is off the default path and
+            # it is a shipped configuration, for an operator who wants one turn
+            # per solve and will take the score that comes with it.
+            #
+            # Both turns go together. Inputs with no reference cannot be
+            # answered and a reference with no inputs has nothing to run on, so
+            # keeping either one alone would buy a conversation and a model's
+            # time for a comparison that cannot happen.
+            inputs_task = (
+                asyncio.create_task(self._write_inputs(
+                    task, analysis, budget, started, avoid, probe, plan, phases))
+                if self._self_tests else None
+            )
+            oracle_task = (
+                asyncio.create_task(self._write_oracle(
+                    task, analysis, budget, started, avoid, plan, phases))
+                if self._self_tests else None
+            )
+
             conversation = await self._open_within(
-                budget, started, avoid, phase="program"
+                budget, started, avoid, phase="candidate"
             )
             provider = best_provider = getattr(conversation, "provider", None)
             phases.mark(f"open {provider or 'tab'}")
-            # Turn 1: the cases, before the program exists. Cases written
-            # ALONGSIDE a program can be back-filled from what the program
-            # happens to do, and then they agree with its bugs; cases written
-            # first cannot. That is the whole argument for spending a round
-            # trip here.
-            cases: Optional[list] = None
-            two_phase = plan is None or plan.two_phase
-            if self._self_tests and two_phase and self._independent_bar:
-                # A SECOND conversation, on the `cases` phase's model, asked at
-                # the same moment the program is. Two things follow, and both
-                # are what the archived runs say is missing.
-                #
-                # Independence. Sequentially in one session the program turn is
-                # written with the cases already in its context, by the model
-                # that wrote them, from that model's one reading of the
-                # statement. A bar the author can see is not a check. Measured
-                # across the 97 solves the two archived runs report: 96 shipped
-                # a program that passed EVERY one of its own ~18 cases, and 71
-                # never had a single disagreement to repair -- against a hidden
-                # suite those runs passed 78-83% of the time. About one shipped
-                # answer in five clears a bar it wrote for itself and still
-                # fails, which is what a bar and a program wrong the same way
-                # looks like from outside.
-                #
-                # Time. Those two turns are 83.8% of all phase time and they
-                # run back to back: cases p50 56.9s, program p50 63.5s, so
-                # p50 120.4s of a 280s budget spent before the first grade.
-                # Side by side that is max() rather than sum: p50 ~63.5s, and
-                # at p90 (95.1s and 171.2s) ~171s instead of ~266s. Shipped
-                # solves ran p90 274s against a 280s stop; this is where the
-                # headroom for the repair rounds comes from.
-                bar_started = time.monotonic()
-                # The OPEN goes inside the task too, not just the turn. A
-                # fleet backend waits for a free tab, and awaiting that here
-                # would put the bar's queue on the program's critical path --
-                # the one thing the split exists to take it off. `bar` is a
-                # one-element list so the cleanup below can close whatever the
-                # task got as far as opening.
-                bar = []
-                bar_task = asyncio.create_task(
-                    self._write_the_bar(
-                        bar, task, budget, started, avoid, plan,
-                        probe=probe if self._size_probe else None,
-                    )
-                )
-                # A SECOND bar, beside the first, on a different model.
-                #
-                # It is the only mechanism here that reaches the solves where
-                # nothing ever disagreed -- 39 of 54 in the last live run, and
-                # 71 of 97 before that. A bar and a program written by one
-                # model from one reading of the statement share that reading's
-                # mistakes, so the bar ratifies the bug instead of catching it,
-                # and no amount of repair-loop work helps a round that never
-                # fires. A reader that is not the program's author is the only
-                # thing that changes which cases get written at all.
-                #
-                # Free in wall-clock and not free in tokens: it runs beside the
-                # program turn like the first bar, so the critical path is
-                # still max() rather than sum, and it costs one cases turn's
-                # output. `cases2` is pinned to a different model in
-                # `cli_phase_profiles` rather than steered with `avoid`,
-                # because the first bar's provider is not known yet -- both
-                # turns start together.
-                if self._second_bar:
-                    bar2_started = time.monotonic()
-                    bar2 = []
-                    bar2_task = asyncio.create_task(
-                        self._write_the_bar(
-                            bar2, task, budget, started, avoid, plan,
-                            phase="cases2", provider_slot="bar2_provider",
-                            # The generator too: when the first bar's turn
-                            # comes back without one, this is a second chance
-                            # at a probe rather than none.
-                            probe=probe if self._size_probe else None,
-                        )
-                    )
-                print(
-                    f"[verify] the bar is being written in a separate "
-                    f"conversation while {provider or 'this one'} writes the "
-                    f"program, so neither reading of the statement can see the "
-                    f"other"
-                    + (
-                        ", and a second bar beside it on another model"
-                        if bar2_task is not None else ""
-                    )
-                )
-            elif self._self_tests and two_phase:
-                asked_at = time.monotonic()
-                left_for_cases = budget - (time.monotonic() - started)
-                # Everything left. A ceiling here is a second deadline on a
-                # solve that has one, and the only thing it can do that the
-                # deadline does not is cut a model off mid-answer -- which
-                # costs the whole turn, because half a bar is worse than none.
-                cases = await self._ask_for_cases(
-                    conversation, task, left_for_cases
-                )
-                # Re-read after EVERY turn, here and below: a backend may move
-                # a conversation to another model or seat inside a turn (the
-                # CLI ladder does), and `provider` bound at open would then
-                # credit the answer to the pair that refused it -- and, passed
-                # back as `avoid`, ask "anyone but the refuser" when the ask
-                # was "anyone but the one that just answered".
-                provider = best_provider = getattr(conversation, "provider", provider)
-                phases.mark("1 cases", model_s=time.monotonic() - asked_at)
-                if cases is None:
-                    # The tab could not be read, or the model was still writing.
-                    # Sending turn 2 into it would queue behind an answer that
-                    # has not arrived, so this conversation is finished either
-                    # way. What differs is whether anything else is worth doing,
-                    # and the clock decides it.
-                    #
-                    # Whether anything ELSE happens is already decided, by the
-                    # clock, in `solve_task`: it will not open another pass
-                    # once the deadline is gone. That is the whole
-                    # guarantee "a turn that ran the deadline out is never
-                    # retried on another tab" rests on, and it holds only
-                    # because turn 1 now reads against the real budget -- when
-                    # it was capped at 60s the budget survived it and four tabs
-                    # were spent in a row. Deciding it a second time here would
-                    # be a duplicate of that floor, and a duplicate that drifts.
-                    #
-                    # So the only job left is to say which failure this was,
-                    # because "asking another model" was printed even when
-                    # nothing else would be asked.
-                    left_after = budget - (time.monotonic() - started)
-                    # WHOSE failure was it, though. `unreadable` is set by
-                    # `_read` only when the tab went blind or the page died,
-                    # and it retires that tab at the same moment -- so the next
-                    # pass is served by a different one and the reason cannot
-                    # follow it there. Every other way this returns None is a
-                    # model that had not finished writing, which belongs to the
-                    # task and the site and WOULD repeat exactly.
-                    tab_side = (
-                        getattr(conversation, "empty_reason", None) == "unreadable"
-                    )
-                    if plan is not None and not tab_side:
-                        # Not the same way twice. A long thinking phase, a slow
-                        # account, a hard problem: the next pass would repeat
-                        # it. It did: four passes, four timed-out cases turns,
-                        # nothing submitted. The remaining passes ask for the
-                        # program alone, and that task is submitted ungraded.
-                        #
-                        # Clearing this for a DEAD TAB was the same mistake
-                        # pointed the other way. It cost the rest of the solve
-                        # the split -- and on live traffic, which ships no
-                        # public examples, the model's own cases are the only
-                        # grading there is. Turn 2 alone falls back to the
-                        # combined prompt, where the cases are written beside
-                        # the program and can be back-filled from whatever it
-                        # happens to do. One blind tab is not evidence about
-                        # the task, and `BLIND_TAB_GRACE_S` bounds what finding
-                        # that out costs.
-                        plan.two_phase = False
-                    if left_after <= 0:
-                        print(
-                            f"[verify] the cases turn used the whole "
-                            f"{budget:.0f}s budget; nothing left to ask anyone "
-                            f"else with"
-                        )
-                    elif tab_side:
-                        print(f"[verify] {left_after:.0f}s left; that tab is gone, "
-                              f"not the cases turn — the next pass asks another "
-                              f"one for cases as usual")
-                    else:
-                        print(f"[verify] {left_after:.0f}s left; not asking for "
-                              f"cases again this task, the remaining attempts "
-                              f"go straight to the program")
-                    # The cases turn never answered, so no program was asked
-                    # for this pass. Unrecorded, `exit=` kept whatever an
-                    # earlier pass had left in it -- or nothing.
-                    if plan is not None:
-                        plan.note_exit("cases")
-                    return best, best_provider
-            prompt = build_code_prompt(
-                task.language, task.statement, task.entrypoint,
-                task.public_examples, cases=cases,
+            candidate_reply = await self._send_within(
+                conversation, build_candidate_prompt(task, analysis),
+                max(1.0, left()),
             )
-            # `cases or []` covers None as well as [], and it matters: the
-            # early return above is the only thing that keeps None out of here,
-            # so `list(cases)` was one edit away from a TypeError -- which this
-            # module CATCHES as a backend failure and reports as "provider=none"
-            # with no answer. A crash that looks like a dead tab is the worst
-            # kind, so the line does not depend on the guard above surviving.
-            agreed = list(cases or [])
-            # The program the LAST round produced, so a repair that corrects a
-            # case can be told apart from one that rewrites both -- and the
-            # reply that carried it, so a correction sent WITHOUT the program
-            # can still be graded against something.
-            last_code: Optional[str] = None
-            last_program_reply: Optional[str] = None
-            # The models this pass has already handed the repair to, in
-            # order. A rotation rather than a single handoff: see
-            # `_resume_elsewhere`. The deadline ends it, not a count.
-            rotated: list = []
-            # Empty unless the backend can be asked for a NAMED model. A
-            # browser fleet cannot -- every tab is the same subscription --
-            # so there a handoff buys a fresh conversation and nothing more,
-            # and the once-per-pass rule it always had still applies.
-            rotation = (
-                self._rotation
-                if getattr(self._backend, "open_profile", None) is not None
-                else ()
-            )
-            # What each round AMOUNTED to -- the program, the defect and the
-            # failing cases -- so a round that changed nothing can be told from
-            # one that did. See `duplicate` below.
-            #
-            # Every round of the pass, not just the one before. Comparing
-            # against the previous round only is blind to the shape this loop
-            # actually spins in, which alternates: a repair round reports
-            # failures F on program P, the next reply comes back as cases the
-            # revision guard refuses, that round grades as something else, and
-            # the round after is P and F again. No two CONSECUTIVE signatures
-            # ever matched, so the guard never fired once -- measured, fifty-
-            # nine sends inside a single solve.
-            seen_signatures: dict[tuple, int] = {}
-            # How many times each repair report has already gone out, so a
-            # prompt is never sent byte-identical twice without saying so. See
-            # `stalled` where the next prompt is built.
-            reports_sent: dict[str, int] = {}
-            # What grading established about each program this pass has seen,
-            # by its source. See `_inherit_evidence` for what it is for.
-            judged: dict[str, Candidate] = {}
-            # The cases the LAST round failed -- the ones the repair prompt
-            # just quoted, and so the only ones the reply to it is entitled to
-            # change. See `_merge_cases`.
-            reported_failed: list[dict] = []
-            # Consecutive rounds that left the program exactly as it was. See
-            # `CASES_ONLY_ROUNDS`.
-            program_unchanged = 0
-            # Replies refused whole for rewriting too much of the bar at once.
-            # See `BULK_CORRECTION_SHARE`.
-            bulk_refusals = 0
-            # Whether the prompt just sent WITHDREW the offer to correct a
-            # case. A withdrawal the reply can ignore is not one.
-            program_only = False
-            async def _resume_elsewhere(
-                why: str, avoid: Optional[str] = None, slow: Optional[str] = None,
-            ):
-                """Carry the repair to a FRESH conversation, or None.
+            phases.mark("2 candidate")
 
-                `slow` is the size probe's sentence when the program in hand
-                is correct on every case and merely too slow at scale. That is
-                a fault worth carrying -- the validator fails every large
-                hidden test on it -- and it used to be refused here, because
-                the guard below asked for failures or a defect and a slow
-                program has neither. So the too_slow handoff was dead code:
-                the loop printed "nobody else to ask" with two models on the
-                rotation never asked, and shipped a program known to time out.
+            inputs = await inputs_task if inputs_task is not None else []
+            oracle = await oracle_task if oracle_task is not None else ""
+            if not self._self_tests:
+                print("[verify] the local check is off "
+                      "(SOLVER_SELF_TESTS=0); the candidate ships unchecked")
 
-                Declines say why. Every caller used to word its exit line from
-                its own guess -- "every model has had it", "nobody else to
-                ask" -- and each guess was wrong on some path.
-
-                The one move available when a conversation will not produce a
-                new answer -- because it is unreadable, or because it just
-                repeated itself. Both are the same situation from here: nothing
-                more is coming from this tab, and the repair is still worth
-                making somewhere else.
-
-                `avoid` is what separates the two. An unreadable tab is a TAB
-                problem -- the model is fine and any tab will do, so it passes
-                none. A conversation that repeated itself is a MODEL problem,
-                and the answer to that is the other model: it arrives holding
-                the previous program and the cases it failed, which is a far
-                better start than the fresh pass `solve_task` would give it.
-                On live traffic that pass does not happen at all -- with no
-                public examples nothing can be graded, and `solve_task` breaks
-                rather than spend a second account on an answer it cannot
-                compare. So this is the only place the other model gets asked.
-
-                Once per pass. A second tab that also fails is a fleet problem
-                rather than something to keep paying for, and the caller then
-                ends the loop holding the best answer it ever had.
-
-                Returns `(conversation, provider, prompt)` for the caller to
-                install, so the loop's own bindings stay the single source of
-                truth for what it is talking to.
-                """
-                nonlocal program_only, program_unchanged, reported_failed
-                nonlocal rounds_here
-                left_now = budget - (time.monotonic() - started)
-                if best is None or not best.code.strip():
-                    print("[verify] the repair is not carried on: no program "
-                          "in hand to carry")
-                    return None
-                if not (best.failures or best.defect or slow):
-                    print("[verify] the repair is not carried on: the program "
-                          "in hand has no fault to report")
-                    return None
-                if left_now < MIN_SLICE_S:
-                    # The only clock. There was a 40s floor here on the theory
-                    # that a fresh conversation needs that long to be worth
-                    # opening; it stopped the rotation with time on the
-                    # validator's clock, which is the one thing the rotation
-                    # must not do. A handoff opened with seconds left is cut by
-                    # the deadline like any other read; one that could not be
-                    # handed the minimum slice without padding past the
-                    # deadline is not opened.
-                    print("[verify] the repair is not carried on: the deadline "
-                          "is gone")
-                    return None
-                # ONCE per model, not once per pass. The old rule stopped after
-                # a single handoff on the theory that a second tab failing is a
-                # fleet problem rather than something to keep paying for -- true
-                # of a DEAD TAB, and not true of the case this is now mostly
-                # used for. A repair that stays where the program was written
-                # asks the model to find a fault in its own reading of the
-                # statement, and measured over 54 live solves it does not:
-                # nine of ten single-case disagreements ended with the model
-                # editing its own case and keeping its program. The answer to
-                # that is another reading, and then another, for as long as the
-                # deadline allows -- which is what bounds this now.
-                if rotation:
-                    # The model handing this on has had its rounds with it, so
-                    # it joins the used set rather than being skipped only
-                    # while it happens to be the incumbent.
-                    leaving = next(
-                        (
-                            profile for profile in rotation
-                            if profile.model
-                            and profile.model.lower() in (provider or "").lower()
-                        ),
-                        None,
-                    )
-                    if leaving is not None and leaving not in rotated:
-                        rotated.append(leaving)
-                    nxt = _next_profile(rotation, rotated, provider)
-                    if nxt is None:
-                        # Every model has had it once. That is a lap, not the
-                        # end: the correction runs until the program passes or
-                        # the deadline stops it (operator's rule), and a model
-                        # is stochastic -- its second look at a program another
-                        # model has since rewritten is a real chance. Stopping
-                        # here was a round cap of 3 x ROTATE_AFTER_ROUNDS that
-                        # shipped wrong programs with minutes left.
-                        rotated.clear()
-                        if leaving is not None:
-                            rotated.append(leaving)
-                        nxt = _next_profile(rotation, rotated, provider)
-                        if nxt is None:
-                            print("[verify] the repair is not carried on: the "
-                                  "rotation has no model but the one answering")
-                            return None
-                        print(f"[verify] every model on the rotation has had "
-                              f"the repair once; going round again with "
-                              f"{left_now:.0f}s left")
-                    rotated.append(nxt)
-                else:
-                    # No models to rotate through -- a browser fleet, where
-                    # every tab is the same model and a handoff buys a fresh
-                    # conversation and nothing else. There the original rule
-                    # still holds: a second tab that also fails is a fleet
-                    # problem rather than something to keep paying for.
-                    if rotated:
-                        print("[verify] the repair is not carried on: it has "
-                              "already been carried once and there is no "
-                              "other model to carry it to")
-                        return None
-                    nxt = None
-                    rotated.append(None)
-                # A fresh conversation is a fresh start, and three pieces of
-                # state are about the OLD one.
-                #
-                # `program_only` most of all: the resume prompt offers the case
-                # correction by name, and leaving the withdrawal set meant the
-                # loop asked the second model for a corrected case and then
-                # threw the answer away when it arrived. The one path that ever
-                # reaches a second model, spending its correction on a rule the
-                # prompt it answered never stated.
-                #
-                # `reported_failed` because the resume prompt quotes `best`'s
-                # failures, so `best`'s cases are the ones in play -- not
-                # whatever the last round happened to leave behind.
-                program_only = False
-                program_unchanged = 0
-                rounds_here = 0
-                reported_failed = list(best.failed_cases)
-                print(
-                    f"[verify] {why}; carrying the repair to a fresh "
-                    f"conversation with {left_now:.0f}s left"
-                )
-                try:
-                    await conversation.close()
-                except Exception:  # noqa: BLE001 - it may already be broken
-                    pass
-                # `phase="repair"` -- which matters on exactly one of the two
-                # call sites. A resume that names an `avoid` is fleeing a model
-                # that just got this wrong, and `open_for` lets `avoid` beat
-                # the preference for that reason; a resume with none is fleeing
-                # a DEAD TAB, where the model was never the problem and the
-                # operator's choice for repairs is the right seat to land on.
-                fresh = await self._open_within(
-                    budget, started, avoid, phase="repair", profile=nxt,
-                )
-                landed = getattr(fresh, "provider", None)
-                # Did the MODEL actually change? A browser fleet has none to
-                # change, and `open_profile` falls through to the ladder when
-                # the one asked for is out everywhere -- so a handoff can land
-                # right back on the model that wrote the program. Telling that
-                # model it is looking at someone else's work is the same false
-                # premise the flag exists to remove, pointed the other way.
-                elsewhere = bool(
-                    landed and provider
-                    and _model_of(landed) != _model_of(provider)
-                )
-                phases.mark(f"open {landed or 'tab'}")
-                if plan is not None and landed:
-                    plan.repair.append(landed)
-                return (
-                    fresh,
-                    landed or provider,
-                    build_resume_prompt(
-                        task.language, task.statement, task.entrypoint,
-                        task.public_examples, agreed, best.code,
-                        best.failures, defect=best.defect,
-                        from_self_tests=best.from_self_tests,
-                        bar_is_independent=self._independent_bar,
-                        failed_cases=best.failed_cases,
-                        # This model did not write the program it is being
-                        # shown. Saying otherwise is a false premise about the
-                        # one thing the round turns on, and a false premise
-                        # gets argued with rather than acted on.
-                        foreign=elsewhere,
-                        # ALL of them, not any: the prompt's confirmation
-                        # withdraws the case offer for every failure it lists,
-                        # so it may only be made when every listed case was
-                        # confirmed. One confirmed and one merely failing used
-                        # to lock the model out of correcting the second.
-                        case_confirmed=bool(best.failed_cases) and all(
-                            adjudicated.get(_case_key(case), ("", None))[0]
-                            == "case"
-                            for case in best.failed_cases
-                        ),
-                        too_slow=slow,
-                    ),
-                )
-
-            bar2_joined = False
-
-            async def join_bar2() -> bool:
-                """The second bar, joined to the first IF it has landed.
-
-                Never waits, and is asked often: when the first bar is
-                collected, before every grade, and once more before a program
-                is called converged. That is what makes it incremental. The
-                second bar is an addition to a bar that already exists, so
-                nothing is ever held for it -- but it was once CANCELLED the
-                first time it was not ready, at the first join, and that cut
-                the stage on the program turn's clock rather than the
-                deadline: whenever sonnet's cases turn ran longer than opus's
-                program turn, the one mechanism aimed at the solves where bar
-                and program agree was thrown away with most of the budget
-                left. Now a bar that lands during round three is graded
-                against from round three.
-
-                True when cases were added, so a caller about to ship can
-                re-grade against them first.
-                """
-                nonlocal agreed, split_keys, bar2_task, bar2, bar2_joined
-                if bar2_task is None or not bar2_task.done():
-                    return False
-                extra = await self._collect_bar(
-                    bar2_task, bar2, phases, budget, started, bar2_started,
-                    label="1 bar2", who="the second bar", quiet=True,
-                )
-                bar2_task, bar2 = None, []
-                bar2_joined = True
-                if not extra:
-                    return False
-                before = len(agreed)
-                agreed, split_keys = _union_bars(agreed, extra, task.language)
-                if plan is not None:
-                    plan.union = (before, len(extra), len(agreed))
-                    plan.split = len(split_keys)
-                print(
-                    f"[verify] the two bars union to {len(agreed)} case(s) "
-                    f"({before} + {len(extra)}, {len(split_keys)} of them the "
-                    f"same call read two ways)"
-                )
-                return len(agreed) > before
-
-            def _too_slow_report(slow: str) -> str:
-                """The too_slow repair prompt, with a repeat named as one.
-
-                Through the same `reports_sent` bookkeeping as every other
-                report. With the verdict cached per program, a model that
-                re-sends the same slow program used to receive the identical
-                prompt word for word every round -- the exact pattern the
-                stalled mechanism exists to break.
-                """
-                report = build_repair_prompt(
-                    [], task.language, task.entrypoint, too_slow=slow
-                )
-                stalled = reports_sent.get(report, 0)
-                reports_sent[report] = stalled + 1
-                if stalled:
-                    print(
-                        f"[verify] this same too_slow report has now gone out "
-                        f"{stalled + 1} times; naming the repetition in it"
-                    )
-                    report = build_repair_prompt(
-                        [], task.language, task.entrypoint, too_slow=slow,
-                        stalled=stalled,
-                    )
-                return report
-
+            # -- 7 and 8: compare, then repair whichever is wrong ----------
+            differential = Differential(self._grader, VERIFY_TIMEOUT_S)
+            router = Router()
+            # Every (candidate, reference, failing cases) this pass has seen.
+            # A round that leaves all three unchanged moved nothing, and the
+            # next round would send the same prompt and read the same reply --
+            # so it is a stall, not progress, and the budget is better spent
+            # shipping what is in hand. Measured under the previous design,
+            # which compared only against the PREVIOUS round rather than all
+            # of them: 59 sends in one solve, cycling between two answers.
+            seen: set[tuple] = set()
+            # Which artifact the previous round patched. A stall only ends the
+            # pass when the router names that same one again -- a stalled
+            # candidate repair is exactly when trying the reference is worth a
+            # round, and giving up there would leave a wrong reference
+            # unexamined.
+            last_patched = ""
+            last_code = ""
+            # How long the round that produced the reply now in hand took. Only
+            # read when that round changed nothing -- see `STALE_ROUND_S`.
+            round_s = float("inf")
+            # Which conversation produced the reply now being graded. Stage 6
+            # writes the first candidate; from round 2 a candidate repair is
+            # written by the repair conversation instead, and "the model was
+            # still writing" is a fact about whichever tab actually wrote it.
+            # Reading it off the stage-6 conversation forever would let one
+            # unfinished first draft end every later round as a cutoff.
+            writer = conversation
             attempt = 0
             while True:
                 attempt += 1
-                left = budget - (time.monotonic() - started)
-                if attempt > 1 and left < MIN_SLICE_S:
-                    # The deadline, and only the deadline. This used to be a
-                    # round-trip floor (12s; 20s on the CLI backend) on the
-                    # theory that a round started under it cannot finish --
-                    # and it stopped the loop with a wrong program in hand and
-                    # time on the validator's clock, which is the one thing the
-                    # correction must not do (operator's rule). A round started
-                    # with seconds left is cut by the same deadline as every
-                    # other read, and `_supersedes` keeps a fragment from
-                    # displacing the answer in hand. `MIN_SLICE_S` is not a
-                    # budget: it is the least slice `send` can be handed, and
-                    # a round that would have to be padded past the deadline
-                    # to be sent at all is one the deadline has ended. The
-                    # first attempt always runs, however little there is,
-                    # exactly as the first pass does in `solve_task`.
-                    #
-                    # And this branch itself used to be the silent one. The
-                    # deadline is the ordinary way a correction loop ends -- it
-                    # runs until the answer passes or the clock stops it -- so
-                    # it is the last thing that should happen without a word.
-                    print(
-                        "[verify] the deadline is gone; submitting the last version"
-                        + (
-                            " unverified"
-                            if best is None or not best.verified
-                            else ""
-                        )
-                    )
-                    if plan is not None:
-                        plan.note_exit("budget")
+                if attempt > 1 and left() < MIN_SLICE_S:
+                    print("[verify] the deadline is gone; submitting the last "
+                          "version" + ("" if best is not None
+                                       and best.verified else " unverified"))
+                    note_exit("budget")
                     break
-                if self._max_attempts and attempt > self._max_attempts:
-                    print(
-                        f"[verify] SOLVER_MAX_ATTEMPTS={self._max_attempts} "
-                        f"reached; submitting the last version"
-                        + (
-                            " unverified"
-                            if best is None or not best.verified
-                            else ""
-                        )
-                    )
-                    if plan is not None:
-                        plan.note_exit("maxattempts")
-                    break
-                # Every round reads against EVERYTHING that is left. Earlier
-                # builds handed the first attempt a fraction (60% with public
-                # examples, 85% without) so a repair would have something to
-                # spend, and that reserve was worth least exactly when it cost
-                # most: `send` returns the moment the model finishes, so the
-                # slice was never a wait -- only a ceiling on a read that ran
-                # long, which is the one case where cutting it short throws away
-                # the answer. The loop below stops when a round trip no longer
-                # fits; nothing is carved out in advance.
-                # No `extend_to_s`, for the same reason the cases turn passes
-                # none: the slice already IS everything left, so there is
-                # nothing being held back to extend into. Passing one equal to
-                # the slice makes `send`'s extension a no-op by construction and
-                # only reads as though a reserve existed.
-                # No `extend_to_s`: `left` already runs to the point the
-                # answer stops being deliverable, so there is nothing past it to
-                # extend into.
-                # Counted HERE, where a prompt is about to go out -- not at the
-                # top of the loop, which counts entries. The budget and
-                # max-attempts breaks sit between the two and send nothing, so
-                # every solve that ended either way reported one round more
-                # than it asked for. Before the send rather than after it: a
-                # round whose send raises or is cut off was still asked, and
-                # `exit=cutoff` should not also lose its round.
                 if plan is not None:
                     plan.rounds += 1
-                if attempt > 1:
-                    # CORRECTION rounds only. Attempt 1 is the program itself,
-                    # and counting it would spend a third of this
-                    # conversation's budget before a single failure existed.
-                    rounds_here += 1
-                round_started = time.monotonic()
-                correction_refused = False
-                # Empty-handed: nothing finished is in hand to ship, so a cut
-                # here ships a fragment or nothing, and both score zero. The
-                # delivery reserve is worth more spent finishing this reply
-                # than protecting the delivery of that -- see `WIRE_TAIL_S`.
-                # With a program already in hand the budget stands: there the
-                # reserve is protecting an answer that can actually be paid
-                # for, and `_supersedes` already refuses to let a fragment
-                # displace it.
-                spare = (
-                    budget + self._reserve - WIRE_TAIL_S
-                    - (time.monotonic() - started)
-                )
-                reply = await self._send_within(
-                    conversation, prompt, max(1.0, left),
-                    extend_to_s=(
-                        spare
-                        if (best is None or not best.code.strip())
-                        and spare > left
-                        else None
-                    ),
-                )
-                provider = getattr(conversation, "provider", provider)
-                # How long the round trip actually took. Used only by the
-                # duplicate branch below, and only to tell a model from a tab.
-                # Read BEFORE the bar is collected: a round that came back in
-                # no time is how a replayed reply is caught, and charging it
-                # for a bar that was still being written elsewhere would hide
-                # exactly the case it exists to find.
-                round_s = time.monotonic() - round_started
-                if bar_task is not None:
-                    # The bar, now that the program it grades exists. Awaited
-                    # HERE rather than before the send, because awaiting it
-                    # before the send is the sequential shape this replaced;
-                    # and here rather than at first use, because `revised`
-                    # below already reasons about what the bar holds.
-                    agreed = await self._collect_bar(
-                        bar_task, bar, phases, budget, started, bar_started
-                    )
-                    bar_task, bar = None, []
-                    # The second reader, joined to the first if it has ALREADY
-                    # finished -- and asked again before every grade if it has
-                    # not. It is never waited for: bar1 has landed by now, so a
-                    # hung second model would otherwise hold the whole
-                    # remaining deadline and the answer would ship UNGRADED
-                    # with a perfectly good bar in hand.
-                    await join_bar2()
-                    if not agreed and not bar_retried:
-                        # A bar that came back with nothing leaves the solve
-                        # with NOTHING TO GRADE: `self_total` is 0, there are
-                        # no failures, the loop breaks on the next line and the
-                        # answer ships ungraded. Measured over the 102 archived
-                        # solves, that is 5 of them -- phase 2 and phase 3 both
-                        # inert -- while the median solve hands back 134s of
-                        # its 290s unspent. One more ask is the cheapest thing
-                        # that budget can buy.
-                        #
-                        # ONCE, and only while the plan still believes a cases
-                        # turn is affordable here. Whatever made the first one
-                        # come back empty -- a refusal, a reply that carried no
-                        # JSON, a turn cut off -- belongs to the task and the
-                        # site as often as not, and `_Plan.two_phase` is where
-                        # that lesson already lives.
-                        bar_retried = True
-                        left_now = budget - (time.monotonic() - started)
-                        if (
-                            self._self_tests
-                            and (plan is None or plan.two_phase)
-                            and left_now >= MIN_SLICE_S
-                        ):
-                            # The program's turn is already over, and the
-                            # retry is about to run AFTER it. Mark the turn
-                            # now, at the instant it ended, so the retry is
-                            # measured from there and not from the open --
-                            # and so the turn's own seconds are not handed to
-                            # the retry. Its grading has not happened yet;
-                            # that gets its own line below.
-                            phases.mark(
-                                "2 program", model_s=round_s,
-                                ended=round_started + round_s,
-                            )
-                            program_marked = True
-                            print(
-                                f"[verify] the cases turn came back with "
-                                f"nothing, so there is no bar to grade against "
-                                f"and the repair loop has nothing to work on; "
-                                f"asking once more with {left_now:.0f}s left"
-                            )
-                            bar, bar_started = [], time.monotonic()
-                            retry = asyncio.create_task(
-                                self._write_the_bar(
-                                    bar, task, budget, started, avoid, plan
-                                )
-                            )
-                            agreed = await self._collect_bar(
-                                retry, bar, phases, budget, started,
-                                bar_started, beside=False,
-                                label="1 cases again",
-                            )
-                            bar = []
-                            if not agreed and plan is not None:
-                                # Twice is evidence about the task, not the
-                                # tab. The remaining passes go straight to the
-                                # program rather than paying for a third.
-                                plan.two_phase = False
-                # A repair reply may carry a CORRECTED case array: the repair
-                # prompt offers it outright ("or, if the case was wrong rather
-                # than the program, a `json` array holding ALL of the cases").
-                # Freezing turn 1's cases would kill that escape hatch and let
-                # one wrong case break a correct program on every round.
-                #
-                # WHEN it takes effect differs by the shape the repair came
-                # back in, and both shapes matter.
-                #
-                # Program UNCHANGED, cases corrected -- exactly what was asked
-                # for. Applied to this same reply, because the alternative is to
-                # report the identical failure it was sent to fix: the round is
-                # spent, the next prompt quotes the same disagreement, and the
-                # correction lands only on the round after -- one more round
-                # trip spent re-reporting a failure already fixed, against a
-                # deadline. Measured on a live
-                # solve: turn 1 wrote three cases whose `final_records` order
-                # was wrong, the program was right, the model corrected the
-                # cases exactly as asked, and the answer still went out
-                # reported 17/20. Nothing is conceded by grading it now: the
-                # program is the one already judged, so a weakened case cannot
-                # launder a rewrite that did not happen.
-                #
-                # Program CHANGED as well -- the reply rewrote both sides of the
-                # disagreement. The prompt no longer spends a sentence
-                # forbidding that, because forbidding it was never what stopped
-                # it: this is. Such a reply is graded against the bar as it
-                # stood BEFORE it arrived, so a model cannot make a rewritten
-                # program pass by rewriting the bar in the same breath. Its
-                # cases apply from the next round.
-                revised = extract_self_tests(reply, task.entrypoint, task.language)
-                if revised and attempt == 1:
-                    # The PROGRAM turn. Its cases are back-filled from what the
-                    # program happens to do -- they agree with its bugs, which
-                    # is the entire argument for splitting the turns -- so the
-                    # bar stays the one turn 1 wrote before any program existed.
-                    #
-                    # Not a theoretical objection. Measured: turn 1 wrote a case
-                    # that CAUGHT the bug, turn 2 sent the buggy program with
-                    # two cases of its own, round 1 reported the real failure
-                    # and then adopted them, and round 2 re-graded the same
-                    # buggy program against the bar it had brought with it --
-                    # `self=2/2`, no failures, loop over, buggy program
-                    # submitted as passing everything. The rule that a reply is
-                    # judged against the bar as it stood before it arrived
-                    # covered repair rounds and left this one round short.
-                    print(
-                        f"[verify] the program turn sent {len(revised)} case(s) "
-                        f"of its own; keeping turn 1's — cases written beside a "
-                        f"program are back-filled from it"
-                    )
-                    revised = []
-                if revised and program_only:
-                    # The last prompt stopped offering the case and asked for
-                    # the program, because two rounds running had corrected the
-                    # bar and left the program alone. A reply that sends cases
-                    # anyway is that same round again, and accepting it would
-                    # make the withdrawal a sentence rather than a rule.
-                    print(
-                        "[verify] the cases came back again after the prompt "
-                        "stopped offering them; keeping the bar as it stands — "
-                        "this round was asked for the program"
-                    )
-                    revised = []
-                if revised:
-                    # MERGED into the agreed suite, not swapped for it, and the
-                    # cases the last round FAILED are the only ones a correction
-                    # may touch. That rule is what makes a short array safe to
-                    # accept, and accepting one matters: the repair prompt asks
-                    # about one disagreement, so the natural reply is that one
-                    # case corrected. Demanding the whole array back re-sent
-                    # twenty cases to fix one of them -- slower, likelier to be
-                    # truncated mid-array, and refused outright whenever it came
-                    # back one short, which left the wrong case breaking a
-                    # correct program on every remaining round of the solve.
-                    #
-                    # What the old refusal was protecting is protected here by
-                    # construction rather than by suspicion: a case the program
-                    # PASSES cannot be corrected, dropped or weakened, so the
-                    # way to game this -- delete the case you cannot pass -- is
-                    # not reachable. See `_merge_cases`.
-                    # A confirmed case is not the model's to correct.
-                    # A reply that rewrites a THIRD of the bar is not
-                    # correcting a case, it is re-specifying the problem.
-                    #
-                    # Kept after the judge was removed, and on narrower grounds
-                    # than it was built on. The judge upheld the model's rewrite
-                    # in 22 of the 25 corrections it ever checked and sided with
-                    # the original case in none of them, so "the model launders
-                    # its own bar" is not what the logs show and is not why this
-                    # is here. What the logs do NOT contain is a single judged
-                    # BULK rewrite -- the one that replaced fifteen of twenty-two
-                    # cases with nine seconds left was never checked by anything.
-                    # The cap costs one correction in thirteen and covers the
-                    # case no evidence speaks to.
-                    # How many cases actually CHANGED, not how many were sent.
-                    # The repair prompt asks for "a json array holding ALL of
-                    # the cases, corrected", so a well-behaved reply carries the
-                    # whole bar every time; counting the array's length refused
-                    # every correct correction and left the bar frozen.
-                    held = {_case_key(c): _expectation(c) for c in agreed}
-                    moved = sum(1 for c in revised
-                                if held.get(_case_key(c)) != _expectation(c))
-                    allowed = max(2, len(agreed) // BULK_CORRECTION_SHARE)
-                    if moved > allowed:
-                        bulk_refusals += 1
-                        # A refused correction is not the model repeating
-                        # itself about the PROGRAM -- the program was never
-                        # asked for -- and the duplicate guard below must not
-                        # read it as one. Both setters of this flag went out
-                        # with the judge in d6c9fc6; this is the one that is
-                        # still needed.
-                        correction_refused = True
-                        print(
-                            f"[verify] {moved} of the {len(agreed)} case(s) "
-                            f"on the bar came back rewritten in one reply, which is "
-                            f"a re-specification rather than a correction; the bar "
-                            f"stands and the program is re-graded against it"
-                        )
-                        merged, changed = list(agreed), ""
-                    else:
-                        merged, changed = _merge_cases(agreed, revised, reported_failed)
-                    if changed.startswith("REFUSED"):
-                        print(f"[verify] {changed[len('REFUSED:'):].strip()}")
-                        revised = []
-                    elif changed.startswith("NOTHING"):
-                        print(f"[verify] {changed[len('NOTHING:'):].strip()}")
-                        revised = merged
-                    else:
-                        if changed:
-                            print(
-                                f"[verify] the repair corrected the cases rather "
-                                f"than the program: {changed}. The program is "
-                                f"re-graded against the {len(merged)} that now "
-                                f"stand; if it still disagrees the loop keeps "
-                                f"going."
-                            )
-                            # What the summary line's `corrected=` counts. The
-                            # increment went out with the judge in d6c9fc6 and
-                            # the line has printed 0 ever since; `moved` is the
-                            # number of cases whose expectation this reply
-                            # actually changed, counted above for the bulk cap.
-                            if plan is not None:
-                                plan.corrected += moved
-                        # Kept even when the merge changed nothing, because
-                        # `revised` is not only the new bar -- it is what tells
-                        # the branches below that this reply carried CASES. A
-                        # reply that sends the suite back untouched and no
-                        # program is still asking for the program in hand to be
-                        # re-graded, and zeroing it here made that reply read as
-                        # "nothing reached me as code" and spend a round trip
-                        # saying so.
-                        revised = merged
-                # Whether this reply carried CASES, recorded before the
-                # branches below consume `revised` -- they set it to None once
-                # it has been applied, and reading it afterwards to decide
-                # whether the round produced anything said "nothing arrived"
-                # about the one reply the repair prompt asks for by name.
-                carried_cases = bool(revised)
-                now_code = extract_code(reply, task.entrypoint, task.language).strip()
-                # Which reply the candidate is actually graded FROM. Normally
-                # this one; see the cases-only branch below for when it is not.
-                graded = reply
-                if revised and last_code:
-                    if now_code == last_code:
-                        agreed, revised = revised, None
-                    elif not now_code:
-                        # Cases corrected, program deliberately NOT resent --
-                        # the one reply the repair prompt asks for by name when
-                        # the case was the thing that was wrong, and until this
-                        # branch existed the answer to it was "your previous
-                        # reply did not reach me as code". Measured: the program
-                        # was right, turn 1's case was not, the model corrected
-                        # exactly the case it was asked to, and the miner spent
-                        # the rest of the budget demanding a program it already
-                        # had before submitting one reported 0/1 on a bogus bar.
-                        #
-                        # Nothing here is taken on trust. The program is the one
-                        # already in hand and already judged, so a weakened bar
-                        # cannot launder a rewrite -- there was no rewrite. It
-                        # is re-graded, not assumed to pass.
-                        agreed, revised = revised, None
-                        graded = last_program_reply or reply
-                # A second bar that landed during this round's turn is graded
-                # against from this round on.
-                await join_bar2()
-                graded_at = time.monotonic()
+
+                still_writing = getattr(writer, "still_writing", False)
+                # `cases=None`: the structural check, the Rust compile and the
+                # validator's own examples happen here; the candidate is RUN by
+                # the differential below, once, rather than twice.
                 candidate = await self._graded(
-                    graded, task, budget - (time.monotonic() - started), agreed,
-                    # The round ABOVE this one, still un-updated here -- see the
-                    # `last_code = now_code` below, which runs after this. That
-                    # is what a reply has to be complete with respect to: a
-                    # round that sends back only the function it fixed is using
-                    # helpers that exist in the reply above it and nowhere in
-                    # the file that would be submitted.
-                    previous=last_code or "",
+                    candidate_reply, task, left(), previous=last_code,
                 )
-                # Numbered as the prompts are: turn 1 asked for the cases, so
-                # the program is phase 2 and the first correction is phase 3.
-                # The operator's own vocabulary all through this file's history
-                # -- "3rd phase output should be full code" -- and a log that
-                # numbered them differently would be answering a question
-                # nobody asked in words nobody used.
-                if program_marked:
-                    # The turn went out above, before the retried bar; what is
-                    # left of this phase is the grading alone.
-                    phases.mark("2 graded", checked_s=time.monotonic() - graded_at)
-                    program_marked = False
+                # The validator's OWN examples are ground truth, and they
+                # take precedence exactly as they did before: when they fail
+                # the program is wrong, there is nothing to weigh, and running
+                # the reference against it would buy an executor run per input
+                # on a question already answered. Only once they are green --
+                # which on live traffic is always, since no task ships any --
+                # does a disagreement with the reference become the open
+                # question. Without this the repair loop consulted only the
+                # differential and a program failing ground truth was never
+                # repaired at all.
+                examples_failed = bool(
+                    candidate.total and candidate.passed < candidate.total
+                )
+                # A structural defect -- a program that will not parse, or Rust
+                # that will not compile -- accuses the candidate on its own
+                # evidence, with no reference involved. It has to drive a
+                # repair by itself: live traffic ships no public examples, so
+                # `compile_defect` is the ONLY check a Rust answer gets, and a
+                # loop that consulted only the differential shipped a program
+                # that does not build without ever asking for a fix.
+                defective = bool(candidate.defect)
+                if examples_failed or defective:
+                    report = DifferentialReport(
+                        note=("the validator's own examples failed"
+                              if examples_failed else candidate.defect)
+                    )
                 else:
-                    phases.mark(
-                        "2 program" if attempt == 1 else f"{attempt + 1} correction",
-                        model_s=round_s,
-                        checked_s=time.monotonic() - graded_at,
+                    report = await asyncio.to_thread(
+                        differential.compare, candidate.code, oracle,
+                        task.language, task.entrypoint, inputs, left(),
                     )
-                # Before anything reads it: a round that could not be graded,
-                # or one graded against itself, must not report less about a
-                # program than an earlier round already established.
-                # The trigger rate, taken at the FIRST grade that actually
-                # ran the program against cases -- before any repair moved
-                # either side. `self_total` is zero when the round produced a
-                # defect or there were no cases, and neither of those is a
-                # disagreement, so both correctly leave this unset.
-                if (
-                    plan is not None
-                    and plan.disagreed is None
-                    and candidate.self_total
-                ):
-                    plan.disagreed = (
-                        candidate.self_total - candidate.self_passed,
-                        candidate.self_total,
-                    )
-                # The model's own case correction, applied now that the
-                # candidate has been graded against the bar as it stood when
-                # the reply arrived. It used to be applied at the END of the
-                # round, and that was where the judge's work went to die: the
-                # judge writes into `agreed`, and a reply carrying BOTH a
-                # corrected case and a changed program left `revised` pending,
-                # so `agreed = revised` restored the pre-judge bar a few lines
-                # later. The dropped case came back, and it could never be
-                # re-judged -- its key is already in `adjudicated` -- so every
-                # remaining round re-reported a disagreement an independent
-                # reader had already said the statement does not decide.
-                if revised:
-                    agreed, revised = revised, None
-                # A DISPUTED case, put to a reader with no stake in either
-                # side, before the repair prompt asks the program's own author
-                # to rule on its own reading. Here rather than beside the
-                # prompt because a "the case was wrong" verdict is applied and
-                # re-graded WITHOUT a model turn, and everything below --
-                # `judged`, `best`, `program_unchanged` -- has to see the
-                # candidate that results rather than the one that arrived.
-                #
-                # Bounded to a couple of cases: a program failing half its bar
-                # is not a disagreement about a reading, it is a wrong program,
-                # and the round is better spent on it.
-                if (
-                    self._judge
-                    and candidate.from_self_tests
-                    and not candidate.defect
-                    and 1 <= len(candidate.failed_cases) <= MAX_ADJUDICATED
-                    and candidate.failed_actuals
-                    and any(
-                        _case_key(case) not in adjudicated
-                        for case in candidate.failed_cases
-                    )
-                ):
-                    # Only the ones nobody has ruled on. Asked again, a case
-                    # gets the same answer for a second turn's money, and
-                    # `note_adjudicated` would count it twice -- the archived
-                    # breakdown of how disputes were settled is the whole
-                    # reason the counters exist.
-                    # ...and only the ones the program ANSWERED. A case the
-                    # program crashed or timed out on is not a disagreement
-                    # between two readings, it is a program that produced no
-                    # value, and it is wrong under both. Put to the judge it
-                    # could be ruled `contested` and dropped, shipping a
-                    # program that crashes on the input.
-                    fresh = [
-                        (case, actual)
-                        for case, actual in zip(
-                            candidate.failed_cases, candidate.failed_actuals
-                        )
-                        if _case_key(case) not in adjudicated and actual.ok
-                    ]
-                    # A call the two BARS split on already has its second
-                    # reading, and the judge -- pinned to the second bar's
-                    # model -- would not be a third. The program's value
-                    # decides: agreeing with the second bar is two readings
-                    # against one, so the case was wrong; agreeing with
-                    # neither is the statement being ambiguous there, and the
-                    # case is dropped. This routing was designed and then
-                    # never wired in: `split_keys` only kept the case away
-                    # from the judge, and the case fell to the ordinary repair
-                    # prompt -- the program's own author, with the case-edit
-                    # offer, deciding a call two other readers disagreed on.
-                    verdicts: dict[tuple, tuple[str, Any]] = {}
-                    for case, actual in fresh:
-                        key = _case_key(case)
-                        if key in split_keys:
-                            other = split_keys[key]
-                            verdicts[key] = (
-                                ("program", other)
-                                if _same_expected(actual.value, other, task.language)
-                                else ("contested", other)
-                            )
-                    unsettled = [
-                        (c, a) for c, a in fresh if _case_key(c) not in verdicts
-                    ]
-                    if unsettled:
-                        verdicts.update(await self._adjudicate(
-                            task, [c for c, _ in unsettled],
-                            [a for _, a in unsettled],
-                            provider, budget, started, split_keys,
-                        ))
-                    adjudicated.update(verdicts)
-                    corrections = [
-                        dict(case, expected=verdicts[_case_key(case)][1])
-                        for case in candidate.failed_cases
-                        if verdicts.get(_case_key(case), ("", None))[0]
-                        == "program"
-                    ]
-                    dropped = [
-                        case for case in candidate.failed_cases
-                        if verdicts.get(_case_key(case), ("", None))[0]
-                        == "contested"
-                    ]
-                    if plan is not None:
-                        for route, _ in verdicts.values():
-                            plan.note_adjudicated(route)
-                    if plan is not None:
-                        plan.contested += len(dropped)
-                    if corrections or dropped:
-                        if corrections:
-                            agreed, _ = _merge_cases(
-                                agreed, corrections, candidate.failed_cases
-                            )
-                            if plan is not None:
-                                plan.corrected += len(corrections)
-                        if dropped:
-                            drop = {_case_key(case) for case in dropped}
-                            agreed = [
-                                case for case in agreed
-                                if _case_key(case) not in drop
-                            ]
-                        print(
-                            f"[verify] an independent reading settled "
-                            f"{len(corrections) + len(dropped)} disputed "
-                            f"case(s): {len(corrections)} where the case was "
-                            f"wrong and {len(dropped)} the statement does not "
-                            f"decide; re-grading the same program against them"
-                        )
-                        # Re-graded, not re-asked. The program did not change,
-                        # so nothing here spends a turn: it may now pass a bar
-                        # that no longer holds a case it was right to fail.
-                        #
-                        # `graded`, not `reply`, and the difference is a lost
-                        # answer. On a cases-only correction round `reply` is
-                        # a JSON array -- the model was asked for the case
-                        # alone and sent exactly that -- so re-grading from it
-                        # extracts no code, and a candidate that was sound a
-                        # line ago becomes a defect. `graded` is the reply the
-                        # program actually came from, which is what the round
-                        # above already used for the same reason.
-                        # `_graded`, not `_grade`: off the event loop, and
-                        # with the fallback candidate its handler builds.
-                        # Grading is a `subprocess.run` of seconds -- a
-                        # container start, or a rustc build for Rust -- and
-                        # now that Docker is the default backend, running it
-                        # straight from this coroutine would stall every other
-                        # solve in flight, including the `wait_for` that
-                        # decides whether they are paid.
-                        candidate = await self._graded(
-                            graded, task,
-                            budget - (time.monotonic() - started), agreed,
-                            # `or ""`: on the first round there is no previous
-                            # program, and the comparison wants a string.
-                            previous=last_code or "",
-                        )
-                key = candidate.code.strip()
-                if key:
-                    prior = judged.get(key)
-                    if prior is not None:
-                        _inherit_evidence(candidate, prior)
-                    judged[key] = candidate
-                # What this round AMOUNTED to. Compared against the rounds
-                # before rather than the replies themselves, because the same
-                # program under a different sentence of prose is the same
-                # program: byte equality misses that and this does not. The
-                # failures are in it so a corrected CASE reads as progress even
-                # when the program is untouched -- which is exactly what the
-                # repair prompt asks for.
+                    _record_differential(candidate, report, inputs)
+                if plan is not None:
+                    plan.ran, plan.agreed = report.ran, report.agreed
+                    plan.mismatch = report.mismatch
+                    plan.oracle_crash = report.oracle_crash
+                print(f"[verify] the differential: {report.summary()}")
+
                 signature = (
-                    candidate.code.strip(), candidate.defect, tuple(candidate.failures)
+                    candidate.code, oracle,
+                    tuple(case.name for case in report.cases),
                 )
-                repeats = seen_signatures.get(signature, 0)
-                # A round whose correction the judge refused is not the model
-                # repeating itself about the PROGRAM: the program was never
-                # asked for. It is neither counted nor held against it.
-                if not correction_refused:
-                    seen_signatures[signature] = repeats + 1
-                duplicate = attempt > 1 and repeats > 0 and not correction_refused
-                # Only when one ARRIVED. A cases-only reply leaves the program
-                # in hand standing, and forgetting it here would make the very
-                # next correction unattributable to any program at all.
-                # A round that CHANGED the program resets it; a round that
-                # left it as it was counts. A round where nothing arrived at
-                # all does neither -- an unreadable tab or a dead read is not
-                # the model refusing to touch its program, and counting it
-                # withdrew the case offer over rounds in which the model was
-                # never heard from. The offer exists for a real reason and is
-                # taken away on evidence, not on silence.
-                if now_code or carried_cases:
-                    program_unchanged = (
-                        0 if now_code and now_code != last_code
-                        else program_unchanged + 1
-                    )
-                if now_code:
-                    last_code = now_code
-                    last_program_reply = reply
-                if best is None or _supersedes(
-                    candidate, best,
-                    getattr(conversation, "still_writing", False),
+                stalled = signature in seen
+                seen.add(signature)
+
+                # The differential first, then the candidate's OWN quality as
+                # the tie-break. Ranking on the comparison alone made every
+                # report that established nothing score identically -- so a
+                # program repaired out of a structural defect could not
+                # outrank the defective one it replaced, and the broken
+                # version shipped. `Candidate.score`'s last term is "has no
+                # defect", which is exactly the missing comparison.
+                score = (report.score(), candidate.score)
+                if _supersedes(candidate, best, still_writing) and (
+                    best is None or score > best_score
                 ):
-                    if plan is not None and (
-                        best is None
-                        or best.code.strip() != candidate.code.strip()
-                    ):
-                        # A different program is now the one in hand, and the
-                        # probe verdict describes the one that shipped: the
-                        # predecessor's `too_slow` must not be reported for a
-                        # program that was never timed. What is known about
-                        # THIS program, if it was timed before, is in `probed`.
-                        known = probed.get(candidate.code.strip())
-                        plan.note_probe(known.state if known is not None else "")
-                    best, best_provider = candidate, provider
-                # A second bar that landed since the grade above: joined, and
-                # the program re-graded against the union before anything is
-                # called converged. `graded` is the reply the program came
-                # from; `_graded` is off the loop, as every grade is.
-                if (
-                    not candidate.defect and not candidate.failures
-                    and best is candidate and await join_bar2()
-                ):
-                    candidate = await self._graded(
-                        graded, task, budget - (time.monotonic() - started),
-                        agreed, previous=last_code or "",
-                    )
-                    judged[candidate.code.strip()] = candidate
-                    best, best_provider = candidate, provider
-                # `best is candidate`: a fragment the model was still writing
-                # that happens to pass is not the answer -- `_supersedes` just
-                # refused it -- and probing it, then recording `exit=verified`
-                # for it, described a program that did not ship.
-                if candidate.verified and not candidate.failures and best is candidate:
+                    best, best_score, best_provider = candidate, score, provider
+                elif attempt > 1 and plan is not None:
+                    # Repair is MONOTONE: a round that did not raise the score
+                    # leaves the previous version in place. Counted, because a
+                    # rising count with `mismatch` flat is the one signature of
+                    # the routing heuristic blaming the program that was right.
+                    plan.regressed += 1
+
+                if report.ok:
                     slow, probe_state = await self._probe_now(
-                        candidate, probe, probed, task, budget, started
+                        candidate, probe or [], probed, task, budget, started
                     )
                     if plan is not None:
                         plan.note_probe(probe_state)
-                    if slow is not None:
-                        # A too_slow round is a correction round like any
-                        # other, so it faces the handoff. It did not: this
-                        # `continue` jumps over the `rounds_here` check below,
-                        # and with the verdict now cached per program a model
-                        # that keeps re-sending the same slow answer would be
-                        # asked the same thing until the deadline, never
-                        # reaching the rotation that is the one thing left.
-                        #
-                        # CHECKED, not counted. `rounds_here` is incremented
-                        # where a correction prompt is SENT, at the top of the
-                        # loop, and the prompt this branch builds is sent by
-                        # the next iteration -- so counting here too would
-                        # charge every too_slow round twice and hand off after
-                        # half the rounds the setting names.
-                        if rounds_here >= (
-                            ROTATE_AFTER_ROUNDS if rotation
-                            else (HANDOFF_ROUNDS if rotated else FIRST_PHASE_ROUNDS)
-                        ):
-                            carried = await _resume_elsewhere(
-                                f"{rounds_here} round(s) with "
-                                f"{provider or 'this model'} did not make it "
-                                f"fast enough",
-                                avoid=provider, slow=slow,
-                            )
-                            if carried is not None:
-                                conversation, provider, prompt = carried
-                                continue
-                            # Nowhere left to take it -- `_resume_elsewhere`
-                            # said why. The answer in hand is correct and slow,
-                            # which still beats nothing.
-                            print(
-                                f"[verify] the program is still too slow after "
-                                f"{rounds_here} round(s) and the repair cannot "
-                                f"be carried on; submitting it as it stands"
-                            )
-                            if plan is not None:
-                                plan.note_exit("exhausted")
-                            break
-                        prompt = _too_slow_report(slow)
-                        continue
-                    if plan is not None:
-                        plan.note_exit("verified")
-                    break
+                    if slow is None:
+                        note_exit("verified")
+                        break
+                    # The program agrees with the reference and is too slow at
+                    # the statement's own scale. That is the candidate's fault
+                    # on evidence the reference had no part in.
+                    report.note = slow
 
-                if getattr(conversation, "still_writing", False):
-                    # The model had not finished when the read stopped, so
-                    # whatever is in hand is a fragment of an answer rather than
-                    # a wrong one -- and there is nothing to say to a
-                    # conversation that is mid-sentence. The composer is
-                    # usually disabled while a reply streams; where it is not,
-                    # the prompt queues behind the answer it is asking about.
+                if still_writing:
+                    # The model had not finished when the read stopped, so what
+                    # is in hand is a FRAGMENT of an answer rather than a wrong
+                    # one, and a repair report about a half-written program
+                    # describes a bug its author was still in the middle of not
+                    # writing. Measured against the old browser backend:
                     #
-                    # Measured, with the site's busy selector dropped at startup
-                    # (which `usable_busy_selectors` does whenever a candidate
-                    # matches an idle page) and the model still writing:
-                    #
-                    #   captured=''             -> "your reply did not reach me
-                    #                              as code", sent to a model
-                    #                              that was still writing it
+                    #   captured=''   -> "your reply did not reach me as code",
+                    #                    sent to a model still writing it
                     #   captured='def g(n):\n    total = 0\n    while n > 0:'
-                    #                           -> "the code is not valid
-                    #                              Python", about a program the
-                    #                              model had not finished
+                    #                 -> "the code is not valid Python", about a
+                    #                    program the model had not finished
                     #
-                    # `send` already reads past its slice rather than stop here,
-                    # so reaching this means the whole budget is gone. Stop.
+                    # `_send_within` already reads past its own slice rather
+                    # than stop early, so reaching here means the whole budget
+                    # is gone and there is no round to spend anyway. Stop, and
+                    # say which turn ran out -- the summary otherwise blames
+                    # the inputs turn for the candidate turn's failure.
                     print(
-                        f"[verify] {provider or 'this model'} was still writing when "
-                        f"the budget ran out; "
-                        + (
-                            "submitting the part that arrived"
-                            if candidate.code.strip()
-                            else "nothing arrived to submit"
-                        )
+                        f"[verify] {provider or 'this model'} was still writing "
+                        f"when the budget ran out; "
+                        + ("submitting the part that arrived"
+                           if candidate.code.strip()
+                           else "nothing arrived to submit")
                         + " rather than interrupting it with a repair prompt"
                     )
-                    if plan is not None:
-                        plan.note_exit("cutoff")
+                    note_exit("cutoff")
                     break
-                if not candidate.code.strip() and (
-                    getattr(conversation, "empty_reason", None)
-                    in ("unreadable", "unfinished")
-                ):
-                    # Nothing was captured, and the conversation itself is why.
-                    # A repair round here sends the fix-this prompt into a tab
-                    # that just proved it cannot be read, or queues it behind an
-                    # answer the model has not finished writing. Measured on a
-                    # live miner, twice in one run: the first read spent 191s
-                    # and returned nothing, the repair spent another 29s on the
-                    # same dead conversation and returned nothing, and the task
-                    # ended with 5s left -- too few to ask any of the five
-                    # healthy tabs standing idle.
-                    #
-                    # A reply that RENDERED and simply had no code block in it
-                    # is the opposite case and deliberately not caught here:
-                    # that is the model breaking the output contract, telling it
-                    # so is what fixes it, and the conversation is fine.
-                    #
-                    # The distinction cannot be made from the candidate: an
-                    # empty one always carries a `defect`, because the
-                    # structural checks reject empty source exactly as they
-                    # reject a broken program. Only the tab knows.
-                    reason = getattr(conversation, "empty_reason", "?")
-                    if reason == "unreadable":
-                        # The conversation is gone; the REPAIR is not. Carry it
-                        # to a fresh tab rather than submitting an answer whose
-                        # failures nobody asked the model to fix. Measured over
-                        # a production run: fifteen solves ended exactly here,
-                        # each holding a candidate that failed its own cases,
-                        # with an average of 129 seconds still on the clock.
-                        carried = await _resume_elsewhere(
-                            f"{provider or 'this model'} returned nothing and "
-                            f"that conversation is unreadable"
-                        )
-                        if carried is not None:
-                            conversation, provider, prompt = carried
-                            continue
-                    # No repair to carry, or nothing left to carry it with. Say
-                    # which -- this line used to promise that somebody else
-                    # would be asked, and when an answer was already in hand
-                    # `solve_task` submitted it instead and asked nobody.
-                    print(
-                        f"[verify] {provider or 'this model'} returned nothing and "
-                        f"the conversation is {reason}; "
-                        + (
-                            "submitting the answer already in hand"
-                            if best is not None and best.code.strip()
-                            else "asking elsewhere"
-                        )
-                    )
-                    if plan is not None:
-                        plan.note_exit("empty")
-                    break
-                if duplicate:
-                    # Same program, same failures: the round changed nothing.
-                    # Change something rather than re-ask -- a FRESH
-                    # conversation is a real change where a re-ask is not, and
-                    # `_resume_elsewhere` is that move.
-                    #
-                    # With what is KNOWN about this program: a repeat of a
-                    # program the probe already called too slow has a fault to
-                    # carry even though its failure list is empty, and without
-                    # it the handoff declined ("no fault to report") and the
-                    # stale-tab check below ended the pass.
-                    known = probed.get(candidate.code.strip())
-                    carried = await _resume_elsewhere(
-                        f"{provider or 'this model'} sent back the same program "
-                        f"and the same failures after being shown them",
-                        avoid=provider,
-                        slow=known.sentence if known is not None else None,
-                    )
-                    if carried is not None:
-                        conversation, provider, prompt = carried
-                        continue
-                    # Nowhere left to carry it. Whether that ends the loop turns
-                    # on WHY the round changed nothing, and those are two
-                    # different things wearing one shape.
-                    #
-                    # A round that cost no time did not involve the model: the
-                    # read returned text that was already on the page. Re-asking
-                    # that spins at machine speed for the rest of the budget,
-                    # and this branch is the only thing standing between a
-                    # broken tab and that spin. Stop.
-                    #
-                    # A round that took a real round trip is the other thing
-                    # entirely -- the model answered, and answered the same.
-                    # Stopping there ended solves with the whole budget unspent:
-                    # measured, a model repeating itself once ended the loop at
-                    # 0.2s of a 60s budget, throwing away every round the clock
-                    # would still have paid for. Correcting runs until the
-                    # answer passes or the deadline stops it, and a model is
-                    # stochastic -- the next ask is a real chance, not a
-                    # certainty, and a real chance is what the remaining budget
-                    # is for. Fall through and ask again.
-                    if round_s < STALE_ROUND_S:
-                        print(
-                            f"[verify] {provider or 'this model'} returned the same "
-                            f"program in {round_s:.1f}s without being asked again — "
-                            f"the tab is replaying an old reply rather than "
-                            f"answering; submitting the last version"
-                        )
-                        if plan is not None:
-                            plan.note_exit("stalled")
-                        break
-                if not candidate.defect and not candidate.failures and best is candidate:
-                    # Nothing the program's cases can say against it -- and the
-                    # cases are all small, by a rule this file cannot relax: an
-                    # `expected` is derived by hand, so no case on the bar is
-                    # ever the size the validator will run. The probe asks the
-                    # one question the bar cannot, and asks it before this
-                    # counts as converged.
-                    slow, probe_state = await self._probe_now(
-                        candidate, probe, probed, task, budget, started
-                    )
-                    if plan is not None:
-                        plan.note_probe(probe_state)
-                    if slow is not None:
-                        # A too_slow round is a correction round like any
-                        # other, so it faces the handoff. It did not: this
-                        # `continue` jumps over the `rounds_here` check below,
-                        # and with the verdict now cached per program a model
-                        # that keeps re-sending the same slow answer would be
-                        # asked the same thing until the deadline, never
-                        # reaching the rotation that is the one thing left.
-                        #
-                        # CHECKED, not counted. `rounds_here` is incremented
-                        # where a correction prompt is SENT, at the top of the
-                        # loop, and the prompt this branch builds is sent by
-                        # the next iteration -- so counting here too would
-                        # charge every too_slow round twice and hand off after
-                        # half the rounds the setting names.
-                        if rounds_here >= (
-                            ROTATE_AFTER_ROUNDS if rotation
-                            else (HANDOFF_ROUNDS if rotated else FIRST_PHASE_ROUNDS)
-                        ):
-                            carried = await _resume_elsewhere(
-                                f"{rounds_here} round(s) with "
-                                f"{provider or 'this model'} did not make it "
-                                f"fast enough",
-                                avoid=provider, slow=slow,
-                            )
-                            if carried is not None:
-                                conversation, provider, prompt = carried
-                                continue
-                            # Nowhere left to take it -- `_resume_elsewhere`
-                            # said why. The answer in hand is correct and slow,
-                            # which still beats nothing.
-                            print(
-                                f"[verify] the program is still too slow after "
-                                f"{rounds_here} round(s) and the repair cannot "
-                                f"be carried on; submitting it as it stands"
-                            )
-                            if plan is not None:
-                                plan.note_exit("exhausted")
-                            break
-                        prompt = _too_slow_report(slow)
-                        continue
-                    # Reported as `converged`, and the summary line says beside
-                    # it how many cases DISAGREED to begin with -- because
-                    # converging from nothing and converging from four failures
-                    # are the same word here and very different evidence.
-                    if plan is not None:
-                        plan.note_exit("converged")
-                    break
-                # Kept apart, not merged into one list of "problems": a defect
-                # means the code never ran, and the repair prompt has to say so
-                # rather than blame logic that was never executed.
-                # The round did not clear it. Whether to ask THIS conversation
-                # again is a question about the conversation, not the budget:
-                # the deadline will stop the loop eventually, and eventually is
-                # measured -- seven, nine and nine correction rounds on three
-                # solves of eleven, alternating between a reply the parser
-                # dropped and a rewrite that failed the same case, one ending
-                # with the budget gone and nothing submitted.
-                if rounds_here >= (
-                    ROTATE_AFTER_ROUNDS if rotation
-                    else (HANDOFF_ROUNDS if rotated else FIRST_PHASE_ROUNDS)
-                ):
-                    carried = await _resume_elsewhere(
-                        f"{rounds_here} correction round(s) with "
-                        f"{provider or 'this model'} did not clear it",
-                        avoid=provider,
-                    )
-                    if carried is not None:
-                        # Holding the program and the whole bar, so its first
-                        # round starts where this conversation's last one
-                        # ended. Where it LANDS is the operator's, through the
-                        # `repair` phase profile -- `open_for` honours that pin
-                        # now even against an `avoid`, provided the pin is not
-                        # the model being fled.
-                        conversation, provider, prompt = carried
-                        continue
-                    # Nowhere to carry it to -- `_resume_elsewhere` said why,
-                    # and this line no longer guesses. The answer in hand is
-                    # the best this pass is going to hold.
-                    print(
-                        f"[verify] {rounds_here} correction round(s) here and "
-                        f"the repair cannot be carried on; submitting the best "
-                        f"version in hand"
-                    )
-                    if plan is not None:
-                        plan.note_exit("exhausted")
-                    break
-                # An independent reader agreed with a case this program
-                # failed. Two readings against one is as much as anything here
-                # establishes, so the case stands and the offer to rewrite it
-                # is withdrawn for THIS round -- by evidence rather than by the
-                # exhaustion the two conditions below describe.
-                # ALL of the failing cases, not any of them: the confirmation
-                # withdraws the case offer for every failure the prompt lists,
-                # and one confirmed case beside one that was merely failing
-                # used to lock the model out of correcting the second -- which
-                # may be the very call the two bars split on.
-                case_confirmed = bool(candidate.failed_cases) and all(
-                    adjudicated.get(_case_key(case), ("", None))[0] == "case"
-                    for case in candidate.failed_cases
-                )
-                insist = (
-                    program_unchanged >= CASES_ONLY_ROUNDS
-                    # A pass that has twice answered a repair by rewriting a
-                    # third of its bar has said what it has to say about the
-                    # cases. The offer does not come back.
-                    or bulk_refusals >= MAX_BULK_REFUSALS
-                )
-                program_only = (
-                    insist or case_confirmed
-                ) and candidate.from_self_tests
-                if program_only and program_unchanged >= CASES_ONLY_ROUNDS:
-                    print(
-                        f"[verify] the program has not changed in "
-                        f"{program_unchanged} round(s); asking for the program "
-                        f"this time and not offering the cases"
-                    )
 
-                report = build_repair_prompt(
-                    candidate.failures,
-                    task.language,
-                    task.entrypoint,
-                    defect=candidate.defect,
-                    from_self_tests=candidate.from_self_tests,
-                    insist_on_program=insist,
-                    # WHOSE cases these are, said truthfully. The conversation
-                    # being repaired never saw the bar when the bar is written
-                    # elsewhere, and a repair round turns on exactly that.
-                    bar_is_independent=self._independent_bar,
-                    failed_cases=candidate.failed_cases,
-                    case_confirmed=case_confirmed,
+                blamed_elsewhere = defective or examples_failed or (
+                    plan is not None and plan.probe in ("too_slow", "oom")
                 )
-                # Asking the same question a second time is worth doing -- a
-                # model is stochastic and the budget is there to spend on the
-                # chance. Asking it in the same WORDS is not: the conversation
-                # still holds the reply it gave, and the likeliest continuation
-                # of an identical prompt is an identical answer. So the report
-                # goes out again, with the repetition named in it.
-                # The cases this prompt is about. The reply may correct these
-                # and nothing else. Kept from the last GRADED round when this
-                # one ran nothing: an empty candidate has no failed cases, and
-                # forgetting the reported set here made the next correction --
-                # the JSON for exactly those cases -- merge against nothing
-                # and vanish without a line of log.
-                if candidate.total or candidate.self_total:
-                    reported_failed = list(candidate.failed_cases)
-                stalled = reports_sent.get(report, 0)
-                reports_sent[report] = stalled + 1
-                if stalled:
-                    print(
-                        f"[verify] this same report has now gone out "
-                        f"{stalled + 1} times; naming the repetition in it "
-                        f"rather than re-sending it word for word"
-                    )
-                    report = build_repair_prompt(
-                        candidate.failures,
-                        task.language,
-                        task.entrypoint,
-                        defect=candidate.defect,
-                        from_self_tests=candidate.from_self_tests,
+                if examples_failed or defective:
+                    # Ground truth accuses the candidate and nothing else is in
+                    # dispute, so the router is not consulted at all.
+                    blame = "candidate"
+                else:
+                    blame = router.choose(
+                        report, candidate_blamed_independently=blamed_elsewhere,
                         stalled=stalled,
-                        insist_on_program=insist,
-                        bar_is_independent=self._independent_bar,
-                        failed_cases=candidate.failed_cases,
-                        case_confirmed=case_confirmed,
                     )
-                prompt = report
+                if plan is not None:
+                    plan.flipped = router.flipped
+                if not blame:
+                    note_exit("converged")
+                    break
+                if stalled and round_s < STALE_ROUND_S:
+                    # Nothing moved, and the round that moved nothing was free.
+                    # Whatever wrote that reply was not a model. Flipping to
+                    # the reference would ask the same tab the same way, so
+                    # this stops the pass whoever the router blames.
+                    print(
+                        f"[verify] {provider or 'this model'} returned the same "
+                        f"program in {round_s:.1f}s without being asked again — "
+                        f"the tab is replaying an old reply rather than "
+                        f"answering; submitting the last version"
+                    )
+                    note_exit("stalled")
+                    break
+                if stalled and blame == last_patched:
+                    # The round that just ran changed neither program, and the
+                    # router still wants the artifact that produced nothing.
+                    # It has nowhere else to go, so the next round would send
+                    # the same prompt and read the same reply.
+                    print("[verify] the last round changed neither program "
+                          "and there is nothing else to try; submitting what "
+                          "is in hand")
+                    note_exit("stalled")
+                    break
+                if left() < MIN_SLICE_S:
+                    note_exit("budget")
+                    break
+
+                if repair_conv is None:
+                    repair_conv = await self._open_within(
+                        budget, started, avoid, phase="repair"
+                    )
+                repair_provider = getattr(repair_conv, "provider", None)
+                if plan is not None:
+                    plan.repair.append(_model_of(repair_provider))
+                    plan.patched.append(
+                        "cand" if blame == "candidate" else "oracle"
+                    )
+                last_code = candidate.code
+                last_patched = blame
+                round_started = time.monotonic()
+                reply = await self._send_within(
+                    repair_conv,
+                    build_differential_repair_prompt(
+                        task, analysis,
+                        candidate.code if blame == "candidate" else oracle,
+                        ("\n".join(candidate.failures) if examples_failed
+                         else report.prompt_text()),  # the defect rides in `defect=`
+                        kind=blame,
+                        defect=candidate.defect if blame == "candidate" else None,
+                        # What the prompt may claim was RUN. A defect is found
+                        # before execution, so a repair that says "I compared
+                        # it against a reference" is describing a run that did
+                        # not happen -- and a model told its logic disagreed
+                        # rewrites logic that was never the problem.
+                        found_by=("examples" if examples_failed
+                                  else "unrun" if defective
+                                  else "differential"),
+                    ),
+                    max(1.0, left()),
+                )
+                round_s = time.monotonic() - round_started
+                phases.mark(f"{attempt + 2} repair {blame}")
+                if not reply.strip():
+                    note_exit("empty")
+                    break
+                if blame == "oracle":
+                    # The candidate is untouched and is re-graded next round
+                    # against a reference that may now agree with it.
+                    patched = extract_code(reply, task.entrypoint, task.language)
+                    if not patched.strip():
+                        note_exit("empty")
+                        break
+                    oracle = patched
+                else:
+                    candidate_reply = reply
+                    writer = repair_conv
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - a failed solve scores zero, never crashes
-            print(f"[verify] backend failure: {type(exc).__name__}: {exc}")
-            if plan is not None:
-                plan.note_exit("failed")
+        except Exception as exc:  # noqa: BLE001 - never lose an answer in hand
+            print(f"[verify] the solve failed: {type(exc).__name__}: {exc}")
+            note_exit("failed")
         finally:
-            # The bar's turn outlives the pass whenever the pass ended before
-            # the program's first reply -- a backend failure, a cancelled
-            # solve. Left alone it would hold a CLI process and a seat for as
-            # long as the model kept writing, for a bar nothing will read.
-            if bar_task is not None and not bar_task.done():
-                bar_task.cancel()
-            if bar2_task is not None and not bar2_task.done():
-                bar2_task.cancel()
-            for live in (conversation, *bar, *bar2):
-                if live is None:
-                    continue
-                try:
-                    await live.close()
-                except Exception:  # noqa: BLE001 - cleanup must not mask a result
-                    pass
-            # Observe the cancellation, bounded, AFTER the closes so a cancel
-            # of this pass mid-wait cannot skip them. On this interpreter
-            # (3.11) `asyncio.wait_for` can swallow a cancel that lands in the
-            # loop iteration where its inner future has just completed -- at
-            # the bar's slot acquire, that means the cases turn spawns a
-            # child and runs to the end of its slice on the seat's quota,
-            # with nothing left holding a reference to cancel it again.
-            # Reproduced through this method with the real backend: cancels
-            # landing 1-3 iterations after the send began returned normally.
-            # So: wait a bounded moment, and if it is still running, cancel
-            # once more. The wait is `asyncio.wait`, which does not cancel
-            # what it waits on, and a cancel of THIS task during it
-            # propagates, as it should, with the re-cancel in the finally.
-            for pending in (bar_task, bar2_task):
-                if pending is None or pending.done():
-                    continue
-                try:
-                    await asyncio.wait({pending}, timeout=6.0)
-                finally:
-                    if not pending.done():
-                        pending.cancel()
-            # A bar task that finished with an exception before the pass
-            # ended -- its open raised, its send raised -- is done, so it was
-            # neither cancelled nor awaited above, and asyncio logs "Task
-            # exception was never retrieved" at collection, reading as a crash
-            # in the miner log. Retrieved here, and that is all.
-            for finished in (bar_task, bar2_task):
-                if finished is not None and finished.done() and not finished.cancelled():
-                    finished.exception()
-            # The second bar never landed while this pass ran. Its conversation
-            # was closed above like the others; what remains is to say so on
-            # the summary line, where `bar2=late` is the instrument for
-            # deciding whether the second reader is fast enough to be worth
-            # its turn.
-            if bar2_task is not None and not bar2_joined and plan is not None:
-                plan.bar2_provider = "late"
-                print("[verify] the second bar never landed before the pass "
-                      "ended; the first bar stood on its own")
+            for conv in (conversation, repair_conv):
+                if conv is not None:
+                    with contextlib.suppress(Exception):
+                        await conv.close()
         return best, best_provider
 
-    async def _write_the_bar(
-        self, holder: list, task, budget: float, started: float,
-        avoid: Optional[str], plan, probe=None, phase: str = "cases",
-        provider_slot: str = "bar_provider",
-    ) -> tuple[Optional[list], float]:
-        """Open a conversation of the bar's own and ask it for the cases.
 
-        Returns the cases and how long the TURN itself took.
-
-        Runs as a task beside the program turn, which is why the open is in
-        here: a backend that queues would otherwise make the program wait for
-        a tab the program does not use.
-
-        `holder` receives the conversation as soon as there is one, so
-        `_attempt`'s cleanup can close it however this ends -- including the
-        ways that never return, where the task is cancelled mid-open.
-
-        The whole remaining budget is offered, and no share of it withheld.
-        The share existed because the program turn had to wait its turn; it no
-        longer does, and a ceiling here would cost the bar without buying the
-        program anything. What bounds the wait is `_collect_bar`, on the other
-        side, where the cost is actually paid.
-        """
-        conversation = await self._open_within(
-            budget, started, avoid, phase=phase
-        )
-        holder.append(conversation)
-        left = budget - (time.monotonic() - started)
-        # Timed HERE, and handed back with the cases. Timing it where it is
-        # collected instead measures from the bar's start to the moment the
-        # program's turn happened to finish and got round to awaiting it --
-        # which is `max(bar, program)`, not the bar, and reads as the bar
-        # whenever the program is the slower of the two. That is the one
-        # comparison the split exists to let an operator make.
-        began = time.monotonic()
-        cases = await self._ask_for_cases(
-            conversation, task, max(1.0, left), probe=probe, independent=True,
-        )
-        # Read AFTER the turn, not at open: the ladder may hop the
-        # conversation to another model inside the turn, and `bar=` on the
-        # summary line is the instrument for deciding which model should
-        # write the bar -- bound at open it credited the one that refused.
-        if plan is not None and getattr(plan, provider_slot, None) != "late":
-            setattr(plan, provider_slot, getattr(conversation, "provider", None))
-        return cases, time.monotonic() - began
-
-    async def _collect_bar(
-        self, bar_task, bar: list, phases, budget: float, started: float,
-        bar_started: float, beside: bool = True, label: str = "1 cases",
-        who: str = "the bar", quiet: bool = False,
-    ) -> list[dict]:
-        """The independent cases turn's result, or an empty bar.
-
-        Bounded by what is left of the solve, and by nothing else. Reserving a
-        correction round out of it was a second deadline on a phase: it bought
-        the repair loop time to act on a disagreement, at the price of
-        sometimes discarding the bar that would have found one. A bar that
-        arrives too late to repair against is still the difference between an
-        answer graded and an answer shipped unchecked -- `disagreed=` and
-        `self=` on the summary line are worth more than a round nobody may
-        need, and 74% of solves never use one.
-
-        Returns `[]` for every way the BAR can fail -- a cases turn still
-        writing, an unreadable tab, a reply carrying nothing usable. None of
-        them are the program's problem: the program was written in a
-        conversation this one never touched, and it ships either way. That is
-        the difference this split buys and the reason no failure here is
-        allowed to propagate. A cancelled SOLVE is the one exception and is
-        re-raised; see below.
-        """
-        left = budget - (time.monotonic() - started)
-        cases: Optional[list] = None
-        # How long the bar's own turn took, as measured beside it. Falls back
-        # to the elapsed wall time only when the turn never reported one,
-        # which is every path where there are no cases to report anyway.
-        spent: Optional[float] = None
-        try:
-            cases, spent = await asyncio.wait_for(
-                bar_task, timeout=max(1.0, left)
-            )
-        except asyncio.CancelledError:
-            # The SOLVE was cancelled, not the bar. `wait_for` raises the same
-            # exception either way, and swallowing it here would leave a
-            # cancelled solve grading and reporting an answer nobody is
-            # waiting for -- `CancelledError` is a BaseException precisely so
-            # that a blanket handler cannot do that.
-            bar_task.cancel()
-            raise
-        except asyncio.TimeoutError:
-            bar_task.cancel()
-            # Measured NOW, when the wait ended -- not before it began, which
-            # reported a bar that ran out the budget as having taken no time.
-            spent = time.monotonic() - bar_started
-            print(
-                f"[verify] {who} was still being written when the "
-                f"{budget:.0f}s budget ran out"
-                + ("" if quiet else "; the program is graded against "
-                   "the public examples alone")
-            )
-        except Exception as exc:  # noqa: BLE001 - the program ships regardless
-            spent = time.monotonic() - bar_started
-            print(f"[verify] {who} came back unusable ({exc})"
-                  + ("" if quiet else "; the program is graded against "
-                     "the public examples alone"))
-        finally:
-            for conversation in bar:
-                try:
-                    await conversation.close()
-                except Exception:  # noqa: BLE001 - cleanup must not mask a result
-                    pass
-            # Emptied HERE, not by the caller. When this is cancelled mid-wait
-            # the re-raise skips the caller's `bar = []`, and `_attempt`'s own
-            # finally then closes the same conversations a second time --
-            # `release()` clamps at zero, so the live-session count drifts
-            # low and a real leak later reads as nothing.
-            bar.clear()
-        # `beside` only when it really ran beside the program. A RETRY does
-        # not: the program's turn has already returned by then, so the retry is
-        # sequential and must move the phase cursor like any other phase.
-        # Marking it alongside would leave the cursor behind it and charge the
-        # next correction round with the retry's seconds -- the same
-        # misreporting, pointed the other way.
-        phases.mark(
-            label,
-            model_s=spent if spent is not None else time.monotonic() - bar_started,
-            beside=beside,
-        )
-        if cases:
-            print(f"[verify] {who} holds {len(cases)} case(s), written "
-                  f"without sight of the program")
-        return list(cases or [])
 
     @staticmethod
     def _takes_extension(conversation) -> bool:
@@ -4282,125 +2569,6 @@ class VerifyingSolver:
             )
         return await conversation.send(prompt, timeout_s)
 
-    async def _adjudicate(
-        self, task, cases: list[dict], actuals: list, provider: Optional[str],
-        budget: float, started: float, split_keys: dict,
-    ) -> dict[tuple, tuple[str, Any]]:
-        """Who is right about a disputed case: the bar, the program, or nobody.
-
-        Returns `{case key: (route, what the reader said)}` where route is
-        "case", "program" or "contested" -- the value beside it is what makes
-        a "the case was wrong" verdict applicable without asking anyone
-        again. `{}` for
-        every way this can fail. A judge that does not answer leaves the round
-        exactly as it was -- the repair prompt still goes out offering both
-        ways, which is what happened before this existed.
-
-        THE PROBLEM. A disagreement is one reading of the statement against
-        another, and the repair prompt asks the program's own author to say
-        which was wrong. Measured over 54 live solves: of ten single-case
-        disagreements, nine ended with the model editing its own case and
-        keeping its program. That may often be right -- an earlier run had a
-        judge uphold case rewrites 22 times in 25 -- but the model deciding it
-        is the one whose reading is on trial, and when the bar has caught a
-        real bug this is exactly where the catch is erased.
-
-        WHY THIS QUESTION AND NOT ANOTHER. The judge is never asked "is this
-        program correct" or "which of these two is right". It is shown the
-        statement and the failing CALLS, no program and no expected values,
-        and asked what each call must return -- the one question two
-        independent readings actually agree about. `two_bar_overlap.py`: two
-        models choosing their own inputs shared 5 of 233. `fixed_inputs.py`:
-        the same two models, inputs held fixed, agreed on 91 of 97 expected
-        values. So the judge is put to the second question and never the first.
-
-        WHAT ITS ANSWER MEANS. Agreeing with the bar makes two independent
-        readings against the program's one, which is as much as anything here
-        can establish, and the case stands. Agreeing with the program means
-        the case was wrong and it is corrected without spending a model turn
-        on it. Agreeing with neither is the statement being ambiguous at that
-        call, and the case is dropped rather than held against a program that
-        may well be right.
-
-        Cases the two BARS already split on are not brought here: the second
-        bar is itself an independent reading of that call, and the judge --
-        pinned to the same model as the second bar -- would not be a third one.
-        """
-        wanted = [
-            (case, actual)
-            for case, actual in zip(cases, actuals)
-            if _case_key(case) not in split_keys
-        ]
-        if not wanted:
-            return {}
-        left = budget - (time.monotonic() - started)
-        if left <= 0:
-            return {}
-        asked = [case for case, _ in wanted]
-        conversation = None
-        try:
-            conversation = await self._open_within(
-                budget, started, provider, phase="judge"
-            )
-            reply = await self._send_within(
-                conversation,
-                build_expected_prompt(
-                    task.language, task.statement, task.entrypoint, asked,
-                    examples=task.public_examples,
-                ),
-                max(1.0, budget - (time.monotonic() - started)),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - no verdict is not a failure
-            print(f"[verify] the independent reading did not arrive ({exc}); "
-                  f"the round asks as it always did")
-            return {}
-        finally:
-            if conversation is not None:
-                try:
-                    await conversation.close()
-                except Exception:  # noqa: BLE001 - cleanup must not mask this
-                    pass
-        said = extract_expected(reply, len(asked))
-        if not said:
-            print("[verify] the independent reading came back unusable; the "
-                  "round asks as it always did")
-            return {}
-        verdicts: dict[tuple, tuple[str, Any]] = {}
-        for index, (case, actual) in enumerate(wanted):
-            if index not in said:
-                # Left out on purpose, by a reader told to leave out a call
-                # the statement does not determine. That is a vote for
-                # ambiguity, but a weak one, so it decides nothing.
-                continue
-            judged = said[index]
-            if task.language == "rust" and isinstance(judged, (int, float, bool)):
-                # A Rust case's `expected` is stdout, a string, and the grader
-                # compares strings; a reader that answered a numeric problem
-                # with the number -- `6` for `"6"` -- matched neither side
-                # and had the case DROPPED as contested. JSON's spelling of
-                # the scalar is what the program would have printed.
-                judged = json.dumps(judged)
-            # The GRADER's comparison, both times. Two earlier passes at this
-            # measurement compared with `json.dumps` and reported agreement of
-            # 0% and 48%, every point of the difference whitespace: for Rust a
-            # verdict is stdout compared on whitespace tokens, and nothing
-            # else may decide it.
-            like_bar = _same_expected(judged, case.get("expected"), task.language)
-            like_program = bool(actual.ok) and _same_expected(
-                judged, actual.value, task.language
-            )
-            key = _case_key(case)
-            if like_bar and not like_program:
-                verdicts[key] = ("case", judged)
-            elif like_program and not like_bar:
-                verdicts[key] = ("program", judged)
-            elif not like_bar and not like_program:
-                verdicts[key] = ("contested", judged)
-            # Agreeing with both is impossible unless the program already
-            # passed, which is not how a case gets here.
-        return verdicts
 
     async def _probe_now(
         self, candidate, probe: list, probed: dict, task, budget: float,
@@ -4525,6 +2693,9 @@ class VerifyingSolver:
                 raise _NoExecutor() from exc
 
         try:
+            # The last rung that crashed, if any -- so a ladder that crashes
+            # all the way down still reports `crashed` rather than "no input".
+            crashed: Optional[tuple] = None
             for scale in PROBE_SCALES:
                 if remaining() <= 0:
                     print("[verify] the size probe: out of time before a large "
@@ -4614,22 +2785,41 @@ class VerifyingSolver:
                         "oom",
                     )
                 if not ran[0].ok:
-                    # Any OTHER crash at scale is far likelier to be the
-                    # generator handing the program an input the statement
-                    # does not actually allow than a fault in the program, and
-                    # reporting it as one would spend a round making a correct
-                    # answer worse. So: no sentence. But it is not a program
-                    # that FINISHED either, and it used to be recorded as one
-                    # -- a recursive solution that blew the stack at n=50000
-                    # went into the permanent cache as timed-and-passed.
+                    # A CRASH DESCENDS THE LADDER rather than ending it, which
+                    # is the only way to tell the two things it can mean apart.
+                    #
+                    # `PROBE_MAX_BYTES` bounds the INPUT; the runner also caps
+                    # what a case may hand BACK -- 256 KiB of framed status in
+                    # `_batch_runner`, and the subprocess executor keeps only
+                    # the last 256 KiB of stdout, where an over-long reply
+                    # loses its opening frame marker. So a correct program
+                    # whose answer is about the size of its input fails at the
+                    # top rung, and the two failures do not even read alike:
+                    # one says "serialized return value is too large" and the
+                    # other says "sandbox produced no verdict (crashed or
+                    # exited early)", which is also what a real crash says.
+                    #
+                    # No message can separate them; a smaller input can. The
+                    # generator has always retried at a smaller rung for
+                    # exactly this reason, and the program abandoning the two
+                    # smaller rungs meant the one shape a smaller input surely
+                    # fixes was the one shape that never got one. If every
+                    # rung crashes it is reported as a crash, as before.
                     head = (ran[0].error or "").strip().splitlines()
+                    detail = head[-1] if head else "no detail"
+                    crashed = (size, detail)
                     print(
-                        f"[verify] the size probe: the program crashed on a "
-                        f"{size:,}-byte input ({head[-1] if head else 'no detail'}); "
-                        f"probably the generator's input rather than the program, "
-                        f"so no repair is asked -- and no pass is recorded"
+                        f"[verify] the size probe: the program did not survive "
+                        f"a {size:,}-byte input ({detail}); "
+                        + (
+                            "the answer was too large for the runner to carry, "
+                            "which is this harness rather than the program"
+                            if _transport_limit(ran[0].error)
+                            else "trying a smaller input to tell a fault from "
+                                 "an input the statement does not allow"
+                        )
                     )
-                    return _Probe(None, "crashed")
+                    continue
                 # `runtime_ms` is the executor's, and both Docker executors
                 # stamp a result with the whole container's wall time -- for
                 # Rust that includes the release build. Reported as what it is.
@@ -4648,6 +2838,15 @@ class VerifyingSolver:
                 return _Probe(None, "passed")
         except _NoExecutor:
             return _Probe(None, "none")
+        if crashed is not None:
+            size, detail = crashed
+            print(
+                f"[verify] the size probe: the program crashed at every size "
+                f"down to {size:,} bytes ({detail}); more likely an input the "
+                f"statement does not allow than a fault, so no repair is asked "
+                f"-- and no pass is recorded"
+            )
+            return _Probe(None, "crashed")
         print(
             "[verify] the size probe: no large input could be had; the program "
             "is graded on the bar's own cases alone"
@@ -4704,8 +2903,7 @@ class VerifyingSolver:
             )
 
     async def _graded(
-        self, reply: str, task, left: float, cases: Optional[list] = None,
-        previous: str = "",
+        self, reply: str, task, left: float, previous: str = "",
     ) -> Candidate:
         """`_grade`, run OFF the event loop.
 
@@ -4734,7 +2932,7 @@ class VerifyingSolver:
         """
         try:
             return await asyncio.to_thread(
-                self._grade, reply, task, left, cases, previous
+                self._grade, reply, task, left, previous
             )
         except asyncio.CancelledError:
             raise
@@ -4753,70 +2951,13 @@ class VerifyingSolver:
             row = self._by_provider.setdefault(winner, {"asked": 0, "verified": 0})
             row["verified"] += 1
 
-    # ---------------------------------------------------------------------- #
-    def _run_self_tests(
-        self, candidate: Candidate, task, cases: Optional[list] = None,
-        left: Optional[float] = None,
-    ) -> None:
-        """Grade a candidate against the cases turn 1 obtained.
-
-        Never raises and never blocks the answer. A model wrote both halves of
-        this -- the cases and the JSON they arrived in -- so every failure mode
-        here ends in "no self-tests ran", which is exactly where this code path
-        started.
-
-        It does not read the reply. The program turn asks for ONE block, so
-        there is nothing to extract from it -- and mining it for cases anyway
-        would mean grading a program against whatever it volunteered about
-        itself, which is the back-filling the split exists to prevent. A repair
-        reply that CORRECTS a case is handled where it belongs, in `_attempt`,
-        which feeds the corrected array to the next round.
-        """
-        cases = list(cases or [])
-        if not cases:
-            return
-        names = [case.get("name", "") for case in cases]
-        try:
-            passed, total, failures, failed, actuals = (
-                self._grader.check_detailed(
-                    candidate.code, task.language, task.entrypoint, cases,
-                    names, budget_s=left,
-                )
-            )
-        except Exception as exc:  # noqa: BLE001 - a broken executor loses no answer
-            # Same four words as the public-examples path below, deliberately.
-            # They are what an operator counts to decide whether a missing
-            # executor is costing anything -- and on live traffic, which ships
-            # no public examples, THIS is the only path that can print it. The
-            # other wording made that count read zero while every answer in the
-            # language went out ungraded.
-            print(f"[verify] local grading unavailable, so the model's own cases "
-                  f"could not be run: {type(exc).__name__}: {exc}")
-            return
-        if not total:
-            return
-        candidate.self_passed, candidate.self_total = passed, total
-        # Exact for THIS call: `check` counts every result as either a pass or
-        # a failure line, so the two together are what ran.
-        candidate.self_observed = passed + len(failures)
-        candidate.from_self_tests = True
-        # Only failures drive a repair. A clean run is left silent: it is the
-        # ordinary outcome and saying so on every solve would bury the line
-        # that matters.
-        candidate.failures = failures
-        # WHICH cases failed, not just what the failures looked like. A repair
-        # round may take these back corrected, and the merge that does it has
-        # to know exactly which of the agreed cases are in play.
-        candidate.failed_cases = failed
-        candidate.failed_actuals = actuals
-        candidate.self_bar = list(cases)
 
     def _grade(
         self, reply: str, task, left: Optional[float] = None,
-        cases: Optional[list] = None, previous: str = "",
+        previous: str = "",
     ) -> Candidate:
         code = extract_code(reply, task.entrypoint, task.language)
-        candidate = Candidate(code=code, raw=reply, self_cases=len(cases or []))
+        candidate = Candidate(code=code, raw=reply)
         defect = (
             rust_defect(code)
             if task.language == "rust"
@@ -4948,14 +3089,13 @@ class VerifyingSolver:
             # live task: production ships none, so the one line explaining why
             # an answer went out ungraded was the one line that never printed.
             # What could not be run is what to name.
-            unrun = []
+            # The comparison against the reference is run by the caller, not
+            # here, so the only suite this can report as unrun is the
+            # validator's own -- which live traffic never ships.
             if task.public_examples:
-                unrun.append(f"the {len(task.public_examples)} public example(s)")
-            if cases:
-                unrun.append(f"the model's {len(cases)} own case(s)")
-            if unrun:
                 print(
-                    f"[verify] out of budget before {' or '.join(unrun)} could be "
+                    f"[verify] out of budget before the "
+                    f"{len(task.public_examples)} public example(s) could be "
                     f"run; submitting the answer unverified"
                 )
             return candidate
@@ -4994,18 +3134,11 @@ class VerifyingSolver:
             )
             if failures:
                 return candidate
-        # Running these is not verification and is never recorded as any:
-        # `passed`/`total` are the validator's examples alone, so `verified`
-        # cannot be earned by a model agreeing with itself. What they catch is
-        # the commonest failure by far -- the model knowing what the answer
-        # should be and coding it wrong -- and that is objectively checkable
-        # with the validator's own executor.
-        if self._self_tests and code.strip():
-            # Bounded by what is left of the grading budget NOW, after the
-            # compile and the examples above have spent their share: the two
-            # suites share one deadline, and `run_tests` still stops at
-            # `VERIFY_TIMEOUT_S` per case inside it.
-            self._run_self_tests(candidate, task, cases, left=_budget_left())
+        # The candidate is not RUN here. It used to be, against cases the
+        # model wrote for itself; now the differential runs it once against
+        # the reference's answers and `_record_differential` writes the result
+        # back onto this candidate. Running it in both places would pay for
+        # every case twice -- a container apiece on Rust.
         return candidate
 
     # -- what a Rust answer is actually checked with ----------------------- #

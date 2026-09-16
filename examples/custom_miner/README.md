@@ -133,48 +133,41 @@ latency tiebreaker, so a partially-correct, late, or empty answer earns zero.
 - **Never raise.** On any failure return empty `code` — a zero is survivable, a
   crash loop is not. `custom_miner.py` already wraps your solver this way.
 
-### The prompt is one delimited document, and the order is the argument
+### Every stage prompt is the same document, and the order is the argument
 
-Every solve takes **two turns** — the cases first, then the program — and both
-are laid out the same way:
+A solve takes five kinds of turn, and all five are laid out the same way:
 
 ```
-TURN 1 (cases)                      TURN 2 (program)
-<output>   one json block           <output>   one code block          ← first
-<problem>  the statement            <problem>  the statement
-<examples> a floor to agree with    <examples> a floor, not the spec
-<task>     which cases, in order    <contract> what is TRUE: how it is
-                                               run, compared, and what
-                                               the environment does
-                                               silently
-                                    <must_pass> the model's OWN cases
-                                                from turn 1          ← last
+language / entrypoint            ← what it is
+PROBLEM STATEMENT                ← the statement, verbatim
+WORKED EXAMPLES                  ← only when the task ships any; live traffic never does
+WHAT THE STATEMENT HIDES         ← the trap block, heuristics + the analysis turn
+<the task>                       ← the one thing THIS stage is for
+RULES / THE ENVIRONMENT IT RUNS IN
+the output contract              ← one fenced block, and what is in it   ← last
 ```
-Both turns ask for **one** block, and there is no third shape: the single-turn
-prompt that asked for a program and its cases together is gone — see
-*[The cases are written before the program exists](#the-cases-are-written-before-the-program-exists)*.
-…then the site's nudge, appended after everything, repeats the output rule.
 
-The output contract holds **both ends**. It is the only instruction whose
-failure costs the entire answer rather than degrading it, so it gets primacy and
-recency and nothing else competes for either. The problem comes next, because
-instructions about how to solve something are unreadable before you know what it
-is. What the program has to clear comes last, immediately before it is written.
+…then the site's nudge, where there is one, repeats the output rule.
 
-**Everything else has been deleted, and the deletion is the design.** Turn 2
-used to carry a `<method>` — a six-step numbered procedure — wrapping an
-`<edge_cases>` checklist of twelve input shapes, a `<self_check>` of seven
-re-reads, and a closing coda. Inside that one message *"a wrong answer pays
-zero"* was stated four times, *"work silently, not in the reply"* three times,
-and *"send only the program"* three times over plus the nudge; turn 1's case
-classes were then restated almost verbatim as turn 2's edge cases, so the model
-was told the same thing twice across two turns and neither telling was the one
-it was graded against.
+The output contract sits **last**, which is the opposite end from where it used
+to sit. It is still the only instruction whose failure costs the entire answer
+rather than degrading it — but an instruction about how to answer is read at
+the moment answering starts, not two kilobytes before the model knows the
+question. Every stage asks for **one** block, and says so by number; the one
+exception is the inputs turn when it is also asked for a size-probe generator,
+which asks for two and says *that* by number.
+
+**Everything else has been deleted, and the deletion is the design.** The
+program turn used to carry a `<method>` — a six-step numbered procedure —
+wrapping an `<edge_cases>` checklist of twelve input shapes, a `<self_check>`
+of seven re-reads, and a closing coda. Inside that one message *"a wrong answer
+pays zero"* was stated four times, *"work silently, not in the reply"* three
+times, and *"send only the program"* three times over plus the nudge.
 
 None of that was free. Every sentence is an instruction a model can obey
-*instead of* answering, and a procedure that says how to think competes with the
-task for the same attention. The prompts now state **what is true** — how the
-code is invoked, compared and timed — and **what it must clear**, and stop.
+*instead of* answering, and a procedure that says how to think competes with
+the task for the same attention. The prompts now state **what is true** — how
+the code is invoked, compared and timed — and **what it must clear**, and stop.
 
 The hurrying went with it. `"every character you emit spends wall-clock inside
 the deadline"`, `"keep every trace terse"`, `"the payment rule pays the slowest
@@ -197,14 +190,16 @@ so. And **hash order is not stable across processes**: measured, four runs of
 order every time — so a solution tested with integers looks stable and is not.
 Rust randomises `HashMap`/`HashSet` iteration for the same reason.
 
-### The hidden suite is where the score is, so turn 1 is written for it
+### The hidden suite is where the score is, so the inputs turn is written for it
 
-The public examples are the friendly ones, and on live traffic there are usually
-none at all. Grading is on the **complete hidden suite**, written to break a
-solution that only handles the shape it was shown — so the cases the program
-will be checked against are asked for *first, in their own turn*, before the
-program exists to back-fill them from. Turn 1 names six classes and their
-order is the instruction:
+The public examples are the friendly ones, and on live traffic there are none
+at all — all 97 archived requests carry an empty list. Grading is on the
+**complete hidden suite**, written to break a solution that only handles the
+shape it was shown. So the inputs the program will be checked against are
+asked for in their own turn, beside the program rather than after it, and
+without answers attached — see *[Nothing is asked what a call should
+return](#nothing-is-asked-what-a-call-should-return)*. The turn names the
+classes and their order is the instruction:
 
     ONE ORDINARY     a typical input — the common path an all-boundary suite
                      never checks, and where a program wrong down the middle
@@ -228,16 +223,17 @@ of its public examples demonstrates. A model that never wrote a case for that
 result usually never wrote the branch either, and the hidden suite always
 tests it.
 
-That list used to be nine classes with a per-class count, and it was restated
-almost verbatim in turn 2 as an `<edge_cases>` checklist the model was asked to
-walk before answering. Both are gone: the classes belong to the turn that
-produces cases, and turn 2 is handed the cases themselves under `<must_pass>`,
-which is the same information as something the grader will actually run.
+The prompt asks for 8 to 20 of them and the parser keeps at most 20, thinned
+rather than truncated: the first three plus an even stride through the rest,
+because the classes arrive easiest-first and a head slice would throw away
+every boundary. Twenty is a ceiling with a price behind it — each input is run
+**twice**, once by the reference to produce the expectation and once by the
+candidate to be graded on it, and for Rust that is two containers.
 
-The examples are rendered *with* the problem and labelled a floor rather than
-the specification — and, since the statement is the spec, the label carries the
-one disambiguation rule a solver gets: where the statement is ambiguous, the
-examples decide.
+The examples, where a task ships any, are rendered *with* the problem and
+labelled a floor rather than the specification — and, since the statement is
+the spec, the label carries the one disambiguation rule a solver gets: where
+the statement is ambiguous, the examples decide.
 
 Each language is then warned about its own way of losing a large number, because
 they are not the same failure:
@@ -259,10 +255,10 @@ they are not the same failure:
 
 ### What was removed, and what it cost
 
-Turn 2 used to end with a `<self_check>`: seven things to re-read the program
-for, drawn from real submissions. Read off 43 answers a live miner sent, ten
-were the model's own bugs and **eight of those ten were visible on a careful
-re-read** — no test, no execution, no cleverness required:
+The program turn used to end with a `<self_check>`: seven things to re-read the
+program for, drawn from real submissions. Read off 43 answers a live miner
+sent, ten were the model's own bugs and **eight of those ten were visible on a
+careful re-read** — no test, no execution, no cleverness required:
 
 | what shipped | what a re-read would have caught |
 | --- | --- |
@@ -277,11 +273,11 @@ re-read** — no test, no execution, no cleverness required:
 The evidence is kept here because it is worth knowing what these models get
 wrong. The *section* is gone, deliberately: it was the third place in one
 message telling the model to work silently before replying, it competed with the
-task for attention, and the cases from turn 1 catch the same class of bug by
-running the program rather than by asking it to look again. That is the trade —
-a mechanism that sometimes caught a bug, exchanged for a prompt with one job in
-it. If a future run shows those bugs coming back, the answer is a better case
-turn, not another checklist.
+task for attention, and running the program against a reference catches the same
+class of bug by executing it rather than by asking it to look again. That is the
+trade — a mechanism that sometimes caught a bug, exchanged for a prompt with one
+job in it. If a future run shows those bugs coming back, the answer is a better
+inputs turn, not another checklist.
 
 The code is no longer asked for **unexplained**, either. That bullet — no
 comments, no docstrings — existed because output costs wall-clock, and
@@ -1047,34 +1043,30 @@ about how good the code is:
 problem independently and neither saw the other. There, grading is the only
 thing that can separate them.
 
-### A repair carries the error and nothing else
+### A repair carries the evidence and nothing else
 
-The correction prompt is the evidence plus one sentence naming what may come
-back:
+The repair prompt is the statement, the trap block, the program, and what the
+two programs each produced for the input they disagreed on:
 
 ```
-I ran `solve` against the test cases you sent and got:
-  - case 2 'single digit': solve(*[7], **{}) returned 0, expected 7
-
-Send back ONE fenced block: the corrected program — or, if the case was wrong
-rather than the program, a `json` array holding ALL of the cases, corrected.
+WHAT THE CHECK FOUND:
+ran=14 agreed=13 mismatch=1 oracle_crash=0
+FAIL empty input: this program and the reference disagree
+  reference produced: 0
+  this program produced: null
 ```
 
-What it no longer carries is method — *"trace the failing call through your
+What it does not carry is method — *"trace the failing call through your
 code"*, *"do not guess at the fix from the shape of the failure"*, *"re-check
-the fix against every OTHER case you were sent, silently"*, *"Do not change both
-to make them agree"*. That is work which never reaches the reply, competing with
-the failure itself for attention, and it is the same class of instruction the
-two-phase rewrite already took out of turns 1 and 2.
+the fix against every OTHER case you were sent, silently"*. That is work which
+never reaches the reply, competing with the failure itself for attention.
 
-Nothing is conceded by dropping *"do not change both"*: the grader keeps that
-promise rather than the prompt asking for it. A reply that rewrites the program
-**and** the cases is graded against the bar as it stood before it arrived, and a
-revision that drops cases is refused outright.
-
-The validator's own examples are the one place a case cannot be corrected — they
-shipped with the task and are ground truth — so that branch asks for the program
-alone.
+It also does not offer to let the model rewrite the test case, which the old
+correction prompt did. There is nothing to rewrite: the inputs came from one
+turn and the expected values from running a program, so a model that disagrees
+with a case is disagreeing with the reference, and the way to act on that is to
+repair the reference — which is a decision the router makes, on a count, rather
+than one the model talks its way into.
 
 ### Never give up on a task while an answer is still obtainable
 
@@ -1160,514 +1152,155 @@ salvage 1 + postmortem 2 = 11s) plus grading, archiving, signing and
 transmission. The budget is the advertised
 deadline minus that, and nothing else.
 
-### The model writes the tests, because nobody else does
+### Nothing is asked what a call should return
 
-Live traffic ships **no** `public_examples`. Measured over one run, 56 solves in
-a row reported `examples=0/0` — so the repair loop, the one mechanism here that
-turns a nearly-right answer into a right one, never had anything to run, and
-`verified` was False on every answer because nothing *could* be checked rather
-than because anything was wrong.
+This is the one idea the solver turns on, and it replaced a design that had
+been measured and found wanting.
 
-The only source of cases is the model. So the output contract now asks for two
-blocks: the program, then a `json` array of the cases it traced.
-
-```json
-[{"name": "empty input",  "args": [[]],        "expected": 0},
- {"name": "single item",  "args": [[5]],       "expected": 5},
- {"name": "stated bound", "args": [[1000000]], "expected": 1000000}]
-```
-
-Those run through **the validator's own executor**, and a disagreement fires the
-existing repair round. End to end, on a program with the classic `while n > 9`
-bug — right for 12345, wrong for 0 and every single digit:
+The old shape asked a model to write test cases *with their expected values*,
+then graded the program against them. Two readers were used instead of one, and
+a third — a judge — settled the cases they disagreed about. It did not work,
+and the logs say why. Over 54 live solves, 39 never produced a disagreement at
+all: two readings of one statement by one family of model agree for reasons
+that have nothing to do with being right. The judge upheld the rewrite 22
+times, sided against it 0 times and was unusable 7 — a rubber stamp with no
+discriminating power. And the line a converged solve printed,
 
 ```
-[verify] python entrypoint=g examples=0/0 self=3/3 verified=False
-  repair: case 2 'single digit': g(*[7], **{}) returned 0, expected 7
-  submitted: while n > 0   ← the corrected program
+[verify] … rounds=1 corrected=0/18 disagreed=0/18 exit=converged 57.4s/290s
 ```
 
-**What this does not do is verify anything.** A model cannot confirm its own
-reading of a statement, and cases that encode the same misreading agree with the
-code. That class stays uncaught. What it catches is the commoner one by far —
-the model knowing what the answer should be and coding it wrong — and that is
-objectively checkable.
+is the same line a *wrong* answer printed. Eighteen cases, nothing established,
+232 seconds handed back.
 
-### Turn 2 is asked to pass both suites, so both are run
+Now no model is asked for an expected value at all. Two **programs** are
+written instead, from deliberately opposed instructions, and run on the same
+inputs. The reference's outputs *are* the expectations.
 
-The validator's examples and the model's own cases are both in the turn-2
-prompt — `<examples>` and `<must_pass>`. Only one of them used to be executed:
-the self-test path sat under `if not task.public_examples`, so a task that
-**shipped** examples had its own cases quoted and never run. A program right on
-the one example and wrong on its own boundary cases verified, ended the loop and
-shipped, and the repair round that exists to catch precisely that never fired.
-Live traffic ships no examples, which is why it went unnoticed rather than why
-it was harmless.
+Two programs told to optimise for different things that still agree is
+evidence. Two that disagree is a fault with a concrete input attached.
 
-The **order** is the whole of the precedence:
+### The reference and the candidate are asked for opposite things
 
-1. The validator's examples first. They shipped with the task and are ground
-   truth — when they fail, the program is wrong, there is nothing to weigh, and
-   the own cases are not run at all. A second opinion from the same model on a
-   program already known wrong tells you nothing and costs an executor run per
-   case.
-2. Only once those are all green does a disagreement with the model's **own**
-   cases become the open question, and `failures` carries that instead.
+The difference between the two prompts is the whole of the evidence, so it is
+deliberate rather than incidental:
 
-So `failures` names one suite at a time and `from_self_tests` says which — which
-is exactly what lets the repair prompt offer a corrected `json` array where a
-case may be wrong, and refuse to where the examples are ground truth.
+| | the reference | the candidate |
+|---|---|---|
+| told | inputs are tiny; be obviously correct | hidden tests run at the stated maximums |
+| nested loops | fine | a bound you would have to iterate to reach means you need a closed form |
+| recomputing from scratch | fine | use a compressed or implicit representation |
+| clever structures | *don't* | yes, where they are what makes it fit |
+| model | `opus:low` | `opus:medium` |
 
-`verified` still means what it always meant: every public example reproduced. It
-can now be True on an answer that still disagrees with the model's own cases, so
-the answer **cache** is gated on `not failures` as well — caching one of those
-re-serves a wrong answer for every later task with the same statement.
+If both were asked for a fast correct program, the two answers would carry the
+same misreading of the statement and comparing them would establish nothing.
+The reference being cheap is not an economy — it is the point.
 
-So `self_passed` is kept in its own field. It never touches `passed`/`total`,
-`verified` is earned by the validator's examples alone — with none shipped it
-stays False however many of its own cases a program passes. The in-memory answer
-cache is gated on `verified` **and** on having no outstanding failures, so an
-answer that cleared the examples and still disagrees with its own cases is not
-cached either: one wrong answer must not be re-served for every later task with
-the same statement.
+### The inputs are written before either program exists
 
-There is a second, on-disk cache for live traffic, which ships no public
-examples and so never fills the first: `solvers/solution_cache.py` keeps an
-answer under `solutions/cache/<problem hash>.json` when it passed every case its
-readers wrote, nothing was left contested, the size probe timed it at scale and
-finished (`probe=passed`), and grading was not degraded to the subprocess
-fallback. A request with the same statement, language and entrypoint is answered
-from that file in about a second, before any conversation opens (`cache=hit` on
-the summary line). `SOLVER_SOLUTION_CACHE=0` turns it off.
+A third turn writes the inputs, and it is forbidden to supply answers for them.
+A model that writes both the inputs and what they should return has put its own
+reading of the statement back inside the thing meant to check it; the reference
+computes the answers by being run instead, which is a strictly easier thing for
+the inputs turn to be right about. The parser drops any expected value that
+arrives anyway.
 
-Two rules keep the bar honest, and they are the same rule at two moments:
+Every input has to be small enough for a deliberately slow reference to finish,
+which is also what keeps the suite affordable: the whole thing is re-run on
+every repair round. The parser keeps at most twenty of them, thinned rather
+than truncated — the first three plus an even stride through the rest, because
+the classes arrive easiest-first and a head slice would drop every boundary.
 
-- **The program turn cannot bring its own bar.** Cases written beside a program
-  are back-filled from what it happens to do, so they agree with its bugs. A
-  `json` block in turn 2 is refused and turn 1's cases stand. Measured before
-  this existed: turn 1 wrote a case that *caught* the bug, turn 2 sent the buggy
-  program with two cases of its own, round 1 reported the real failure and then
-  adopted them, and round 2 re-graded the same buggy program against the bar it
-  had brought with it — `self=2/2`, no failures, loop over, buggy program
-  submitted as passing everything.
-- **A repair cannot pass a bar it rewrote in the same breath.** A reply that
-  changes the program *and* the cases is graded against the bar as it stood
-  before it arrived; its cases apply from the next round.
+### The three writing turns run side by side
 
-A repair reply that corrects a case and leaves the program alone is the one the
-prompt asks for, and it may arrive **without the program** — a `json` array and
-nothing else. The program already in hand is then re-graded against the
-corrected bar. Re-graded, not assumed to pass: there is no rewrite to launder
-because there is no new program.
-
-The repair wording changes with it. Not *"your solution is WRONG"* — these cases
-came from the model, so a disagreement proves only that two things it wrote
-contradict each other, and blaming the code when the **case** was wrong is how a
-repair round breaks a correct program:
-
-> I ran `solve` against the test cases you sent and got: … Send back ONE fenced
-> block: the corrected program — or, if the case was wrong rather than the
-> program, a `json` array holding ALL of the cases, corrected.
-
-A repair reply may carry a corrected `json` block beside the program, and that
-is safe because `extract_code` picks the block that **defines the entrypoint**,
-not the first or last one. Verified against the layouts models actually produce
-— program first, cases first, an untagged JSON block, and a reply carrying only
-cases, which still reports *"the reply contained no code"* exactly as before.
-
-`SOLVER_SELF_TESTS=0` turns the whole mechanism off: one turn, no cases asked
-for, and every answer submitted ungraded.
-
-### The cases are written before the program exists
-
-Asking for both in one reply has a flaw that no amount of prompt wording fixes:
-a model writing cases **alongside** a program back-fills the `expected` values
-from what the program happens to do. Those cases then agree with the program's
-bugs, which is the one thing a test must not do. Cases written *first* cannot.
-
-That is why the combined prompt is not kept as a fallback. It looked free — one
-round trip instead of two, and cases where there would otherwise be none — but
-what it produced was evidence the grader could not trust, paid for in output
-tokens spent inside the deadline. When turn 1 fails in a way that belongs to the
-task, the remaining passes ask for the program **alone** and the answer goes out
-ungraded, which is the honest version of the same outcome.
-
-So the solve spends a round trip on them, at every deadline:
-
-```
-turn 1  the cases, and explicitly NOT the program
-turn 2  the program, with those cases restated as <must_pass>
-turn 3+ repair, if the program disagrees with them
-```
-
-Turn 1 is asked for the shape the classes actually break on, with counts stated
-**per class** rather than as a total — a total invites a model to spend it all
-on the easy classes:
-
-```
-1. ONE ordinary case            the common path, which an all-boundary
-                                suite never checks at all
-2. then 2–10 cases per class:   zero and the empty input · one and two ·
-                                every limit the statement names, at it,
-                                one below, one above · negatives ·
-                                largest/smallest, and i32 overflow ·
-                                ties and duplicates · degenerate shape ·
-                                each rule fired and NEARLY fired ·
-                                the case you are most likely to get wrong
-```
-
-Four things make the extra round trip safe rather than a second way to run out
-of time:
-
-- **Turn 1 has no timeout of its own.** There is one clock on a solve — the
-  deadline the validator advertised — and turn 1 reads against it like every
-  other read here. It carried a private cap twice and both were wrong the same
-  way: the first set `extend_to_s` equal to the slice, which makes the extension
-  a no-op by construction; the second used a soft 60s slice and a hard 100s cap.
-  Both cut the model off **mid-think**, which is the one moment where stopping
-  cannot help — the reply does not exist yet, so the cap saves time that bought
-  nothing and costs the whole turn.
-
-  A cap *looks* like it protects the program's read and does not. `send` returns
-  the moment the model finishes, so the slice is a ceiling and never a wait: a
-  cases turn that takes 90 seconds hands the program the other 190 whether or
-  not a cap exists. The only case a cap changes is the one where the model has
-  not finished — and there it converts a slow answer into no answer, the one
-  trade the payment policy says never to make.
-
-  Live, on a hard Rust task: `Thought for 1m 17s` before a character appeared,
-  against a 60s cap. Turn 1 timed out, the conversation was unusable, the pass
-  was handed on — four times, 189 seconds, `provider=none`, the program never
-  asked for once. The same task before the split got one 238s read.
-- **A cases turn that costs a pass does not cost every pass.** Whatever makes
-  turn 1 unaffordable — a long thinking phase, a slow account, a hard problem —
-  belongs to the task and the site, not to one tab, so the next pass would
-  repeat it exactly. One pass may be spent finding that out; the rest go
-  straight to the program, which is the half that pays. That, plus the budget
-  itself, is what protects the program now that no cap does.
-- **There is no deadline below which it is skipped.** There was — a 100-second
-  floor, on the reasoning that a cases turn *costs* 20-30s of submit-and-settle
-  before the model writes anything, which a 40s budget cannot spare. That
-  priced the worst case into every solve: turn 1 is a ceiling, not a spend, so
-  a fast cases turn on a short deadline costs what it took and the program
-  gets the rest.
-- **A turn 1 that produces nothing still gets a program.** No usable cases is
-  not a failure; it costs the time it took and turn 2 goes out regardless.
-- **A turn 1 that could not be *read* is handed on; one that ran the deadline
-  out is not.** They are not the same failure, and the clock tells them apart.
-  A tab that dies leaves the budget intact and another tab can still spend it.
-  A turn that ran the deadline out leaves nothing — handing on would lease a
-  second tab, ask a second account for a whole program with seconds on the
-  clock, and reach the same empty answer having spent someone's quota to get
-  there. So that one stops.
-- **A wrong case can still be corrected.** Turn 1 derives its `expected` values
-  by reasoning, so one of them can simply be wrong — and freezing them would
-  make a **correct** program fail the same bogus case on every repair round.
-  The repair prompt offers a corrected `json` array as one of the two things it
-  will accept back,
-  and a repair reply carrying a corrected array replaces the frozen one for the
-  *next* round. Not the round that carried it: a reply is graded against the
-  cases agreed before it arrived, so a model cannot make its program pass by
-  rewriting the bar in the same breath.
-
-`MAX_SELF_TESTS = 20` is the cap the model is told about *and* the cap the miner
-enforces, and over-long arrays are thinned by keeping the first three and then
-striding — a head-slice would keep only the cheap opening cases and throw away
-every boundary, discarding exactly what the mechanism exists to run. The head is
-three because that is where the first three classes sit (the ordinary case, the
-empty value, and one), not because the ordinary case is asked for three times:
-turn 1 asks for exactly ONE of those. Three runs of the common path are three
-runs of the same code, paid for out of the solve's own deadline and re-paid on
-every repair round.
-
-### The bar is written where the program cannot see it
-
-Writing the cases *first* stops them being back-filled from a program that
-already exists. It does not stop something subtler, and the production logs
-say so plainly.
-
-Sequentially, turn 1 and turn 2 are two turns of ONE conversation on ONE model.
-The program is written with the cases already in context, by the model that
-wrote them, from that model's single reading of the statement. When that
-reading is wrong, the program and its bar are wrong *the same way* and agree
-perfectly. Across the 97 solves in `calibration/logs-2026-09-05*.log`:
-
-```
-96 of 97   shipped a program that passed EVERY one of its own ~18 cases
-71 of 97   never produced a single disagreement to repair (rounds=1)
-78-83%     is what those same runs scored against the hidden suite
-```
-
-About one shipped answer in five clears a bar it wrote for itself and still
-fails. The repair loop was not the weak link — it almost never had anything to
-work on.
-
-So the cases turn now runs in its **own conversation**, asked at the same
-moment the program is, and the program's prompt carries no `<must_pass>`
-section at all:
-
-```
-             ┌─ conversation A ─ the cases, from the statement alone
-   open ─────┤
-             └─ conversation B ─ the program, from the statement alone
-                                      │
-                   grade B against A ─┤
-                                      └─ turn 3+ repair, in B, quoting the
-                                         disagreement
-```
-
-Two readings of the statement that cannot see each other. A disagreement is now
-evidence rather than a formality, which is the whole point — and when they
-agree, they agree for a reason.
-
-It is also **faster**, which is what pays for the extra repair rounds an
-independent bar produces. Those two turns are 83.8% of all phase time and they
-used to run back to back:
-
-```
-                cases   program   sequential   side by side
-p50             56.9s     63.5s       120.4s          63.5s
-p90             95.1s    171.2s       266.3s         171.2s
-```
-
-Shipped solves ran p50 156s and p90 274s against a 280s stop — six seconds of
-headroom at p90. Overlapping the two turns is where the room for correction
-rounds (p50 16.4s each) comes from.
-
-Measured end to end on the five sample challenges, each shown **no** public
-examples and graded on all of them (`--challenge <name> --examples 0`):
-
-```
-                                 solve       output tokens
-                              seq → split      seq → split
-asset-rebuild-planner        67.1s → 44.6s    6,066 →  6,441   3/3 both, 2 rounds → 1
-extent-journal               96.5s → 71.8s    8,789 →  8,869   3/3 both
-reactive-stat-board          76.3s → 69.7s    7,217 →  9,669   rust: not gradeable here
-revocable-verification-gate 136.0s → 69.3s   11,851 → 10,131   rust: not gradeable here
-sparse-circular-array       101.7s → 53.6s    8,964 →  8,192   rust: not gradeable here
-                            ──────────────   ───────────────
-median                       96.5s → 69.3s   42,887 → 43,302
-max                         136.0s → 71.8s
-```
-
-Faster on all five, and output tokens are flat overall (+1%): the program's
-prompt loses its `<must_pass>` block, and the bar's conversation pays its own
-cache write instead.
-
-Be clear about what that table does and does not show. The **times** are five
-paired measurements and they all point the same way. The **correctness** column
-is two problems, three cases each — Rust needs Docker to grade and this box has
-none — which is a smoke test, not a powered comparison. The evidence that the
-shared bar was catching nothing is the 97-solve production sample above, not
-these five. `calibration/bar_ab.py` prints this table from the archived runs in
-`calibration/bar-ab/`, and its docstring carries the command that reproduces
-them.
-
-Four rules keep the split from becoming a second way to lose:
-
-- **The bar is a separate failure domain, and that is the point.** A cases
-  conversation that hangs, dies, or returns nothing costs the bar and nothing
-  else: the program was written somewhere this never touched, and it ships. The
-  ceiling and the still-writing reopen that the sequential shape needed exist
-  because a slow cases turn used to take the program's budget with it.
-- **The bar is waited for, bounded by the deadline and nothing else.** There
-  is no round held back and no floor under the wait: a disagreement that
-  arrives late still turns an answer shipped unchecked into one that was
-  graded, and `disagreed=` on the summary line is worth more than a round
-  nobody may need. The second bar is never waited for at all -- it is joined
-  whenever it has landed, before every grade, and reported `late` if it never
-  does.
-- **A repair still quotes the bar.** Independence is about how the program is
-  *written*, not about what it is shown afterwards. Turn 3 onward names the
-  failing case, because a repair that cannot see what it failed is a guess.
-- **`SOLVER_INDEPENDENT_BAR=0` restores the sequential shape.** It is a
-  supported configuration, not a dead branch.
+None of the inputs, the reference or the candidate consumes another's output —
+all three need only the statement and the trap block. So they are one
+`asyncio.create_task` each and the pass waits for all three. The critical path
+is the analysis turn plus the **slowest** of the three rather than the sum of
+four, which is what makes room for repair rounds inside 290 seconds. The phase
+lines say `alongside` for the two that ran beside the candidate.
 
 ### Which model answers which phase
 
-Each phase may name its own model and effort:
-
 ```
-SOLVER_CLI_PHASE_PROFILES=cases=sonnet:medium,program=opus:low
-```
-
-Phases are `cases`, `program`, `repair`, `judge` and `cases2`. The first three
-are **unset by default**, and that is deliberate rather than cautious: every one
-of the 102 solves in the archived runs opened on the same model, so those logs
-say nothing whatever about how another model answers a cases turn or a program
-turn here. A default naming one would be a guess with a measurement's authority.
-Measure it on your own traffic, then set it. `judge` and `cases2` DO default,
-and to **different** models, because what each wants from one is different.
-Both are a reading of the statement the program's author did not make, so
-neither is ever the model that writes programs -- but the judge is asked to be
-*right* about one expected value, and the second bar is asked to be
-*different*.
-
-- `judge` defaults to **`sonnet:medium`**. Its answer settles a case, and
-  sonnet is the model measured for that: 91 of 97 expected values agreed with
-  opus, inputs held fixed (`calibration/fixed_inputs.py`). Medium because it is
-  the one turn where being right is the entire product, and the cheapest --
-  it never reads a program.
-- `cases2` defaults to **`fable:low`**. The second bar's product is the union
-  of two readers' calls, and two models choosing their own inputs share about
-  2% of them (`calibration/two_bar_overlap.py`) -- a property of any two
-  distinct models rather than of sonnet. Fable's `expected` values have no
-  study behind them; the judge is what keeps a bad one from being enforced.
-
-Correction rounds rotate through `SOLVER_REPAIR_ROTATION`
-(`opus:low,sonnet:medium,fable:low`) until the program passes or the deadline
-stops it -- around again when every model has had it once.
-
-What a phase names is a **preference, never a pin**, and the two escapes are
-what make it safe to use at all:
-
-- a phase whose model is refused on every account falls through to the ordinary
-  ladder, so a model going down costs that phase its first choice and never an
-  answer;
-- `avoid` beats the preference. It is how a pass says *not the one that just
-  got this wrong*, and honouring a pin ahead of it would send the retry
-  straight back to the model being retried.
-
-### The correction phase says what triggered it and why it stopped
-
-Phase 3 converges. Over the 102 archived solves it entered 26 of them and
-converged in 25 — it is not failing at its job. The trouble is what it never
-sees:
-
-```
-102 solves
-   76  (75%)  never entered a correction round at all   rounds=1
-   26  (25%)  entered one, and 25 of 26 converged
-    5         shipped with NO cases at all — nothing to grade, nothing to repair
-  ~20         wrong answers implied by the 78–83% hidden-suite rate
+analysis  opus:low     tests  opus:low     oracle  opus:low
+candidate opus:medium  repair fable:medium
 ```
 
-Most of those wrong answers are among the 76, not the 26. A program that agreed
-with its own cases on the first try and submitted is exactly what a wrong answer
-looks like from inside. **You cannot correct what never disagreed**, so the
-number that matters is not how well the loop converges but how often anything
-disagrees at all — and `rounds=1` cannot tell a program that was RIGHT from one
-whose cases could not tell.
+`repair` names a **different model** from `candidate`, and that is the point of
+it. A model asked to repair its own program defends its own reading of the
+statement — which is the failure the comparison exists to catch, reappearing
+one layer up. Measured under the previous design over 54 live solves: of ten
+single-case disagreements, nine ended with the model editing its own test case
+and keeping its program.
 
-So the summary line carries both:
+What that costs, said rather than glossed: a phase change means the repair
+cannot inherit the candidate's conversation, so its first prompt carries the
+statement a second time. Rounds after the first stay on the same profile and do
+resume, so it is one prompt per solve and not one per round.
 
-```
-[verify] python entrypoint=g provider=cli:opus bar=cli:opus examples=0/0
-         self=18/18 verified=False rounds=1 corrected=0/18
-         disagreed=0/18 exit=converged  44.6s/290s id=…
-```
+A phase names a preference and never a pin. A model refused on every account
+falls through to the ordinary ladder, so `fable` in a log line is ambiguous on
+its own — either the repair phase asking for it, or the ladder falling back to
+it — and the summary line says which.
 
-- **`disagreed=N/M`** — how many cases the program failed on the FIRST grade,
-  before any repair moved either side. This is the trigger rate. `disagreed=none`
-  means no grade ever ran: a defect, no cases at all, or an executor that could
-  not run them — on a Rust box without Docker that is every Rust solve, and the
-  line then says `rounds=1 disagreed=none exit=converged` for an answer nothing
-  was able to check. It is the first grade
-  of the *solve*: when a second pass runs, it reports what the bar found on the
-  first, because the question is whether the bar found anything on this task —
-  unlike `exit=`, which describes how the solve ended and so reports the last.
-- **`exit=`** — which condition ended the loop: `converged`, `verified`,
-  `budget`, `stalled`, `cutoff`, `empty`, `maxattempts`, plus `cases` (the cases
-  turn never answered, so no program was asked for), `exhausted` (the repair
-  could not be carried on: no model but the one answering, or nothing left to
-  carry) and `failed` (the backend raised). Every way out of a pass records one,
-  so the line never carries an earlier pass's reason for this one, or nothing.
-- **`probe=`** — what the size probe said about the program that shipped:
-  `passed` (finished at the statement's own scale inside 5s), `too_slow`,
-  `oom`, `crashed`, `skipped` (the clock ran out first) or `none` (no
-  generator, no valid large input). Only `passed` lets an answer into the
-  on-disk solution cache.
-- **`bar2=`, `union=`, `split=`, `adjudicated=`, `contested=`, `repair=`** —
-  the second bar's model (or `late`/`none`), what the two bars union to, how
-  many calls they read two ways, how the judge settled disputed cases, how many
-  were dropped as ambiguous, and which models the correction rounds ran on.
+### The repair loop says which program it patched
 
-Read them together. `rounds=1 disagreed=0/18 exit=converged` is a program
-nothing could fault. `rounds=1 disagreed=none exit=converged` is a program
-nothing was ABLE to fault, which is the failure this instrumentation exists to
-count.
+A disagreement does not say *which* program is wrong. The router's default is
+that a mismatch accuses the candidate and a reference that could not produce a
+value at all accuses the reference — and that default can be wrong. On the
+closest measurement available, two independent encodings of one statement, the
+shipped program was the wrong party 7 times in 27 and the second encoding 11.
 
-### An empty cases turn is asked for once more
+So two things sit on top of the default.
 
-A cases turn that comes back with nothing leaves the solve with nothing to
-grade: no cases, so no failures, so the loop breaks immediately and the answer
-ships having been run against nothing at all. Both later phases are inert.
-Measured, that is 5 of 102 solves — while the median solve hands back 134s of
-its 290s unspent.
+**Repair is monotone.** A round whose verdict score does not improve leaves the
+previous version in place, and `regressed=` counts it. The worst case of a
+wrong blame is a wasted round, never a worse answer shipped.
 
-So it is asked once more, and once only. Whatever made the first turn come back
-empty — a refusal, a reply carrying no JSON, a turn cut off — belongs to the
-task and the site as often as to the tab, and a third ask would repeat it; after
-two the remaining passes go straight to the program, which is what
-`_Plan.two_phase` already encodes. An empty bar costs the grading, never the
-answer.
+**The router counts, and then flips.** The same set of failing cases blamed on
+the candidate twice hands the next round to the reference instead, and
+`flipped=` records it. Two rounds and not one, because a first disagreement
+really is likelier the candidate's fault — it was written under the harder
+instruction, against the larger inputs. One failed repair is ordinary; two on
+the same case, with nothing else accusing it, is the signature of a reference
+that is itself wrong.
 
-When the retry fires, the phase log changes shape — three lines where there
-was one — because the retry runs *between* the program's turn and its grading:
+A signal that does not come from the reference is never second-guessed: the
+Rust compile gate and the size probe accuse the candidate on their own
+evidence, and when either has spoken there is no dispute to arbitrate. That
+asymmetry is worth knowing about — `compile_defect` is Rust-only, so on Python
+the independent signal is the size probe alone.
+
+A round that changes neither program is a stall, and a stall flips immediately
+rather than waiting out a counter that a repair producing nothing will never
+advance.
+
+### What the summary line says
 
 ```
-[phase] 1 cases        took  0.0s  (alongside, model 0.0s)   ← the empty one, beside the program
-[phase] 2 program      took 52.2s  (model 52.2s)             ← the turn, marked at the instant it ended
-[phase] 1 cases again  took 48.1s  (model 48.1s)             ← the retry, sequential
-[phase] 2 graded       took  1.3s  (checked 1.3s)            ← the grading, once there is a bar
+[verify] python entrypoint=solve provider=cli:opus@primary
+  inputs=cli:opus@primary reference=cli:opus@primary
+  examples=0/0 self=14/14 verified=False (verified on local: agreed with an
+  independently written reference on all 14 inputs; …)
+  ran=14 agreed=14 mismatch=0 rounds=1 corrected=0/14 probe=passed
+  exit=verified 214.8s/290s
 ```
 
-Each line is charged only its own seconds and the sequential ones sum to the
-solve. Measured before this was right, the retry printed `took 0.7s` for a
-0.4s turn and the program `took 0.2s` for a 0.3s one — the program's time
-credited to the retry — because phases were being marked in a different order
-from the one they ran in.
+`ran=` is the field that earns its place. Without it the line said the same
+thing about an answer checked against fourteen inputs and an answer checked
+against none. `agreed=`, `mismatch=` and `oracle_crash=` say what the
+comparison established; `repair=fable:cand>fable:oracle` says which artifact
+each round patched; `regressed=` and `flipped=` are the instruments for the
+routing heuristic being wrong.
 
-### What an audit before production found, and fixed
-
-Thirty findings from six independent readers of the shipped code, each one
-adversarially verified against the real source before it was acted on. The
-ones that mattered:
-
-- **`corrected=` had printed 0 since `d6c9fc6`.** Removing the judge removed
-  the one line that incremented it. The production logs' `corrected=1…15`
-  all predate that commit. It counts again, from the same `moved` figure the
-  bulk cap already computes.
-- **A bulk-refused correction was scored as the model repeating itself.**
-  Both `correction_refused = True` setters went out with the judge; the
-  duplicate guard then read a refused rewrite as the same program twice and
-  could end the pass as `stalled`. The one setter still needed is back.
-- **Under the independent bar, a Rust repair could not see its input.** The
-  failure line clips stdin to 160 characters, which was a summary when the
-  model had the full case one turn back in its own context and is the *only*
-  thing it knows when the case was written elsewhere. The repair prompt now
-  carries the failing case(s) in full, exactly as the grader runs them — so
-  the model can reproduce the failure, and a corrected case can match the
-  original by key.
-- **The resume prompt contradicted itself.** Carried to a fresh conversation
-  it said `YOUR OWN cases` in `<must_pass>` and *someone who has not seen
-  your program* a paragraph later. The block now says whose they are.
-- **`rounds=` accumulated across passes** while `exit=` described only the
-  last; a solve whose first pass spent three rounds and died reported
-  `rounds=4` for its second pass's one. Per pass now, like `exit=`.
-- **`bar=` was bound at open.** A ladder hop inside the bar's turn credited
-  the model that refused. Read after the turn.
-- **A bar that timed out reported the time its wait *began*.** Measured at
-  the end now.
-- **`rounds=` counted loop entries, not prompts sent.** The budget and
-  max-attempts breaks sit after the increment and send nothing, so every solve
-  ending either way reported one round more than it asked for.
-- **`close()` was not idempotent** while more than one owner calls it by
-  design, so each double release decremented the live-session count twice and
-  the clamp at zero hid the drift instead of reporting it.
-- **The line could describe a pass that lost.** A second pass runs with an
-  answer in hand whenever public examples ran and something failed; a pass that
-  then scored lower did not replace the answer but had already overwritten the
-  plan. `exit=`, `bar=`, `rounds=` and `corrected=` are snapshotted as a pass
-  wins, the way `provider=` always has been.
-- **`bar_task.cancel()` was fire-and-forget.** On Python 3.11 `asyncio.wait_for`
-  can swallow a cancel that lands as its inner future completes — at the bar's
-  slot acquire, that meant a cases turn nobody would read ran to the end of its
-  slice on the seat's quota. Reproduced through `_attempt` with the real
-  backend. The slot acquire no longer uses the swallowing form, and the pass's
-  cleanup observes the cancellation, bounded, and cancels once more if it was
-  swallowed.
-
+`rounds=` and `corrected=` are kept across the rebuild for a reason that is
+not about reading the line: `calibration/bar_ab.py` is the only consumer of
+this format, and its failure mode is silence — a regex that stops matching
+returns zero rows rather than raising. A test runs its regexes over a line a
+real solve just printed, so a future field cannot quietly take the comparison
+tool with it.
 
 ### A short deadline must still get an answer
 
@@ -2031,22 +1664,32 @@ submitting and each further ask spends a real account's quota.
 ## Self-verification: the part that earns the money
 
 Scoring is accuracy-or-nothing, and models routinely produce *nearly* right
-answers. But every task ships real `public_examples`, and the comparators the
-validator will judge you with live in this repository
-(`rlvr/execution/compare.py`, `rlvr/execution/rust_judge.py`). So the miner
-grades its own candidate with the validator's executor before answering, and on
-failure hands the model the concrete evidence:
+answers. The comparators the validator will judge you with live in this
+repository (`rlvr/execution/compare.py`, `rlvr/execution/rust_judge.py`), and
+the miner grades its own candidate with the validator's own executor before
+answering.
+
+What it grades against is the question. **No live task has ever shipped a
+public example** — `public_examples` is `[]` on all 97 recorded requests in
+`examples/problems/` — so there is no ground truth to check against and the
+`examples=0/0` in every summary line is not a bug. The miner has to manufacture
+its own evidence, and the only kind worth having is a second program written
+under a different instruction: see
+[Nothing is asked what a call should return](#nothing-is-asked-what-a-call-should-return).
+
+On failure the model is handed the concrete disagreement rather than a verdict:
 
 ```
-Your solution is WRONG. I ran `sum_of_digits` against the examples and got:
-  - sum_of_digits(*[12345], **{}) returned 14, expected 15
-  - sum_of_digits(*[999], **{}) returned 18, expected 27
+FAIL empty input: this program and the reference disagree
+  reference produced: 0
+  this program produced: null
 ```
 
-That turns a one-shot paste into a repair loop that converges. Passing the
-public examples is not proof of passing the hidden suite, but it eliminates the
-large class of answers that are simply wrong on the stated contract. When even
-that is not enough, the second opinion asks the other model — see
+That turns a one-shot paste into a repair loop that converges. Agreement with
+an independently written reference is not proof of passing the hidden suite,
+but it is strictly more than the old shape established, and it is all a live
+solve can get. When even that is not enough, the second opinion asks the other
+model — see
 [The one time the provider matters](#the-one-time-the-provider-matters).
 
 The ChatGPT reader is a direct port of
@@ -2059,6 +1702,8 @@ fresh conversation.
 |---|---|---|
 | `SOLVER_MAX_ATTEMPTS` | `0` | Rounds per solve, `0` meaning **unlimited** — correct until it passes or the request's deadline stops it. A count here is a second, private deadline under the only real one, and there is no partial credit for stopping early. Set a number to cap it anyway |
 | `SOLVER_MAX_BUDGET_S` | `3600` | The protocol's own maximum for `deadline_s`, so it cannot bind on a spec-compliant request. Lowering it below the advertised deadline throws away answers the validator would still pay for |
+| `SOLVER_LLM_ANALYSIS` | `true` | Stage 3: ask a model to add to the free trap scan before anything else is written. The scan itself is regexes and always runs, so off is a poorer prompt rather than a broken solve — the same place a solve lands when the turn fails. Measured over the 97 recorded tasks, the scan alone finds a median of 5 traps and never fewer than 3 |
+| `SOLVER_SELF_TESTS` | `true` | The local check at all — stages 4 and 5 as well as the grading. Live traffic ships no public examples, so off means nothing is compared, the repair loop never fires, and the candidate turn's first answer ships. One writing turn per solve instead of three |
 | `SOLVER_VERIFY_EXECUTOR` | `docker` | Python grading backend, matching the validator's 256 MiB / no-swap container; Rust always uses Docker. When no daemon answers, Python falls back to `subprocess` (1 GiB) with a once-per-run warning, tries Docker again every `SOLVER_EXECUTOR_RETRY_S`, and answers graded that way are kept out of the on-disk cache |
 | `SOLVER_EXECUTOR_RETRY_S` | `300` | How long an executor that could not be BUILT stays unavailable before a solve tries again. Without a daemon, building the Rust executor runs `docker info` — 60ms against a missing socket, up to 20s against a hung one — and it used to run once per Rust task, inside the solve's budget. A hold rather than a verdict: a daemon started after the miner is picked up on its own |
 | `MINER_RESPONSE_GRACE_S` | `5` | How far past `deadline_s` the solve may run. The validator reads until `deadline_s + 10` (`_MINER_RESPONSE_GRACE_S`, `rlvr/neurons/decentralized.py`), and the reference handler stopped at `deadline_s` flat. Not all ten: the rest is the response's own trip across the wire. `0` restores the reference behaviour |
@@ -2537,7 +2182,6 @@ Five layers, cheapest first, each isolating a different failure:
 ```bash
 # from the repo root
 python -m pytest examples/custom_miner    # 1. code only — no browser, no chain
-python scripts/two_turn_demo.py           # 1b. see the two turns, still no browser
 
 # from examples/custom_miner
 cd examples/custom_miner

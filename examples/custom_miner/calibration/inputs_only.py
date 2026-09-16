@@ -25,15 +25,34 @@ which is what the prompt asks for. One reply in six did not parse as a JSON
 array, so any production use needs a tolerant parser or a retry.
 
 ARBITRARY. Asked TWICE, on the same problem, the same model reproduced a median
-of 10% of its own choices. That is what killed the two-bar design in
-two_bar_overlap.py, and it is not a disagreement between models: the input
-space for "boundary cases for this statement" is enormous and the selection is
-close to a coin toss. No design can use agreement about WHICH inputs to test as
-a signal, from any pair of readers, including one reader with itself.
+of 10% of its own choices. The input space for "boundary cases for this
+statement" is enormous and the selection is close to a coin toss. No design can
+use agreement about WHICH inputs to test as a signal, from any pair of readers,
+including one reader with itself.
 
-What follows is fixed_inputs.py: fix the calls at ONE source and the divergence
-is gone by construction, because every reader is then asked about the same
-calls.
+THE TWO EXPERIMENTS THAT CAME BEFORE, and the designs each one settled. Both
+scripts have been retired with the mechanisms they measured; their numbers are
+the reason this turn has the shape it does.
+
+  two_bar_overlap.py -- opus against sonnet, eight archived requests, each
+  asked to invent its own test cases. TOTAL shared inputs 5 of 233 written;
+  of those five both models agreed on all five and contested none. Two
+  independent readings that evaluate the SAME input agree. They just do not
+  choose the same input -- so a "second bar" arbitrating by agreement would
+  have been empty on almost every solve, and the design was refused.
+
+  fixed_inputs.py -- the same two models, inputs held fixed at one source,
+  asked only what each call must RETURN, neither having seen any program:
+  91 of 97 agreed, 94%. That settled where the divergence lives. It is in
+  choosing the calls, not in reading the statement.
+
+Fixing the calls at ONE source removes the divergence by construction. What
+supplies the expected values for them is the other half of the answer, and it
+is not a reader at all: a reference PROGRAM is written under a
+correctness-first instruction and run on these inputs, and its outputs are the
+expectations. See `solvers/differential.py`. 94% agreement between two readers
+is not good enough when the reply is all-or-nothing, and a program that has
+been executed is not an opinion.
 
     python -m calibration.inputs_only opus <request>.json ...
 """
@@ -47,7 +66,7 @@ sys.path.insert(0, '/home/user/Scope/examples/custom_miner')
 sys.path.insert(0, '/home/user/Scope')
 
 from solvers.claude_cli import CliBackend
-from solvers.prompts import MAX_SELF_TESTS
+from solvers.prompts import MAX_INPUTS
 
 CLASSES = ("ordinary", "empty", "one", "boundary", "likely-wrong")
 
@@ -106,7 +125,7 @@ async def ask(backend, task, model):
     try:
         p = INPUTS_ONLY.format(lang=task['language'], entry=task['entrypoint'],
                                statement=task['statement'].strip(),
-                               limit=MAX_SELF_TESTS)
+                               limit=MAX_INPUTS)
         if task['language'] == 'rust':
             p += RUST_NOTE
         t = time.monotonic()

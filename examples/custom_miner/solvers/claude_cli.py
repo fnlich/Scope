@@ -117,7 +117,7 @@ _MODEL_WINDOWS = {"seven_day_opus": "opus", "seven_day_sonnet": "sonnet"}
 LIMIT_RECHECK_S = 1800.0
 
 # The share of a seat's window past which FRESH conversations -- solves, and
-# the named-model turns of the second reading and the judge alike -- go to
+# the named-model turns of every phase alike -- go to
 # another seat while one is free. Below it the first seat is drained first:
 # spreading turns across seats does not create capacity, and it spends the
 # backup while the primary is healthy, which is the one thing the backup is
@@ -411,8 +411,8 @@ class Profile:
 def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profile, ...]:
     """What answers when the default model will not, in order.
 
-    `SOLVER_CLI_EMERGENCY_PROFILES=sonnet:medium,fable:low` -- each entry a
-    model alias the CLI accepts, optionally with an effort after a colon.
+    `SOLVER_CLI_EMERGENCY_PROFILES=fable:low` -- each entry a model alias
+    the CLI accepts, optionally with an effort after a colon.
 
     Sonnet first, and the order is a correctness judgement rather than a speed
     one. Latency says the opposite: on a real production problem the program
@@ -422,13 +422,15 @@ def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profil
     measures a problem that justifies it. But an emergency rung answers a
     whole solve, not a phase, and the subnet pays only for a complete pass of
     the hidden suite: 161s inside a 290s deadline is affordable, and a wrong
-    answer at 38s earns exactly what no answer earns. Sonnet is also the model
-    `fixed_inputs.py` measured against opus -- 94% agreement on expected
-    values with the inputs held fixed -- so it is the one rung with evidence
-    that it reads these statements the way the default model does.
+    answer at 38s earns exactly what no answer earns. Sonnet is also the one rung
+    with evidence that it reads these statements the way the default model
+    does: measured against opus with the inputs held fixed, the two agreed on
+    91 of 97 expected values -- see `calibration/inputs_only.py`, which carries
+    that result now that the script producing it has been retired with the
+    design it settled.
     """
     default_effort = default_effort or cli_effort()
-    raw = _flag("SOLVER_CLI_EMERGENCY_PROFILES", "sonnet:medium,fable:low")
+    raw = _flag("SOLVER_CLI_EMERGENCY_PROFILES", "fable:low")
     profiles: list[Profile] = []
     for entry in raw.split(","):
         entry = entry.strip()
@@ -450,47 +452,46 @@ def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profil
     return tuple(profiles)
 
 
-PHASES = ("cases", "program", "repair", "judge", "cases2")
+PHASES = ("analysis", "tests", "oracle", "candidate", "repair")
 
-# The phases whose model is named here rather than left to the ladder, and the
-# reason each is: both want a reader that is NOT the one writing the program.
+# Every phase is named here, which is new. Under the two-bar design `cases` and
+# `program` were deliberately left unset, because every solve in the archived
+# runs opened on the same model and the logs therefore said nothing about how
+# another model answers those turns. That reasoning does not carry over: these
+# five phases are not five ways of asking the same thing, and which model
+# answers each is now part of what the design MEANS rather than a tuning knob
+# waiting on a measurement.
 #
-# `cases2` is the second bar and `judge` settles a case the first bar and the
-# program disagree about. Neither is a preference about speed or skill; both
-# exist to break the correlation that makes a self-written bar agree with the
-# bug it was supposed to catch. `avoid=` cannot express that here -- it is
-# resolved against the ladder, whose first alternative rung is whatever the
-# operator ordered, and the program's own provider is not even known at the
-# moment `cases2` is launched (the two turns start together). So the model is
-# named, and `open_for` still falls through to the ladder when it is out
-# everywhere, which keeps the preference from ever deciding whether anyone
-# answers at all.
+# A phase named here is still a PREFERENCE and never a pin -- `open_for` falls
+# through to the ordinary ladder when that model is out on every account, so an
+# outage costs a phase its preferred model and never the answer.
 #
-# What each of the two wants from a model is NOT the same thing, and one name
-# for both hid that.
+# `analysis`, `tests` and `oracle` take the fast profile. The oracle's being
+# cheap is the load-bearing one and it is not a cost compromise: it is written
+# under a correctness-first instruction (slow, literal, small inputs assumed)
+# precisely so that it is NOT the same program the candidate would write. Two
+# programs produced by the same model at the same effort from the same
+# statement copy the same misreading, and then comparing them establishes
+# nothing. The difference between the two instructions is the evidence.
 #
-# THE JUDGE IS ASKED TO BE RIGHT. It settles one expected value, and its answer
-# is taken as the verdict -- so the measurement that applies is the one about
-# agreement on expected values: `calibration/fixed_inputs.py`, opus and sonnet
-# each deriving `expected` for the same fixed inputs, agreed on 91 of 97. Close
-# enough to trust a value it rules on, far enough apart that the 6 it split on
-# are the statement's real ambiguities rather than one model's noise. That is a
-# measurement about SONNET specifically and it is why the judge names sonnet.
+# `candidate` takes the strong profile because it is the program that ships.
 #
-# THE SECOND BAR IS ASKED TO BE DIFFERENT. Its product is the UNION, not
-# agreement: `calibration/two_bar_overlap.py` measured two models choosing
-# their own inputs sharing about 2% of them, which is what makes agreement
-# useless as a signal here and the union worth a turn. That property belongs to
-# any two distinct models rather than to sonnet, so the second bar is the seat
-# where an operator's choice costs nothing the measurements can price -- and
-# fable is that choice.
+# `repair` takes a DIFFERENT MODEL, and that is the point of it rather than a
+# side effect. A model asked to repair its own program defends its own reading
+# of the statement -- which is the exact failure the differential exists to
+# catch, reappearing one layer up. Measured under the previous design over 54
+# live solves: of ten single-case disagreements, nine ended with the model
+# editing its own test case and keeping its program. Handing the failure report
+# to a reader with no stake in the original answer is a second opinion for the
+# price of a turn.
 #
-# What fable has NO measurement for is the quality of the `expected` values it
-# writes, and the second bar does write them. The judge is the answer to that:
-# a case the program disputes is adjudicated rather than enforced, which is the
-# same protection a sonnet-written case gets.
-_JUDGE_READER = "sonnet"
-_SECOND_BAR_READER = "fable"
+# The cost of that, stated rather than glossed: a phase change means the repair
+# cannot inherit the candidate's conversation, so its first prompt has to carry
+# the statement a second time. Rounds after the first stay on this profile and
+# do resume, so it is one prompt per solve, not one per round.
+_FAST_PROFILE = Profile("opus", "low")
+_STRONG_PROFILE = Profile("opus", "medium")
+_REPAIR_PROFILE = Profile("fable", "medium")
 
 
 def cli_phase_profiles(
@@ -498,39 +499,36 @@ def cli_phase_profiles(
 ) -> dict[str, Profile]:
     """Which model answers which phase.
 
-    `SOLVER_CLI_PHASE_PROFILES=cases=sonnet:medium,program=opus:low` -- one
+    `SOLVER_CLI_PHASE_PROFILES=oracle=fable:low,candidate=opus:high` -- one
     entry per phase named in `PHASES`, each a model alias with an optional
     effort after a colon, exactly as `SOLVER_CLI_EMERGENCY_PROFILES` spells
     them.
 
-    `cases` and `program` are UNSET by default, and deliberately so. Every
-    solve in the two archived production runs -- 102 of them -- opened on the
-    same model, so the logs say nothing about how any other model answers a
-    cases turn or a program turn here. A default naming one would be a guess
-    wearing a measurement's clothes; which model belongs where is a number to
-    be measured on this corpus and then written down.
+    All five phases are SET by default:
 
-    `judge` and `cases2` are SET, and to different models for different
-    reasons -- the judge to be right about one value, the second bar to be a
-    different reading from the program's author. See `_JUDGE_READER` and
-    `_SECOND_BAR_READER`. An operator may still name something else for
-    either, and does so the same way.
+        analysis  opus:low     tests  opus:low     oracle  opus:low
+        candidate opus:medium  repair fable:medium
+
+    The reasoning for each is above `_FAST_PROFILE`. The short version is that
+    the oracle is cheap on purpose, the candidate is the program that ships,
+    and the repair is a different model so that a failure is read by someone
+    with no stake in the answer that produced it.
 
     A phase named here is a PREFERENCE, never a pin: `open_for` falls through
     to the ordinary ladder when that model is out on every account, so an
-    outage costs the phase its preferred model and nothing else.
+    outage costs the phase its preferred model and nothing else. That is also
+    why `fable` appearing in a log line is ambiguous on its own and the summary
+    line has to say which of the two it was -- the repair phase asking for it,
+    or the ladder falling back to it.
     """
     default_effort = default_effort or cli_effort()
     raw = _flag("SOLVER_CLI_PHASE_PROFILES", "")
     chosen: dict[str, Profile] = {
-        # Medium, alone among the shipped efforts, and for the one turn where
-        # being right IS the product: the judge decides a single expected value
-        # and the loop then treats it as settled. It is also the cheapest turn
-        # here -- it reads a statement and some calls, never a program -- so
-        # what a longer think costs is measured in seconds on a turn the logs
-        # show finishing in three to ten.
-        "judge": Profile(_JUDGE_READER, "medium"),
-        "cases2": Profile(_SECOND_BAR_READER, "low"),
+        "analysis": _FAST_PROFILE,
+        "tests": _FAST_PROFILE,
+        "oracle": _FAST_PROFILE,
+        "candidate": _STRONG_PROFILE,
+        "repair": _REPAIR_PROFILE,
     }
     for entry in raw.split(","):
         entry = entry.strip()
@@ -558,50 +556,6 @@ def cli_phase_profiles(
             )
         chosen[phase] = Profile(model, effort)
     return chosen
-
-
-def cli_repair_rotation(
-    default_effort: Optional[str] = None,
-) -> tuple[Profile, ...]:
-    """The models a correction round moves through, in order.
-
-    `SOLVER_REPAIR_ROTATION=opus:low,sonnet:medium,fable:low`, spelled exactly
-    as the emergency ladder is.
-
-    A repair that stays where the program was written is a model being asked
-    to find a bug in its own reading of the statement, and measured over 54
-    live solves it mostly does not: of ten single-case disagreements, nine
-    ended with the model editing its own test case and keeping the program.
-    Rotating hands the same failure to a reader who has no stake in the
-    original answer.
-
-    The rotation is not the emergency ladder. That one answers "who can serve
-    at all" and is ordered by which rung still has quota; this one answers
-    "who has not already been wrong about this problem" and is ordered by
-    which model is likeliest to be right. Opus leads because it writes the
-    program; the two behind it are the readers that did not.
-    """
-    default_effort = default_effort or cli_effort()
-    raw = _flag("SOLVER_REPAIR_ROTATION", "opus:low,sonnet:medium,fable:low")
-    profiles: list[Profile] = []
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        model, _, effort = entry.partition(":")
-        model, effort = model.strip(), effort.strip() or default_effort
-        if not model or any(ch.isspace() for ch in model):
-            raise SystemExit(
-                f"SOLVER_REPAIR_ROTATION entry {entry!r}: expected "
-                f"model or model:effort"
-            )
-        if effort not in EFFORTS:
-            raise SystemExit(
-                f"SOLVER_REPAIR_ROTATION entry {entry!r}: effort must be "
-                f"one of {', '.join(EFFORTS)}"
-            )
-        profiles.append(Profile(model, effort))
-    return tuple(profiles)
 
 
 def cli_backup_dirs() -> tuple[str, ...]:
@@ -971,11 +925,12 @@ class CliConversation:
             # The SAME MODEL on another account first, whatever the verdict.
             # A limit and a sign-out are the account's; a model benched
             # everywhere is refused there too and falls through to the
-            # ladder. Walking the ladder first re-sent a `judge` or `cases2`
-            # conversation -- each pinned to a reader that is NOT the one
-            # writing programs -- as the other account's DEFAULT, which is the
-            # program's own model, removing the independence while leaving the
-            # line that claims it. `busy` decided on the other
+            # ladder. Walking the ladder first re-sent an `oracle` or
+            # `repair` conversation -- each pinned to a model chosen to differ
+            # from the one writing the candidate -- as the other account's
+            # DEFAULT, which is the candidate's own model, removing the
+            # difference while leaving the line that claims it. `busy` decided
+            # on the other
             # account's freedom a moment ago; if that moment has passed, the
             # ladder is still better than returning nothing for a turn that
             # was killed in order to move.
@@ -1030,10 +985,12 @@ class CliConversation:
 
         The MODEL is kept, and that is the other half. This is a move about
         seats, and the conversations that reach it most are the ones pinned to
-        a model for a reason: `judge` and `cases2` exist to be a reading the
-        program's author did not make, and answering them on whatever the next
-        account defaults to would remove the independence while leaving the
-        line that claims it.
+        a model for a reason: the `oracle` is deliberately the weaker
+        instruction and the `repair` turn is deliberately a different model
+        from the one that wrote the candidate. Answering either on whatever
+        the next account defaults to would collapse both back onto the
+        candidate's own model, removing the difference the design is built on
+        while leaving the line that claims it.
 
         Nothing doing once the session has started: a session lives in its
         account's config directory, so it cannot move. There the wait is the
@@ -1047,10 +1004,11 @@ class CliConversation:
             # THE SAME MODEL on another account, not that account's default.
             # This is a move about processes, and the profile is nothing to do
             # with it -- while the conversations that most often reach here are
-            # exactly the ones pinned to a model for a reason: `cases2` and
-            # `judge` exist to be a reading the program's author did not make,
-            # and quietly answering them on the default model would remove the
-            # independence without removing the line that claims it.
+            # exactly the ones pinned to a model for a reason: the `oracle`
+            # and the `repair` turn are both chosen to differ from the
+            # candidate's model, and quietly answering them on the default
+            # would remove that difference without removing the line that
+            # claims it.
             if self._backend.outage_for(account, self.model)[0] > 0:
                 continue
             if self._backend.slot_for(account).locked():
@@ -2011,17 +1969,17 @@ class CliBackend:
     async def open_profile(self, model: str, effort: str) -> CliConversation:
         """A fresh session on a NAMED model and effort, where the ladder allows.
 
-        For the second reading, the judge, and any phase the operator pinned
-        a model to -- all of which want a particular model rather than the
-        best available one. The first signed-in account on which that model
+        For any phase whose model is named -- the reference, the repair, and
+        anything the operator pinned -- all of which want a particular model
+        rather than the best available one. The first signed-in account on which that model
         is not out gets it; if the model is out everywhere, the ladder's own
         choice answers instead, and says so through `provider`, so the caller
         can tell.
 
         THE FIRST SEAT, not the lightest. It sorted by usage once, to spread
         turns that belong to no conversation and can go anywhere -- measured
-        as a five-hour window holding 35 solves rather than 18 with the
-        second reading and the judge both on the primary. That measurement is
+        as a five-hour window holding 35 solves rather than 18 with every
+        named-model turn on the primary. That measurement is
         about the RATE one seat is spent at, and spreading does not create
         capacity: two windows hold what two windows hold, whether they are
         drained together or in turn. What it does do is send turns to the

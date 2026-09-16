@@ -141,14 +141,18 @@ def build_solver(browsers: Optional[Sequence[Browser]] = None) -> VerifyingSolve
         # One boolean grammar for the whole `.env` (`off` included) -- see
         # `verify._env_on`.
         second_opinion=_env_on("SOLVER_SECOND_OPINION"),
-        # The model's own cases, run with the validator's executor. Live traffic
-        # ships no `public_examples` at all, so without these there is nothing to
-        # grade and the repair loop never fires. `SOLVER_SELF_TESTS=0` turns the
-        # cases turn off: one round trip per solve instead of two, and every
-        # answer submitted ungraded. It no longer ASKS for cases either -- the
-        # combined prompt requested a second block that this switch then told
-        # the grader to ignore, so the model spent output tokens inside the
-        # deadline writing something nothing read.
+        # The local check: synthesized inputs, a reference program run on them
+        # to produce the expectations, and the candidate graded against those
+        # with the validator's own executor. Live traffic ships no
+        # `public_examples` at all, so without this there is nothing to grade
+        # and the repair loop never fires.
+        #
+        # `SOLVER_SELF_TESTS=0` turns off BOTH turns that exist to produce it,
+        # not just the grading: inputs with no reference cannot be answered and
+        # a reference with no inputs has nothing to run on, so keeping either
+        # alone would buy a model's time for a comparison that cannot happen.
+        # One writing turn per solve instead of three, and every answer
+        # submitted ungraded.
         self_tests=_env_on("SOLVER_SELF_TESTS"),
     )
 
