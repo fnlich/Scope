@@ -10850,7 +10850,8 @@ def test_every_phase_runs_at_the_effort_the_operator_set():
     assert _REPAIR_PROFILE.label == "fable/low"
 
     phases = cli_phase_profiles()
-    assert set(phases) == {"analysis", "tests", "oracle", "candidate", "repair"}
+    assert set(phases) == {"analysis", "tests", "oracle", "candidate",
+                           "hedge", "repair"}
     assert all(p.effort == "low" for p in phases.values()), phases
     assert phases["repair"].model != phases["candidate"].model, (
         "the repair must still be read by a different model; only the effort "
@@ -11553,7 +11554,7 @@ def test_a_reply_that_never_streamed_is_still_read_from_the_result_event(
 
 
 def test_every_phase_names_a_model_and_the_repair_is_a_different_one(monkeypatch):
-    """All five phases ship a default, which is a change. Under the two-bar
+    """All six phases ship a default, which is a change. Under the two-bar
     design the two writing turns were deliberately unset, because every one of
     the 102 solves in the archived runs opened on the same model and the logs
     therefore said nothing about how another model answers them. That does not
@@ -11587,11 +11588,19 @@ def test_every_phase_names_a_model_and_the_repair_is_a_different_one(monkeypatch
         "tests": Profile("opus", "low"),
         "oracle": Profile("opus", "low"),
         "candidate": Profile("opus", "low"),
+        "hedge": Profile("fable", "low"),
         "repair": Profile("fable", "low"),
     }, shipped
     assert set(shipped) == set(PHASES), "a phase ships without a model"
     assert shipped["repair"].model != shipped["candidate"].model, (
         "the repair reads a failure in a program written by the same model"
+    )
+    # The hedge is a SECOND DRAW, and a second draw from the same model is a
+    # draw from the same distribution -- which is the thing that went wrong.
+    # The same recorded prompt was measured at 235s to its first character,
+    # at 505s, and at never; re-rolling the same die does not narrow that.
+    assert shipped["hedge"].model != shipped["candidate"].model, (
+        "the hedge draws from the same model it is hedging against"
     )
 
     monkeypatch.setenv(
@@ -13692,4 +13701,237 @@ def test_an_early_candidate_tab_is_closed_even_when_the_pass_never_reads_it(
     assert closed and closed[0] == "candidate", (
         "the early candidate's tab was never closed; a pass that fails "
         "between starting stage 6 and reading it leaks the seat"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# SOLVER_CANDIDATE_HEDGE_S: a second draw, because the first one is a lottery.
+#
+# Stage 6 does not fail on hard problems. It fails when the model thinks for
+# longer than the budget, and the thinking length is close to random: the same
+# recorded prompt was measured at 235s to its first character, at 505s, and at
+# never. The fix for a tail that wide is `min` of two draws, on two models.
+#
+# These tests pin the three things that make that a fix rather than a gamble:
+# the second turn starts only after the wait, the FIRST usable answer wins
+# whichever tab it came from, and an empty reply never counts as an answer.
+# --------------------------------------------------------------------------- #
+
+
+class _RacingSeats(_EarlySeats):
+    """Seats whose stage-6 turns take a scripted number of seconds to reply.
+
+    `timing` maps a phase to `(delay_s, reply)`. Every other phase answers at
+    once, so a test says only what it is about.
+    """
+
+    def __init__(self, timing, replies=None):
+        super().__init__(replies)
+        self.timing = timing
+
+    def _seat(self, phase):
+        seat = super()._seat(phase)
+        send = seat.send
+        delay, reply = self.timing.get(phase, (0.0, None))
+
+        async def _slow(text, timeout_s, extend_to_s=None):
+            await send(text, timeout_s, extend_to_s)
+            if delay:
+                await asyncio.sleep(delay)
+            return reply if reply is not None else ""
+
+        seat.send = _slow
+        return seat
+
+
+_HEDGE_PROGRAM = "```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"
+_HEDGE_OTHER = "```python\ndef g(n):\n    return sum(map(int, str(n)))\n```"
+
+
+def _hedge_solver(monkeypatch, seats, hedge_after):
+    monkeypatch.setenv("SOLVER_CANDIDATE_HEDGE_S", str(hedge_after))
+    monkeypatch.setenv("SOLVER_LLM_ANALYSIS", "0")
+    monkeypatch.setenv("SOLVER_CANDIDATE_EARLY", "0")
+    return VerifyingSolver(seats, reserve_s=0, max_budget_s=120)
+
+
+def test_no_hedge_is_opened_when_the_candidate_answers_inside_the_wait(
+    monkeypatch,
+):
+    """The common case, and the one that decides what this costs.
+
+    Seventy per cent of recorded candidate turns answer on their own. If the
+    hedge opened for those too it would spend a seat per solve to buy nothing,
+    and the fleet has twelve against four solves already holding three turns
+    each.
+    """
+    seats = _RacingSeats({"candidate": (0.0, _HEDGE_PROGRAM)})
+    answer = asyncio.run(
+        _hedge_solver(monkeypatch, seats, 5.0).solve_task(_two_seat_task(), 120.0)
+    )
+
+    assert "hedge" not in seats.opened, (
+        f"the hedge was opened although the candidate had already answered: "
+        f"{seats.opened}"
+    )
+    assert "sum(int(c)" in answer.code, answer.code
+
+
+def test_a_silent_candidate_is_answered_by_the_hedge(monkeypatch):
+    """The case the flag exists for: stage 6 says nothing, the other model does."""
+    seats = _RacingSeats({
+        "candidate": (30.0, _HEDGE_PROGRAM),   # far past the budget
+        "hedge": (0.0, _HEDGE_OTHER),
+    })
+    answer = asyncio.run(
+        _hedge_solver(monkeypatch, seats, 0.05).solve_task(_two_seat_task(), 120.0)
+    )
+
+    assert "hedge" in seats.opened, (
+        f"the candidate turn said nothing and no hedge was opened: {seats.opened}"
+    )
+    assert "sum(map(int" in answer.code, (
+        f"the hedge answered but its program did not ship: {answer.code!r}"
+    )
+
+
+def test_the_hedge_does_not_lose_the_race_to_an_empty_reply(monkeypatch):
+    """REGRESSION-SHAPED. `FIRST_COMPLETED` returns whichever task FINISHED,
+    and a turn that returns an empty string has finished without answering.
+
+    Taking that as the winner would cancel the tab that was still writing and
+    ship nothing -- turning the hedge into a way to LOSE answers on exactly the
+    solves it was added to rescue. The race is over the first usable reply, not
+    the first return.
+    """
+    seats = _RacingSeats({
+        "candidate": (0.30, _HEDGE_PROGRAM),  # slower, but it actually answers
+        "hedge": (0.0, ""),                   # instant, and says nothing
+    })
+    answer = asyncio.run(
+        _hedge_solver(monkeypatch, seats, 0.05).solve_task(_two_seat_task(), 120.0)
+    )
+
+    assert "sum(int(c)" in answer.code, (
+        f"an empty hedge reply won the race and the real answer was thrown "
+        f"away: {answer.code!r}"
+    )
+
+
+def test_no_hedge_is_opened_once_the_budget_is_gone(monkeypatch):
+    """One clock, still.
+
+    The wait is not a per-stage budget -- nothing is refused and the first turn
+    keeps its whole slice. But a second turn opened with nothing left cannot
+    answer, and asking for it takes a seat from a solve that could.
+
+    Note what this does NOT need to guard: a wait LONGER than the budget. The
+    first turn is cut off at the deadline by its own slice, the wait ends when
+    it does, and the hedge is never reached. Guarding that case separately
+    looked prudent and was dead code -- it is checked here so the next reader
+    does not add it back.
+    """
+    seats = _RacingSeats({"candidate": (0.20, _HEDGE_PROGRAM),
+                          "hedge": (0.0, _HEDGE_OTHER)})
+    # A budget the wait outlives: the hedge point is never reached at all.
+    solver = _hedge_solver(monkeypatch, seats, 5.0)
+    asyncio.run(solver.solve_task(_two_seat_task(), 0.35))
+    assert "hedge" not in seats.opened, (
+        f"a hedge was opened after the budget was spent: {seats.opened}"
+    )
+
+
+def test_the_hedge_phase_is_a_phase_the_backend_knows(monkeypatch):
+    """An unknown phase string falls through to the ladder SILENTLY, so a typo
+    here would not raise -- it would quietly give the hedge the same model as
+    the turn it is meant to differ from, and the whole point is the other
+    model."""
+    from solvers.claude_cli import PHASES, cli_phase_profiles
+
+    assert "hedge" in PHASES, PHASES
+    profiles = cli_phase_profiles()
+    assert profiles["hedge"].model != profiles["candidate"].model, (
+        f"the hedge draws from the same model as the candidate: "
+        f"{profiles['hedge']} vs {profiles['candidate']}"
+    )
+
+
+def test_the_hedge_seconds_read_the_same_grammar_as_every_other_switch():
+    """`=1` means ON, not one second. Every boolean in this project spells on
+    that way, and a one-second hedge would fire on every solve."""
+    from solvers import verify
+
+    cases = {"": 0.0, "0": 0.0, "off": 0.0, "no": 0.0, "false": 0.0,
+             "1": verify.HEDGE_AFTER_S, "true": verify.HEDGE_AFTER_S,
+             "on": verify.HEDGE_AFTER_S, "120": 120.0, "45.5": 45.5,
+             "nonsense": verify.HEDGE_AFTER_S}
+    for raw, want in cases.items():
+        os.environ["SOLVER_CANDIDATE_HEDGE_S"] = raw
+        got = verify._hedge_after_s()
+        assert got == want, f"{raw!r} read as {got}, expected {want}"
+    os.environ.pop("SOLVER_CANDIDATE_HEDGE_S", None)
+
+
+def test_a_cancelled_turn_gives_its_tab_back(monkeypatch):
+    """REGRESSION. A pass that gives up cancels the turns still in flight, and
+    cancelling ALONE does not release the seat.
+
+    Stages 4 and 5 close their own conversation in their own `finally`, with an
+    `await`. A cancelled task is never resumed to reach it -- measured
+    directly: cancel-only leaves the close unrun, cancel-then-await runs it. So
+    the first version of that reclamation released the seat in the log and
+    leaked it in fact, which is strictly worse than the lingering turn it
+    replaced. Found by a browser-fleet test whose pool ended one tab short, two
+    commits after the code that caused it.
+
+    The pass is made to give up the way one actually does: stage 6 raises,
+    which nothing catches, while the reference turn is still writing.
+    """
+    monkeypatch.setenv("SOLVER_LLM_ANALYSIS", "0")
+    monkeypatch.setenv("SOLVER_CANDIDATE_HEDGE_S", "0")
+    closed: list = []
+
+    class _Leaky(_EarlySeats):
+        def _seat(self, phase):
+            seat = super()._seat(phase)
+            send = seat.send
+
+            async def _turn(text, timeout_s, extend_to_s=None):
+                await send(text, timeout_s, extend_to_s)
+                if phase == "oracle":
+                    await asyncio.Event().wait()   # still writing; gets cancelled
+                if phase == "candidate":
+                    raise RuntimeError("the candidate tab died")
+                return ""
+
+            seat.send = _turn
+            close = seat.close
+
+            async def _closed():
+                closed.append(phase)
+                await close()
+
+            seat.close = _closed
+            return seat
+
+    seats = _Leaky()
+
+    async def drive():
+        await VerifyingSolver(seats, reserve_s=0, max_budget_s=120,
+                              max_attempts=1, second_opinion=False
+                              ).solve_task(_two_seat_task(), 120.0)
+        # Snapshotted HERE and not after `asyncio.run` returns. Loop shutdown
+        # cancels the leftovers AND gathers them, so every tab closes on the
+        # way out of the test whether the pass reclaimed it or not -- an
+        # assertion made afterwards passes with the reclamation deleted, which
+        # is how this test first fooled its own author. What the miner needs is
+        # the seat back while it is still running.
+        return list(closed)
+
+    closed_by_the_time_it_returned = asyncio.run(drive())
+
+    assert "oracle" in closed_by_the_time_it_returned, (
+        f"the cancelled reference turn never closed its tab; the pass released "
+        f"the seat in the log and leaked it in fact. "
+        f"closed={closed_by_the_time_it_returned}"
     )

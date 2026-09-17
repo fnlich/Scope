@@ -452,7 +452,7 @@ def cli_emergency_profiles(default_effort: Optional[str] = None) -> tuple[Profil
     return tuple(profiles)
 
 
-PHASES = ("analysis", "tests", "oracle", "candidate", "repair")
+PHASES = ("analysis", "tests", "oracle", "candidate", "hedge", "repair")
 
 # Every phase is named here, which is new. Under the two-bar design `cases` and
 # `program` were deliberately left unset, because every solve in the archived
@@ -522,10 +522,18 @@ def cli_phase_profiles(
     effort after a colon, exactly as `SOLVER_CLI_EMERGENCY_PROFILES` spells
     them.
 
-    All five phases are SET by default:
+    All six phases are SET by default:
 
         analysis  opus:low     tests  opus:low     oracle  opus:low
-        candidate opus:low     repair fable:low
+        candidate opus:low     hedge  fable:low    repair fable:low
+
+    `hedge` is the SECOND candidate turn, and it only exists when
+    `SOLVER_CANDIDATE_HEDGE_S` arms it. It shares the repair profile's model
+    for the same reason repair does not share the candidate's: a second draw
+    from the same model is a second draw from the same distribution, and the
+    distribution is the problem. Measured on the six prompts whose candidate
+    turn shipped nothing, the other model answered five of them inside the
+    budget with code that builds.
 
     The reasoning for each is above `_FAST_PROFILE`. The short version is that
     the oracle is cheap on purpose, the candidate is the program that ships,
@@ -546,6 +554,7 @@ def cli_phase_profiles(
         "tests": _FAST_PROFILE,
         "oracle": _FAST_PROFILE,
         "candidate": _STRONG_PROFILE,
+        "hedge": _REPAIR_PROFILE,
         "repair": _REPAIR_PROFILE,
     }
     for entry in raw.split(","):

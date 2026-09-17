@@ -84,6 +84,35 @@ VERIFY_TIMEOUT_S = float(os.environ.get("SOLVER_VERIFY_TIMEOUT_S", "5"))
 # The one boolean grammar every solver setting is read with; see `config`.
 _env_on = env_on
 
+# How long stage 6 may say nothing before a second stage 6 opens beside it.
+# `SOLVER_CANDIDATE_HEDGE_S`: unset or 0 is off, bare `1`/`true`/`on` means the
+# measured default rather than one second -- the same courtesy the boolean
+# settings get, because every other switch in this file is spelled that way and
+# an operator who writes `=1` to turn something on should not get a one-second
+# hedge that fires on every solve.
+HEDGE_AFTER_S = 75.0
+
+# How long a pass waits for the turns it cancelled to close their own tabs.
+#
+# Sized to the close and not to the deadline: the CLI's `close` is a `_kill`
+# capped at 5s and a browser tab's is quicker, so this is "long enough for the
+# cleanup that exists" rather than a budget. Overrunning it is not a failure --
+# it leaves the turn running on its seat, which is precisely where a pass left
+# it before any of this was reclaimed at all.
+RECLAIM_GRACE_S = 5.0
+
+
+def _hedge_after_s() -> float:
+    raw = os.environ.get("SOLVER_CANDIDATE_HEDGE_S", "").strip().lower()
+    if not raw or raw in ("0", "false", "no", "off"):
+        return 0.0
+    if raw in ("1", "true", "yes", "on"):
+        return HEDGE_AFTER_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return HEDGE_AFTER_S
+
 # The least a case may be given when the budget cannot afford the full timeout.
 #
 # `check` would rather shorten every case's clock than refuse cases outright --
@@ -1574,6 +1603,24 @@ class VerifyingSolver:
         # candidate does not is still only one of two readings, and the router
         # blames the candidate by default.
         self._candidate_early = _env_on("SOLVER_CANDIDATE_EARLY", False)
+        # Seconds of silence from stage 6 before a SECOND stage 6 is opened on
+        # the hedge phase's model. 0 is off, and off is the default.
+        #
+        # Not a per-stage budget, which the one-clock rule forbids: nothing is
+        # refused here and nothing is cut short. The first turn keeps its full
+        # slice and is never cancelled; this only decides when a second turn
+        # starts running BESIDE it. The deadline is still the only thing that
+        # stops either of them.
+        #
+        # 75s by default when armed, and the number is measured from both
+        # sides. Above it: of the recorded candidate turns that answered at
+        # all, the ones taking longer than ~75s are where the silent ones are
+        # indistinguishable from the slow ones -- so a shorter wait spends
+        # seats on turns that were about to speak. Below the budget: the hedge
+        # model's own first text landed at 30s, 96s, 100s, 118s and 221s on the
+        # six prompts that had shipped nothing, so starting it at 75s leaves
+        # its slowest measured draw 215s of a 290s budget to finish in.
+        self._hedge_after_s = _hedge_after_s()
         # The size probe: one extra fenced block on the inputs turn, and one
         # local run of the finished program on a large valid input. No extra
         # model turn, and no reference -- see `_timed_out_at_scale`. It is
@@ -2222,7 +2269,7 @@ class VerifyingSolver:
     # -- stage 6: the program that ships ---------------------------------- #
     async def _write_candidate(
         self, task, analysis, budget: float, started: float,
-        avoid: Optional[str], phases: "_Phases",
+        avoid: Optional[str], phases: "_Phases", phase: str = "candidate",
     ):
         """One turn, and the conversation it was written in, still open.
 
@@ -2236,7 +2283,7 @@ class VerifyingSolver:
         pass either await it in place or start it before the analysis turn.
         """
         conversation = await self._open_within(
-            budget, started, avoid, phase="candidate"
+            budget, started, avoid, phase=phase
         )
         # The LABEL in the phase line, the provider everywhere else. A
         # backend that carries an effort says so here; `provider` stays the
@@ -2253,6 +2300,100 @@ class VerifyingSolver:
             max(1.0, budget - (time.monotonic() - started)),
         )
         return conversation, reply
+
+    async def _hedged_candidate(
+        self, task, analysis, budget: float, started: float,
+        avoid: Optional[str], phases: "_Phases",
+    ):
+        """Stage 6, and after `SOLVER_CANDIDATE_HEDGE_S` a second one beside it.
+
+        Why a second DRAW rather than a longer wait, and why a different model.
+
+        The candidate turn does not fail because a problem is hard. It fails
+        because the model thinks for longer than the budget, and how long it
+        thinks is close to random: the same prompt for one recorded problem was
+        measured at 235s to its first character, at 505s, and at never -- three
+        draws, one input. There is no statement feature to route on; the hunt
+        for one found a discriminator that separated the ten labelled problems
+        perfectly and then failed a Monte-Carlo null at 13.3%.
+
+        A tail that wide is not waited out. `min` of two independent draws is,
+        and the second draw is taken on the OTHER model because two draws from
+        the same one are two draws from the same distribution.
+
+        Measured on the six recorded prompts whose candidate turn shipped
+        nothing: the second model answered five, at 30s, 96s, 100s, 118s and
+        221s to first text, every one inside the budget and every one with code
+        that compiled. It went silent on the sixth. So this is a second chance
+        and not a guarantee, which is the honest shape of the fix -- and it is
+        why the first turn is never cancelled: whichever speaks first wins, and
+        a hedge that killed the original would trade a wide tail for a short one
+        rather than taking the better of the two.
+
+        Costs one extra seat for as long as both are open. The fleet allows
+        `SOLVER_CLI_CONCURRENCY` per account (12) against
+        `MINER_MAX_CONCURRENT_REQUESTS` solves (4), and a solve already holds
+        three turns at its peak -- so an armed hedge can ask for a sixteenth
+        seat where there are twelve. It waits for one like any other turn; it
+        does not jump the queue, and a hedge that never gets a seat costs
+        nothing but the wait.
+        """
+        primary = asyncio.create_task(self._write_candidate(
+            task, analysis, budget, started, avoid, phases))
+        after = self._hedge_after_s
+        if after <= 0:
+            return await primary
+
+        done, _ = await asyncio.wait({primary}, timeout=after)
+        if primary in done:
+            return await primary
+
+        # The budget is checked HERE and not before the wait. A wait longer
+        # than the budget needs no guard of its own: the first turn is cut off
+        # at the deadline by its own slice, `wait` returns when it does, and
+        # the branch above sends it back. What does need one is the seat -- a
+        # second turn opened with nothing left cannot answer, and asking for it
+        # takes a seat from a solve that could.
+        if budget - (time.monotonic() - started) <= MIN_SLICE_S:
+            return await primary
+
+        print(f"[verify] the candidate turn has said nothing in {after:.0f}s; "
+              f"asking the hedge model the same question and taking whichever "
+              f"answers first")
+        backup = asyncio.create_task(self._write_candidate(
+            task, analysis, budget, started, avoid, phases, phase="hedge"))
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {primary, backup}, return_when=asyncio.FIRST_COMPLETED)
+                # A turn that returns EMPTY has not answered. Reading it as an
+                # answer would let the hedge lose a race to a blank reply and
+                # ship nothing while the other tab was still writing -- which
+                # is the exact failure this exists to remove.
+                spoke = [t for t in done
+                         if not t.cancelled() and t.exception() is None
+                         and (t.result()[1] or "").strip()]
+                if spoke:
+                    winner = spoke[0]
+                    loser = backup if winner is primary else primary
+                    if not loser.done():
+                        loser.cancel()
+                    else:
+                        with contextlib.suppress(Exception):
+                            conv = loser.result()[0]
+                            if conv is not None:
+                                await conv.close()
+                    which = "candidate" if winner is primary else "hedge"
+                    print(f"[verify] the {which} turn answered first")
+                    return winner.result()
+                if primary.done() and backup.done():
+                    # Both spent. Re-raise whatever the first one did, or hand
+                    # back its empty reply, exactly as an unhedged solve would.
+                    return await primary
+        finally:
+            for t in (primary, backup):
+                if not t.done():
+                    t.cancel()
 
     async def _attempt(
         self,
@@ -2344,7 +2485,7 @@ class VerifyingSolver:
                 and left() >= MIN_SLICE_S
             )
             candidate_task = started_turns["candidate"] = (
-                asyncio.create_task(self._write_candidate(
+                asyncio.create_task(self._hedged_candidate(
                     task, analysis, budget, started, avoid, phases))
                 if early else None
             )
@@ -2388,7 +2529,7 @@ class VerifyingSolver:
             if candidate_task is not None:
                 conversation, candidate_reply = await candidate_task
             else:
-                conversation, candidate_reply = await self._write_candidate(
+                conversation, candidate_reply = await self._hedged_candidate(
                     task, analysis, budget, started, avoid, phases
                 )
             provider = best_provider = getattr(conversation, "provider", None)
@@ -2667,15 +2808,34 @@ class VerifyingSolver:
             # Nothing is awaited: this runs on the cancellation path too,
             # where awaiting would either block the unwind or swallow the
             # CancelledError that put us here.
+            reclaim = []
             for name, turn in started_turns.items():
                 if turn is None:
                     continue
                 if not turn.done():
                     turn.cancel()
+                    reclaim.append(turn)
                 elif (name == "candidate" and conversation is None
                         and not turn.cancelled()):
                     with contextlib.suppress(Exception):
                         conversation = turn.result()[0]
+            if reclaim:
+                # Cancelling ALONE does not give the tab back, and that is the
+                # whole of why this line exists. Stages 4 and 5 close their own
+                # conversation in their own `finally` -- with an `await` -- and
+                # a cancelled task is never resumed to reach it. Measured
+                # directly: cancel-only leaves the close unrun, cancel-then-
+                # await runs it. So the first version of this reclamation
+                # released the seat in the log and leaked it in fact, which is
+                # worse than the lingering turn it replaced.
+                #
+                # Bounded, because an unwind must not be hostage to a close:
+                # past the grace the turn is left exactly where it was before
+                # any of this -- still holding its seat until it ends by
+                # itself. A slow close costs what it always cost; it no longer
+                # costs the seat outright.
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait(reclaim, timeout=RECLAIM_GRACE_S)
             for conv in (conversation, repair_conv):
                 if conv is not None:
                     with contextlib.suppress(Exception):
