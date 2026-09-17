@@ -14,34 +14,34 @@ Measured over 275 recorded tasks -- the 97 in `examples/problems` plus the 178
 in `fnlich/hone-examples`, which also ships the ACCEPTED solution beside each
 statement. Median 7 traps per task:
 
-    275/275  sandbox_constraints        25/275  amortized_total_budget
-    275/275  no_public_examples         25/275  case_sensitivity_stated
-    248/275  large_n_hidden_tests       16/275  fixpoint_closure
-    147/275  rust_contract              14/275  modular_arithmetic
-    141/275  token_output_compare       13/275  unicode_indexing
-    128/275  python_contract            13/275  persistent_or_branching_state
-    109/275  huge_numeric_bounds        10/275  error_priority_order
-     81/275  index_base                 10/275  no_mutation_of_inputs
-     71/275  rust_wide_arithmetic       10/275  negative_index_wrap
-     60/275  deterministic_tiebreak      8/275  all_branches_no_shortcircuit
-     52/275  duplicates_defined          8/275  exact_output_shape
+    275/275  sandbox_constraints        20/275  first_match_fallback
+    275/275  no_public_examples         16/275  fixpoint_closure
+    248/275  large_n_hidden_tests       14/275  modular_arithmetic
+    147/275  rust_contract              13/275  unicode_indexing
+    141/275  token_output_compare       13/275  persistent_or_branching_state
+    128/275  python_contract            10/275  error_priority_order
+    109/275  huge_numeric_bounds        10/275  no_mutation_of_inputs
+     81/275  index_base                 10/275  negative_index_wrap
+     71/275  rust_wide_arithmetic        8/275  all_branches_no_shortcircuit
+     60/275  deterministic_tiebreak      8/275  exact_output_shape
+     52/275  duplicates_defined          8/275  non_canonical_encoding
      51/275  inclusive_bounds            7/275  retry_accounting
-     47/275  cycle_self_reference        7/275  exact_rational_no_float
+     48/275  cycle_self_reference        7/275  exact_rational_no_float
      47/275  intra_timestamp_phase       7/275  lexicographic_objectives
-     36/275  recursive_descent_depth     6/275  float_exactness
-     30/275  preserve_untouched          5/275  bool_is_not_int
-                                         5/275  validate_before_applying
-                                         4/275  implicit_default_behavior
+     36/275  recursive_descent_depth     7/275  validate_before_applying
+     30/275  preserve_untouched          6/275  float_exactness
+     25/275  amortized_total_budget      5/275  bool_is_not_int
+     25/275  case_sensitivity_stated     4/275  implicit_default_behavior
                                          3/275  integer_division_rounding
 
 SIX of those entries are structural -- they say what language this is and that
 the suite is hidden, and they fire on everything. What a solve actually gains is
-the rest, and that is the number worth watching. Before the 21 entries mined
+the rest, and that is the number worth watching. Before the 23 entries mined
 from `hone-examples`, a THIRD of statements drew none of them at all:
 
                           problem-specific traps      tasks with none
-    hone-examples (178)   median 1 -> 3               61 (34%) -> 14 (8%)
-    examples/problems(97) median 1 -> 3               30 (31%) ->  3 (3%)
+    hone-examples (178)   median 1 -> 3               61 (34%) ->  6 (3%)
+    examples/problems(97) median 1 -> 3               30 (31%) ->  2 (2%)
 
 The 97 were not a blind holdout -- they were in the set the hit rates were
 measured over -- but the wording was mined from the OTHER 178 and from what
@@ -65,7 +65,18 @@ statement beside its accepted solution. They proposed 67 candidates; the filter
 that mattered was mechanical rather than editorial -- run each proposal's
 phrases over all 275 statements and drop anything matching ONE, because a
 phrase lifted from a single statement is a note about that problem and not a
-catalog entry. Two thirds fell to it.
+catalog entry. Two thirds fell to it -- including several that read as the
+sharpest findings of the lot. They were real observations about real problems;
+none of them was a regex worth carrying.
+
+A third pass then went back to whatever the first two had left silent and took
+two more entries (`first_match_fallback`, `non_canonical_encoding`) plus two
+widenings: a deadlock is a cycle in a wait-for graph, so it belongs to
+`cycle_self_reference` rather than to an entry of its own, and "the entire
+transaction fails" is `validate_before_applying` in other words. Eight of 275
+statements still draw nothing problem-specific, and reading them says why --
+their traps are stated in vocabulary the statement invents for itself
+("herald", "suit", "bounded banner"), which is exactly what stage 3 is for.
 
 Three entries -- `no_full_materialization`, `exact_arithmetic` and `dag_not_tree`
 -- fire on NONE of the 275. They are kept rather than deleted because they do
@@ -250,7 +261,7 @@ _KEYWORD_TRAPS: list[tuple[re.Pattern[str], str, str, str]] = [
     (
         re.compile(
             r"\bcyclic\b|\bcycles?\b|self-referen|leads back to|"
-            r"nonempty chain|circular",
+            r"nonempty chain|circular|deadlock",
             re.I,
         ),
         "cycle_self_reference",
@@ -259,7 +270,8 @@ _KEYWORD_TRAPS: list[tuple[re.Pattern[str], str, str, str]] = [
         "A self-loop is a cycle: read `a nonempty chain back to itself` "
         "literally. Detect with colours (white/grey/black), not a visited "
         "set -- and note that `is on a cycle` and `can reach a cycle` are "
-        "different questions.",
+        "different questions. A deadlock is the same shape in a wait-for "
+        "graph, and `waits on itself` is the case that gets dropped.",
     ),
     (
         re.compile(
@@ -433,7 +445,8 @@ _KEYWORD_TRAPS: list[tuple[re.Pattern[str], str, str, str]] = [
         re.compile(
             r"before applying any|fully validate .{0,30}before|"
             r"validate .{0,25}before (?:applying|any)|"
-            r"(?:all|either) .{0,20}or (?:none|nothing)|no partial",
+            r"(?:all|either) .{0,20}or (?:none|nothing)|no partial|"
+            r"entire transaction fails|transaction fails|rolled back",
             re.I,
         ),
         "validate_before_applying",
@@ -489,6 +502,36 @@ _KEYWORD_TRAPS: list[tuple[re.Pattern[str], str, str, str]] = [
         "one completely before starting the next. A single priority queue "
         "keyed on time alone breaks ties by whatever the tuple happens to "
         "compare on next, which is not the order the statement named.",
+    ),
+    # --- a third pass, aimed at the statements the first two left silent.
+    (
+        re.compile(
+            r"select the earliest|the earliest .{0,25}having|if none exists|"
+            r"if present, otherwise|otherwise,? if .{0,20}present|"
+            r"falls? back to",
+            re.I,
+        ),
+        "first_match_fallback",
+        "Selection walks a chain of alternatives in a stated order and stops "
+        "at the first that exists.",
+        "Follow the chain exactly and stop at the first hit -- the ORDER is "
+        "the specification, and a later rung must never win over an earlier "
+        "one that was present. Note what the fallback is when nothing "
+        "matches at all; the statement names it, and it is rarely an error.",
+    ),
+    (
+        re.compile(
+            r"need not use|not necessarily (?:minimal|shortest|canonical)|"
+            r"shortest encoding|may be padded|leading zero",
+            re.I,
+        ),
+        "non_canonical_encoding",
+        "An encoding is explicitly allowed to be non-minimal, so the obvious "
+        "round-trip check is wrong.",
+        "ACCEPT the long form -- do not reject it, and do not normalise it "
+        "before comparing. A value written in four bytes that would fit in "
+        "one is still that value; re-encoding it and testing equality "
+        "against the input rejects a legal case.",
     ),
 ]
 

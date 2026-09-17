@@ -12276,6 +12276,23 @@ _MINED_TRAPS = (
     ("intra_timestamp_phase",
      "At each time, first finish all operations ending then, in "
      "channel-number order; next make new assignments."),
+    ("first_match_fallback",
+     "Select the considered variant with the smallest catalogue position. "
+     "If none exists, select fallback position `N+1`."),
+    ("non_canonical_encoding",
+     "Ranks 28-30 are illegal. Arguments need not use their shortest "
+     "encoding."),
+    # A deadlock is a cycle in the wait-for graph, so it belongs to the cycle
+    # entry rather than to one of its own -- and `this includes t=i` is the
+    # self-wait case a naive check drops.
+    ("cycle_self_reference",
+     "If `t` is active anywhere in the nested invocation stack, execution "
+     "deadlocks immediately. This includes `t=i`."),
+    # ...and an all-or-nothing transaction is `validate_before_applying` said
+    # in the other vocabulary this corpus uses for it.
+    ("validate_before_applying",
+     "If any row in that region is outside `universe`, the entire "
+     "transaction fails."),
 )
 
 
@@ -12349,11 +12366,12 @@ def test_the_mined_traps_moved_the_number_they_were_mined_to_move():
     specific = [len(set(trap_names(heuristic_analyze(t))) - structural) for t in tasks]
     silent = sum(1 for n in specific if n == 0)
 
-    assert silent / len(tasks) <= 0.10, (
+    assert silent / len(tasks) <= 0.06, (
         f"{silent}/{len(tasks)} statements draw no problem-specific trap; "
-        f"it was 31% before the mined entries and must not regress there"
+        f"it was 31% before the mined entries and 2% after, and must not "
+        f"regress toward the former"
     )
-    assert sorted(specific)[len(specific) // 2] >= 2, (
+    assert sorted(specific)[len(specific) // 2] >= 3, (
         f"median problem-specific traps fell to {sorted(specific)[len(specific)//2]}"
     )
 
