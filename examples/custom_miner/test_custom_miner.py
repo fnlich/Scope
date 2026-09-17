@@ -12215,6 +12215,132 @@ def test_the_trap_scan_has_something_to_say_about_every_recorded_task():
         assert len(set(names)) == len(names), f"duplicate trap: {names}"
 
 
+# --- the fifteen traps mined from fnlich/hone-examples ---------------------- #
+# Each is pinned by REAL statement wording, copied out of the corpus it was
+# mined from, plus a control that must NOT fire. A trap whose regex is written
+# to match a sentence invented here proves only that the regex matches itself.
+
+_MINED_TRAPS = (
+    ("recursive_descent_depth",
+     "There is no expression or metadata depth limit. Across the input, the "
+     "total number of fields, links and bindings is at most 200000."),
+    ("deterministic_tiebreak",
+     "dispatch the noncancelled expiration with the smallest timestamp not "
+     "exceeding `T`; ties are resolved by smaller insertion rank."),
+    ("cycle_self_reference",
+     "A bound name is cyclic if a nonempty chain of dependencies leads back "
+     "to it."),
+    ("duplicates_defined",
+     "flatten directly nested unions from left to right, discard structurally "
+     "equal items after their first occurrence."),
+    ("inclusive_bounds",
+     "Its inclusive interval `[lo, hi]` contains `sequence`."),
+    ("preserve_untouched",
+     "Missing and cyclic references remain unchanged. Preserve each `meta` "
+     "wrapper and its extras exactly."),
+    ("case_sensitivity_stated",
+     "Names are matched case-insensitive after casefolding."),
+    ("error_priority_order",
+     "Then scan joints structurally. For each index, check in order: "
+     "duplicate joint name, unresolved parent, unresolved child."),
+    ("fixpoint_closure",
+     "The complete preparation set is the smallest set containing all "
+     "directly changed fields such that every reachable field whose child is "
+     "in the set is also included."),
+    ("modular_arithmetic",
+     "Report the total modulo 1000000007."),
+    ("all_branches_no_shortcircuit",
+     "A union matches only when exactly one branch successfully rebuilds the "
+     "entire value. If a second branch succeeds, fail with UNION_AMBIGUOUS."),
+    ("exact_output_shape",
+     "Return a dictionary with exactly these keys: `x`, `y`, `z`."),
+    ("bool_is_not_int",
+     "Values must exactly match the logical field type: booleans are not "
+     "integers."),
+    ("float_exactness",
+     "Compare with relative error below 1e-9; values are IEEE 754 binary64."),
+)
+
+
+@pytest.mark.parametrize("name,wording", _MINED_TRAPS)
+def test_a_mined_trap_fires_on_the_wording_it_was_mined_from(name, wording):
+    """Every entry added from the 178-statement corpus, against a sentence
+    lifted out of a real statement rather than one written to match."""
+    from solvers.analyze import heuristic_analyze, trap_names
+
+    task = SolveTask(problem_id="m", language="python", statement=wording,
+                     entrypoint="solve", public_examples=[], deadline_s=300.0)
+    assert name in trap_names(heuristic_analyze(task)), (
+        f"{name} missed its own wording: {wording!r}"
+    )
+
+
+def test_a_plain_statement_draws_none_of_the_mined_traps():
+    """The control, and the one that decides whether any of this is worth
+    anything. A catalog that fires on everything has told the solver nothing:
+    the block is read by four later prompts, and a trap that is always there
+    is noise competing with the traps that are not."""
+    from solvers.analyze import heuristic_analyze, trap_names
+
+    plain = SolveTask(
+        problem_id="p", language="python",
+        statement="Return the sum of the decimal digits of n. n is at most 99.",
+        entrypoint="g", public_examples=[], deadline_s=300.0,
+    )
+    names = set(trap_names(heuristic_analyze(plain)))
+    mined = {n for n, _ in _MINED_TRAPS} | {"rust_wide_arithmetic"}
+    assert not (names & mined), f"fired on a statement with no traps: {names & mined}"
+
+
+def test_rust_gets_the_overflow_trap_and_python_never_does():
+    """The one mined trap that is conditional on the language, and the reason
+    it is: Python integers do not overflow, so the same 1e18 bound means
+    `use a closed form` there and `i64 is not wide enough` in Rust. Telling
+    Python about a Rust overflow wastes the only prompt there is."""
+    from solvers.analyze import heuristic_analyze, trap_names
+
+    wording = ("Each weight is at most 10^18 and the total is the sum of the "
+               "selected weights.")
+    for language, entry in (("rust", "main"), ("python", "solve")):
+        task = SolveTask(problem_id="o", language=language, statement=wording,
+                         entrypoint=entry, public_examples=[], deadline_s=300.0)
+        names = trap_names(heuristic_analyze(task))
+        assert "huge_numeric_bounds" in names, language
+        if language == "rust":
+            assert "rust_wide_arithmetic" in names, names
+        else:
+            assert "rust_wide_arithmetic" not in names, (
+                "told Python about an overflow it cannot have"
+            )
+
+
+def test_the_mined_traps_moved_the_number_they_were_mined_to_move():
+    """The catalog's own claim, checked against the corpus rather than
+    asserted in a docstring.
+
+    SIX entries are structural -- they name the language and say the suite is
+    hidden -- and fire on everything, so they cannot distinguish one statement
+    from another. What a solve gains is the rest. Before this batch a third of
+    recorded statements drew NONE of them; the block those solves carried said
+    only `this is Python, stdlib only, no examples`, which is true of every
+    task on the subnet."""
+    from solvers.analyze import heuristic_analyze, trap_names
+
+    structural = {"sandbox_constraints", "no_public_examples", "python_contract",
+                  "rust_contract", "token_output_compare", "large_n_hidden_tests"}
+    tasks = list(_recorded_requests())
+    specific = [len(set(trap_names(heuristic_analyze(t))) - structural) for t in tasks]
+    silent = sum(1 for n in specific if n == 0)
+
+    assert silent / len(tasks) <= 0.10, (
+        f"{silent}/{len(tasks)} statements draw no problem-specific trap; "
+        f"it was 31% before the mined entries and must not regress there"
+    )
+    assert sorted(specific)[len(specific) // 2] >= 2, (
+        f"median problem-specific traps fell to {sorted(specific)[len(specific)//2]}"
+    )
+
+
 def test_the_language_contract_matches_the_language():
     """Python is graded by calling a function and Rust by running a program,
     and a solver told the wrong one writes the wrong shape of answer."""
