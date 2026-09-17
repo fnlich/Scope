@@ -13429,3 +13429,267 @@ def test_a_program_repaired_out_of_a_defect_outranks_the_broken_one():
     )
     assert answer.diagnostics["regressed"] == 0, answer.diagnostics
     assert answer.diagnostics["patched"] == ["cand"], answer.diagnostics
+
+
+# --------------------------------------------------------------------------- #
+# SOLVER_CANDIDATE_EARLY: whether the program that ships waits for the analysis.
+#
+# The flag exists because the two halves of that wait are measured differently.
+# The cost is: a median 63s of a 290s budget spent before the candidate turn
+# starts, in front of a turn whose own p90 is 235s. The benefit is: a median 13
+# extra traps in the prompt, worth an amount nobody has measured.
+#
+# So the tests below pin the MECHANISM rather than the choice -- that each arm
+# does exactly what it says, that nothing leaks either way, and in particular
+# that turning it on moves the analysis out of the candidate's prompt and
+# NOWHERE else. An operator reading `mismatch=` to price the trade is reading a
+# number that only means something if the inputs turn still got the traps.
+# --------------------------------------------------------------------------- #
+
+
+_ANALYSIS_REPLY = (
+    '```json\n{"summary": "s", "algorithm_sketch": "k", "traps": ['
+    '{"name": "only_the_analysis_turn_knows_this", "evidence": "e",'
+    ' "mitigation": "m", "severity": "high"}]}\n```'
+)
+
+
+_EARLY_PROGRAM = "```python\ndef g(n):\n    return sum(int(c) for c in str(n))\n```"
+
+
+class _EarlySeats:
+    """One seat per phase, each answering for its own phase and recording the
+    prompt it was handed.
+
+    Not `_TwoSeats`: that harness's `_Chat` answers the analysis, inputs and
+    reference turns with the empty string, which is exactly the turn these
+    tests need to produce something. So the analysis turn here really does
+    return a trap, and the assertions are about where that trap ends up.
+    """
+
+    def __init__(self, replies=None):
+        self._replies = replies or {"analysis": _ANALYSIS_REPLY,
+                                    "candidate": _EARLY_PROGRAM}
+        self.opened: list = []
+        self.sent: dict = {}
+
+    async def open_for(self, phase=None, avoid=None, timeout_s=None):
+        await asyncio.sleep(0)
+        self.opened.append(phase)
+        return self._seat(phase)
+
+    async def open(self, avoid=None, timeout_s=None):
+        await asyncio.sleep(0)
+        self.opened.append(None)
+        return self._seat(None)
+
+    def _seat(self, phase):
+        return _EarlySeat(self, phase)
+
+    async def aclose(self): pass
+    def stats(self): return {}
+
+
+class _EarlySeat:
+    """Yields on every call, which is the point rather than realism.
+
+    A fake whose `open` and `send` complete without ever awaiting anything
+    real never hands control back to the loop, so a task started beside it
+    does not get to run -- and a test of concurrency then measures the fake.
+    """
+
+    def __init__(self, fleet, phase):
+        self._fleet, self._phase = fleet, phase
+        self.provider = f"claude:{phase or 'ladder'}"
+
+    async def send(self, text, timeout_s, extend_to_s=None):
+        await asyncio.sleep(0)
+        self._fleet.sent.setdefault(self._phase, []).append(text)
+        return self._fleet._replies.get(self._phase, "")
+
+    async def close(self): pass
+
+
+def _early_seats():
+    """A backend that records, per phase, what each stage was actually sent."""
+    return _EarlySeats()
+
+
+def _run_early(monkeypatch, *, early, analysis=True):
+    monkeypatch.setenv("SOLVER_CANDIDATE_EARLY", "1" if early else "0")
+    monkeypatch.setenv("SOLVER_LLM_ANALYSIS", "1" if analysis else "0")
+    seats = _early_seats()
+    solver = VerifyingSolver(seats, reserve_s=0, max_budget_s=120)
+    asyncio.run(solver.solve_task(_two_seat_task(), 120.0))
+    return seats
+
+
+def test_the_candidate_waits_for_the_analysis_turn_by_default(monkeypatch):
+    """The default arm. Every prompt after stage 3 carries what it found."""
+    seats = _run_early(monkeypatch, early=False)
+
+    candidate = "\n".join(seats.sent.get("candidate", []))
+    assert "only_the_analysis_turn_knows_this" in candidate, (
+        "the default arm is meant to hand the merged trap list to the program "
+        "that ships, and the candidate prompt does not carry it"
+    )
+
+
+def test_an_early_candidate_writes_from_the_scan_and_the_checkers_still_dont(
+    monkeypatch,
+):
+    """The traded arm, and the half of it that is easy to get wrong.
+
+    Moving the analysis off the candidate's path is the point. Moving it off
+    the INPUTS path would be a silent bug that looks like the feature working:
+    the candidate would ship blind, no case would probe the traps it is blind
+    to, `mismatch=` would stay at zero, and the log would read as a clean
+    solve. The trade is only a trade while the checkers stay informed.
+    """
+    seats = _run_early(monkeypatch, early=True)
+
+    candidate = "\n".join(seats.sent.get("candidate", []))
+    assert "only_the_analysis_turn_knows_this" not in candidate, (
+        "the candidate turn was started early and still saw the analysis "
+        "turn's traps, so nothing was traded and nothing was saved"
+    )
+    for phase in ("tests", "oracle"):
+        seen = "\n".join(seats.sent.get(phase, []))
+        assert "only_the_analysis_turn_knows_this" in seen, (
+            f"the {phase} turn lost the analysis it is supposed to keep: with "
+            f"this flag on the analysis decides what the candidate is TESTED "
+            f"on, and that is the whole of what is left of it"
+        )
+
+
+def test_an_early_candidate_really_is_in_flight_before_the_analysis_returns(
+    monkeypatch,
+):
+    """The claim is about the CLOCK, and prompt contents cannot prove it.
+
+    A version that built the candidate prompt from the heuristics and then
+    still awaited the analysis first would pass the prompt tests above, cost
+    the same 63s, and buy nothing. So this one holds the analysis turn open
+    until the candidate turn has started, which deadlocks unless they really
+    are concurrent.
+    """
+    monkeypatch.setenv("SOLVER_CANDIDATE_EARLY", "1")
+    monkeypatch.setenv("SOLVER_LLM_ANALYSIS", "1")
+
+    candidate_started = asyncio.Event()
+    overlapped = []
+
+    class _Latched(_EarlySeats):
+        def _seat(self, phase):
+            seat = super()._seat(phase)
+            send = seat.send
+
+            async def _hold(text, timeout_s, extend_to_s=None):
+                if phase == "analysis":
+                    # Returns only once the candidate is under way. If the
+                    # stages are serial this never fires and the wait expires.
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(candidate_started.wait(), 5.0)
+                    overlapped.append(candidate_started.is_set())
+                elif phase == "candidate":
+                    candidate_started.set()
+                return await send(text, timeout_s, extend_to_s)
+
+            seat.send = _hold
+            return seat
+
+    seats = _Latched()
+    asyncio.run(VerifyingSolver(seats, reserve_s=0, max_budget_s=120)
+                .solve_task(_two_seat_task(), 120.0))
+
+    assert overlapped == [True], (
+        "the candidate turn had not started while the analysis turn was still "
+        "open, so the two ran back to back and the flag bought no time"
+    )
+
+
+def test_the_early_flag_does_nothing_when_there_is_no_analysis_turn_to_race(
+    monkeypatch,
+):
+    """`SOLVER_LLM_ANALYSIS=0` already gives the candidate the bare scan.
+
+    With no stage 3 there is nothing for stage 6 to run beside, so the flag
+    must not start reordering a solve for its own sake -- the two arms have to
+    be the same solve, or an operator turning one knob has silently turned two.
+    """
+    off = _run_early(monkeypatch, early=False, analysis=False)
+    on = _run_early(monkeypatch, early=True, analysis=False)
+
+    assert off.opened == on.opened, (
+        f"with no analysis turn the flag still changed the solve: "
+        f"{off.opened} became {on.opened}"
+    )
+    assert "analysis" not in on.opened, on.opened
+
+
+def test_an_early_candidate_tab_is_closed_even_when_the_pass_never_reads_it(
+    monkeypatch,
+):
+    """The one thing concurrency adds that sequence did not: an orphan.
+
+    Started before stage 3 and read after it, the candidate turn outlives any
+    failure in between. A seat left open is not a lost answer -- it is a seat
+    the NEXT solve cannot have, which is how a fleet with twelve of them ends
+    up waiting on a tab nobody is using.
+
+    The failure is injected where one can actually happen: between the task
+    being created and the task being awaited. Nothing in that window raises
+    today -- stage 3 swallows everything -- so this is a guard rather than a
+    reproduction, and it is written as one on purpose: the window is the kind
+    that grows when somebody adds a line to it.
+    """
+    monkeypatch.setenv("SOLVER_CANDIDATE_EARLY", "1")
+    monkeypatch.setenv("SOLVER_LLM_ANALYSIS", "1")
+    closed = []
+    candidate_done = asyncio.Event()
+
+    class _Counted(_EarlySeats):
+        def _seat(self, phase):
+            seat = super()._seat(phase)
+            send = seat.send
+
+            async def _staged(text, timeout_s, extend_to_s=None):
+                if phase == "analysis":
+                    # Hold stage 3 open until stage 6 has finished, so the
+                    # pass reaches the failure below with a COMPLETED task it
+                    # has not read -- the state this guard is for, reached
+                    # deterministically rather than by scheduler luck.
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(candidate_done.wait(), 5.0)
+                    return await send(text, timeout_s, extend_to_s)
+                reply = await send(text, timeout_s, extend_to_s)
+                if phase == "candidate":
+                    candidate_done.set()
+                return reply
+
+            seat.send = _staged
+            if phase == "candidate":
+                async def _close():
+                    closed.append(phase)
+                seat.close = _close
+            return seat
+
+    seats = _Counted()
+    solver = VerifyingSolver(seats, reserve_s=0, max_budget_s=120)
+
+    def _explode(*a, **kw):
+        raise RuntimeError("the pass fell over before reading stage 6")
+
+    # A PLAIN function, so it raises where the pass BUILDS the task rather
+    # than where it awaits it -- which is the window this guard is about.
+    monkeypatch.setattr(solver, "_write_oracle", _explode)
+    asyncio.run(solver.solve_task(_two_seat_task(), 120.0))
+
+    assert candidate_done.is_set(), (
+        "the candidate turn never finished, so this asserts nothing about "
+        "what happens to a finished one"
+    )
+    assert closed and closed[0] == "candidate", (
+        "the early candidate's tab was never closed; a pass that fails "
+        "between starting stage 6 and reading it leaks the seat"
+    )

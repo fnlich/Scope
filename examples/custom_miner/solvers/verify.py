@@ -1550,6 +1550,30 @@ class VerifyingSolver:
         # with it off the later prompts see fewer traps, which is a worse
         # prompt rather than a broken one.
         self._llm_analysis = _env_on("SOLVER_LLM_ANALYSIS")
+        # Whether stage 6 waits for stage 3. Off -- the default -- is the
+        # shape the design was written in: every later prompt, the shipping
+        # program among them, is handed the merged trap list.
+        #
+        # On, the candidate turn starts at once on the HEURISTIC scan and the
+        # analysis turn runs beside it, reaching the inputs, the reference and
+        # the repair loop but never the program that ships. That is a trade,
+        # not an optimisation, and it is off by default because only one half
+        # of it is measured. Measured (46 recorded solves): the analysis turn
+        # costs a median 57.7s in front of a candidate turn whose own median is
+        # 126.2s and whose p90 is 235.3s, so on the slow tail it is the
+        # difference between finishing and being cut off. Not measured: what
+        # the median 13 traps it adds are worth to the program that reads them.
+        #
+        # What the trade actually moves is WHERE a trap is spent. The inputs
+        # prompt is told to write "one case per trap listed above", so with
+        # this on the analysis still decides what the candidate is TESTED on
+        # while no longer deciding what it is TOLD -- a trap it gets wrong
+        # becomes a mismatch the repair loop can act on instead of a silently
+        # wrong answer. That is the bet. `mismatch=` should RISE when this is
+        # on, and `regressed=` should not: a reference that knows a trap the
+        # candidate does not is still only one of two readings, and the router
+        # blames the candidate by default.
+        self._candidate_early = _env_on("SOLVER_CANDIDATE_EARLY", False)
         # The size probe: one extra fenced block on the inputs turn, and one
         # local run of the finished program on a large valid input. No extra
         # model turn, and no reference -- see `_timed_out_at_scale`. It is
@@ -2063,7 +2087,7 @@ class VerifyingSolver:
     # -- stage 3: what the statement hides -------------------------------- #
     async def _analyse(
         self, task, heuristic, budget: float, started: float,
-        avoid: Optional[str], phases: "_Phases",
+        avoid: Optional[str], phases: "_Phases", beside: bool = False,
     ):
         """Ask a model to add to the free trap scan. Never costs the solve.
 
@@ -2074,6 +2098,7 @@ class VerifyingSolver:
         wrapped whole rather than guarded condition by condition.
         """
         conversation = None
+        turn = time.monotonic()
         try:
             conversation = await self._open_within(
                 budget, started, avoid, phase="analysis"
@@ -2084,7 +2109,17 @@ class VerifyingSolver:
                 max(1.0, budget - (time.monotonic() - started)),
             )
             merged = analysis_from_json(extract_analysis(reply), heuristic)
-            phases.mark("1 analysis")
+            # `beside` is passed its own elapsed time rather than measured from
+            # the cursor: with the candidate running alongside, the cursor has
+            # not moved since the pass began and the difference would be the
+            # candidate's seconds charged to the analysis. The cursor is left
+            # where it is, so the candidate is still billed from the start of
+            # the pass -- which is when it actually began.
+            phases.mark(
+                "1 analysis",
+                **({"beside": True, "model_s": time.monotonic() - turn}
+                   if beside else {}),
+            )
             added = len(merged.traps) - len(heuristic.traps)
             print(f"[verify] the analysis turn added {added} trap(s) to the "
                   f"{len(heuristic.traps)} the scan already had")
@@ -2184,6 +2219,41 @@ class VerifyingSolver:
                 with contextlib.suppress(Exception):
                     await conversation.close()
 
+    # -- stage 6: the program that ships ---------------------------------- #
+    async def _write_candidate(
+        self, task, analysis, budget: float, started: float,
+        avoid: Optional[str], phases: "_Phases",
+    ):
+        """One turn, and the conversation it was written in, still open.
+
+        The one writing turn that does NOT close its conversation here. The
+        repair loop records which conversation wrote the program it is about to
+        grade -- `writer` -- and the pass closes both tabs in its `finally`, so
+        closing this one on the way out would take the session that a repair on
+        the same profile resumes.
+
+        Nothing in here is conditional on when it runs. That is what lets the
+        pass either await it in place or start it before the analysis turn.
+        """
+        conversation = await self._open_within(
+            budget, started, avoid, phase="candidate"
+        )
+        # The LABEL in the phase line, the provider everywhere else. A
+        # backend that carries an effort says so here; `provider` stays the
+        # bare `cli:<model>[@<account>]` that the summary line, the archive
+        # and two parsers all depend on.
+        label = (
+            getattr(conversation, "label", None)
+            or getattr(conversation, "provider", None)
+            or "tab"
+        )
+        phases.mark(f"open {label}")
+        reply = await self._send_within(
+            conversation, build_candidate_prompt(task, analysis),
+            max(1.0, budget - (time.monotonic() - started)),
+        )
+        return conversation, reply
+
     async def _attempt(
         self,
         task,
@@ -2196,10 +2266,13 @@ class VerifyingSolver:
 
         The shape, and why it is this shape:
 
-          * stage 3 runs alone, because every later prompt is handed its result;
+          * stage 3 runs alone, because every later prompt is handed its
+            result -- unless `SOLVER_CANDIDATE_EARLY` is on, which excuses
+            stage 6 from waiting for it and hands it the free scan instead;
           * stages 4, 5 and 6 run TOGETHER, because none consumes another's
             output -- the critical path is one analysis plus the slowest of
-            three, not the sum of four;
+            three, not the sum of four, and with the flag on it is the slowest
+            of three alone;
           * stage 7 runs the reference and the candidate on the same inputs and
             is the only stage with no model call in it;
           * stage 8 repairs whichever artifact the router names, on a phase
@@ -2217,6 +2290,9 @@ class VerifyingSolver:
         best_provider: Optional[str] = None
         conversation = None
         repair_conv = None
+        # Every turn this pass may have put in flight, so the pass can take
+        # them back. See the `finally`.
+        started_turns: dict = {"candidate": None, "inputs": None, "oracle": None}
         provider: Optional[str] = None
 
         def left() -> float:
@@ -2247,10 +2323,38 @@ class VerifyingSolver:
             # -- 2. the free trap scan -------------------------------------
             analysis = heuristic_analyze(task)
 
-            # -- 3. the analysis turn --------------------------------------
+            # -- 3, and 6 either in front of it or beside it ---------------
+            # `SOLVER_CANDIDATE_EARLY` decides which, and it is the only thing
+            # that decides it -- both arms run the same two coroutines, so the
+            # flag moves WHEN stage 6 starts and nothing else.
+            #
+            # Off: stage 3 runs alone and hands its merged list to every prompt
+            # after it, the shipping program included.
+            #
+            # On: stage 6 starts here, on the heuristic scan, and stage 3 runs
+            # beside it -- reaching the inputs, the reference and the repair
+            # loop, but never the program that ships.
+            #
+            # `_llm_analysis` off makes the flag a no-op on purpose rather than
+            # by accident: with no analysis turn there is nothing to run the
+            # candidate beside, and starting it early would only reorder a log.
+            early = (
+                self._candidate_early
+                and self._llm_analysis
+                and left() >= MIN_SLICE_S
+            )
+            candidate_task = started_turns["candidate"] = (
+                asyncio.create_task(self._write_candidate(
+                    task, analysis, budget, started, avoid, phases))
+                if early else None
+            )
+            if early:
+                print("[verify] the candidate turn is writing from the free "
+                      "scan alone (SOLVER_CANDIDATE_EARLY=1); the analysis "
+                      "turn reaches the inputs, the reference and any repair")
             if self._llm_analysis and left() >= MIN_SLICE_S:
                 analysis = await self._analyse(
-                    task, analysis, budget, started, avoid, phases
+                    task, analysis, budget, started, avoid, phases, beside=early
                 )
 
             # -- 4, 5, 6 side by side --------------------------------------
@@ -2268,32 +2372,26 @@ class VerifyingSolver:
             # answered and a reference with no inputs has nothing to run on, so
             # keeping either one alone would buy a conversation and a model's
             # time for a comparison that cannot happen.
-            inputs_task = (
+            inputs_task = started_turns["inputs"] = (
                 asyncio.create_task(self._write_inputs(
                     task, analysis, budget, started, avoid, probe, plan, phases))
                 if self._self_tests else None
             )
-            oracle_task = (
+            oracle_task = started_turns["oracle"] = (
                 asyncio.create_task(self._write_oracle(
                     task, analysis, budget, started, avoid, plan, phases))
                 if self._self_tests else None
             )
 
-            conversation = await self._open_within(
-                budget, started, avoid, phase="candidate"
-            )
+            # Awaited HERE either way, so the turn is billed to the same
+            # place in the log whether it started here or before stage 3.
+            if candidate_task is not None:
+                conversation, candidate_reply = await candidate_task
+            else:
+                conversation, candidate_reply = await self._write_candidate(
+                    task, analysis, budget, started, avoid, phases
+                )
             provider = best_provider = getattr(conversation, "provider", None)
-            # The LABEL in the phase line, the provider everywhere else. A
-            # backend that carries an effort says so here; `provider` stays the
-            # bare `cli:<model>[@<account>]` that the summary line, the archive
-            # and two parsers all depend on.
-            phases.mark(
-                f"open {getattr(conversation, 'label', None) or provider or 'tab'}"
-            )
-            candidate_reply = await self._send_within(
-                conversation, build_candidate_prompt(task, analysis),
-                max(1.0, left()),
-            )
             phases.mark("2 candidate")
 
             inputs = await inputs_task if inputs_task is not None else []
@@ -2555,6 +2653,29 @@ class VerifyingSolver:
             print(f"[verify] the solve failed: {type(exc).__name__}: {exc}")
             note_exit("failed")
         finally:
+            # Any turn this pass started and never got to read still owns a
+            # tab. Found by a test rather than reasoned about: with the inputs
+            # turn made to fail, the REFERENCE turn's phase line printed after
+            # the summary line -- it was still running, on a seat the next
+            # solve could not have, in a pass that had already given up.
+            #
+            # Stages 4 and 5 close their own conversations in their own
+            # `finally`, so cancelling is enough to release those. Stage 6
+            # deliberately does not -- the repair loop needs its conversation
+            # alive -- so a finished one is unwrapped here and closed below.
+            #
+            # Nothing is awaited: this runs on the cancellation path too,
+            # where awaiting would either block the unwind or swallow the
+            # CancelledError that put us here.
+            for name, turn in started_turns.items():
+                if turn is None:
+                    continue
+                if not turn.done():
+                    turn.cancel()
+                elif (name == "candidate" and conversation is None
+                        and not turn.cancelled()):
+                    with contextlib.suppress(Exception):
+                        conversation = turn.result()[0]
             for conv in (conversation, repair_conv):
                 if conv is not None:
                     with contextlib.suppress(Exception):
