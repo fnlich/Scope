@@ -476,6 +476,24 @@ PHASES = ("analysis", "tests", "oracle", "candidate", "repair")
 #
 # `candidate` takes the strong profile because it is the program that ships.
 #
+# THE TWO PROFILES ARE THE SAME VALUE TODAY, and saying so is better than
+# leaving a reader to notice. Every phase runs at `low`, by the operator's
+# choice, so `_FAST_PROFILE` and `_STRONG_PROFILE` are both opus/low and the
+# only difference left between the oracle and the candidate is the one that was
+# always load-bearing: the INSTRUCTION. The oracle is asked for a slow, literal,
+# obviously-correct program and the candidate for one that holds at the stated
+# maximums, and that difference is what makes their disagreement evidence.
+# Effort was a second lever on the same distinction, never the distinction
+# itself. Both names are kept because they say which role a phase plays, and
+# re-separating them later is a one-line edit rather than a re-reading of which
+# phase meant what.
+#
+# The latency this buys is not incidental. Measured over a 97-task replay, the
+# candidate turn was still writing at the deadline on 10 of 45 fresh solves --
+# every one of them submitting nothing -- and on the solves that did finish it
+# took a median 87s before its first character. `low` everywhere is the
+# operator's answer to that.
+#
 # `repair` takes a DIFFERENT MODEL, and that is the point of it rather than a
 # side effect. A model asked to repair its own program defends its own reading
 # of the statement -- which is the exact failure the differential exists to
@@ -490,8 +508,8 @@ PHASES = ("analysis", "tests", "oracle", "candidate", "repair")
 # the statement a second time. Rounds after the first stay on this profile and
 # do resume, so it is one prompt per solve, not one per round.
 _FAST_PROFILE = Profile("opus", "low")
-_STRONG_PROFILE = Profile("opus", "medium")
-_REPAIR_PROFILE = Profile("fable", "medium")
+_STRONG_PROFILE = Profile("opus", "low")
+_REPAIR_PROFILE = Profile("fable", "low")
 
 
 def cli_phase_profiles(
@@ -507,7 +525,7 @@ def cli_phase_profiles(
     All five phases are SET by default:
 
         analysis  opus:low     tests  opus:low     oracle  opus:low
-        candidate opus:medium  repair fable:medium
+        candidate opus:low     repair fable:low
 
     The reasoning for each is above `_FAST_PROFILE`. The short version is that
     the oracle is cheap on purpose, the candidate is the program that ships,
@@ -784,6 +802,14 @@ class CliConversation:
         """What `avoid` is matched against. Reflects the pair NOW, after any hop."""
         return self._backend.provider_of(self.account, self.profile)
 
+    @property
+    def label(self) -> str:
+        """`provider` plus the effort. What the LOG says; never what is stored.
+
+        See `CliBackend.label_of` for why the two are not one string.
+        """
+        return self._backend.label_of(self.account, self.profile)
+
     def _argv(self) -> list[str]:
         argv = [
             self._backend.binary, "-p",
@@ -854,7 +880,7 @@ class CliConversation:
             if wait > 0:
                 if self._hop_account(why) or self._hop(why):
                     continue
-                print(f"[cli] {self.provider}: turned away ({why}; "
+                print(f"[cli] {self.label}: turned away ({why}; "
                       f"{_minutes(wait)} to go) and nobody else on the ladder "
                       f"can answer")
                 self.empty_reason = "unreadable"
@@ -879,7 +905,7 @@ class CliConversation:
                 # Nobody else was free either, or this session is pinned to
                 # its account. Then the wait was the only thing to do and it
                 # ran out -- and the line says which of the two it was.
-                print(f"[cli] {self.provider}: no free slot inside {budget:.0f}s "
+                print(f"[cli] {self.label}: no free slot inside {budget:.0f}s "
                       f"({self._backend.concurrency} allowed at once on "
                       f"{self.account.name}) and "
                       + ("this session is pinned to its account"
@@ -1021,12 +1047,12 @@ class CliConversation:
             # full, limited, signed out -- so the choice is between the tail
             # of a window and a wait, and the operator's rule is that a seat
             # that cannot serve is switched away from, never waited on.
-            was = self.provider
+            was = self.label
             self._session = str(uuid.uuid4())
             self.account = account
             self.hops += 1
             self._backend.note_hop()
-            print(f"[cli] hop: {was} -> {self.provider} ({why})")
+            print(f"[cli] hop: {was} -> {self.label} ({why})")
             return True
         return False
 
@@ -1046,13 +1072,13 @@ class CliConversation:
         if pair is None:
             return False
         account, profile = pair
-        was = self.provider
+        was = self.label
         if account != self.account:
             self._session = str(uuid.uuid4())
         self.account, self.profile = account, profile
         self.hops += 1
         self._backend.note_hop()
-        print(f"[cli] hop: {was} -> {self.provider} ({why})")
+        print(f"[cli] hop: {was} -> {self.label} ({why})")
         return True
 
     async def _send(self, text: str, timeout_s: float) -> tuple[str, str]:
@@ -1112,7 +1138,7 @@ class CliConversation:
             await self._kill(proc)
             errfile.close()
             body = "".join(chunks).strip()
-            print(f"[cli] {self.provider} did not finish inside "
+            print(f"[cli] {self.label} did not finish inside "
                   f"{timeout_s:.0f}s; "
                   + (f"keeping the {len(body)} character(s) that arrived"
                      if body else "nothing had arrived")
@@ -1126,7 +1152,7 @@ class CliConversation:
             # minutes, and the silent turns measured on a production day were
             # spread over hours -- the hold would have expired before each
             # recurrence and bought nothing. The turn is lost; the seat is fine.
-            print(f"[cli] {self.provider} has sent no answer text at all "
+            print(f"[cli] {self.label} has sent no answer text at all "
                   f"({self._stream_note()}); cutting it rather than spending "
                   f"the rest of the slice on a stream that is not writing")
             return self._verdict("", "silent")
@@ -1134,7 +1160,7 @@ class CliConversation:
             await self._kill(proc)
             errfile.close()
             self._backend.note_stall(self.account, self.model)
-            print(f"[cli] {self.provider} produced no event at all in "
+            print(f"[cli] {self.label} produced no event at all in "
                   f"{FIRST_EVENT_S:.0f}s. At the subscription's usage limit the "
                   f"CLI blocks rather than fails; treating this turn as lost "
                   f"rather than spending the slice on it.")
@@ -1142,7 +1168,7 @@ class CliConversation:
         except _Limited:
             await self._kill(proc)
             errfile.close()
-            print(f"[cli] {self.provider} turn refused: "
+            print(f"[cli] {self.label} turn refused: "
                   f"{self._backend.last_error or 'limit reached'}")
             return self._verdict("", "limited")
         except _Busy as exc:
@@ -1170,7 +1196,7 @@ class CliConversation:
         except Exception as exc:  # noqa: BLE001 - a failed turn is not a crash
             await self._kill(proc)
             errfile.close()
-            print(f"[cli] {self.provider} turn failed: {type(exc).__name__}: {exc}")
+            print(f"[cli] {self.label} turn failed: {type(exc).__name__}: {exc}")
             self._backend.last_error = f"{type(exc).__name__}: {exc}"
             return self._verdict("", "failed")
 
@@ -1185,7 +1211,7 @@ class CliConversation:
             # the clock is: kept, and marked unfinished, so the repair loop
             # does not ask the model to fix what it never finished saying.
             self.still_writing = True
-            print(f"[cli] {self.provider} failed after {len(body)} character(s) "
+            print(f"[cli] {self.label} failed after {len(body)} character(s) "
                   f"had arrived ({self._backend.last_error or 'error'}); "
                   f"keeping them as an unfinished reply")
             return self._verdict(body, "partial")
@@ -1195,13 +1221,13 @@ class CliConversation:
             # A clean exit with no text is the MODEL declining to say
             # anything: the conversation is working and the turn was wasted.
             # Telling it so is what fixes that, and `_attempt` does.
-            print(f"[cli] {self.provider} returned nothing after "
+            print(f"[cli] {self.label} returned nothing after "
                   f"{time.monotonic() - started:.1f}s (exit 0)")
             return self._verdict("", "no-code")
         # A non-zero exit is the SESSION failing -- a lost conversation, a
         # refused resume, a signed-out account, a broken install -- and what
         # the CLI said about it decides which way the ladder moves.
-        print(f"[cli] {self.provider} returned nothing after "
+        print(f"[cli] {self.label} returned nothing after "
               f"{time.monotonic() - started:.1f}s ({self._backend.last_error})")
         kind = classify(stderr)
         if kind == "auth":
@@ -1251,7 +1277,7 @@ class CliConversation:
             # long a healthy turn stays quiet, and it is what any watchdog
             # threshold has to be sized against; before this line the logs
             # held it for failures only, which is the wrong tail.
-            print(f"[cli] {self.provider} {verdict}: {self._stream_note()}")
+            print(f"[cli] {self.label} {verdict}: {self._stream_note()}")
         elif verdict == "unfinished":
             self.empty_reason = "unfinished"
         elif verdict == "no-code":
@@ -1447,7 +1473,7 @@ class CliConversation:
         # be silent, and a turn that spent its slice in the CLI's own retry
         # loop read exactly like a model thinking.
         limit = _number(event.get("max_retries"))
-        print(f"[cli] {self.provider} retry {attempt}"
+        print(f"[cli] {self.label} retry {attempt}"
               + (f"/{int(limit)}" if limit else "")
               + f": {error or (f'HTTP {code}' if code else 'connection error')}"
               + f", next wait {delay_ms / 1000:.0f}s")
@@ -1656,7 +1682,11 @@ class CliBackend:
         # Consecutive unexplained failures per (account, model).
         self._failures: dict[tuple[str, str], int] = {}
         # The pair a fresh solve was last handed, so a change is said once.
-        self._mode: tuple[str, str] = (self.accounts[0].name, self.default.model)
+        # (account, model, can it actually answer). The third element is what
+        # stops a fully-out seat reading as a recovery -- see `_announce`.
+        self._mode: tuple[str, str, bool] = (
+            self.accounts[0].name, self.default.model, True
+        )
         # How much of each seat's window is used, as the last turn on it
         # reported: (share, when it resets). See `SWITCH_AT`.
         self._usage: dict[str, tuple[float, Optional[float]]] = {}
@@ -1713,6 +1743,23 @@ class CliBackend:
         if len(self.accounts) == 1:
             return f"cli:{profile.model}"
         return f"cli:{profile.model}@{account.name}"
+
+    def label_of(self, account: Account, profile: Profile) -> str:
+        """The provider string plus the effort, for LOGS only.
+
+        Kept apart from `provider_of` on purpose. That string is a contract:
+        two independent parsers read it -- `_parse_provider` here and
+        `_model_of` in `verify.py` -- it is matched against `avoid`, it is
+        stored on every archived answer and it is grepped out of old logs.
+        Widening it to carry the effort would silently change all of that.
+
+        The effort belongs in the log all the same, and did not used to be
+        there: every phase now runs at the same effort by configuration, so a
+        line reading `cli:opus` no longer says whether it ran at the effort the
+        operator set. When one phase is moved off that default, this is the
+        only place the log would show it.
+        """
+        return f"{self.provider_of(account, profile)} (effort {profile.effort})"
 
     def _parse_provider(self, provider: str) -> tuple[Optional[str], Optional[str]]:
         """(model, account name) named by a provider string, either may be None."""
@@ -1873,13 +1920,41 @@ class CliBackend:
 
     def _announce(self, account: Account, profile: Profile) -> None:
         """Say when a fresh solve is not going to the default pair, once."""
-        pair = (account.name, profile.model)
-        top = (self.accounts[0].name, self.default.model)
-        if pair == self._mode:
+        # Whether the pair being announced can ANSWER, not just which pair it
+        # is. `pick` hands out the default pair when nothing on the ladder is
+        # healthy -- deliberately, so `send` turns it away with the reason in a
+        # millisecond -- and `_announce` cannot tell that fall-through from a
+        # genuine recovery by the pair alone.
+        #
+        # Measured, one account: a 529 storm parks opus, `fable` takes over and
+        # EMERGENCY MODE is printed. The seat then spends its five-hour window,
+        # every model goes out, `pick` falls back to the default pair, and the
+        # line that reached the operator at the moment NOTHING could answer was
+        #
+        #   [cli] back to normal: cli:opus (effort low) answers again
+        #
+        # which is the worst thing this backend can say: it announces recovery
+        # at the moment of total outage, and an operator reading it goes back
+        # to sleep. The state is (pair, can it serve), so a seat going fully
+        # out is a change and says so.
+        wait_here, why_here = self.outage_for(account, profile.model)
+        state = (account.name, profile.model, wait_here <= 0)
+        top = (self.accounts[0].name, self.default.model, True)
+        if state == self._mode:
             return
-        self._mode = pair
-        label = self.provider_of(account, profile) + f" (effort {profile.effort})"
-        if pair == top:
+        self._mode = state
+        label = self.label_of(account, profile)
+        if wait_here > 0:
+            # Handed out because there was nothing else, not because it works.
+            print(f"[cli] NOTHING CAN ANSWER: every pair on the ladder is out. "
+                  f"{label} is handed out and will be turned away "
+                  f"({why_here}; {_minutes(wait_here)} until it is tried "
+                  f"again). Solves score zero until then"
+                  + ("" if len(self.accounts) > 1 else
+                     "; a second account is what answers a spent seat "
+                     "(SOLVER_CLI_BACKUP_ACCOUNTS)"))
+            return
+        if state == top:
             print(f"[cli] back to normal: {label} answers again")
             return
         wait, why = self.outage_for(self.accounts[0], self.default.model)
@@ -2221,6 +2296,21 @@ class CliBackend:
             "backend": "claude-cli",
             "accounts": [a.name for a in self.accounts],
             "default": self.default.label,
+            # WHICH RUNG IS ANSWERING, which `out` cannot say: it records what
+            # is broken, not who took over, and most of its entries are neither
+            # a limit nor an emergency. This was printed by `_announce` and
+            # nowhere else, so the one question an operator asks of
+            # /solver-status -- "am I on the emergency rung right now?" -- could
+            # only be answered by grepping the log. `serving` is false when the
+            # ladder had nothing healthy and this pair was handed out to be
+            # turned away.
+            "answering": {
+                "account": self._mode[0],
+                "model": self._mode[1],
+                "serving": self._mode[2],
+                "is_default": (self._mode[0], self._mode[1])
+                              == (self.accounts[0].name, self.default.model),
+            },
             "ladder": [p.label for p in self.profiles],
             "concurrency": self._limit,
             "sessions_opened": self._opened,

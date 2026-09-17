@@ -10,24 +10,86 @@ wording it matches is wording this subnet's statements actually use, and because
 a solver that misses it produces a program that passes small cases and fails the
 hidden suite -- the exact failure that scores zero while looking fine.
 
-Measured over the 97 recorded tasks in `examples/problems` (48 python, 49 rust),
-median 5 traps per task, never fewer than 3:
+Measured over 275 recorded tasks -- the 97 in `examples/problems` plus the 178
+in `fnlich/hone-examples`, which also ships the ACCEPTED solution beside each
+statement. Median 7 traps per task:
 
-    97/97  sandbox_constraints          32/97  index_base
-    97/97  no_public_examples            6/97  unicode_indexing
-    88/97  large_n_hidden_tests          6/97  negative_index_wrap
-    49/97  rust_contract                 5/97  persistent_or_branching_state
-    48/97  python_contract               3/97  implicit_default_behavior
-    47/97  token_output_compare          3/97  no_mutation_of_inputs
-    40/97  huge_numeric_bounds           1/97  retry_accounting
+    275/275  sandbox_constraints        20/275  first_match_fallback
+    275/275  no_public_examples         16/275  fixpoint_closure
+    248/275  large_n_hidden_tests       14/275  modular_arithmetic
+    147/275  rust_contract              13/275  unicode_indexing
+    141/275  token_output_compare       13/275  persistent_or_branching_state
+    128/275  python_contract            10/275  error_priority_order
+    109/275  huge_numeric_bounds        10/275  no_mutation_of_inputs
+     81/275  index_base                 10/275  negative_index_wrap
+     71/275  rust_wide_arithmetic        8/275  all_branches_no_shortcircuit
+     60/275  deterministic_tiebreak      8/275  exact_output_shape
+     52/275  duplicates_defined          8/275  non_canonical_encoding
+     51/275  inclusive_bounds            7/275  retry_accounting
+     48/275  cycle_self_reference        7/275  exact_rational_no_float
+     47/275  intra_timestamp_phase       7/275  lexicographic_objectives
+     36/275  recursive_descent_depth     7/275  validate_before_applying
+     30/275  preserve_untouched          6/275  float_exactness
+     25/275  amortized_total_budget      5/275  bool_is_not_int
+     25/275  case_sensitivity_stated     4/275  implicit_default_behavior
+                                         3/275  integer_division_rounding
+
+SIX of those entries are structural -- they say what language this is and that
+the suite is hidden, and they fire on everything. What a solve actually gains is
+the rest, and that is the number worth watching. Before the 23 entries mined
+from `hone-examples`, a THIRD of statements drew none of them at all:
+
+                          problem-specific traps      tasks with none
+    hone-examples (178)   median 1 -> 3               61 (34%) ->  6 (3%)
+    examples/problems(97) median 1 -> 3               30 (31%) ->  2 (2%)
+
+The 97 were not a blind holdout -- they were in the set the hit rates were
+measured over -- but the wording was mined from the OTHER 178 and from what
+their accepted solutions had to do, so carrying across is some evidence the
+patterns are not overfitted to one draw.
+
+How an entry earned its place, and the bar for the next one: the wording must be
+greppable and copied verbatim from real statements; the hit rate must
+discriminate rather than fire on everything (nothing below is above 26% outside
+the structural six); and every match was read to confirm it is not a false
+positive. Six patterns were narrowed during that read:
+`in this order` was matching "in this ordering", a bare `reserved` was matching
+reserved TOKENS, `lexicographically smallest` belonged to `deterministic_tiebreak`
+rather than to `lexicographic_objectives`, `have no effect` was catching no-op
+rules rather than all-or-nothing ones, and `without overflow` was matching a
+REASSURANCE that Python cannot overflow. That is the whole reason the read is
+not optional: five of the six looked right until the matches were printed.
+
+The last six entries came from a second pass in which subagents read each
+statement beside its accepted solution. They proposed 67 candidates; the filter
+that mattered was mechanical rather than editorial -- run each proposal's
+phrases over all 275 statements and drop anything matching ONE, because a
+phrase lifted from a single statement is a note about that problem and not a
+catalog entry. Two thirds fell to it -- including several that read as the
+sharpest findings of the lot. They were real observations about real problems;
+none of them was a regex worth carrying.
+
+A third pass then went back to whatever the first two had left silent and took
+two more entries (`first_match_fallback`, `non_canonical_encoding`) plus two
+widenings: a deadlock is a cycle in a wait-for graph, so it belongs to
+`cycle_self_reference` rather than to an entry of its own, and "the entire
+transaction fails" is `validate_before_applying` in other words. Eight of 275
+statements still draw nothing problem-specific, and reading them says why --
+their traps are stated in vocabulary the statement invents for itself
+("herald", "suit", "bounded banner"), which is exactly what stage 3 is for.
 
 Three entries -- `no_full_materialization`, `exact_arithmetic` and `dag_not_tree`
--- fire on NONE of those 97. They are kept rather than deleted because they do
+-- fire on NONE of the 275. They are kept rather than deleted because they do
 fire on the upstream ChallengeBox statements (2/10, 1/10 and 1/10 of that set),
-so the wording is real and this corpus simply has not drawn it yet. A regex that
-has never matched costs microseconds; the trap it would have caught costs the
-solve. If a later corpus still shows them at zero, delete them then -- but say so
-with a number, not an impression.
+so the wording is real and this corpus has not drawn it. A regex that has never
+matched costs microseconds; the trap it would have caught costs the solve. But
+`exact_arithmetic` is now the weakest of the three for a reason worth recording:
+the overflow it was reaching for turns out to be REAL and common -- 27 of 98
+accepted Rust solutions reach for i128 -- and it missed every one of them,
+because it waits on the words `exact arithmetic` and the statements instead say
+`10^18`. `rust_wide_arithmetic` is what catches that, off the bound rather than
+off a phrase. The lesson generalises: match what statements SAY, not what the
+trap is called.
 
 Two rules govern the merge with the model's own analysis in `merge_analysis`:
 
@@ -157,6 +219,319 @@ _KEYWORD_TRAPS: list[tuple[re.Pattern[str], str, str, str]] = [
         "Negative indexes wrap and then clamp.",
         "Resolve with n+x first, then clamp. Python slice semantics are not "
         "the same thing.",
+    ),
+    # --------------------------------------------------------------------- #
+    # Mined from 275 recorded statements (97 in `examples/problems`, 178 in
+    # fnlich/hone-examples) and, where the corpus carries one, from the
+    # ACCEPTED solution beside each. A trap earned a place here only when the
+    # wording is greppable, the hit rate is discriminating rather than
+    # universal, and every match was read to confirm it is not a false
+    # positive. Rates below are over all 275.
+    # --------------------------------------------------------------------- #
+    (
+        re.compile(
+            r"no (?:[a-z ]{0,30})?depth limit|arbitrarily deep|deeply nested|"
+            r"nesting depth|nested (?:expression|structure|object|list|value|"
+            r"union|group)|recursiv|\bsubtree\b|\bdescendant",
+            re.I,
+        ),
+        "recursive_descent_depth",
+        "The input itself is a nested structure, so its depth is an INPUT and "
+        "not a constant.",
+        "Python recurses 1000 deep by default and a 200k-node chain is legal "
+        "input -- write it with an explicit stack, or raise the limit at the "
+        "top of the file. Rust overflows its 8 MiB stack the same way. "
+        "Measured on this corpus: 30 of 80 accepted Python solutions either "
+        "used an explicit stack or called `sys.setrecursionlimit`.",
+    ),
+    (
+        re.compile(
+            r"\bties?\b (?:are|use|is|go)|tie-break|ties use|resolve ties|"
+            r"lexicographically smallest|lexicographically largest|"
+            r"smallest .{0,20}(?:key|name|index)|earliest .{0,20}(?:branch|index)",
+            re.I,
+        ),
+        "deterministic_tiebreak",
+        "The statement names the rule for breaking a tie, which means ties "
+        "happen and the hidden tests contain them.",
+        "Sort by the FULL key the statement gives, tie-break included, in one "
+        "comparison. Never leave the order to the sort's stability or to a "
+        "dict's iteration order.",
+    ),
+    (
+        re.compile(
+            r"\bcyclic\b|\bcycles?\b|self-referen|leads back to|"
+            r"nonempty chain|circular|deadlock",
+            re.I,
+        ),
+        "cycle_self_reference",
+        "The input may contain a cycle, and the statement defines what that "
+        "means rather than forbidding it.",
+        "A self-loop is a cycle: read `a nonempty chain back to itself` "
+        "literally. Detect with colours (white/grey/black), not a visited "
+        "set -- and note that `is on a cycle` and `can reach a cycle` are "
+        "different questions. A deadlock is the same shape in a wait-for "
+        "graph, and `waits on itself` is the case that gets dropped.",
+    ),
+    (
+        re.compile(
+            r"duplicate|appears more than once|repeated (?:entries|keys|names)|"
+            r"after their first occurrence|first occurrence",
+            re.I,
+        ),
+        "duplicates_defined",
+        "Duplicates are possible and the statement says what to do with them.",
+        "Follow the rule exactly -- keep the first, keep the last, reject, or "
+        "merge are four different answers. A `set` or a `dict` silently picks "
+        "one of them for you.",
+    ),
+    (
+        re.compile(r"\binclusive\b|\bexclusive\b|half-open", re.I),
+        "inclusive_bounds",
+        "A range endpoint is called out as inclusive or exclusive, which is "
+        "said only when it is not the obvious one.",
+        "Write the interval one way internally and convert at the boundary. "
+        "Python slices and `range` are half-open; the statement usually is "
+        "not.",
+    ),
+    (
+        re.compile(
+            r"reserved (?:bit|field|key|name|word|value)|must be preserved|"
+            r"must not be (?:modified|changed|masked|touched)|"
+            r"leave .{0,25} unchanged|remain(?:s)? unchanged|"
+            r"never (?:changed|modified)|bits? .{0,25}(?:must not|never) ",
+            re.I,
+        ),
+        "preserve_untouched",
+        "Part of the structure must come back exactly as it went in.",
+        "Touch only what the statement names. Build the result from the "
+        "original rather than from a normalised copy, and never rewrite a "
+        "field just because you parsed it.",
+    ),
+    (
+        re.compile(
+            r"case-sensitive|case sensitive|casefold|case-insensitive", re.I
+        ),
+        "case_sensitivity_stated",
+        "Case handling is stated, so it is load-bearing somewhere.",
+        "Casefold once at the boundary if the match is insensitive, and keep "
+        "the ORIGINAL spelling for output. `lower()` and `casefold()` differ, "
+        "and Rust `to_lowercase` is not ASCII-only.",
+    ),
+    (
+        re.compile(
+            r"check,? in order\b|in the following order\b|"
+            r"report the (?:first|earliest)|error (?:precedence|priority)|"
+            r"whichever (?:comes|occurs) first|takes precedence|"
+            r"check .{0,40}before (?:descend|child|its )|"
+            r"(?:first|earliest) (?:failure|error|violation) (?:in|is|encountered)",
+            re.I,
+        ),
+        "error_priority_order",
+        "WHICH failure is reported is specified, not just that one is.",
+        "Check in the stated order and return the first hit. A program that "
+        "validates in its own order reports a real error at the wrong "
+        "priority and scores zero on a case it almost got right.",
+    ),
+    (
+        re.compile(
+            r"smallest set|least fixed point|fixpoint|transitive(?:ly)? closure|"
+            r"until no (?:more|further|additional)|repeat until|"
+            r"such that every|is also included|propagat|cascad",
+            re.I,
+        ),
+        "fixpoint_closure",
+        "The answer is the least set closed under a rule, not a single pass.",
+        "Iterate to a fixed point, or walk the REVERSED dependency edges from "
+        "the seeds with a worklist. One forward sweep terminates early and "
+        "under-reports.",
+    ),
+    (
+        re.compile(
+            r"modulo|modulus|1000000007|998244353|10\^9 \+ 7", re.I
+        ),
+        "modular_arithmetic",
+        "Results are reduced modulo something.",
+        "Reduce at every step, not at the end. Negative intermediates must "
+        "come back non-negative -- Python `%` already does, Rust `%` does "
+        "not. Division means a modular inverse, never `/`.",
+    ),
+    (
+        re.compile(
+            r"exactly one branch|more than one .{0,25}succeed|\bambiguous\b|"
+            r"all branches|every branch",
+            re.I,
+        ),
+        "all_branches_no_shortcircuit",
+        "Ambiguity is an outcome, so every alternative has to be tried even "
+        "after one succeeds.",
+        "Evaluate them all and count the successes. Returning on the first "
+        "match cannot tell one from two, which is the case the statement "
+        "singled out.",
+    ),
+    (
+        re.compile(
+            r"exactly these keys|exactly those keys|with exactly the keys|"
+            r"exactly these fields",
+            re.I,
+        ),
+        "exact_output_shape",
+        "The returned container's key set is pinned exactly.",
+        "Emit every named key on every path, including the empty and error "
+        "ones, and emit nothing else. The comparison is structural: a missing "
+        "key and an extra key both fail.",
+    ),
+    (
+        re.compile(
+            r"booleans? are not (?:integers|ints|numbers)|are distinct kinds|"
+            r"bool(?:ean)?s? (?:are|is) not (?:an? )?(?:integer|number)",
+            re.I,
+        ),
+        "bool_is_not_int",
+        "Booleans, integers and floats are separate kinds here.",
+        "Python disagrees: `True == 1`, `isinstance(True, int)` is true, and "
+        "`1 == 1.0`, so a dict key, a `set` or a bare `==` conflates them. "
+        "Compare `type(x) is bool` FIRST, and key on `(type(x).__name__, x)`.",
+    ),
+    (
+        re.compile(
+            r"floating-point|floating point|IEEE ?754|binary64|"
+            r"relative error|absolute error|round-half",
+            re.I,
+        ),
+        "float_exactness",
+        "Floating-point behaviour is named, so the answer turns on it.",
+        "Do not accumulate error: compare with the stated tolerance, or stay "
+        "in integers or `fractions.Fraction` and convert once at the end. "
+        "`round()` is banker's rounding in Python and is not round-half-up.",
+    ),
+    # --- a second pass, over the same 275, with subagents reading the
+    # statements and their accepted solutions side by side. Every candidate
+    # they proposed was filtered the same way: the phrases were run over the
+    # whole corpus, and anything matching a single statement was dropped as a
+    # note about that problem rather than a catalog entry.
+    (
+        re.compile(
+            r"truncat\w{0,3} toward zero|rounds? toward zero|toward zero|"
+            r"floor division|rounded toward",
+            re.I,
+        ),
+        "integer_division_rounding",
+        "The statement says which way integer division rounds, because the "
+        "two languages do not agree.",
+        "Python `//` FLOORS: `-7 // 2` is -4. Rust `/` TRUNCATES: it is -3. "
+        "Only negative operands tell them apart, so every positive test "
+        "passes either way. For truncation in Python take the magnitude and "
+        "reapply the sign; `%` differs the same way and by the same sign.",
+    ),
+    (
+        re.compile(
+            r"subject to that|subject to those|"
+            r"among those .{0,30}(?:choose|use|pick|minim|maxim)|"
+            r"among all .{0,30}(?:choose|use|pick|minim|maxim)|"
+            r"at the first differing (?:index|position)|priorities,? in order",
+            re.I,
+        ),
+        "lexicographic_objectives",
+        "Several objectives ranked, not one -- each is optimised only among "
+        "the optima of the one above it.",
+        "Solve objective 1 to its exact optimal VALUE, pin that value as a "
+        "hard constraint, then solve objective 2 under it, and so on. A "
+        "single weighted score, or the first optimum a greedy pass finds, "
+        "gets objective 1 right and everything below it wrong -- which is "
+        "what the hidden tests are built to separate.",
+    ),
+    (
+        re.compile(
+            r"before applying any|fully validate .{0,30}before|"
+            r"validate .{0,25}before (?:applying|any)|"
+            r"(?:all|either) .{0,20}or (?:none|nothing)|no partial|"
+            r"entire transaction fails|transaction fails|rolled back",
+            re.I,
+        ),
+        "validate_before_applying",
+        "An operation is all-or-nothing: it is checked completely before any "
+        "part of it takes effect.",
+        "Two passes. Validate the whole operation, then apply it. A streaming "
+        "loop that validates each piece as it applies it leaves the first "
+        "half written when the second half is rejected, and the statement "
+        "says that must not happen.",
+    ),
+    (
+        re.compile(
+            r"exact rational|exact integer arithmetic|"
+            r"floating-point .{0,20}(?:is )?(?:forbidden|not allowed|must not)|"
+            r"exact distance|must be exact\b",
+            re.I,
+        ),
+        "exact_rational_no_float",
+        "A value is defined as an exact rational, so a float cannot represent "
+        "it.",
+        "Keep it as a reduced integer pair `(p, q)` with `q > 0` and compare "
+        "by CROSS-MULTIPLICATION, never by dividing. Past 2^53 a double "
+        "silently stops distinguishing neighbours, which turns a tie the "
+        "statement resolves by index into a coin toss. Rust: cross-multiply "
+        "in i128.",
+    ),
+    (
+        re.compile(
+            r"across all queries|(?:the )?sum of all .{0,30}is at most|"
+            r"combined (?:count|size|total) is at most|"
+            r"total .{0,40}across the input is at most",
+            re.I,
+        ),
+        "amortized_total_budget",
+        "The bound is on the TOTAL across every operation, not on any one of "
+        "them.",
+        "One operation may legally be enormous, so a per-operation bound "
+        "cannot be assumed -- but the total is what you may spend. Record "
+        "what each step touched and reset only that, never a whole array per "
+        "query; that is the difference between linear overall and quadratic.",
+    ),
+    (
+        re.compile(
+            r"at (?:each|the same) (?:event )?time,? (?:first|process)|"
+            r"events at (?:a|the same) timestamp|equal-time events|"
+            r"same (?:timestamp|time) .{0,30}order|in input order",
+            re.I,
+        ),
+        "intra_timestamp_phase",
+        "Things happening at the SAME instant have a stated order among "
+        "themselves.",
+        "Run each timestamp as explicit phases in the order given, draining "
+        "one completely before starting the next. A single priority queue "
+        "keyed on time alone breaks ties by whatever the tuple happens to "
+        "compare on next, which is not the order the statement named.",
+    ),
+    # --- a third pass, aimed at the statements the first two left silent.
+    (
+        re.compile(
+            r"select the earliest|the earliest .{0,25}having|if none exists|"
+            r"if present, otherwise|otherwise,? if .{0,20}present|"
+            r"falls? back to",
+            re.I,
+        ),
+        "first_match_fallback",
+        "Selection walks a chain of alternatives in a stated order and stops "
+        "at the first that exists.",
+        "Follow the chain exactly and stop at the first hit -- the ORDER is "
+        "the specification, and a later rung must never win over an earlier "
+        "one that was present. Note what the fallback is when nothing "
+        "matches at all; the statement names it, and it is rarely an error.",
+    ),
+    (
+        re.compile(
+            r"need not use|not necessarily (?:minimal|shortest|canonical)|"
+            r"shortest encoding|may be padded|leading zero",
+            re.I,
+        ),
+        "non_canonical_encoding",
+        "An encoding is explicitly allowed to be non-minimal, so the obvious "
+        "round-trip check is wrong.",
+        "ACCEPT the long form -- do not reject it, and do not normalise it "
+        "before comparing. A value written in four bytes that would fit in "
+        "one is still that value; re-encoding it and testing equality "
+        "against the input rejects a legal case.",
     ),
 ]
 
@@ -336,6 +711,32 @@ def heuristic_analyze(task: Any) -> Analysis:
                 severity="medium",
             )
         )
+        # Rust has no big integers, and this corpus says the difference bites.
+        # `i64` tops out just past 9.2e18, so a statement carrying a 1e18-scale
+        # bound leaves under one decimal order of headroom: a single sum of two
+        # such values, or any product, is already over. Overflow there is not a
+        # panic -- the validator builds with `-C opt-level=2`, which turns the
+        # checks OFF -- so the program exits 0 with a plausible wrong number and
+        # nothing in the failure points at the cause.
+        #
+        # Measured: 27 of 98 accepted Rust solutions in this corpus reach for
+        # i128/u128, and 63% of those statements carry 1e18-scale wording
+        # against 20% of the rest -- a 3.2x lift. This is the trap the
+        # never-firing `exact_arithmetic` entry was reaching for; that one
+        # waits on the words `exact arithmetic`, which no statement here says.
+        if _LARGE_BOUND.search(text):
+            add(
+                Trap(
+                    name="rust_wide_arithmetic",
+                    evidence="A 1e9/1e18-scale bound in Rust, where i64 holds "
+                    "only to 9.2e18 and overflow at opt-level=2 is SILENT.",
+                    mitigation="i64 for stated values, i128 for any sum or "
+                    "product of them, and cast before multiplying rather than "
+                    "after. Where wrapping is wanted, say so with "
+                    "`wrapping_mul`; where it is not, `checked_`/`saturating_` "
+                    "turns a silent wrong answer into a visible one.",
+                )
+            )
         signature = "fn main()"
         io_notes = (
             "Stdin to stdout. The judge tokenises on ASCII whitespace "

@@ -606,7 +606,9 @@ def _inherit_evidence(candidate: Candidate, prior: Candidate) -> None:
     candidate.partial = candidate.partial or prior.partial
 
 
-def _supersedes(candidate: Candidate, best: Candidate, still_writing: bool) -> bool:
+def _supersedes(
+    candidate: Candidate, best: Optional[Candidate], still_writing: bool
+) -> bool:
     """Should `candidate` replace `best` as the answer that ships?
 
     THE LATEST VERSION WINS. No score is compared, and that is the whole rule.
@@ -646,6 +648,24 @@ def _supersedes(candidate: Candidate, best: Candidate, still_writing: bool) -> b
     """
     if not candidate.code.strip():
         return False
+    # NOTHING TO BEAT. The first round has no `best`, and both rules below are
+    # about displacing one -- asking whether a fragment should push a finished
+    # program aside is not a question when there is no program there. Anything
+    # with code in it is the answer so far.
+    #
+    # Measured, and it cost a whole solve: a Python task whose candidate turn
+    # was still writing at the budget and left 5,489 characters behind. The
+    # caller guards `best is None` in its SECOND conjunct, so this ran first,
+    # dereferenced None and raised straight out of the round --
+    #
+    #   [verify] the solve failed: AttributeError: 'NoneType' object has no
+    #            attribute 'code'
+    #   [rehearse] submitted 0 chars of python
+    #
+    # -- throwing away a program that was in hand. A crash is the one outcome
+    # this function exists to prevent.
+    if best is None:
+        return True
     if still_writing:
         return not best.code.strip()
     if candidate.partial and best.code.strip() and not best.partial:
@@ -2263,7 +2283,13 @@ class VerifyingSolver:
                 budget, started, avoid, phase="candidate"
             )
             provider = best_provider = getattr(conversation, "provider", None)
-            phases.mark(f"open {provider or 'tab'}")
+            # The LABEL in the phase line, the provider everywhere else. A
+            # backend that carries an effort says so here; `provider` stays the
+            # bare `cli:<model>[@<account>]` that the summary line, the archive
+            # and two parsers all depend on.
+            phases.mark(
+                f"open {getattr(conversation, 'label', None) or provider or 'tab'}"
+            )
             candidate_reply = await self._send_within(
                 conversation, build_candidate_prompt(task, analysis),
                 max(1.0, left()),

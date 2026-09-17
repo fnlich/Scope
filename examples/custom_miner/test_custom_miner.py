@@ -10629,7 +10629,7 @@ def test_a_cli_that_hangs_without_a_word_is_given_up_on_quickly(
     assert backend.stats()["stalls"] == 2
     out = capsys.readouterr().out
     assert "produced no event at all" in out
-    assert "hop: cli:opus -> cli:fable" in out, out
+    assert "hop: cli:opus (effort low) -> cli:fable (effort low)" in out, out
 
 
 def test_a_failed_first_cli_turn_does_not_reuse_its_session_id(
@@ -10724,7 +10724,8 @@ def test_a_usage_limit_moves_the_solve_to_the_backup_account(
     assert calls[1]["session"] == calls[2]["session"]
     assert calls[0]["session"] != calls[1]["session"], "a session cannot change seats"
     out = capsys.readouterr().out
-    assert "hop: cli:opus@primary -> cli:opus@claude-2" in out, out
+    assert ("hop: cli:opus@primary (effort low) -> "
+            "cli:opus@claude-2 (effort low)") in out, out
     assert "EMERGENCY MODE: cli:opus@claude-2" in out and "limit" in out, out
     assert "primary/*" in backend.stats()["out"], backend.stats()
 
@@ -10757,6 +10758,239 @@ def test_a_limit_mid_conversation_hands_the_repair_to_a_fresh_one(
     assert conversation.hops == 0, "a started session must not change seats"
     assert conversation.provider == "cli:opus@primary"
     assert carried.provider == "cli:opus@claude-2", carried.provider
+
+
+def test_a_first_round_fragment_is_kept_rather_than_crashing_the_solve():
+    """REGRESSION, off a replay of the 97 recorded tasks.
+
+    `_supersedes` answers "should this displace the answer in hand", and two of
+    its rules read `best` to decide. On the FIRST round there is no `best` --
+    the caller guards `best is None`, but in the second conjunct of an `and`,
+    so this runs first. A candidate turn that was still writing at the budget
+    and left a fragment behind dereferenced None and raised straight out of
+    the round:
+
+        [verify] the solve failed: AttributeError: 'NoneType' object has no
+                 attribute 'code'
+        [rehearse] submitted 0 chars of python
+
+    5,489 characters were in hand and went in the bin. A crash is the one
+    outcome this function exists to prevent, and it turned a partial answer --
+    which might have scored -- into a certain zero.
+    """
+    from solvers.verify import Candidate, _supersedes
+
+    fragment = Candidate(code="def g(n):\n    while n > 0:", raw="...")
+
+    # Both rules that read `best`, with nothing to read.
+    assert _supersedes(fragment, None, True) is True
+    fragment.partial = True
+    assert _supersedes(fragment, None, False) is True
+    # ...and the one rule that does not: an empty capture is still not an
+    # answer, with or without something to beat.
+    assert _supersedes(Candidate(code="", raw=""), None, True) is False
+
+
+def test_a_still_writing_first_round_submits_the_part_that_arrived(capsys):
+    """The same bug through a whole solve, which is where it was found.
+
+    The candidate turn runs out of budget with a partial program in hand and
+    no inputs to check it against. That must end the pass as a cutoff and
+    SUBMIT the fragment -- a partial answer can score, and a crash cannot."""
+    from solvers import verify
+
+    partial = "```python\ndef g(n):\n    total = 0\n    while n > 0:\n```"
+
+    class _Unfinished(_Chat):
+        still_writing = False
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            phase = _phase_of(text)
+            if phase in ("analysis", "inputs", "oracle"):
+                return ""
+            # The candidate turn: the model is still writing when the budget
+            # is gone, and what arrived is a fragment.
+            self.still_writing = True
+            self.empty_reason = "unfinished"
+            return partial
+
+    class _Backend2(_Backend):
+        async def open(self, avoid=None):
+            return _Unfinished(self._script, self._provider)
+
+    task = SolveTask(problem_id="frag", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=30.0)
+    solver = verify.VerifyingSolver(_Backend2([]), reserve_s=0, max_budget_s=30,
+                                    second_opinion=False)
+    answer = asyncio.run(solver.solve_task(task, timeout_s=30.0))
+    out = capsys.readouterr().out
+
+    assert "the solve failed" not in out, out
+    assert "AttributeError" not in out, out
+    assert "while n > 0" in answer.code, (
+        f"threw away the fragment that was in hand: {answer.code!r}\n{out}"
+    )
+    assert "still writing when the budget ran out" in out, out
+
+
+def test_every_phase_runs_at_the_effort_the_operator_set():
+    """All five phases at `low`, which makes two of the three profiles the
+    same value and leaves the INSTRUCTION as the only difference between the
+    reference and the candidate -- which is the difference that was always
+    load-bearing. The ladder collapses to two rungs because there is nothing
+    else left to fall to."""
+    from solvers.claude_cli import (
+        CliBackend, _FAST_PROFILE, _REPAIR_PROFILE, _STRONG_PROFILE,
+        cli_phase_profiles,
+    )
+
+    assert _FAST_PROFILE.label == "opus/low"
+    assert _STRONG_PROFILE.label == "opus/low"
+    assert _REPAIR_PROFILE.label == "fable/low"
+
+    phases = cli_phase_profiles()
+    assert set(phases) == {"analysis", "tests", "oracle", "candidate", "repair"}
+    assert all(p.effort == "low" for p in phases.values()), phases
+    assert phases["repair"].model != phases["candidate"].model, (
+        "the repair must still be read by a different model; only the effort "
+        "was levelled"
+    )
+    assert [p.label for p in CliBackend().profiles] == ["opus/low", "fable/low"]
+
+
+def test_the_log_carries_the_effort_and_the_provider_string_never_does(
+    tmp_path, monkeypatch, capsys
+):
+    """Two halves of one rule.
+
+    The LOG says the effort, because with every phase on the same profile the
+    line `cli:opus` no longer tells an operator what it ran at -- and the day
+    one phase is moved off that default, this is the only place it shows.
+
+    The PROVIDER STRING does not, and must not. It is a contract: `avoid` is
+    matched against it, `_parse_provider` here and `_model_of` in verify.py
+    both parse it, it is stored on every archived answer and it is grepped out
+    of logs months old. Widening it to carry the effort changes all of that at
+    once, silently."""
+    from solvers.claude_cli import CliBackend, Profile
+
+    _fake_cli(tmp_path, monkeypatch)
+    backend = CliBackend()
+    account, profile = backend.accounts[0], Profile("opus", "low")
+
+    assert backend.provider_of(account, profile) == "cli:opus"
+    assert backend.label_of(account, profile) == "cli:opus (effort low)"
+
+    async def go():
+        conversation = await backend.open()
+        reply = await conversation.send("hello", 30.0)
+        return conversation, reply
+
+    conversation, reply = asyncio.run(go())
+    out = capsys.readouterr().out
+
+    # What is STORED stays bare -- this is what `avoid` and the archive see.
+    assert conversation.provider == "cli:opus", conversation.provider
+    assert "effort" not in conversation.provider
+    # What is LOGGED carries it.
+    assert conversation.label == "cli:opus (effort low)"
+    assert "cli:opus (effort low)" in out, out
+    # ...and no `[cli]` line names the model without saying at what effort.
+    for line in out.splitlines():
+        if not line.startswith("[cli] cli:"):
+            continue
+        assert "(effort " in line, f"a cli log line lost its effort: {line}"
+
+
+def test_a_seat_with_nothing_left_says_so_instead_of_reading_as_recovery(
+    tmp_path, monkeypatch, capsys
+):
+    """REGRESSION, and the worst line this backend could print.
+
+    `pick` hands out the DEFAULT pair when nothing on the ladder is healthy --
+    deliberately, so `send` turns it away with the reason in a millisecond
+    rather than spawning a process that cannot work. `_announce` compared only
+    the (account, model) pair, so it could not tell that fall-through from a
+    genuine recovery.
+
+    The sequence that produced it, measured on one account: a 529 storm parks
+    opus, `fable` takes over, EMERGENCY MODE is printed and the mode is now
+    fable. The seat then spends its five-hour window, EVERY model goes out,
+    `pick` falls back to opus -- and because opus is the default pair, the line
+    that reached the operator at the moment nothing could answer was
+
+        [cli] back to normal: cli:opus (effort low) answers again
+
+    An operator reading that goes back to sleep while every solve scores zero.
+    The announced state is now (pair, can it serve), so going fully out is a
+    change and says what it costs.
+    """
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch)
+    backend = CliBackend()
+
+    # 1. A refused model: the emergency rung answers, on this one account.
+    backend.note_degraded("opus", "529 overloaded")
+    backend._announce(*backend.pick())
+    assert "EMERGENCY MODE" in capsys.readouterr().out
+
+    # 2. The whole seat is spent. Nothing on the ladder can answer.
+    backend.note_limit(backend.accounts[0], "*", time.time() + 3600, "five_hour")
+    assert backend._healthy() == [], "this reproduction needs an empty ladder"
+    backend._announce(*backend.pick())
+    out = capsys.readouterr().out
+    assert "back to normal" not in out, (
+        "announced a recovery at the moment the seat went fully out:\n" + out
+    )
+    assert "NOTHING CAN ANSWER" in out, out
+    # It says what it COSTS, and -- on a single seat -- what fixes it.
+    assert "score zero" in out and "SOLVER_CLI_BACKUP_ACCOUNTS" in out, out
+
+    # 3. Saying it once is the rule everywhere else here; it holds.
+    backend._announce(*backend.pick())
+    assert capsys.readouterr().out == "", "repeated the same state"
+
+    # 4. And a seat that comes BACK from fully out still announces recovery --
+    #    the guard must not latch.
+    backend._out.clear()
+    backend._announce(*backend.pick())
+    assert "back to normal" in capsys.readouterr().out
+
+
+def test_solver_status_says_which_rung_is_answering(tmp_path, monkeypatch, capsys):
+    """`out` says what is BROKEN; it cannot say who took over.
+
+    Most of its entries are neither a limit nor an emergency -- a wedged pair,
+    a refused model, a signed-out seat -- and a seat can be steered away from
+    at 95% of its window with `out` completely empty. So the one question an
+    operator asks of /solver-status, "am I on the emergency rung right now?",
+    had no answer there: the current pair was printed by `_announce` and kept
+    nowhere a machine could read it."""
+    from solvers.claude_cli import CliBackend
+
+    _fake_cli(tmp_path, monkeypatch)
+    backend = CliBackend()
+
+    assert backend.stats()["answering"] == {
+        "account": "primary", "model": "opus",
+        "serving": True, "is_default": True,
+    }
+
+    # The emergency rung, and `is_default` is the flag to alert on.
+    backend.note_degraded("opus", "529 overloaded")
+    backend._announce(*backend.pick())
+    answering = backend.stats()["answering"]
+    assert answering["model"] == "fable" and answering["is_default"] is False
+    assert answering["serving"] is True, "fable can answer; it is not an outage"
+
+    # Nothing left: the pair is handed out to be turned away, and says so.
+    backend.note_limit(backend.accounts[0], "*", time.time() + 3600, "five_hour")
+    backend._announce(*backend.pick())
+    assert backend.stats()["answering"]["serving"] is False
+
+    capsys.readouterr()
 
 
 def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session(
@@ -10816,7 +11050,7 @@ def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session
     assert after.provider == "cli:fable"
     assert after.effort == cli_emergency_profiles("low")[0].effort
     out = capsys.readouterr().out
-    assert "hop: cli:opus -> cli:fable" in out, out
+    assert "hop: cli:opus (effort low) -> cli:fable (effort low)" in out, out
     assert (
         f"EMERGENCY MODE: cli:fable "
         f"(effort {cli_emergency_profiles('low')[0].effort})"
@@ -11126,10 +11360,17 @@ def test_the_ladder_tracks_every_model_a_phase_can_ask_for(tmp_path, monkeypatch
     through. So every profile that can be asked for has to be a rung, or an
     outage on it would be invisible to the table that is supposed to notice.
 
-    `fable/low` is the emergency rung and `fable/medium` is the repair phase.
-    They are the same model at two efforts and they are two DIFFERENT rungs on
-    purpose: an outage is reported per model and effort, and collapsing them
-    would bench a working repair phase because an emergency turn was refused.
+    With every phase at `low` the table is two rungs, not four: `opus/low` is
+    the default and the three opus phases, and `fable/low` is BOTH the
+    emergency rung and the repair phase. They collapse to one entry, which is
+    what the dedup below is for -- the same profile listed twice would take an
+    outage against one copy and be read healthy off the other.
+
+    That collapse is a real consequence of levelling the effort and is worth
+    naming: `fable` in a log line was already ambiguous between the repair
+    phase and a ladder fallback, and now they are the same rung rather than
+    two. The summary line is what tells them apart, by which artifact the round
+    patched.
     """
     from solvers.claude_cli import CliBackend, cli_phase_profiles
 
@@ -11325,10 +11566,17 @@ def test_every_phase_names_a_model_and_the_repair_is_a_different_one(monkeypatch
     ten single-case disagreements, nine ended with the model editing its own
     test case and keeping its program.
 
-    `oracle` sharing the cheap profile is not an economy either. The reference
-    is written under a correctness-first instruction so that it is NOT the
-    program the candidate would write; two programs from one model at one
-    effort copy one misreading, and comparing them then establishes nothing.
+    `oracle` sharing the candidate's profile is not an economy either -- and
+    since every phase now runs at `low`, they share it EXACTLY. That leaves the
+    INSTRUCTION as the whole of the difference between the reference and the
+    candidate, which is the difference that was always load-bearing: one is
+    asked for a slow literal program and the other for one that holds at the
+    stated maximums, and they diverge where the statement is ambiguous. Effort
+    was a second lever on the same distinction, never the distinction itself.
+
+    So the assertion below is really about the MODEL split, which is the one
+    thing a phase profile still varies. If a future edit levels that too, the
+    repair stops being a second opinion and this test is what says so.
     """
     from solvers.claude_cli import PHASES, Profile, cli_phase_profiles
 
@@ -11338,8 +11586,8 @@ def test_every_phase_names_a_model_and_the_repair_is_a_different_one(monkeypatch
         "analysis": Profile("opus", "low"),
         "tests": Profile("opus", "low"),
         "oracle": Profile("opus", "low"),
-        "candidate": Profile("opus", "medium"),
-        "repair": Profile("fable", "medium"),
+        "candidate": Profile("opus", "low"),
+        "repair": Profile("fable", "low"),
     }, shipped
     assert set(shipped) == set(PHASES), "a phase ships without a model"
     assert shipped["repair"].model != shipped["candidate"].model, (
@@ -11352,7 +11600,7 @@ def test_every_phase_names_a_model_and_the_repair_is_a_different_one(monkeypatch
     assert chosen["oracle"] == Profile("fable", "low")
     assert chosen["candidate"] == Profile("opus", "high")
     # Naming one phase must not move any other.
-    assert chosen["repair"] == Profile("fable", "medium"), chosen
+    assert chosen["repair"] == Profile("fable", "low"), chosen
     assert chosen["tests"] == Profile("opus", "low"), chosen
 
 
@@ -12049,6 +12297,167 @@ def test_the_trap_scan_has_something_to_say_about_every_recorded_task():
         assert "sandbox_constraints" in names, task.problem_id
         assert "no_public_examples" in names, task.problem_id
         assert len(set(names)) == len(names), f"duplicate trap: {names}"
+
+
+# --- the fifteen traps mined from fnlich/hone-examples ---------------------- #
+# Each is pinned by REAL statement wording, copied out of the corpus it was
+# mined from, plus a control that must NOT fire. A trap whose regex is written
+# to match a sentence invented here proves only that the regex matches itself.
+
+_MINED_TRAPS = (
+    ("recursive_descent_depth",
+     "There is no expression or metadata depth limit. Across the input, the "
+     "total number of fields, links and bindings is at most 200000."),
+    ("deterministic_tiebreak",
+     "dispatch the noncancelled expiration with the smallest timestamp not "
+     "exceeding `T`; ties are resolved by smaller insertion rank."),
+    ("cycle_self_reference",
+     "A bound name is cyclic if a nonempty chain of dependencies leads back "
+     "to it."),
+    ("duplicates_defined",
+     "flatten directly nested unions from left to right, discard structurally "
+     "equal items after their first occurrence."),
+    ("inclusive_bounds",
+     "Its inclusive interval `[lo, hi]` contains `sequence`."),
+    ("preserve_untouched",
+     "Missing and cyclic references remain unchanged. Preserve each `meta` "
+     "wrapper and its extras exactly."),
+    ("case_sensitivity_stated",
+     "Names are matched case-insensitive after casefolding."),
+    ("error_priority_order",
+     "Then scan joints structurally. For each index, check in order: "
+     "duplicate joint name, unresolved parent, unresolved child."),
+    ("fixpoint_closure",
+     "The complete preparation set is the smallest set containing all "
+     "directly changed fields such that every reachable field whose child is "
+     "in the set is also included."),
+    ("modular_arithmetic",
+     "Report the total modulo 1000000007."),
+    ("all_branches_no_shortcircuit",
+     "A union matches only when exactly one branch successfully rebuilds the "
+     "entire value. If a second branch succeeds, fail with UNION_AMBIGUOUS."),
+    ("exact_output_shape",
+     "Return a dictionary with exactly these keys: `x`, `y`, `z`."),
+    ("bool_is_not_int",
+     "Values must exactly match the logical field type: booleans are not "
+     "integers."),
+    ("float_exactness",
+     "Compare with relative error below 1e-9; values are IEEE 754 binary64."),
+    ("integer_division_rounding",
+     "Arithmetic requires equal numeric types and preserves the type. "
+     "Integer `/` truncates toward zero."),
+    ("lexicographic_objectives",
+     "Canonical plan; priorities in order: 1. Maximize `sum(k_i)` over the "
+     "entire batch. 2. Among those plans, minimize the number of batches."),
+    ("validate_before_applying",
+     "Process predicates in order. Fully validate a predicate before applying "
+     "any part of it, then translate its values to the backend field."),
+    ("exact_rational_no_float",
+     "Otherwise, let the previous value be the exact rational `x`. A bin is "
+     "eligible when `S[i] >= M-T`."),
+    ("amortized_total_budget",
+     "`1 <= K`, and the sum of all `K` is at most `200000`."),
+    ("intra_timestamp_phase",
+     "At each time, first finish all operations ending then, in "
+     "channel-number order; next make new assignments."),
+    ("first_match_fallback",
+     "Select the considered variant with the smallest catalogue position. "
+     "If none exists, select fallback position `N+1`."),
+    ("non_canonical_encoding",
+     "Ranks 28-30 are illegal. Arguments need not use their shortest "
+     "encoding."),
+    # A deadlock is a cycle in the wait-for graph, so it belongs to the cycle
+    # entry rather than to one of its own -- and `this includes t=i` is the
+    # self-wait case a naive check drops.
+    ("cycle_self_reference",
+     "If `t` is active anywhere in the nested invocation stack, execution "
+     "deadlocks immediately. This includes `t=i`."),
+    # ...and an all-or-nothing transaction is `validate_before_applying` said
+    # in the other vocabulary this corpus uses for it.
+    ("validate_before_applying",
+     "If any row in that region is outside `universe`, the entire "
+     "transaction fails."),
+)
+
+
+@pytest.mark.parametrize("name,wording", _MINED_TRAPS)
+def test_a_mined_trap_fires_on_the_wording_it_was_mined_from(name, wording):
+    """Every entry added from the 178-statement corpus, against a sentence
+    lifted out of a real statement rather than one written to match."""
+    from solvers.analyze import heuristic_analyze, trap_names
+
+    task = SolveTask(problem_id="m", language="python", statement=wording,
+                     entrypoint="solve", public_examples=[], deadline_s=300.0)
+    assert name in trap_names(heuristic_analyze(task)), (
+        f"{name} missed its own wording: {wording!r}"
+    )
+
+
+def test_a_plain_statement_draws_none_of_the_mined_traps():
+    """The control, and the one that decides whether any of this is worth
+    anything. A catalog that fires on everything has told the solver nothing:
+    the block is read by four later prompts, and a trap that is always there
+    is noise competing with the traps that are not."""
+    from solvers.analyze import heuristic_analyze, trap_names
+
+    plain = SolveTask(
+        problem_id="p", language="python",
+        statement="Return the sum of the decimal digits of n. n is at most 99.",
+        entrypoint="g", public_examples=[], deadline_s=300.0,
+    )
+    names = set(trap_names(heuristic_analyze(plain)))
+    mined = {n for n, _ in _MINED_TRAPS} | {"rust_wide_arithmetic"}
+    assert not (names & mined), f"fired on a statement with no traps: {names & mined}"
+
+
+def test_rust_gets_the_overflow_trap_and_python_never_does():
+    """The one mined trap that is conditional on the language, and the reason
+    it is: Python integers do not overflow, so the same 1e18 bound means
+    `use a closed form` there and `i64 is not wide enough` in Rust. Telling
+    Python about a Rust overflow wastes the only prompt there is."""
+    from solvers.analyze import heuristic_analyze, trap_names
+
+    wording = ("Each weight is at most 10^18 and the total is the sum of the "
+               "selected weights.")
+    for language, entry in (("rust", "main"), ("python", "solve")):
+        task = SolveTask(problem_id="o", language=language, statement=wording,
+                         entrypoint=entry, public_examples=[], deadline_s=300.0)
+        names = trap_names(heuristic_analyze(task))
+        assert "huge_numeric_bounds" in names, language
+        if language == "rust":
+            assert "rust_wide_arithmetic" in names, names
+        else:
+            assert "rust_wide_arithmetic" not in names, (
+                "told Python about an overflow it cannot have"
+            )
+
+
+def test_the_mined_traps_moved_the_number_they_were_mined_to_move():
+    """The catalog's own claim, checked against the corpus rather than
+    asserted in a docstring.
+
+    SIX entries are structural -- they name the language and say the suite is
+    hidden -- and fire on everything, so they cannot distinguish one statement
+    from another. What a solve gains is the rest. Before this batch a third of
+    recorded statements drew NONE of them; the block those solves carried said
+    only `this is Python, stdlib only, no examples`, which is true of every
+    task on the subnet."""
+    from solvers.analyze import heuristic_analyze, trap_names
+
+    structural = {"sandbox_constraints", "no_public_examples", "python_contract",
+                  "rust_contract", "token_output_compare", "large_n_hidden_tests"}
+    tasks = list(_recorded_requests())
+    specific = [len(set(trap_names(heuristic_analyze(t))) - structural) for t in tasks]
+    silent = sum(1 for n in specific if n == 0)
+
+    assert silent / len(tasks) <= 0.06, (
+        f"{silent}/{len(tasks)} statements draw no problem-specific trap; "
+        f"it was 31% before the mined entries and 2% after, and must not "
+        f"regress toward the former"
+    )
+    assert sorted(specific)[len(specific) // 2] >= 3, (
+        f"median problem-specific traps fell to {sorted(specific)[len(specific)//2]}"
+    )
 
 
 def test_the_language_contract_matches_the_language():

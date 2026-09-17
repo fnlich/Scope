@@ -1191,11 +1191,15 @@ deliberate rather than incidental:
 | nested loops | fine | a bound you would have to iterate to reach means you need a closed form |
 | recomputing from scratch | fine | use a compressed or implicit representation |
 | clever structures | *don't* | yes, where they are what makes it fit |
-| model | `opus:low` | `opus:medium` |
+| model | `opus:low` | `opus:low` |
 
-If both were asked for a fast correct program, the two answers would carry the
-same misreading of the statement and comparing them would establish nothing.
-The reference being cheap is not an economy — it is the point.
+Same model, same effort — so the **instruction is the whole of the difference**,
+and that is deliberate rather than a corner cut. If both were asked for a fast
+correct program the two answers would carry the same misreading of the
+statement and comparing them would establish nothing; asked for opposite
+things, they diverge where the statement is ambiguous, which is exactly where
+the hidden tests live. Effort was a second lever on the same distinction, never
+the distinction itself.
 
 ### The inputs are written before either program exists
 
@@ -1225,8 +1229,19 @@ lines say `alongside` for the two that ran beside the candidate.
 
 ```
 analysis  opus:low     tests  opus:low     oracle  opus:low
-candidate opus:medium  repair fable:medium
+candidate opus:low     repair fable:low
 ```
+
+Every phase runs at `low`. The candidate turn is the reason: over a 97-task
+replay it was still writing at the deadline on 10 of 45 fresh solves — every
+one of them submitting nothing — and on the solves that finished it took a
+median 87 seconds before its first character.
+
+That leaves the **model** as the only thing a phase profile still varies, and
+every `[cli]` log line now names the effort beside it (`cli:opus (effort low)`)
+so that a phase moved off the default is visible rather than inferred. The
+provider string itself stays `cli:<model>[@<account>]` — `avoid` is matched
+against it, two parsers read it, and it is stored on every archived answer.
 
 `repair` names a **different model** from `candidate`, and that is the point of
 it. A model asked to repair its own program defends its own reading of the
@@ -1713,8 +1728,35 @@ fresh conversation.
 section naming the two checks a Rust answer gets before it is submitted — the
 local compile gate and the grading executor. It reports what is already known
 and probes nothing, so polling it is cheap even when the Docker daemon is hung.
-Watch it — a browser miner fails quietly, and silence looks identical to
-success.
+Watch it — a miner fails quietly, and silence looks identical to success.
+
+On the CLI backend, four keys under `fleet` answer the four questions worth
+asking, and they answer different ones — do not read any of them for another:
+
+```json
+"answering": {"account": "primary", "model": "fable",
+              "serving": true, "is_default": false},
+"out":       {"*/opus": {"seconds": 540, "why": "refused: 529 overloaded"}},
+"usage":     {"primary": 0.82},
+"hops":      3
+```
+
+* **`answering`** — *which rung is serving right now.* `is_default: false` is
+  the emergency rung; alert on it. `serving: false` means the ladder had
+  nothing healthy and this pair was handed out only to be turned away, so
+  every solve is scoring zero until something recovers.
+* **`out`** — *what is broken,* not who took over. Most entries are neither a
+  limit nor an emergency: a wedged pair, a refused model, a signed-out seat.
+  A key of `account/*` is the whole seat; `*/model` is that model everywhere.
+* **`usage`** — *how close a seat is to its window.* A seat steered away from
+  at 95% (`SOLVER_CLI_SWITCH_AT`) has **nothing in `out`** — being nearly spent
+  is not an outage — so this is the only place that state is visible.
+* **`hops`** — how often the ladder is moving. Rising with a healthy `out` is
+  churn worth investigating.
+
+`python -m solvers.claude_cli status` answers none of these. It builds its own
+`CliBackend` in its own process, so its outage table is empty by construction:
+it is a sign-in and ladder check, and it cannot see a running miner's state.
 
 Both Rust checks are also probed once at startup, right after the fleet warms
 up, because neither is otherwise looked at until a Rust challenge has already
