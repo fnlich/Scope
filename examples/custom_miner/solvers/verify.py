@@ -84,6 +84,35 @@ VERIFY_TIMEOUT_S = float(os.environ.get("SOLVER_VERIFY_TIMEOUT_S", "5"))
 # The one boolean grammar every solver setting is read with; see `config`.
 _env_on = env_on
 
+# How long stage 6 may say nothing before a second stage 6 opens beside it.
+# `SOLVER_CANDIDATE_HEDGE_S`: unset or 0 is off, bare `1`/`true`/`on` means the
+# measured default rather than one second -- the same courtesy the boolean
+# settings get, because every other switch in this file is spelled that way and
+# an operator who writes `=1` to turn something on should not get a one-second
+# hedge that fires on every solve.
+HEDGE_AFTER_S = 75.0
+
+# How long a pass waits for the turns it cancelled to close their own tabs.
+#
+# Sized to the close and not to the deadline: the CLI's `close` is a `_kill`
+# capped at 5s and a browser tab's is quicker, so this is "long enough for the
+# cleanup that exists" rather than a budget. Overrunning it is not a failure --
+# it leaves the turn running on its seat, which is precisely where a pass left
+# it before any of this was reclaimed at all.
+RECLAIM_GRACE_S = 5.0
+
+
+def _hedge_after_s() -> float:
+    raw = os.environ.get("SOLVER_CANDIDATE_HEDGE_S", "").strip().lower()
+    if not raw or raw in ("0", "false", "no", "off"):
+        return 0.0
+    if raw in ("1", "true", "yes", "on"):
+        return HEDGE_AFTER_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return HEDGE_AFTER_S
+
 # The least a case may be given when the budget cannot afford the full timeout.
 #
 # `check` would rather shorten every case's clock than refuse cases outright --
@@ -1550,6 +1579,48 @@ class VerifyingSolver:
         # with it off the later prompts see fewer traps, which is a worse
         # prompt rather than a broken one.
         self._llm_analysis = _env_on("SOLVER_LLM_ANALYSIS")
+        # Whether stage 6 waits for stage 3. Off -- the default -- is the
+        # shape the design was written in: every later prompt, the shipping
+        # program among them, is handed the merged trap list.
+        #
+        # On, the candidate turn starts at once on the HEURISTIC scan and the
+        # analysis turn runs beside it, reaching the inputs, the reference and
+        # the repair loop but never the program that ships. That is a trade,
+        # not an optimisation, and it is off by default because only one half
+        # of it is measured. Measured (46 recorded solves): the analysis turn
+        # costs a median 57.7s in front of a candidate turn whose own median is
+        # 126.2s and whose p90 is 235.3s, so on the slow tail it is the
+        # difference between finishing and being cut off. Not measured: what
+        # the median 13 traps it adds are worth to the program that reads them.
+        #
+        # What the trade actually moves is WHERE a trap is spent. The inputs
+        # prompt is told to write "one case per trap listed above", so with
+        # this on the analysis still decides what the candidate is TESTED on
+        # while no longer deciding what it is TOLD -- a trap it gets wrong
+        # becomes a mismatch the repair loop can act on instead of a silently
+        # wrong answer. That is the bet. `mismatch=` should RISE when this is
+        # on, and `regressed=` should not: a reference that knows a trap the
+        # candidate does not is still only one of two readings, and the router
+        # blames the candidate by default.
+        self._candidate_early = _env_on("SOLVER_CANDIDATE_EARLY", False)
+        # Seconds of silence from stage 6 before a SECOND stage 6 is opened on
+        # the hedge phase's model. 0 is off, and off is the default.
+        #
+        # Not a per-stage budget, which the one-clock rule forbids: nothing is
+        # refused here and nothing is cut short. The first turn keeps its full
+        # slice and is never cancelled; this only decides when a second turn
+        # starts running BESIDE it. The deadline is still the only thing that
+        # stops either of them.
+        #
+        # 75s by default when armed, and the number is measured from both
+        # sides. Above it: of the recorded candidate turns that answered at
+        # all, the ones taking longer than ~75s are where the silent ones are
+        # indistinguishable from the slow ones -- so a shorter wait spends
+        # seats on turns that were about to speak. Below the budget: the hedge
+        # model's own first text landed at 30s, 96s, 100s, 118s and 221s on the
+        # six prompts that had shipped nothing, so starting it at 75s leaves
+        # its slowest measured draw 215s of a 290s budget to finish in.
+        self._hedge_after_s = _hedge_after_s()
         # The size probe: one extra fenced block on the inputs turn, and one
         # local run of the finished program on a large valid input. No extra
         # model turn, and no reference -- see `_timed_out_at_scale`. It is
@@ -2063,7 +2134,7 @@ class VerifyingSolver:
     # -- stage 3: what the statement hides -------------------------------- #
     async def _analyse(
         self, task, heuristic, budget: float, started: float,
-        avoid: Optional[str], phases: "_Phases",
+        avoid: Optional[str], phases: "_Phases", beside: bool = False,
     ):
         """Ask a model to add to the free trap scan. Never costs the solve.
 
@@ -2074,6 +2145,7 @@ class VerifyingSolver:
         wrapped whole rather than guarded condition by condition.
         """
         conversation = None
+        turn = time.monotonic()
         try:
             conversation = await self._open_within(
                 budget, started, avoid, phase="analysis"
@@ -2084,7 +2156,17 @@ class VerifyingSolver:
                 max(1.0, budget - (time.monotonic() - started)),
             )
             merged = analysis_from_json(extract_analysis(reply), heuristic)
-            phases.mark("1 analysis")
+            # `beside` is passed its own elapsed time rather than measured from
+            # the cursor: with the candidate running alongside, the cursor has
+            # not moved since the pass began and the difference would be the
+            # candidate's seconds charged to the analysis. The cursor is left
+            # where it is, so the candidate is still billed from the start of
+            # the pass -- which is when it actually began.
+            phases.mark(
+                "1 analysis",
+                **({"beside": True, "model_s": time.monotonic() - turn}
+                   if beside else {}),
+            )
             added = len(merged.traps) - len(heuristic.traps)
             print(f"[verify] the analysis turn added {added} trap(s) to the "
                   f"{len(heuristic.traps)} the scan already had")
@@ -2184,6 +2266,135 @@ class VerifyingSolver:
                 with contextlib.suppress(Exception):
                     await conversation.close()
 
+    # -- stage 6: the program that ships ---------------------------------- #
+    async def _write_candidate(
+        self, task, analysis, budget: float, started: float,
+        avoid: Optional[str], phases: "_Phases", phase: str = "candidate",
+    ):
+        """One turn, and the conversation it was written in, still open.
+
+        The one writing turn that does NOT close its conversation here. The
+        repair loop records which conversation wrote the program it is about to
+        grade -- `writer` -- and the pass closes both tabs in its `finally`, so
+        closing this one on the way out would take the session that a repair on
+        the same profile resumes.
+
+        Nothing in here is conditional on when it runs. That is what lets the
+        pass either await it in place or start it before the analysis turn.
+        """
+        conversation = await self._open_within(
+            budget, started, avoid, phase=phase
+        )
+        # The LABEL in the phase line, the provider everywhere else. A
+        # backend that carries an effort says so here; `provider` stays the
+        # bare `cli:<model>[@<account>]` that the summary line, the archive
+        # and two parsers all depend on.
+        label = (
+            getattr(conversation, "label", None)
+            or getattr(conversation, "provider", None)
+            or "tab"
+        )
+        phases.mark(f"open {label}")
+        reply = await self._send_within(
+            conversation, build_candidate_prompt(task, analysis),
+            max(1.0, budget - (time.monotonic() - started)),
+        )
+        return conversation, reply
+
+    async def _hedged_candidate(
+        self, task, analysis, budget: float, started: float,
+        avoid: Optional[str], phases: "_Phases",
+    ):
+        """Stage 6, and after `SOLVER_CANDIDATE_HEDGE_S` a second one beside it.
+
+        Why a second DRAW rather than a longer wait, and why a different model.
+
+        The candidate turn does not fail because a problem is hard. It fails
+        because the model thinks for longer than the budget, and how long it
+        thinks is close to random: the same prompt for one recorded problem was
+        measured at 235s to its first character, at 505s, and at never -- three
+        draws, one input. There is no statement feature to route on; the hunt
+        for one found a discriminator that separated the ten labelled problems
+        perfectly and then failed a Monte-Carlo null at 13.3%.
+
+        A tail that wide is not waited out. `min` of two independent draws is,
+        and the second draw is taken on the OTHER model because two draws from
+        the same one are two draws from the same distribution.
+
+        Measured on the six recorded prompts whose candidate turn shipped
+        nothing: the second model answered five, at 30s, 96s, 100s, 118s and
+        221s to first text, every one inside the budget and every one with code
+        that compiled. It went silent on the sixth. So this is a second chance
+        and not a guarantee, which is the honest shape of the fix -- and it is
+        why the first turn is never cancelled: whichever speaks first wins, and
+        a hedge that killed the original would trade a wide tail for a short one
+        rather than taking the better of the two.
+
+        Costs one extra seat for as long as both are open. The fleet allows
+        `SOLVER_CLI_CONCURRENCY` per account (12) against
+        `MINER_MAX_CONCURRENT_REQUESTS` solves (4), and a solve already holds
+        three turns at its peak -- so an armed hedge can ask for a sixteenth
+        seat where there are twelve. It waits for one like any other turn; it
+        does not jump the queue, and a hedge that never gets a seat costs
+        nothing but the wait.
+        """
+        primary = asyncio.create_task(self._write_candidate(
+            task, analysis, budget, started, avoid, phases))
+        after = self._hedge_after_s
+        if after <= 0:
+            return await primary
+
+        done, _ = await asyncio.wait({primary}, timeout=after)
+        if primary in done:
+            return await primary
+
+        # The budget is checked HERE and not before the wait. A wait longer
+        # than the budget needs no guard of its own: the first turn is cut off
+        # at the deadline by its own slice, `wait` returns when it does, and
+        # the branch above sends it back. What does need one is the seat -- a
+        # second turn opened with nothing left cannot answer, and asking for it
+        # takes a seat from a solve that could.
+        if budget - (time.monotonic() - started) <= MIN_SLICE_S:
+            return await primary
+
+        print(f"[verify] the candidate turn has said nothing in {after:.0f}s; "
+              f"asking the hedge model the same question and taking whichever "
+              f"answers first")
+        backup = asyncio.create_task(self._write_candidate(
+            task, analysis, budget, started, avoid, phases, phase="hedge"))
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {primary, backup}, return_when=asyncio.FIRST_COMPLETED)
+                # A turn that returns EMPTY has not answered. Reading it as an
+                # answer would let the hedge lose a race to a blank reply and
+                # ship nothing while the other tab was still writing -- which
+                # is the exact failure this exists to remove.
+                spoke = [t for t in done
+                         if not t.cancelled() and t.exception() is None
+                         and (t.result()[1] or "").strip()]
+                if spoke:
+                    winner = spoke[0]
+                    loser = backup if winner is primary else primary
+                    if not loser.done():
+                        loser.cancel()
+                    else:
+                        with contextlib.suppress(Exception):
+                            conv = loser.result()[0]
+                            if conv is not None:
+                                await conv.close()
+                    which = "candidate" if winner is primary else "hedge"
+                    print(f"[verify] the {which} turn answered first")
+                    return winner.result()
+                if primary.done() and backup.done():
+                    # Both spent. Re-raise whatever the first one did, or hand
+                    # back its empty reply, exactly as an unhedged solve would.
+                    return await primary
+        finally:
+            for t in (primary, backup):
+                if not t.done():
+                    t.cancel()
+
     async def _attempt(
         self,
         task,
@@ -2196,10 +2407,13 @@ class VerifyingSolver:
 
         The shape, and why it is this shape:
 
-          * stage 3 runs alone, because every later prompt is handed its result;
+          * stage 3 runs alone, because every later prompt is handed its
+            result -- unless `SOLVER_CANDIDATE_EARLY` is on, which excuses
+            stage 6 from waiting for it and hands it the free scan instead;
           * stages 4, 5 and 6 run TOGETHER, because none consumes another's
             output -- the critical path is one analysis plus the slowest of
-            three, not the sum of four;
+            three, not the sum of four, and with the flag on it is the slowest
+            of three alone;
           * stage 7 runs the reference and the candidate on the same inputs and
             is the only stage with no model call in it;
           * stage 8 repairs whichever artifact the router names, on a phase
@@ -2217,6 +2431,9 @@ class VerifyingSolver:
         best_provider: Optional[str] = None
         conversation = None
         repair_conv = None
+        # Every turn this pass may have put in flight, so the pass can take
+        # them back. See the `finally`.
+        started_turns: dict = {"candidate": None, "inputs": None, "oracle": None}
         provider: Optional[str] = None
 
         def left() -> float:
@@ -2247,10 +2464,38 @@ class VerifyingSolver:
             # -- 2. the free trap scan -------------------------------------
             analysis = heuristic_analyze(task)
 
-            # -- 3. the analysis turn --------------------------------------
+            # -- 3, and 6 either in front of it or beside it ---------------
+            # `SOLVER_CANDIDATE_EARLY` decides which, and it is the only thing
+            # that decides it -- both arms run the same two coroutines, so the
+            # flag moves WHEN stage 6 starts and nothing else.
+            #
+            # Off: stage 3 runs alone and hands its merged list to every prompt
+            # after it, the shipping program included.
+            #
+            # On: stage 6 starts here, on the heuristic scan, and stage 3 runs
+            # beside it -- reaching the inputs, the reference and the repair
+            # loop, but never the program that ships.
+            #
+            # `_llm_analysis` off makes the flag a no-op on purpose rather than
+            # by accident: with no analysis turn there is nothing to run the
+            # candidate beside, and starting it early would only reorder a log.
+            early = (
+                self._candidate_early
+                and self._llm_analysis
+                and left() >= MIN_SLICE_S
+            )
+            candidate_task = started_turns["candidate"] = (
+                asyncio.create_task(self._hedged_candidate(
+                    task, analysis, budget, started, avoid, phases))
+                if early else None
+            )
+            if early:
+                print("[verify] the candidate turn is writing from the free "
+                      "scan alone (SOLVER_CANDIDATE_EARLY=1); the analysis "
+                      "turn reaches the inputs, the reference and any repair")
             if self._llm_analysis and left() >= MIN_SLICE_S:
                 analysis = await self._analyse(
-                    task, analysis, budget, started, avoid, phases
+                    task, analysis, budget, started, avoid, phases, beside=early
                 )
 
             # -- 4, 5, 6 side by side --------------------------------------
@@ -2268,32 +2513,26 @@ class VerifyingSolver:
             # answered and a reference with no inputs has nothing to run on, so
             # keeping either one alone would buy a conversation and a model's
             # time for a comparison that cannot happen.
-            inputs_task = (
+            inputs_task = started_turns["inputs"] = (
                 asyncio.create_task(self._write_inputs(
                     task, analysis, budget, started, avoid, probe, plan, phases))
                 if self._self_tests else None
             )
-            oracle_task = (
+            oracle_task = started_turns["oracle"] = (
                 asyncio.create_task(self._write_oracle(
                     task, analysis, budget, started, avoid, plan, phases))
                 if self._self_tests else None
             )
 
-            conversation = await self._open_within(
-                budget, started, avoid, phase="candidate"
-            )
+            # Awaited HERE either way, so the turn is billed to the same
+            # place in the log whether it started here or before stage 3.
+            if candidate_task is not None:
+                conversation, candidate_reply = await candidate_task
+            else:
+                conversation, candidate_reply = await self._hedged_candidate(
+                    task, analysis, budget, started, avoid, phases
+                )
             provider = best_provider = getattr(conversation, "provider", None)
-            # The LABEL in the phase line, the provider everywhere else. A
-            # backend that carries an effort says so here; `provider` stays the
-            # bare `cli:<model>[@<account>]` that the summary line, the archive
-            # and two parsers all depend on.
-            phases.mark(
-                f"open {getattr(conversation, 'label', None) or provider or 'tab'}"
-            )
-            candidate_reply = await self._send_within(
-                conversation, build_candidate_prompt(task, analysis),
-                max(1.0, left()),
-            )
             phases.mark("2 candidate")
 
             inputs = await inputs_task if inputs_task is not None else []
@@ -2555,6 +2794,48 @@ class VerifyingSolver:
             print(f"[verify] the solve failed: {type(exc).__name__}: {exc}")
             note_exit("failed")
         finally:
+            # Any turn this pass started and never got to read still owns a
+            # tab. Found by a test rather than reasoned about: with the inputs
+            # turn made to fail, the REFERENCE turn's phase line printed after
+            # the summary line -- it was still running, on a seat the next
+            # solve could not have, in a pass that had already given up.
+            #
+            # Stages 4 and 5 close their own conversations in their own
+            # `finally`, so cancelling is enough to release those. Stage 6
+            # deliberately does not -- the repair loop needs its conversation
+            # alive -- so a finished one is unwrapped here and closed below.
+            #
+            # Nothing is awaited: this runs on the cancellation path too,
+            # where awaiting would either block the unwind or swallow the
+            # CancelledError that put us here.
+            reclaim = []
+            for name, turn in started_turns.items():
+                if turn is None:
+                    continue
+                if not turn.done():
+                    turn.cancel()
+                    reclaim.append(turn)
+                elif (name == "candidate" and conversation is None
+                        and not turn.cancelled()):
+                    with contextlib.suppress(Exception):
+                        conversation = turn.result()[0]
+            if reclaim:
+                # Cancelling ALONE does not give the tab back, and that is the
+                # whole of why this line exists. Stages 4 and 5 close their own
+                # conversation in their own `finally` -- with an `await` -- and
+                # a cancelled task is never resumed to reach it. Measured
+                # directly: cancel-only leaves the close unrun, cancel-then-
+                # await runs it. So the first version of this reclamation
+                # released the seat in the log and leaked it in fact, which is
+                # worse than the lingering turn it replaced.
+                #
+                # Bounded, because an unwind must not be hostage to a close:
+                # past the grace the turn is left exactly where it was before
+                # any of this -- still holding its seat until it ends by
+                # itself. A slow close costs what it always cost; it no longer
+                # costs the seat outright.
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait(reclaim, timeout=RECLAIM_GRACE_S)
             for conv in (conversation, repair_conv):
                 if conv is not None:
                     with contextlib.suppress(Exception):
