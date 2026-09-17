@@ -10759,6 +10759,80 @@ def test_a_limit_mid_conversation_hands_the_repair_to_a_fresh_one(
     assert carried.provider == "cli:opus@claude-2", carried.provider
 
 
+def test_a_first_round_fragment_is_kept_rather_than_crashing_the_solve():
+    """REGRESSION, off a replay of the 97 recorded tasks.
+
+    `_supersedes` answers "should this displace the answer in hand", and two of
+    its rules read `best` to decide. On the FIRST round there is no `best` --
+    the caller guards `best is None`, but in the second conjunct of an `and`,
+    so this runs first. A candidate turn that was still writing at the budget
+    and left a fragment behind dereferenced None and raised straight out of
+    the round:
+
+        [verify] the solve failed: AttributeError: 'NoneType' object has no
+                 attribute 'code'
+        [rehearse] submitted 0 chars of python
+
+    5,489 characters were in hand and went in the bin. A crash is the one
+    outcome this function exists to prevent, and it turned a partial answer --
+    which might have scored -- into a certain zero.
+    """
+    from solvers.verify import Candidate, _supersedes
+
+    fragment = Candidate(code="def g(n):\n    while n > 0:", raw="...")
+
+    # Both rules that read `best`, with nothing to read.
+    assert _supersedes(fragment, None, True) is True
+    fragment.partial = True
+    assert _supersedes(fragment, None, False) is True
+    # ...and the one rule that does not: an empty capture is still not an
+    # answer, with or without something to beat.
+    assert _supersedes(Candidate(code="", raw=""), None, True) is False
+
+
+def test_a_still_writing_first_round_submits_the_part_that_arrived(capsys):
+    """The same bug through a whole solve, which is where it was found.
+
+    The candidate turn runs out of budget with a partial program in hand and
+    no inputs to check it against. That must end the pass as a cutoff and
+    SUBMIT the fragment -- a partial answer can score, and a crash cannot."""
+    from solvers import verify
+
+    partial = "```python\ndef g(n):\n    total = 0\n    while n > 0:\n```"
+
+    class _Unfinished(_Chat):
+        still_writing = False
+
+        async def send(self, text, timeout_s, extend_to_s=None):
+            phase = _phase_of(text)
+            if phase in ("analysis", "inputs", "oracle"):
+                return ""
+            # The candidate turn: the model is still writing when the budget
+            # is gone, and what arrived is a fragment.
+            self.still_writing = True
+            self.empty_reason = "unfinished"
+            return partial
+
+    class _Backend2(_Backend):
+        async def open(self, avoid=None):
+            return _Unfinished(self._script, self._provider)
+
+    task = SolveTask(problem_id="frag", language="python",
+                     statement="Return the sum of the decimal digits of n.",
+                     entrypoint="g", public_examples=[], deadline_s=30.0)
+    solver = verify.VerifyingSolver(_Backend2([]), reserve_s=0, max_budget_s=30,
+                                    second_opinion=False)
+    answer = asyncio.run(solver.solve_task(task, timeout_s=30.0))
+    out = capsys.readouterr().out
+
+    assert "the solve failed" not in out, out
+    assert "AttributeError" not in out, out
+    assert "while n > 0" in answer.code, (
+        f"threw away the fragment that was in hand: {answer.code!r}\n{out}"
+    )
+    assert "still writing when the budget ran out" in out, out
+
+
 def test_a_seat_with_nothing_left_says_so_instead_of_reading_as_recovery(
     tmp_path, monkeypatch, capsys
 ):
