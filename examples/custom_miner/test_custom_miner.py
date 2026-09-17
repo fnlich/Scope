@@ -12259,6 +12259,23 @@ _MINED_TRAPS = (
      "integers."),
     ("float_exactness",
      "Compare with relative error below 1e-9; values are IEEE 754 binary64."),
+    ("integer_division_rounding",
+     "Arithmetic requires equal numeric types and preserves the type. "
+     "Integer `/` truncates toward zero."),
+    ("lexicographic_objectives",
+     "Canonical plan; priorities in order: 1. Maximize `sum(k_i)` over the "
+     "entire batch. 2. Among those plans, minimize the number of batches."),
+    ("validate_before_applying",
+     "Process predicates in order. Fully validate a predicate before applying "
+     "any part of it, then translate its values to the backend field."),
+    ("exact_rational_no_float",
+     "Otherwise, let the previous value be the exact rational `x`. A bin is "
+     "eligible when `S[i] >= M-T`."),
+    ("amortized_total_budget",
+     "`1 <= K`, and the sum of all `K` is at most `200000`."),
+    ("intra_timestamp_phase",
+     "At each time, first finish all operations ending then, in "
+     "channel-number order; next make new assignments."),
 )
 
 

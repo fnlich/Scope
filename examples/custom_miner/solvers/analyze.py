@@ -14,7 +14,7 @@ Measured over 275 recorded tasks -- the 97 in `examples/problems` plus the 178
 in `fnlich/hone-examples`, which also ships the ACCEPTED solution beside each
 statement. Median 7 traps per task:
 
-    275/275  sandbox_constraints        30/275  preserve_untouched
+    275/275  sandbox_constraints        25/275  amortized_total_budget
     275/275  no_public_examples         25/275  case_sensitivity_stated
     248/275  large_n_hidden_tests       16/275  fixpoint_closure
     147/275  rust_contract              14/275  modular_arithmetic
@@ -26,17 +26,21 @@ statement. Median 7 traps per task:
      60/275  deterministic_tiebreak      8/275  all_branches_no_shortcircuit
      52/275  duplicates_defined          8/275  exact_output_shape
      51/275  inclusive_bounds            7/275  retry_accounting
-     47/275  cycle_self_reference        6/275  float_exactness
-     36/275  recursive_descent_depth     5/275  bool_is_not_int
+     47/275  cycle_self_reference        7/275  exact_rational_no_float
+     47/275  intra_timestamp_phase       7/275  lexicographic_objectives
+     36/275  recursive_descent_depth     6/275  float_exactness
+     30/275  preserve_untouched          5/275  bool_is_not_int
+                                         5/275  validate_before_applying
                                          4/275  implicit_default_behavior
+                                         3/275  integer_division_rounding
 
 SIX of those entries are structural -- they say what language this is and that
 the suite is hidden, and they fire on everything. What a solve actually gains is
-the rest, and that is the number worth watching. Before the 15 entries mined
+the rest, and that is the number worth watching. Before the 21 entries mined
 from `hone-examples`, a THIRD of statements drew none of them at all:
 
                           problem-specific traps      tasks with none
-    hone-examples (178)   median 1 -> 2               61 (34%) -> 14 (8%)
+    hone-examples (178)   median 1 -> 3               61 (34%) -> 14 (8%)
     examples/problems(97) median 1 -> 3               30 (31%) ->  3 (3%)
 
 The 97 were not a blind holdout -- they were in the set the hit rates were
@@ -48,9 +52,20 @@ How an entry earned its place, and the bar for the next one: the wording must be
 greppable and copied verbatim from real statements; the hit rate must
 discriminate rather than fire on everything (nothing below is above 26% outside
 the structural six); and every match was read to confirm it is not a false
-positive. Two patterns were narrowed during that read -- `in this order` was
-matching "in this ordering" and a bare `reserved` was matching reserved TOKENS
--- which is the whole reason the read is not optional.
+positive. Six patterns were narrowed during that read:
+`in this order` was matching "in this ordering", a bare `reserved` was matching
+reserved TOKENS, `lexicographically smallest` belonged to `deterministic_tiebreak`
+rather than to `lexicographic_objectives`, `have no effect` was catching no-op
+rules rather than all-or-nothing ones, and `without overflow` was matching a
+REASSURANCE that Python cannot overflow. That is the whole reason the read is
+not optional: five of the six looked right until the matches were printed.
+
+The last six entries came from a second pass in which subagents read each
+statement beside its accepted solution. They proposed 67 candidates; the filter
+that mattered was mechanical rather than editorial -- run each proposal's
+phrases over all 275 statements and drop anything matching ONE, because a
+phrase lifted from a single statement is a note about that problem and not a
+catalog entry. Two thirds fell to it.
 
 Three entries -- `no_full_materialization`, `exact_arithmetic` and `dag_not_tree`
 -- fire on NONE of the 275. They are kept rather than deleted because they do
@@ -377,6 +392,103 @@ _KEYWORD_TRAPS: list[tuple[re.Pattern[str], str, str, str]] = [
         "Do not accumulate error: compare with the stated tolerance, or stay "
         "in integers or `fractions.Fraction` and convert once at the end. "
         "`round()` is banker's rounding in Python and is not round-half-up.",
+    ),
+    # --- a second pass, over the same 275, with subagents reading the
+    # statements and their accepted solutions side by side. Every candidate
+    # they proposed was filtered the same way: the phrases were run over the
+    # whole corpus, and anything matching a single statement was dropped as a
+    # note about that problem rather than a catalog entry.
+    (
+        re.compile(
+            r"truncat\w{0,3} toward zero|rounds? toward zero|toward zero|"
+            r"floor division|rounded toward",
+            re.I,
+        ),
+        "integer_division_rounding",
+        "The statement says which way integer division rounds, because the "
+        "two languages do not agree.",
+        "Python `//` FLOORS: `-7 // 2` is -4. Rust `/` TRUNCATES: it is -3. "
+        "Only negative operands tell them apart, so every positive test "
+        "passes either way. For truncation in Python take the magnitude and "
+        "reapply the sign; `%` differs the same way and by the same sign.",
+    ),
+    (
+        re.compile(
+            r"subject to that|subject to those|"
+            r"among those .{0,30}(?:choose|use|pick|minim|maxim)|"
+            r"among all .{0,30}(?:choose|use|pick|minim|maxim)|"
+            r"at the first differing (?:index|position)|priorities,? in order",
+            re.I,
+        ),
+        "lexicographic_objectives",
+        "Several objectives ranked, not one -- each is optimised only among "
+        "the optima of the one above it.",
+        "Solve objective 1 to its exact optimal VALUE, pin that value as a "
+        "hard constraint, then solve objective 2 under it, and so on. A "
+        "single weighted score, or the first optimum a greedy pass finds, "
+        "gets objective 1 right and everything below it wrong -- which is "
+        "what the hidden tests are built to separate.",
+    ),
+    (
+        re.compile(
+            r"before applying any|fully validate .{0,30}before|"
+            r"validate .{0,25}before (?:applying|any)|"
+            r"(?:all|either) .{0,20}or (?:none|nothing)|no partial",
+            re.I,
+        ),
+        "validate_before_applying",
+        "An operation is all-or-nothing: it is checked completely before any "
+        "part of it takes effect.",
+        "Two passes. Validate the whole operation, then apply it. A streaming "
+        "loop that validates each piece as it applies it leaves the first "
+        "half written when the second half is rejected, and the statement "
+        "says that must not happen.",
+    ),
+    (
+        re.compile(
+            r"exact rational|exact integer arithmetic|"
+            r"floating-point .{0,20}(?:is )?(?:forbidden|not allowed|must not)|"
+            r"exact distance|must be exact\b",
+            re.I,
+        ),
+        "exact_rational_no_float",
+        "A value is defined as an exact rational, so a float cannot represent "
+        "it.",
+        "Keep it as a reduced integer pair `(p, q)` with `q > 0` and compare "
+        "by CROSS-MULTIPLICATION, never by dividing. Past 2^53 a double "
+        "silently stops distinguishing neighbours, which turns a tie the "
+        "statement resolves by index into a coin toss. Rust: cross-multiply "
+        "in i128.",
+    ),
+    (
+        re.compile(
+            r"across all queries|(?:the )?sum of all .{0,30}is at most|"
+            r"combined (?:count|size|total) is at most|"
+            r"total .{0,40}across the input is at most",
+            re.I,
+        ),
+        "amortized_total_budget",
+        "The bound is on the TOTAL across every operation, not on any one of "
+        "them.",
+        "One operation may legally be enormous, so a per-operation bound "
+        "cannot be assumed -- but the total is what you may spend. Record "
+        "what each step touched and reset only that, never a whole array per "
+        "query; that is the difference between linear overall and quadratic.",
+    ),
+    (
+        re.compile(
+            r"at (?:each|the same) (?:event )?time,? (?:first|process)|"
+            r"events at (?:a|the same) timestamp|equal-time events|"
+            r"same (?:timestamp|time) .{0,30}order|in input order",
+            re.I,
+        ),
+        "intra_timestamp_phase",
+        "Things happening at the SAME instant have a stated order among "
+        "themselves.",
+        "Run each timestamp as explicit phases in the order given, draining "
+        "one completely before starting the next. A single priority queue "
+        "keyed on time alone breaks ties by whatever the tuple happens to "
+        "compare on next, which is not the order the statement named.",
     ),
 ]
 
