@@ -1191,11 +1191,15 @@ deliberate rather than incidental:
 | nested loops | fine | a bound you would have to iterate to reach means you need a closed form |
 | recomputing from scratch | fine | use a compressed or implicit representation |
 | clever structures | *don't* | yes, where they are what makes it fit |
-| model | `opus:low` | `opus:medium` |
+| model | `opus:low` | `opus:low` |
 
-If both were asked for a fast correct program, the two answers would carry the
-same misreading of the statement and comparing them would establish nothing.
-The reference being cheap is not an economy — it is the point.
+Same model, same effort — so the **instruction is the whole of the difference**,
+and that is deliberate rather than a corner cut. If both were asked for a fast
+correct program the two answers would carry the same misreading of the
+statement and comparing them would establish nothing; asked for opposite
+things, they diverge where the statement is ambiguous, which is exactly where
+the hidden tests live. Effort was a second lever on the same distinction, never
+the distinction itself.
 
 ### The inputs are written before either program exists
 
@@ -1225,8 +1229,19 @@ lines say `alongside` for the two that ran beside the candidate.
 
 ```
 analysis  opus:low     tests  opus:low     oracle  opus:low
-candidate opus:medium  repair fable:medium
+candidate opus:low     repair fable:low
 ```
+
+Every phase runs at `low`. The candidate turn is the reason: over a 97-task
+replay it was still writing at the deadline on 10 of 45 fresh solves — every
+one of them submitting nothing — and on the solves that finished it took a
+median 87 seconds before its first character.
+
+That leaves the **model** as the only thing a phase profile still varies, and
+every `[cli]` log line now names the effort beside it (`cli:opus (effort low)`)
+so that a phase moved off the default is visible rather than inferred. The
+provider string itself stays `cli:<model>[@<account>]` — `avoid` is matched
+against it, two parsers read it, and it is stored on every archived answer.
 
 `repair` names a **different model** from `candidate`, and that is the point of
 it. A model asked to repair its own program defends its own reading of the

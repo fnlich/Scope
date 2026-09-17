@@ -2283,7 +2283,13 @@ class VerifyingSolver:
                 budget, started, avoid, phase="candidate"
             )
             provider = best_provider = getattr(conversation, "provider", None)
-            phases.mark(f"open {provider or 'tab'}")
+            # The LABEL in the phase line, the provider everywhere else. A
+            # backend that carries an effort says so here; `provider` stays the
+            # bare `cli:<model>[@<account>]` that the summary line, the archive
+            # and two parsers all depend on.
+            phases.mark(
+                f"open {getattr(conversation, 'label', None) or provider or 'tab'}"
+            )
             candidate_reply = await self._send_within(
                 conversation, build_candidate_prompt(task, analysis),
                 max(1.0, left()),

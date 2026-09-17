@@ -10629,7 +10629,7 @@ def test_a_cli_that_hangs_without_a_word_is_given_up_on_quickly(
     assert backend.stats()["stalls"] == 2
     out = capsys.readouterr().out
     assert "produced no event at all" in out
-    assert "hop: cli:opus -> cli:fable" in out, out
+    assert "hop: cli:opus (effort low) -> cli:fable (effort low)" in out, out
 
 
 def test_a_failed_first_cli_turn_does_not_reuse_its_session_id(
@@ -10724,7 +10724,8 @@ def test_a_usage_limit_moves_the_solve_to_the_backup_account(
     assert calls[1]["session"] == calls[2]["session"]
     assert calls[0]["session"] != calls[1]["session"], "a session cannot change seats"
     out = capsys.readouterr().out
-    assert "hop: cli:opus@primary -> cli:opus@claude-2" in out, out
+    assert ("hop: cli:opus@primary (effort low) -> "
+            "cli:opus@claude-2 (effort low)") in out, out
     assert "EMERGENCY MODE: cli:opus@claude-2" in out and "limit" in out, out
     assert "primary/*" in backend.stats()["out"], backend.stats()
 
@@ -10831,6 +10832,75 @@ def test_a_still_writing_first_round_submits_the_part_that_arrived(capsys):
         f"threw away the fragment that was in hand: {answer.code!r}\n{out}"
     )
     assert "still writing when the budget ran out" in out, out
+
+
+def test_every_phase_runs_at_the_effort_the_operator_set():
+    """All five phases at `low`, which makes two of the three profiles the
+    same value and leaves the INSTRUCTION as the only difference between the
+    reference and the candidate -- which is the difference that was always
+    load-bearing. The ladder collapses to two rungs because there is nothing
+    else left to fall to."""
+    from solvers.claude_cli import (
+        CliBackend, _FAST_PROFILE, _REPAIR_PROFILE, _STRONG_PROFILE,
+        cli_phase_profiles,
+    )
+
+    assert _FAST_PROFILE.label == "opus/low"
+    assert _STRONG_PROFILE.label == "opus/low"
+    assert _REPAIR_PROFILE.label == "fable/low"
+
+    phases = cli_phase_profiles()
+    assert set(phases) == {"analysis", "tests", "oracle", "candidate", "repair"}
+    assert all(p.effort == "low" for p in phases.values()), phases
+    assert phases["repair"].model != phases["candidate"].model, (
+        "the repair must still be read by a different model; only the effort "
+        "was levelled"
+    )
+    assert [p.label for p in CliBackend().profiles] == ["opus/low", "fable/low"]
+
+
+def test_the_log_carries_the_effort_and_the_provider_string_never_does(
+    tmp_path, monkeypatch, capsys
+):
+    """Two halves of one rule.
+
+    The LOG says the effort, because with every phase on the same profile the
+    line `cli:opus` no longer tells an operator what it ran at -- and the day
+    one phase is moved off that default, this is the only place it shows.
+
+    The PROVIDER STRING does not, and must not. It is a contract: `avoid` is
+    matched against it, `_parse_provider` here and `_model_of` in verify.py
+    both parse it, it is stored on every archived answer and it is grepped out
+    of logs months old. Widening it to carry the effort changes all of that at
+    once, silently."""
+    from solvers.claude_cli import CliBackend, Profile
+
+    _fake_cli(tmp_path, monkeypatch)
+    backend = CliBackend()
+    account, profile = backend.accounts[0], Profile("opus", "low")
+
+    assert backend.provider_of(account, profile) == "cli:opus"
+    assert backend.label_of(account, profile) == "cli:opus (effort low)"
+
+    async def go():
+        conversation = await backend.open()
+        reply = await conversation.send("hello", 30.0)
+        return conversation, reply
+
+    conversation, reply = asyncio.run(go())
+    out = capsys.readouterr().out
+
+    # What is STORED stays bare -- this is what `avoid` and the archive see.
+    assert conversation.provider == "cli:opus", conversation.provider
+    assert "effort" not in conversation.provider
+    # What is LOGGED carries it.
+    assert conversation.label == "cli:opus (effort low)"
+    assert "cli:opus (effort low)" in out, out
+    # ...and no `[cli]` line names the model without saying at what effort.
+    for line in out.splitlines():
+        if not line.startswith("[cli] cli:"):
+            continue
+        assert "(effort " in line, f"a cli log line lost its effort: {line}"
 
 
 def test_a_seat_with_nothing_left_says_so_instead_of_reading_as_recovery(
@@ -10980,7 +11050,7 @@ def test_an_overloaded_model_hops_to_the_emergency_profile_and_keeps_the_session
     assert after.provider == "cli:fable"
     assert after.effort == cli_emergency_profiles("low")[0].effort
     out = capsys.readouterr().out
-    assert "hop: cli:opus -> cli:fable" in out, out
+    assert "hop: cli:opus (effort low) -> cli:fable (effort low)" in out, out
     assert (
         f"EMERGENCY MODE: cli:fable "
         f"(effort {cli_emergency_profiles('low')[0].effort})"
@@ -11290,10 +11360,17 @@ def test_the_ladder_tracks_every_model_a_phase_can_ask_for(tmp_path, monkeypatch
     through. So every profile that can be asked for has to be a rung, or an
     outage on it would be invisible to the table that is supposed to notice.
 
-    `fable/low` is the emergency rung and `fable/medium` is the repair phase.
-    They are the same model at two efforts and they are two DIFFERENT rungs on
-    purpose: an outage is reported per model and effort, and collapsing them
-    would bench a working repair phase because an emergency turn was refused.
+    With every phase at `low` the table is two rungs, not four: `opus/low` is
+    the default and the three opus phases, and `fable/low` is BOTH the
+    emergency rung and the repair phase. They collapse to one entry, which is
+    what the dedup below is for -- the same profile listed twice would take an
+    outage against one copy and be read healthy off the other.
+
+    That collapse is a real consequence of levelling the effort and is worth
+    naming: `fable` in a log line was already ambiguous between the repair
+    phase and a ladder fallback, and now they are the same rung rather than
+    two. The summary line is what tells them apart, by which artifact the round
+    patched.
     """
     from solvers.claude_cli import CliBackend, cli_phase_profiles
 
@@ -11489,10 +11566,17 @@ def test_every_phase_names_a_model_and_the_repair_is_a_different_one(monkeypatch
     ten single-case disagreements, nine ended with the model editing its own
     test case and keeping its program.
 
-    `oracle` sharing the cheap profile is not an economy either. The reference
-    is written under a correctness-first instruction so that it is NOT the
-    program the candidate would write; two programs from one model at one
-    effort copy one misreading, and comparing them then establishes nothing.
+    `oracle` sharing the candidate's profile is not an economy either -- and
+    since every phase now runs at `low`, they share it EXACTLY. That leaves the
+    INSTRUCTION as the whole of the difference between the reference and the
+    candidate, which is the difference that was always load-bearing: one is
+    asked for a slow literal program and the other for one that holds at the
+    stated maximums, and they diverge where the statement is ambiguous. Effort
+    was a second lever on the same distinction, never the distinction itself.
+
+    So the assertion below is really about the MODEL split, which is the one
+    thing a phase profile still varies. If a future edit levels that too, the
+    repair stops being a second opinion and this test is what says so.
     """
     from solvers.claude_cli import PHASES, Profile, cli_phase_profiles
 
@@ -11502,8 +11586,8 @@ def test_every_phase_names_a_model_and_the_repair_is_a_different_one(monkeypatch
         "analysis": Profile("opus", "low"),
         "tests": Profile("opus", "low"),
         "oracle": Profile("opus", "low"),
-        "candidate": Profile("opus", "medium"),
-        "repair": Profile("fable", "medium"),
+        "candidate": Profile("opus", "low"),
+        "repair": Profile("fable", "low"),
     }, shipped
     assert set(shipped) == set(PHASES), "a phase ships without a model"
     assert shipped["repair"].model != shipped["candidate"].model, (
@@ -11516,7 +11600,7 @@ def test_every_phase_names_a_model_and_the_repair_is_a_different_one(monkeypatch
     assert chosen["oracle"] == Profile("fable", "low")
     assert chosen["candidate"] == Profile("opus", "high")
     # Naming one phase must not move any other.
-    assert chosen["repair"] == Profile("fable", "medium"), chosen
+    assert chosen["repair"] == Profile("fable", "low"), chosen
     assert chosen["tests"] == Profile("opus", "low"), chosen
 
 
