@@ -483,10 +483,16 @@ _KEYWORD_TRAPS: list[tuple[re.Pattern[str], str, str, str]] = [
         "amortized_total_budget",
         "The bound is on the TOTAL across every operation, not on any one of "
         "them.",
+        # NOT classified as a performance trap, and not dropped from the
+        # correctness-only candidate prompt either. The first half is a
+        # CORRECTNESS finding -- a program that assumes a per-operation bound
+        # is wrong, not merely slow -- and the second half was an asymptotic
+        # demand riding on the back of it. Cutting the clause keeps the
+        # finding where the shipping program can see it.
         "One operation may legally be enormous, so a per-operation bound "
-        "cannot be assumed -- but the total is what you may spend. Record "
-        "what each step touched and reset only that, never a whole array per "
-        "query; that is the difference between linear overall and quadratic.",
+        "cannot be assumed -- read the stated bound as a total across all of "
+        "them. Track what each step actually touched and reset only that, "
+        "rather than clearing a whole array on every query.",
     ),
     (
         re.compile(
@@ -562,31 +568,75 @@ class Analysis:
     io_notes: str = ""
     source: str = "heuristic"
 
-    def trap_block(self) -> str:
-        if not self.traps:
+    def trap_block(self, include_performance: bool = True) -> str:
+        kept = [
+            t for t in self.traps
+            if include_performance or t.name not in PERFORMANCE_TRAPS
+        ]
+        if not kept:
             return "(no traps recorded)"
         return "\n".join(
             f"- [{trap.severity}] {trap.name}: {trap.evidence} "
             f"| mitigation: {trap.mitigation}"
-            for trap in self.traps
+            for trap in kept
         )
 
-    def as_prompt_block(self) -> str:
+    def as_prompt_block(self, include_performance: bool = True) -> str:
+        """The analysis, as a prompt section.
+
+        `include_performance=False` drops the three fields that state a SPEED
+        requirement -- the two complexity targets and why a naive solution
+        fails. It exists for the candidate turn, whose instruction is
+        correctness-only: leaving them in would make the prompt demand a
+        closed form in the analysis block while the task above it says not to
+        look for one, and the heuristic defaults say exactly that ("This needs
+        a closed form or a compressed structure").
+
+        Everything a CORRECTNESS reader wants is kept -- traps, invariants,
+        edge cases, the signature, the I/O notes and the sketch -- because
+        none of those is a demand about running time.
+        """
         invariants = "\n".join(f"- {i}" for i in self.invariants) or "- (none)"
-        edges = "\n".join(f"- {e}" for e in self.edge_cases) or "- (none)"
-        return (
-            f"Summary: {self.summary or '(heuristic only)'}\n"
-            f"Signature: {self.signature}\n"
+        kept_edges = [
+            e for e in self.edge_cases
+            if include_performance or e != _SPEED_EDGE_CASE
+        ]
+        edges = "\n".join(f"- {e}" for e in kept_edges) or "- (none)"
+        performance = (
             f"Time complexity target: {self.complexity_time}\n"
             f"Memory complexity target: {self.complexity_memory}\n"
             f"Naive solutions fail because: {self.naive_failure}\n"
-            f"I/O notes: {self.io_notes}\n"
-            f"Traps:\n{self.trap_block()}\n"
+        ) if include_performance else ""
+        return (
+            f"Summary: {self.summary or '(heuristic only)'}\n"
+            f"Signature: {self.signature}\n"
+            + performance
+            + f"I/O notes: {self.io_notes}\n"
+            f"Traps:\n{self.trap_block(include_performance=include_performance)}\n"
             f"Invariants:\n{invariants}\n"
             f"Edge cases:\n{edges}\n"
             f"Algorithm sketch:\n{self.algorithm_sketch}\n"
         )
 
+
+# Traps whose MITIGATION is an asymptotic demand rather than a correctness one.
+#
+# `include_performance=False` drops these along with the complexity targets,
+# because the candidate turn is correctness-only and a trap saying "Aim for
+# near-linear time and O(n) memory" is the same demand the task text was just
+# told not to make. `test_every_trap_that_demands_a_complexity_is_classified`
+# keeps this honest: any catalog trap whose mitigation asks for an asymptotic
+# property and is NOT named here fails the suite, so the set cannot rot as the
+# catalog grows.
+#
+# `rust_contract` is deliberately absent. It says "read the input up front or
+# with a fast scanner", which is an I/O idiom and not an asymptotic demand --
+# and the rest of that trap is the one-main/stdin/stdout/std-only contract,
+# without which a Rust answer does not run at all.
+PERFORMANCE_TRAPS = frozenset({"huge_numeric_bounds", "large_n_hidden_tests"})
+
+# The one edge case that exists to stress SPEED rather than correctness.
+_SPEED_EDGE_CASE = "Maximum n at tiny numeric values (stresses speed, not overflow)"
 
 _EDGE_CASES = (
     "Empty or zero-length inputs, if the statement allows them",
@@ -772,8 +822,9 @@ def heuristic_analyze(task: Any) -> Analysis:
         traps=traps,
         invariants=list(_INVARIANTS),
         edge_cases=list(_EDGE_CASES),
-        algorithm_sketch="Choose the asymptotically safe shape first, then "
-        "fill in the exact branching from the wording.",
+        algorithm_sketch="Follow the statement's own structure: take each "
+        "rule in the order it is written and implement it literally, getting "
+        "every branch and boundary from the wording rather than inferring it.",
         complexity_time="Near-linear in the stated n, and sublinear in any "
         "huge numeric bound.",
         complexity_memory="Never proportional to a 1e9-scale coordinate space "

@@ -601,6 +601,26 @@ def cli_backup_dirs() -> tuple[str, ...]:
     return tuple(os.path.expanduser(d.strip()) for d in raw.split(",") if d.strip())
 
 
+def _usage_of(event: dict) -> dict[str, int]:
+    """One turn's token counts out of a `result` event, in our own names."""
+    usage = event.get("usage")
+    if not isinstance(usage, dict):
+        return {}
+    out: dict[str, int] = {}
+    for ours, theirs in (("input", "input_tokens"), ("output", "output_tokens"),
+                         ("cache_read", "cache_read_input_tokens"),
+                         ("cache_write", "cache_creation_input_tokens")):
+        value = _number(usage.get(theirs))
+        if value is not None:
+            out[ours] = int(value)
+    details = usage.get("output_tokens_details")
+    if isinstance(details, dict):
+        value = _number(details.get("thinking_tokens"))
+        if value is not None:
+            out["thinking"] = int(value)
+    return out
+
+
 def child_env() -> dict[str, str]:
     """The environment a `claude` child gets. Three removals, each measured.
 
@@ -769,6 +789,7 @@ class CliConversation:
         # had arrived" was undiagnosable from the log -- no event count, no
         # first-text time, no retry.
         self._turn_started = 0.0
+        self.last_usage: dict[str, int] = {}
         self._events = 0
         self._text_chars = 0
         self._first_text_s: Optional[float] = None
@@ -1448,6 +1469,12 @@ class CliConversation:
             return
         if kind == "result":
             self._backend.note_result(event)
+            # The same numbers the backend aggregates, kept for THIS turn too.
+            # The aggregate answers "what has the seat spent"; only a per-turn
+            # copy answers "what did the candidate turn cost", which is the
+            # question the latency work turned on -- `thinking_tokens` is the
+            # quantity that makes a turn slow, and it was parsed and dropped.
+            self.last_usage = _usage_of(event)
             if not event.get("is_error"):
                 # The CLI's own copy of the finished answer. Read only when
                 # nothing streamed: a turn whose deltas never arrived still

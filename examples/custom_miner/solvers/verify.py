@@ -69,6 +69,7 @@ from .prompts import (
     rust_defect,
 )
 from . import solution_cache
+from . import transcript
 from .config import env_on
 from .rust_compile import compile_defect, rustc_path
 
@@ -1629,6 +1630,9 @@ class VerifyingSolver:
         self._size_probe = (
             _env_on("SOLVER_SIZE_PROBE")
         )
+        # Which request the turns being opened belong to. Only the transcript
+        # reads it, and only to file a turn under the right problem.
+        self._solving_id = ""
         self._grader = _Grader()
         self._cache: dict[str, tuple[str, str]] = {}
         self._cache_size = max(0, int(cache_size))
@@ -2426,6 +2430,7 @@ class VerifyingSolver:
         """
         started = time.monotonic()
         budget = max(1.0, remaining)
+        self._solving_id = str(getattr(task, "problem_id", "") or "")
         best: Optional[Candidate] = None
         best_score: tuple = ()
         best_provider: Optional[str] = None
@@ -2870,11 +2875,33 @@ class VerifyingSolver:
         grown one -- and a keyword it does not take would be a TypeError
         inside the one call the whole solve depends on.
         """
-        if extend_to_s is not None and self._takes_extension(conversation):
-            return await conversation.send(
-                prompt, timeout_s, extend_to_s=float(extend_to_s)
+        turn = time.monotonic()
+        try:
+            if extend_to_s is not None and self._takes_extension(conversation):
+                reply = await conversation.send(
+                    prompt, timeout_s, extend_to_s=float(extend_to_s)
+                )
+            else:
+                reply = await conversation.send(prompt, timeout_s)
+        except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
+            # A turn that FAILED is the one most worth having in the
+            # transcript, so it is written before the exception carries on to
+            # whichever caller was going to handle it. Nothing is swallowed.
+            transcript.record(
+                problem_id=getattr(conversation, "solving", "") or "",
+                phase=getattr(conversation, "solving_phase", "?") or "?",
+                conversation=conversation, prompt=prompt, reply="",
+                seconds=time.monotonic() - turn,
+                note=f"the turn raised {type(exc).__name__}: {exc}",
             )
-        return await conversation.send(prompt, timeout_s)
+            raise
+        transcript.record(
+            problem_id=getattr(conversation, "solving", "") or "",
+            phase=getattr(conversation, "solving_phase", "?") or "?",
+            conversation=conversation, prompt=prompt, reply=reply,
+            seconds=time.monotonic() - turn,
+        )
+        return reply
 
 
     async def _probe_now(
@@ -3161,6 +3188,23 @@ class VerifyingSolver:
         return _Probe(None, "none")
 
     async def _open_within(
+        self, budget: float, started: float, avoid: Optional[str],
+        phase: Optional[str] = None, profile=None,
+    ):
+        """`_open_raw`, plus the two labels the transcript needs.
+
+        Tagged HERE and not at each `return` inside `_open_raw`, which has
+        four of them: a label added at three out of four is a transcript that
+        silently mis-files whichever turn took the fourth.
+        """
+        conversation = await self._open_raw(budget, started, avoid, phase, profile)
+        if conversation is not None:
+            with contextlib.suppress(Exception):
+                conversation.solving_phase = phase or "?"
+                conversation.solving = self._solving_id
+        return conversation
+
+    async def _open_raw(
         self, budget: float, started: float, avoid: Optional[str],
         phase: Optional[str] = None, profile=None,
     ):
