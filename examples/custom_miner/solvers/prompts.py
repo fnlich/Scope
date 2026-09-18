@@ -1743,17 +1743,42 @@ rather than fast. Optimise for nothing except following the statement exactly:
 - Do not optimise. If you find yourself choosing a clever structure, choose the
   obvious one instead."""
 
+# Stage 6, and the one instruction in this file that is an OPERATOR POLICY
+# rather than a finding: correctness is the whole of the requirement, and the
+# program does not have to be fast.
+#
+# What that costs, stated here so it is not rediscovered:
+#
+#   * The differential is weaker. Its power came from the candidate and the
+#     reference being written under OPPOSED instructions -- one complexity-
+#     first, one literal -- so that they could not share a misreading. Asked
+#     the same way, two programs from one model agree because they made the
+#     same mistake, and `mismatch=` means less than it did.
+#   * The size probe is now the only thing standing between a correct-but-slow
+#     program and the validator's five-second per-test clock. `SOLVER_SIZE_PROBE`
+#     stops being a diagnostic and becomes the guard.
+#
+# What it buys, measured: the reference turn -- which is asked for correctness
+# and explicitly told not to optimise -- runs at a median 15.3s on the same
+# model at the same effort, against the candidate's 126.2s and a tail that
+# reaches the deadline without emitting a character. The difference between
+# those two turns is the instruction, and the optimisation demand is the
+# instruction.
 _CANDIDATE_TASK = """\
 Write the SOLUTION to this problem — the program that will be submitted.
 
-The hidden tests include the largest inputs the statement allows, and there is
-no partial credit, so it must be both correct and fast enough at those sizes:
+Correctness is the whole of the requirement. A program that is right on every
+case the statement admits is the answer, whatever its running time.
 
-- Correct on every case the statement admits, the degenerate ones included.
-- Fast at the stated maximums. If the statement names a bound you would have to
-  iterate to reach, you need a closed form, a compressed representation or an
-  implicit one — not a faster loop.
-- Every trap listed above is a trap you are expected to have handled."""
+- Be correct on every case the statement admits, the degenerate and empty ones
+  included.
+- Prefer the direct reading of the statement. Where a simple approach and a
+  clever one both follow the statement, take the simple one — it is easier to
+  get right and there is no prize for the other.
+- Do not spend time searching for a faster algorithm or a closed form. If a
+  straightforward approach implements the statement, that IS the answer.
+- The traps listed above are findings already made. Handle them as you write
+  rather than reopening them."""
 
 # The repair turn, and the one thing about it that is structural: the model
 # answering it did NOT write the program it is being shown. The repair phase
@@ -1900,7 +1925,11 @@ def build_candidate_prompt(task, analysis) -> str:
         _statement_header(task)
         + (f"\n{EXAMPLES_LABEL}\n{examples}\n" if examples else "")
         + "\nWHAT THE STATEMENT HIDES:\n"
-        + analysis.as_prompt_block()
+        # Correctness-only, so the complexity targets and the "a naive
+        # solution cannot finish" line are dropped: they are speed demands,
+        # and leaving them in would have the analysis block ask for a closed
+        # form three lines under a task that says not to look for one.
+        + analysis.as_prompt_block(include_performance=False)
         + "\n"
         + _CANDIDATE_TASK
         + "\n\nRULES:\n"

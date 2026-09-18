@@ -571,16 +571,33 @@ class Analysis:
             for trap in self.traps
         )
 
-    def as_prompt_block(self) -> str:
+    def as_prompt_block(self, include_performance: bool = True) -> str:
+        """The analysis, as a prompt section.
+
+        `include_performance=False` drops the three fields that state a SPEED
+        requirement -- the two complexity targets and why a naive solution
+        fails. It exists for the candidate turn, whose instruction is
+        correctness-only: leaving them in would make the prompt demand a
+        closed form in the analysis block while the task above it says not to
+        look for one, and the heuristic defaults say exactly that ("This needs
+        a closed form or a compressed structure").
+
+        Everything a CORRECTNESS reader wants is kept -- traps, invariants,
+        edge cases, the signature, the I/O notes and the sketch -- because
+        none of those is a demand about running time.
+        """
         invariants = "\n".join(f"- {i}" for i in self.invariants) or "- (none)"
         edges = "\n".join(f"- {e}" for e in self.edge_cases) or "- (none)"
-        return (
-            f"Summary: {self.summary or '(heuristic only)'}\n"
-            f"Signature: {self.signature}\n"
+        performance = (
             f"Time complexity target: {self.complexity_time}\n"
             f"Memory complexity target: {self.complexity_memory}\n"
             f"Naive solutions fail because: {self.naive_failure}\n"
-            f"I/O notes: {self.io_notes}\n"
+        ) if include_performance else ""
+        return (
+            f"Summary: {self.summary or '(heuristic only)'}\n"
+            f"Signature: {self.signature}\n"
+            + performance
+            + f"I/O notes: {self.io_notes}\n"
             f"Traps:\n{self.trap_block()}\n"
             f"Invariants:\n{invariants}\n"
             f"Edge cases:\n{edges}\n"

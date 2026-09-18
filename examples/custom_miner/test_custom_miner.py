@@ -13057,21 +13057,84 @@ def test_the_inputs_turn_is_forbidden_to_answer_its_own_cases():
     assert all("expected" not in case for case in cases), cases
 
 
-def test_the_two_programs_are_asked_for_opposite_things():
-    """The oracle and the candidate are the same problem under opposed
-    instructions, and that difference is the entire evidence the design
-    produces. If both prompts asked for a fast correct program the two
-    answers would share their misreadings and comparing them would establish
-    nothing."""
+def test_the_two_programs_are_still_asked_for_different_things():
+    """What is LEFT of the opposition, after the operator made stage 6
+    correctness-only.
+
+    The design's evidence came from the two programs being written under
+    opposed instructions -- one complexity-first, one literal -- so that they
+    could not share a misreading. That opposition is now much narrower by
+    decision: the candidate is no longer asked to be fast, so both turns are
+    asked for a correct program and `mismatch=` is weaker evidence than it
+    was. This test is what stops it narrowing to NOTHING without anyone
+    noticing.
+
+    Three differences still hold, and each is load-bearing:
+      * the reference is told its inputs are tiny and told not to optimise,
+        which the candidate is not -- so the two still reach for different
+        implementations of the same reading;
+      * the candidate carries the language rules and the environment (the
+        overflow warnings, the entrypoint contract), which the reference does
+        not need and is not given;
+      * only the candidate is told its program is the one that ships.
+    """
     prompts_by_stage = _all_stage_prompts(_stage_task("python"))
     oracle, candidate = prompts_by_stage["oracle"], prompts_by_stage["candidate"]
 
     assert "REFERENCE" in oracle and "Do not optimise" in oracle
     assert "tiny inputs" in oracle
-    assert "SOLUTION" in candidate and "largest inputs" in candidate
-    # The oracle must not be told to be fast, nor the candidate to be slow.
+    assert "SOLUTION" in candidate and "will be submitted" in candidate
+    # The reference's licence to be slow is still its own: handed to the
+    # candidate as well, the two turns would be one turn run twice.
     assert "Nested loops are fine" in oracle
     assert "Nested loops are fine" not in candidate
+    assert "tiny inputs" not in candidate
+
+
+def test_no_speed_requirement_reaches_the_program_that_ships():
+    """OPERATOR POLICY, pinned so it cannot drift back in.
+
+    Correctness is the whole of the requirement for stage 6 and the program
+    does not have to be fast. That is a decision, not a finding, and it is
+    easy to undo by accident: the demand used to be stated in THREE places --
+    the task text, and two fields of the analysis block whose heuristic
+    defaults read "This needs a closed form or a compressed structure" and
+    "Near-linear in the stated n". Removing it from the task alone would have
+    left the prompt asking for a closed form three lines below an instruction
+    not to look for one.
+    """
+    for language in ("python", "rust"):
+        prompt = _candidate_prompt(language)
+        for demand in (
+            "largest inputs the statement allows",
+            "fast enough at those sizes",
+            "Fast at the stated maximums",
+            "you need a closed form",
+            "closed form or a compressed structure",
+            "Time complexity target",
+            "Memory complexity target",
+            "Naive solutions fail because",
+        ):
+            assert demand not in prompt, (
+                f"{language}: a speed requirement is back in the candidate "
+                f"prompt: {demand!r}"
+            )
+        # ...and the correctness demand is still there, which is the half of
+        # the policy that was kept rather than dropped.
+        assert "Correctness is the whole of" in prompt
+
+
+def test_the_reference_and_the_inputs_turns_keep_the_complexity_targets():
+    """Dropping the performance fields is the CANDIDATE's alone.
+
+    The inputs turn sizes its cases against them and the reference is what
+    the candidate is compared to; blanking those two as well would have made
+    one operator decision quietly change three stages.
+    """
+    prompts_by_stage = _all_stage_prompts(_stage_task("python"))
+    for stage in ("oracle", "inputs"):
+        assert "Time complexity target" in prompts_by_stage[stage], stage
+        assert "Naive solutions fail because" in prompts_by_stage[stage], stage
 
 
 @pytest.mark.parametrize("language", ["python", "rust"])
@@ -13935,3 +13998,119 @@ def test_a_cancelled_turn_gives_its_tab_back(monkeypatch):
         f"the seat in the log and leaked it in fact. "
         f"closed={closed_by_the_time_it_returned}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# SOLVER_TRANSCRIPT: every prompt, every reply, and what each turn cost.
+#
+# The archive keeps ONE request and ONE response per solve. A solve opens five
+# conversations, so the four turns that produced the answer were unrecoverable
+# -- the prompts had to be rebuilt by hand from the builders to investigate
+# anything, and `thinking_tokens`, the one number that explains why a turn was
+# slow, was parsed out of the event stream and then dropped.
+# --------------------------------------------------------------------------- #
+
+
+def _transcript_solver(monkeypatch, tmp_path, usage=None):
+    log = tmp_path / "turns.log"
+    monkeypatch.setenv("SOLVER_TRANSCRIPT", str(log))
+    monkeypatch.setenv("SOLVER_LLM_ANALYSIS", "0")
+    monkeypatch.setenv("SOLVER_CANDIDATE_HEDGE_S", "0")
+    seats = _EarlySeats({"candidate": _EARLY_PROGRAM})
+    made = seats._seat
+
+    def _seat(phase):
+        seat = made(phase)
+        if usage is not None:
+            seat.last_usage = dict(usage)
+        return seat
+
+    seats._seat = _seat
+    return log, seats, VerifyingSolver(seats, reserve_s=0, max_budget_s=60)
+
+
+def test_the_transcript_keeps_every_turn_with_its_prompt_reply_and_tokens(
+    monkeypatch, tmp_path,
+):
+    log, _, solver = _transcript_solver(
+        monkeypatch, tmp_path,
+        usage={"input": 2067, "output": 1450, "thinking": 18400},
+    )
+    asyncio.run(solver.solve_task(_two_seat_task(), 60.0))
+    written = log.read_text("utf-8")
+
+    for phase in ("tests", "oracle", "candidate"):
+        assert f"phase={phase}" in written, f"the {phase} turn is missing"
+    assert "----- PROMPT" in written and "----- REPLY" in written
+    assert "PROBLEM STATEMENT" in written, "the prompt body was not written"
+    assert _EARLY_PROGRAM.strip()[:20] in written, "the reply body was not written"
+    # The number the latency work turned on. An aggregate over the seat cannot
+    # answer "what did THIS turn cost", which is the only form of the question
+    # that identifies a slow stage.
+    assert "thinking=18400" in written
+    assert "in=2067" in written and "out=1450" in written
+
+
+def test_a_turn_that_failed_is_recorded_and_still_raises(monkeypatch, tmp_path):
+    """The turn most worth having in the transcript is the one that broke, and
+    a transcript that swallowed the exception to get it would trade a
+    diagnostic for the answer."""
+    log, seats, solver = _transcript_solver(monkeypatch, tmp_path)
+    made = seats._seat
+
+    def _seat(phase):
+        seat = made(phase)
+        if phase == "candidate":
+            async def _boom(text, timeout_s, extend_to_s=None):
+                raise RuntimeError("the candidate tab died")
+            seat.send = _boom
+        return seat
+
+    seats._seat = _seat
+    asyncio.run(solver.solve_task(_two_seat_task(), 60.0))
+    written = log.read_text("utf-8")
+
+    assert "the turn raised RuntimeError: the candidate tab died" in written
+    assert "phase=candidate" in written
+    # It raised: the solve reports failure rather than a program.
+    assert "----- PROMPT" in written
+
+
+def test_no_transcript_is_written_unless_the_operator_asks_for_one(
+    monkeypatch, tmp_path,
+):
+    """It writes every prompt in full, and a 97-problem replay is tens of
+    megabytes. Off is the default and the default is what production runs."""
+    monkeypatch.delenv("SOLVER_TRANSCRIPT", raising=False)
+    monkeypatch.setenv("SOLVER_LLM_ANALYSIS", "0")
+    from solvers import transcript
+
+    assert transcript.path() is None and not transcript.enabled()
+    for off in ("", "0", "off", "no", "false"):
+        monkeypatch.setenv("SOLVER_TRANSCRIPT", off)
+        assert transcript.path() is None, f"{off!r} should mean no transcript"
+
+    stray = tmp_path / "must-not-exist.log"
+    monkeypatch.setenv("SOLVER_TRANSCRIPT", "0")
+    asyncio.run(VerifyingSolver(_EarlySeats({"candidate": _EARLY_PROGRAM}),
+                                reserve_s=0, max_budget_s=60)
+                .solve_task(_two_seat_task(), 60.0))
+    assert not stray.exists()
+
+
+def test_a_transcript_that_cannot_be_written_never_costs_the_answer(
+    monkeypatch, tmp_path,
+):
+    """Pointed at a path that cannot be opened, the solve still ships."""
+    # A path whose PARENT is a regular file: `mkdir` raises NotADirectoryError
+    # and the open after it never happens.
+    blocker = tmp_path / "a-file-not-a-directory"
+    blocker.write_text("in the way", encoding="utf-8")
+    monkeypatch.setenv("SOLVER_TRANSCRIPT", str(blocker / "turns.log"))
+    monkeypatch.setenv("SOLVER_LLM_ANALYSIS", "0")
+    answer = asyncio.run(
+        VerifyingSolver(_EarlySeats({"candidate": _EARLY_PROGRAM}),
+                        reserve_s=0, max_budget_s=60)
+        .solve_task(_two_seat_task(), 60.0)
+    )
+    assert "sum(int(c)" in answer.code, answer.code
