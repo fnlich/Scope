@@ -1973,14 +1973,22 @@ def build_differential_repair_prompt(
         "runs on tiny inputs, so do not make it faster — make it stop failing "
         "and keep it obviously correct."
         if oracle
-        else "This is the program that will be SUBMITTED. It must stay correct "
-        "at the largest inputs the statement allows; a repair that fixes this "
-        "case and makes the program quadratic has not helped."
+        else "This is the program that will be SUBMITTED. Correctness is the "
+        "whole of the requirement: fix the case the check found without "
+        "breaking the ones it already passes, and do not spend the repair on "
+        "making the program faster."
     )
     return (
         _statement_header(task)
         + "\nWHAT THE STATEMENT HIDES:\n"
-        + analysis.as_prompt_block()
+        # The CANDIDATE repair rewrites the program that ships, so it inherits
+        # stage 6's correctness-only policy. Without this the repair turn was
+        # the way the speed demand came back: it carried the full performance
+        # block and told the model to stay correct "at the largest inputs the
+        # statement allows" -- reinstating, one round later, exactly what the
+        # candidate prompt had just been cleared of. The REFERENCE repair keeps
+        # the block: it is compared against, never submitted.
+        + analysis.as_prompt_block(include_performance=oracle)
         + "\n"
         + _REPAIR_TASK
         + "\n\n"

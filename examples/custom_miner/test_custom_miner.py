@@ -13170,9 +13170,16 @@ def test_the_repair_prompt_stands_on_its_own():
 
 
 def test_repairing_the_reference_is_not_the_same_job_as_repairing_the_answer():
-    """The reference may be as slow as it likes and only has to stop falling
-    over; the candidate has to stay fast at the stated maximums. Telling the
-    model the wrong one of those is how a repair round makes things worse."""
+    """The two repairs are still different jobs, after the operator made the
+    shipping program correctness-only.
+
+    They used to differ on SPEED: the reference could be as slow as it liked,
+    the candidate had to stay fast at the stated maximums. Neither is asked to
+    be fast now, so what is left is WHICH ARTIFACT is being mended -- one is
+    compared against and one is submitted -- and the reference keeps the only
+    instruction about running time in either prompt, which is a licence to
+    ignore it. Telling the model the wrong one is still how a repair round
+    makes things worse."""
     from solvers import prompts
     from solvers.analyze import heuristic_analyze
 
@@ -13184,7 +13191,23 @@ def test_repairing_the_reference_is_not_the_same_job_as_repairing_the_answer():
         task, analysis, "CODE", "report", kind="candidate")
 
     assert "do not make it faster" in oracle
-    assert "SUBMITTED" in candidate and "quadratic" in candidate
+    assert "REFERENCE implementation, not the submitted one" in oracle
+    # The candidate repair names the artifact and states the policy; what it
+    # must NOT carry is any demand about running time. `quadratic` used to be
+    # asserted here, out of "a repair that makes the program quadratic has not
+    # helped" -- the sentence the correctness-only policy removed.
+    assert "SUBMITTED" in candidate
+    assert "Correctness is the whole of the requirement" in candidate
+    # A DEMAND, not the word. The candidate repair says "do not spend the
+    # repair on making the program faster", which is the instruction and not
+    # a violation of it -- a bare substring check on "faster" flags its own
+    # fix, which is how this assertion was first written and first wrong.
+    for demand in ("quadratic", "largest inputs", "must stay correct at",
+                   "make it faster", "fast enough"):
+        assert demand not in candidate, (
+            f"the repair of the shipping program still demands speed: {demand!r}"
+        )
+    assert "do not spend the repair on making the program faster" in candidate
     assert "do not make it faster" not in candidate
 
 
@@ -14114,3 +14137,126 @@ def test_a_transcript_that_cannot_be_written_never_costs_the_answer(
         .solve_task(_two_seat_task(), 60.0)
     )
     assert "sum(int(c)" in answer.code, answer.code
+
+
+def test_every_trap_that_demands_a_complexity_is_classified_as_one():
+    """`PERFORMANCE_TRAPS` is a hand-written set, and a hand-written set rots.
+
+    The candidate turn is correctness-only, and the way the speed demand got
+    back in was never the task text -- it was the trap mitigations, which say
+    things like "Aim for near-linear time and O(n) memory". Dropping the
+    complexity targets while leaving those in place fixes nothing.
+
+    So rather than trusting the set, this walks the whole catalog: any trap
+    whose mitigation asks for an ASYMPTOTIC property and is not named in the
+    set fails here, the day it is added.
+
+    An asymptotic demand, not any mention of speed. `rust_contract` says "read
+    the input up front or with a fast scanner" -- an I/O idiom, and the rest of
+    that trap is the contract without which a Rust answer does not run at all.
+    """
+    import re
+
+    from solvers.analyze import PERFORMANCE_TRAPS, heuristic_analyze
+
+    asymptotic = re.compile(
+        r"near-linear|O\(n|quadratic|closed form|asymptot|sublinear", re.I
+    )
+    seen, missed = set(), []
+    for task in _recorded_requests():
+        for trap in heuristic_analyze(task).traps:
+            if trap.name in seen:
+                continue
+            seen.add(trap.name)
+            if (asymptotic.search(trap.mitigation)
+                    and trap.name not in PERFORMANCE_TRAPS):
+                missed.append((trap.name, trap.mitigation[:80]))
+    assert len(seen) >= 10, f"the catalog walk saw only {len(seen)} traps"
+    assert not missed, (
+        "these traps demand a complexity but are not in PERFORMANCE_TRAPS, so "
+        "they reach the correctness-only candidate prompt: "
+        + "; ".join(f"{n}: {m}" for n, m in missed)
+    )
+
+
+def test_the_repair_that_rewrites_the_shipping_program_asks_only_for_correctness():
+    """REGRESSION-SHAPED. The repair turn was how the speed demand came back.
+
+    Stage 6 was cleared of it and stage 8 -- which rewrites that same program
+    and whose output is what actually ships -- still carried the whole
+    performance block plus "it must stay correct at the largest inputs the
+    statement allows". One repair round put back everything the candidate
+    prompt had just been cleared of.
+
+    The REFERENCE repair keeps the block on purpose: it is compared against,
+    never submitted.
+    """
+    import re
+
+    from solvers import prompts
+    from solvers.analyze import heuristic_analyze
+
+    task = _stage_task("python")
+    analysis = heuristic_analyze(task)
+    demand = re.compile(
+        r"near-linear|O\(n|quadratic|closed form|asymptot|sublinear|"
+        r"largest inputs|stresses speed|Time complexity target|"
+        r"Memory complexity target|Naive solutions fail",
+        re.I,
+    )
+    shipping = prompts.build_differential_repair_prompt(
+        task, analysis, "CODE", "report", kind="candidate")
+    reference = prompts.build_differential_repair_prompt(
+        task, analysis, "CODE", "report", kind="oracle")
+
+    leaked = [ln.strip() for ln in shipping.splitlines() if demand.search(ln)]
+    assert not leaked, (
+        "a speed demand reaches the repair of the program that ships: " 
+        + " | ".join(leaked[:3])
+    )
+    assert "Correctness is the whole of the requirement" in shipping
+    # The reference repair is untouched by the policy.
+    assert "Time complexity target" in reference
+
+
+def test_the_transcript_names_the_model_and_the_effort(monkeypatch, tmp_path):
+    """Grouping a transcript by model or by effort must not mean parsing them
+    back out of a provider label a backend composed for the log."""
+    log = tmp_path / "turns.log"
+    monkeypatch.setenv("SOLVER_TRANSCRIPT", str(log))
+    monkeypatch.setenv("SOLVER_LLM_ANALYSIS", "0")
+    seats = _EarlySeats({"candidate": _EARLY_PROGRAM})
+    made = seats._seat
+
+    def _seat(phase):
+        seat = made(phase)
+        seat.model, seat.effort = "opus", "low"
+        seat.last_usage = {"input": 11, "output": 22, "thinking": 33}
+        return seat
+
+    seats._seat = _seat
+    asyncio.run(VerifyingSolver(seats, reserve_s=0, max_budget_s=60)
+                .solve_task(_two_seat_task(), 60.0))
+    written = log.read_text("utf-8")
+
+    assert "model=opus" in written and "effort=low" in written
+    assert "thinking=33" in written
+
+
+def test_a_backend_with_no_model_or_tokens_still_gets_a_transcript(
+    monkeypatch, tmp_path,
+):
+    """The browser fleet has no token stream and no effort setting. It must
+    still have its prompts written down, with the absence said plainly rather
+    than printed as `model=None`."""
+    log = tmp_path / "turns.log"
+    monkeypatch.setenv("SOLVER_TRANSCRIPT", str(log))
+    monkeypatch.setenv("SOLVER_LLM_ANALYSIS", "0")
+    asyncio.run(VerifyingSolver(_EarlySeats({"candidate": _EARLY_PROGRAM}),
+                                reserve_s=0, max_budget_s=60)
+                .solve_task(_two_seat_task(), 60.0))
+    written = log.read_text("utf-8")
+
+    assert "----- PROMPT" in written and "phase=candidate" in written
+    assert "model=None" not in written and "effort=None" not in written
+    assert "tokens unavailable for this backend" in written

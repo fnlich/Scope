@@ -81,6 +81,17 @@ def record(
         tokens = _tokens_of(conversation)
         provider = (getattr(conversation, "label", None)
                     or getattr(conversation, "provider", None) or "?")
+        # Model and effort NAMED, not left to be read out of the provider
+        # label. The label is one string a backend composes for the log, and
+        # a transcript that only carries it cannot be grouped by model or by
+        # effort without parsing prose back apart. Both are read straight off
+        # the conversation, so a backend that has neither simply omits them.
+        model = getattr(conversation, "model", None)
+        effort = getattr(conversation, "effort", None)
+        settings = "  ".join(
+            f"{k}={v}" for k, v in (("model", model), ("effort", effort))
+            if v
+        )
         cost = "  ".join(
             f"{k}={v}" for k, v in (
                 ("in", tokens.get("input")),
@@ -94,7 +105,8 @@ def record(
             f"\n{_RULE}\n"
             f"{datetime.now():%H:%M:%S}  id={problem_id[:12]}  phase={phase}  "
             f"{provider}{spent}\n"
-            f"{cost}\n"
+            + (f"{settings}\n" if settings else "")
+            + f"{cost}\n"
             + (f"{note}\n" if note else "")
             + f"{_RULE}\n"
         )
